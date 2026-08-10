@@ -11,24 +11,27 @@
 (function () {
   'use strict';
 
+  /* 这里的色值与 theme.css 的 --cat-* 槽位对齐（蓝 / 绿 / 琥珀），
+     让 Mermaid 专项图和原生 HTML 图读起来是同一套系统。
+     文字仍走各自的深色 ink，不用槽位色当正文色。 */
   var LIGHT = {
     background: '#ffffff',
-    primaryColor: '#e6f1fb', primaryTextColor: '#0c447c', primaryBorderColor: '#185fa5',
-    lineColor: '#8a91a1', lineColorHover: '#185fa5',
-    secondaryColor: '#faeeda', secondaryTextColor: '#633806', secondaryBorderColor: '#ba7517',
-    tertiaryColor: '#eaf3de', tertiaryTextColor: '#173404', tertiaryBorderColor: '#639922',
-    noteBkgColor: '#f1f3f6', noteTextColor: '#4a5160', noteBorderColor: '#d0d5de',
-    clusterBkg: '#f7f9fc', clusterBorder: '#c6cfdb',
+    primaryColor: '#eaf3fd', primaryTextColor: '#0c447c', primaryBorderColor: '#2a78d6',
+    lineColor: '#8b97a6', lineColorHover: '#2a78d6',
+    secondaryColor: '#fdf4e0', secondaryTextColor: '#5d4204', secondaryBorderColor: '#eda100',
+    tertiaryColor: '#e6f7f1', tertiaryTextColor: '#0d4c34', tertiaryBorderColor: '#1baf7a',
+    noteBkgColor: '#f4f6f8', noteTextColor: '#4a5160', noteBorderColor: '#d0d5de',
+    clusterBkg: '#f6f7f9', clusterBorder: '#c6cfdb',
     edgeLabelBackground: '#ffffff', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
     fontSize: '15px'
   };
   var DARK = {
     background: '#181b21',
-    primaryColor: '#14283d', primaryTextColor: '#cfe2f5', primaryBorderColor: '#4f9be0',
-    lineColor: '#5a626e', lineColorHover: '#4f9be0',
-    secondaryColor: '#2e2410', secondaryTextColor: '#e0a44b', secondaryBorderColor: '#e0a44b',
-    tertiaryColor: '#16321a', tertiaryTextColor: '#7ec85a', tertiaryBorderColor: '#7ec85a',
-    noteBkgColor: '#20242c', noteTextColor: '#b3b9c4', noteBorderColor: '#383f4a',
+    primaryColor: '#16283c', primaryTextColor: '#cfe2f5', primaryBorderColor: '#3987e5',
+    lineColor: '#5a626e', lineColorHover: '#3987e5',
+    secondaryColor: '#2c2411', secondaryTextColor: '#e0b361', secondaryBorderColor: '#c98500',
+    tertiaryColor: '#122d26', tertiaryTextColor: '#7fd7b3', tertiaryBorderColor: '#199e70',
+    noteBkgColor: '#1d2128', noteTextColor: '#b3b9c4', noteBorderColor: '#383f4a',
     clusterBkg: '#1e232b', clusterBorder: '#323a46',
     edgeLabelBackground: '#20242c', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
     fontSize: '15px'
@@ -60,12 +63,14 @@
       '.mermaid svg{animation:cbFigIn .55s cubic-bezier(.22,.61,.36,1) both}' +
       '.mermaid svg .node rect,.mermaid svg .node circle,.mermaid svg .node polygon,.mermaid svg .node path' +
       '{shape-rendering:geometricPrecision;stroke-width:1.4px}' +
-      '.mermaid svg .node rect{rx:10px}' +
+      '.mermaid svg .node rect{rx:6px}' +
       '.mermaid svg .label,.mermaid svg .nodeLabel{font-size:15px!important;font-weight:600;line-height:1.45}' +
       '.mermaid svg .edgeLabel{background:transparent!important;font-size:13px!important;font-weight:600}' +
       '.mermaid svg .messageText,.mermaid svg .loopText,.mermaid svg .state-note text{font-size:14px!important}' +
-      '.mermaid svg .cluster rect{rx:12px}' +
-      '.mermaid svg .flowchart-link{stroke-width:1.6px;stroke-linecap:round}';
+      '.mermaid svg .cluster rect{rx:8px}' +
+      /* 连线加粗到 2px、圆头收尾，与原生 HTML 流程图的连接器保持同一手感 */
+      '.mermaid svg .flowchart-link{stroke-width:2px;stroke-linecap:round}' +
+      '.mermaid svg .messageLine0,.mermaid svg .messageLine1{stroke-width:1.8px}';
     var st = document.createElement('style');
     st.textContent = css;
     document.head.appendChild(st);
@@ -273,21 +278,55 @@
 
   // The UMD bundle registers its load handler before this script. Disable
   // auto-start and capture source while the bottom-of-body markup is intact.
-  initMermaid();
-  saveMermaidSrc();
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-  else init();
-
-  /* 供页面自定义图表使用的配色 */
-  window.CB_COLORS = {
-    blue: '#378add', blueSoft: '#e6f1fb',
-    amber: '#ef9f27', amberSoft: '#faeeda',
-    green: '#639922', greenSoft: '#eaf3de',
-    red: '#e24b4a', redSoft: '#fcebeb',
-    purple: '#7f77dd', purpleSoft: '#eeedfe',
-    teal: '#1d9e75', tealSoft: '#e1f5ee',
-    gray: '#888780', graySoft: '#f1efe8'
+  // 引导放在文件末尾：页面里的自定义图表脚本紧跟在 render.js 之后执行，
+  // 必须先备好 CB_COLORS / CB_CHARTS 再引导，否则暗色首屏会拿到浅色取值。
+  /* 供页面自定义图表使用的配色。
+     取值与 theme.css 的 --cat-* 槽位同源，两套主题各自选步（不是浅色值的明暗翻转），
+     因此深浅模式下都通过了明度带、色度下限、色盲相邻可分辨与对比度校验。
+     teal 归并到 green：原来两者几乎同色，留 key 只为兼容已有页面。 */
+  var PALETTES = {
+    light: {
+      blue: '#2a78d6', blueSoft: '#eaf3fd',
+      amber: '#eda100', amberSoft: '#fdf4e0',
+      green: '#1baf7a', greenSoft: '#e6f7f1',
+      red: '#e34948', redSoft: '#fdedec',
+      purple: '#4a3aa7', purpleSoft: '#eeecfa',
+      teal: '#1baf7a', tealSoft: '#e6f7f1',
+      gray: '#5b6675', graySoft: '#f4f6f8'
+    },
+    dark: {
+      blue: '#3987e5', blueSoft: '#16283c',
+      amber: '#c98500', amberSoft: '#2c2411',
+      green: '#199e70', greenSoft: '#122d26',
+      red: '#e66767', redSoft: '#331d1d',
+      purple: '#9085e9', purpleSoft: '#23203a',
+      teal: '#199e70', tealSoft: '#122d26',
+      gray: '#8c97a6', graySoft: '#1d2128'
+    }
   };
+  var paletteKeys = Object.keys(PALETTES.light);
+  window.CB_COLORS = Object.assign({}, PALETTES.light);
+
+  /* 主题切换时，已建好的 Chart 实例里的 dataset 颜色不会自动更新。
+     这里按「旧主题的哪个 key」反查，再换成新主题同一个 key 的取值，
+     所以颜色仍然跟着同一个数据系列，不会因为换主题而重排。 */
+  function swapSeriesColors(from, to) {
+    var lookup = {};
+    paletteKeys.forEach(function (key) { lookup[PALETTES[from][key].toLowerCase()] = PALETTES[to][key]; });
+    function mapped(value) {
+      if (typeof value === 'string') return lookup[value.toLowerCase()] || value;
+      if (Array.isArray(value)) return value.map(mapped);
+      return value;
+    }
+    window.CB_CHARTS.forEach(function (ch) {
+      if (!ch || !ch.data || !ch.data.datasets) return;
+      ch.data.datasets.forEach(function (ds) {
+        ['backgroundColor', 'borderColor', 'pointBackgroundColor', 'pointBorderColor', 'hoverBackgroundColor', 'hoverBorderColor'].forEach(function (prop) {
+          if (ds[prop] !== undefined) ds[prop] = mapped(ds[prop]);
+        });
+      });
+    });
+  }
 
   /* 页面可把自建图表实例推入此数组,主题切换时统一重着色 */
   window.CB_CHARTS = window.CB_CHARTS || [];
@@ -315,10 +354,24 @@
   }
 
   /* 主题切换入口:重着色 Mermaid / Chart 并通知页面重绘自定义图表 */
+  var currentTheme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  if (currentTheme === 'dark') window.CB_COLORS = Object.assign(window.CB_COLORS, PALETTES.dark);
+
   window.CB_SET_THEME = function (theme) {
+    var next = theme === 'dark' ? 'dark' : 'light';
+    if (next !== currentTheme) {
+      swapSeriesColors(currentTheme, next);
+      Object.assign(window.CB_COLORS, PALETTES[next]);
+      currentTheme = next;
+    }
     chartTheme(theme);
     reThemeMermaid(theme);
     recolorCharts(theme);
     window.dispatchEvent(new CustomEvent('cb-theme-change', { detail: { theme: theme } }));
   };
+
+  initMermaid();
+  saveMermaidSrc();
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
 })();
