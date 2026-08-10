@@ -372,6 +372,21 @@
     }, { passive: true });
   }
 
+  /* ---------------- 補充深化资料 ---------------- */
+  function loadResourceCards() {
+    if (!CUR_PART || document.querySelector('.resource-deepening')) return;
+    var script = document.createElement('script');
+    script.src = url('assets/js/resources.js');
+    script.async = true;
+    script.onload = function () {
+      if (typeof window.CB_RENDER_RESOURCES === 'function') window.CB_RENDER_RESOURCES();
+    };
+    script.onerror = function () {
+      // 资料脚本失败时保留正文与手工参考文献，不阻塞页面阅读。
+    };
+    document.head.appendChild(script);
+  }
+
   /* ---------------- 启动 ---------------- */
   function init() {
     initTheme();
@@ -383,6 +398,7 @@
     buildDeepTools();
     buildPageToc();
     markCurrentRead();
+    loadResourceCards();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
