@@ -125,11 +125,21 @@
     }
   };
 
+  var TOPICS = {
+    'attention': { arc: 'Bahdanau 注意力解决固定长度向量瓶颈，Transformer 改成全并行 scaled dot-product attention；FlashAttention 又把瓶颈从 FLOP 转向 HBM IO。', mechanics: '对 X 做 Q=XWq、K=XWk、V=XWv，计算 softmax(QK^T/sqrt(d))V；因果 mask 后第 i 行只能读 j<=i，朴素实现保存 O(n^2) 分数矩阵。', tradeoff: 'head_dim、GQA/MQA、mask 形状和 dtype 会决定 kernel 是否融合；长上下文中减少 KV 头数常比盲目降精度更直接。', frontier: 'FlashAttention-2/3、滑窗和稀疏注意力分别从调度、Tensor Core 与稀疏模式降低 IO，必须按长度和硬件复测。', check: '手算 4-token、2-head 的 QK^T、mask、softmax 和输出，并用 profiler 区分算力与显存瓶颈。' },
+    'scaling-laws': { arc: 'Kaplan 用幂律拟合 loss 与参数、数据和计算量；Chinchilla 说明固定预算下旧路线往往模型过大、训练 token 不足。', mechanics: '典型形式为 L=Linf+A/N^a+B/D^b；实验必须把训练 FLOP、token、序列长度、重算和通信纳入同一预算表。', tradeoff: '小模型外推到大模型会受数据、架构和优化器影响，验证 loss 下降也可能与下游能力、污染和重复脱钩。', frontier: '多 token 预测、数据质量分层、合成数据和测试时计算正在扩展 scaling law 的变量，尚未形成单一公式。', check: '给定 10^23 FLOP 比较两组 N/D 配置，解释 token 不足导致的过拟合并设计跨规模消融。' },
+    'grpo-rlvr': { arc: 'PPO 依赖 value model，DPO 绕过在线采样，GRPO 用同题多样本的组内相对奖励去掉 value model，RLVR 再把 verifier 作为奖励来源。', mechanics: '组内优势 A_i=(r_i-mean(r))/(std(r)+eps)，再用 ratio 的裁剪目标和 reference KL 更新；全对或全错组优势为零。', tradeoff: '组大小、奖励稀疏、长度偏置和 verifier 错误会直接改变梯度，不能只看 pass@1。', frontier: 'DeepSeekMath/R1 展示了可验证数学推理的规模化路径，迁移到开放域 Agent 仍需要过程奖励和副作用约束。', check: '手算奖励 [1,1,0,1] 的组内优势，解释零方差处理，并设计能抓住格式正确但答案错误的 verifier。' },
+    'agent-algorithms': { arc: 'ReAct 交错推理与行动，Plan-and-Execute 拆分规划与执行，Reflexion、SWE-agent、OSWorld 把失败反馈、代码仓库和桌面环境纳入闭环。', mechanics: '轨迹可写成 tau=(s0,a0,o1,...,aT)；工具必须声明 schema、权限、超时、幂等性和结果校验，终止由成功判定或预算触发。', tradeoff: '自由循环提升覆盖面却增加 token、重复调用和越权风险；确定性工作流更稳，但需要明确编排边界。', frontier: 'MCP 解决工具协议，Agentic RL 研究轨迹信用分配，Computer Use 把视觉状态与鼠标键盘动作带入环境，成熟度不同。', check: '实现最大步数、工具超时、幂等写操作、轨迹回放和人工接管，并统计成功率、工具准确率和副作用率。' },
+    'rag': { arc: 'RAG 从 DPR 稠密召回发展到 hybrid search、cross-encoder rerank、图检索和带引用的 Agentic RAG。', mechanics: '在线链路依次执行 query rewrite、召回、重排、上下文压缩和生成；faithfulness 要验证答案是否由证据支持。', tradeoff: 'chunk 越大语义越完整但噪声更高；top-k、重排深度和上下文长度共同决定延迟与成本，检索失败应允许 abstain。', frontier: 'GraphRAG、late interaction、多向量索引和检索训练正在改善复杂问题，但更新、引用粒度和污染仍是难点。', check: '用带 gold evidence 的问题集测 recall@k、MRR、context precision、faithfulness 和无答案拒答率。' },
+    'kv-cache': { arc: 'KV Cache 消除 decode 阶段重复 K/V 计算；PagedAttention 切块管理，prefix caching 与 disaggregation 将缓存变成可调度资源。', mechanics: '缓存显存约为 2*layers*tokens*kv_heads*head_dim*bytes；GQA/MQA 通过减少 kv_heads 降低占用。', tradeoff: '共享缓存提高吞吐却引入匹配、租户隔离和失效策略；offload 节省显存但把瓶颈移到 PCIe/NVLink。', frontier: 'RadixAttention、KV 量化、选择性缓存和 Prefill/Decode 分离正在优化长上下文服务，需同时报告 TTFT、TPOT 和尾延迟。', check: '为 32 层、8 KV heads、128K context、BF16 模型估算缓存显存，并设计超限时的驱逐策略。' }
+  };
+
   function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
   function render() {
     var body = document.body, partId = body.getAttribute('data-part'), topicId = body.getAttribute('data-topic');
     if (!partId || !topicId || document.querySelector('.technical-deepening')) return;
     var t = THREADS[partId]; if (!t) return;
+    if (TOPICS[topicId]) t = Object.assign({}, t, TOPICS[topicId]);
     var topic = (window.TOC && window.TOC.parts || []).reduce(function (found, p) { return found || (p.id === partId ? (p.topics || []).find(function (x) { return x.id === topicId; }) : null); }, null);
     var title = topic ? topic.title : topicId;
     var section = document.createElement('section'); section.className = 'technical-deepening';

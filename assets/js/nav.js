@@ -5,7 +5,12 @@
 (function () {
   'use strict';
 
-  var ROOT = window.ROOT === undefined ? '' : window.ROOT;
+  var ROOT = window.ROOT;
+  if (ROOT === undefined) {
+    var navScript = document.currentScript;
+    var navSrc = navScript && navScript.getAttribute('src') || '';
+    ROOT = navSrc.indexOf('/') >= 0 ? navSrc.replace(/assets\/js\/nav\.js(?:\?.*)?$/, '') : '';
+  }
   var TOC = window.TOC || { parts: [] };
   var IDX = window.SEARCH_INDEX || [];
   var CUR_PART = document.body.getAttribute('data-part') || '';
