@@ -173,6 +173,8 @@
     extra.innerHTML =
       '<a href="' + url('glossary.html') + '">' +
         '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4.5h12M2 8h12M2 11.5h8" stroke-linecap="round"/></svg>术语表</a>' +
+      '<a href="' + url('references.html') + '">' +
+        '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 2.5h7.5A2.5 2.5 0 0 1 13 5v8.5H5.5A2.5 2.5 0 0 0 3 16V2.5Z" stroke-linejoin="round"/><path d="M3 13.5h7.5M5.5 5h5M5.5 7.5h5" stroke-linecap="round"/></svg>参考资料</a>' +
       '<a href="' + url('dependency.html') + '">' +
         '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="4" cy="4" r="1.8"/><circle cx="12" cy="8" r="1.8"/><circle cx="5" cy="12" r="1.8"/><path d="M5.6 4.6 10.4 7.2M5 10.4 4.4 5.8" stroke-linecap="round"/></svg>知识依赖图</a>';
     host.appendChild(extra);

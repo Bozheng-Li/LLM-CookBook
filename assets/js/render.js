@@ -97,6 +97,7 @@
     try {
       mermaid.run({ nodes: document.querySelectorAll('.mermaid') });
     } catch (e) { /* 重渲染失败时保留旧图 */ }
+    initFigureZoom();
   }
 
   /* KaTeX: 自动渲染 $...$ 与 $$...$$ */
@@ -120,6 +121,50 @@
     if (typeof hljs === 'undefined') return;
     document.querySelectorAll('pre code').forEach(function (b) {
       try { hljs.highlightElement(b); } catch (e) { /* noop */ }
+    });
+  }
+
+  /* 图表和论文插图在正文中按列宽显示，点击后打开原尺寸阅读层。 */
+  function initFigureZoom() {
+    document.querySelectorAll('.mermaid').forEach(function (node) {
+      node.dataset.cbZoom = 'ready';
+      node.setAttribute('tabindex', '0');
+      node.setAttribute('role', 'button');
+      node.setAttribute('aria-label', '放大查看流程图');
+    });
+    if (document.body.dataset.cbZoomBound) return;
+    document.body.dataset.cbZoomBound = '1';
+    document.addEventListener('click', function (event) {
+      var source = event.target.closest('.mermaid, .paper-figure img');
+      if (!source || event.target.closest('.cb-zoom-layer')) return;
+      var visual = source.matches('img') ? source.cloneNode(true) : source.querySelector('svg');
+      if (!visual) return;
+      var layer = document.createElement('div');
+      layer.className = 'cb-zoom-layer';
+      layer.setAttribute('role', 'dialog');
+      layer.setAttribute('aria-modal', 'true');
+      var panel = document.createElement('div');
+      panel.className = 'cb-zoom-panel';
+      var close = document.createElement('button');
+      close.className = 'cb-zoom-close';
+      close.type = 'button';
+      close.setAttribute('aria-label', '关闭放大视图');
+      close.textContent = '×';
+      panel.appendChild(close);
+      panel.appendChild(visual);
+      layer.appendChild(panel);
+      document.body.appendChild(layer);
+      document.body.style.overflow = 'hidden';
+      function dismiss() { layer.remove(); document.body.style.overflow = ''; document.removeEventListener('keydown', onKey); }
+      function onKey(e) { if (e.key === 'Escape') dismiss(); }
+      close.addEventListener('click', dismiss);
+      layer.addEventListener('click', function (e) { if (e.target === layer) dismiss(); });
+      document.addEventListener('keydown', onKey);
+      close.focus();
+    });
+    document.addEventListener('keydown', function (event) {
+      var node = document.activeElement;
+      if (event.key === 'Enter' && node && node.matches('.mermaid')) node.click();
     });
   }
 
@@ -152,6 +197,7 @@
     try {
       if (typeof mermaid !== 'undefined') mermaid.run({ nodes: document.querySelectorAll('.mermaid') });
     } catch (e) { /* noop */ }
+    initFigureZoom();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
