@@ -14,6 +14,8 @@
 
 这是推荐入口。站点支持章节导航、站内搜索、难度筛选、阅读进度、深色模式、公式渲染、Mermaid 图表和代码高亮。所有页面都是静态 HTML，打开速度快，也不依赖后端服务。
 
+> 首次启用提示：仓库管理员需要在 GitHub 的 **Settings → Pages → Build and deployment → Source** 选择 **GitHub Actions**。完成一次后，后续推送 `main` 会自动更新阅读端。
+
 ### 本地阅读
 
 ```bash
