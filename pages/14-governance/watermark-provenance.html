@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>内容标识与来源溯源 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="14-governance" data-topic="watermark-provenance">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+              <span class="tag-frontier">时效性强</span>
+            </div>
+            <h1>内容标识与来源溯源</h1>
+            <p class="lead">AI 生成的内容怎么和人类创作的内容区分开？这不只是技术问题——GB 45438-2025 已经把它变成了法律义务。这一页拆解显式标识与隐式标识的双轨体系、文本和图像水印的技术原理与攻击面，以及 C2PA 内容凭证如何建立从生成到传播的信任链。读完你会明白：为什么"加个文字提示"远远不够，以及工程上如何真正落地一套经得起核验的标识方案。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>内容标识有两条独立的技术路线，法律规定两条都要走：<strong>显式标识</strong>让用户一眼看出"这是 AI 生成的"，<strong>隐式标识</strong>让机器能在文件流转中自动溯源。前者管"人知道"，后者管"机器知道"——缺了任何一条，合规就不完整。隐式标识内部又有两条子路线：<strong>元数据路线</strong>（如 C2PA Manifest）和<strong>水印路线</strong>（改写像素/采样值），二者互补。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  subgraph 生成["AI 生成内容"]
+    G["模型输出"]
+  end
+  subgraph 双轨["GB 45438-2025 双轨标识"]
+    E["显式标识<br/>用户可感知"]
+    I["隐式标识<br/>机器可读取"]
+  end
+  G --> E
+  G --> I
+  I --> M["元数据路线<br/>C2PA / EXIF"]
+  I --> W["水印路线<br/>像素/采样扰动"]
+  E --> U["用户看到提示<br/>这是 AI 生成"]
+  M --> V["传播平台核验<br/>读取 Manifest"]
+  W --> V
+  V --> C["拦截篡改/缺失标识"]
+  style E fill:#dcefc8,stroke:#4a7318
+  style I fill:#e6f1fb,stroke:#185fa5
+  style G fill:#fef3c7,stroke:#f59e0b
+  style U fill:#dcefc8,stroke:#4a7318
+  style M fill:#e6f1fb,stroke:#185fa5
+  style W fill:#e6f1fb,stroke:#185fa5
+  style V fill:#e6f1fb,stroke:#185fa5
+  style C fill:#fde7e7,stroke:#dc2626
+              </div>
+              <figcaption>双轨标识体系：显式标识服务用户感知，隐式标识服务机器溯源；隐式标识又分元数据与水印两条子路线</figcaption>
+            </figure>
+          </div>
+
+          <h2>GB 45438-2025 双轨义务</h2>
+          <p>GB 45438-2025《网络安全技术 人工智能生成合成内容标识方法》于 2025 年 2 月 28 日发布、<strong>2025 年 9 月 1 日实施</strong>，是中国首部针对 AI 生成内容的强制性国家标准。它与《人工智能生成合成内容标识办法》（2025 年 3 月发布，同日生效）配套，构建了"显式标识 + 隐式标识"双轨体系。理解这套体系，要先建立两个分层的心智模型：</p>
+          <ul>
+            <li><strong>对象分层</strong>：标识义务既针对"生成合成服务"的提供者（你在哪生成），也针对"内容传播平台"（内容在哪流转）。同一个 AI 生成视频，生成方要打标，平台转发时也要核验和保留标识。</li>
+            <li><strong>技术分层</strong>：一条路给"人"看（显式），一条路给"机器"读（隐式）；隐式内部再分"随文件走的元数据"和"嵌进内容的信号"两条。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">强制性 vs 推荐性</span>
+            GB 45438-2025 是<strong>强制性</strong>国家标准（标准号以"GB"开头，无"/T"），必须执行。而配套的 GB/T 45654-2025（生成式 AI 服务安全基本要求）是<strong>推荐性</strong>标准（"GB/T"开头），不强制。标识义务是强制的，不是"建议"。把强制标准当成推荐标准对待，是最常见的合规误判。
+          </div>
+
+          <h3>显式标识</h3>
+          <p>显式标识是<strong>用户可以直接感知</strong>的标识，目的是让用户在看到内容时就知道"这是 AI 生成的"。GB 45438-2025 对不同模态的显式标识有具体要求：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>内容模态</th><th>显式标识方式</th><th>典型示例</th></tr></thead>
+              <tbody>
+                <tr><td>文本</td><td>文字提示</td><td>"本内容由 AI 生成"前缀或后缀</td></tr>
+                <tr><td>图片</td><td>视觉水印</td><td>角落标识、半透明叠加文字</td></tr>
+                <tr><td>音频</td><td>语音提示</td><td>开头或结尾的"本音频由 AI 生成"语音</td></tr>
+                <tr><td>视频</td><td>视觉水印 + 文字</td><td>持续显示的角标或片头提示</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>显式标识的核心要求是<strong>清晰可辨、位置显著</strong>——不能藏在角落里让人看不到，也不能用不显眼的颜色让它"技术上有但实际看不见"。标准对标识的尺寸、时长、位置都有量化要求，具体以标准原文为准。实践中，很多产品把显式标识做成可一键关闭的浮层，这会在合规审计时成为争议点：标识是否"始终显著可感知"是关键判断标准。</p>
+
+          <h3>隐式标识</h3>
+          <p>隐式标识是<strong>嵌入文件中的机器可读信息</strong>，用户看不到但机器能读。它的作用是在内容传播过程中让平台和工具能自动识别"这是 AI 生成的"，即使显式标识被裁剪或删除。隐式标识有两条子路线：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>技术</th><th>原理</th><th>优势</th><th>局限</th></tr></thead>
+              <tbody>
+                <tr><td><strong>元数据嵌入</strong></td><td>在文件元数据（如 EXIF、C2PA Manifest）中写入生成信息</td><td>标准化、不损质量</td><td>元数据可被剥离</td></tr>
+                <tr><td><strong>数字水印</strong></td><td>在像素/采样值中嵌入不可见信号</td><td>抗裁剪、抗压缩</td><td>可能影响质量、可被攻击</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>GB 45438-2025 要求隐式标识包含生成服务的提供者信息、内容生成方式等要素，且<strong>严禁擅自删除、篡改或隐匿</strong>。这意味着内容传播平台有义务核验隐式标识的完整性——如果用户上传的 AI 生成内容缺少隐式标识，平台可能需要承担连带责任。换句话说，隐式标识不是"生成方的内部实现细节"，而是整条传播链上每个节点都要参与的协作协议。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">为什么需要两条路</span>
+            显式标识能被裁剪——截个图就能切掉角落水印。隐式标识抗裁剪但用户看不到。两条路互补：显式标识管用户感知，隐式标识管机器溯源。攻击者想完全抹除 AI 生成痕迹，需要同时绕过两条——这提高了攻击成本。再叠加隐式标识内部的"元数据 + 水印"双子路线，攻击者还要同时剥离元数据和去除水印，成本进一步提高。
+          </div>
+
+          <h2>文本水印技术</h2>
+          <p>文本是 AI 生成内容中最难加水印的模态——因为文本的每个 token 都是离散的，不像图像像素那样可以连续微调。目前有两条技术路线：统计水印（改概率分布）和语义水印（改内容结构）。本节先讲统计水印，并给出一段可运行的简化实现，帮助你建立直观认识。</p>
+
+          <h3>统计水印：改概率分布</h3>
+          <p>统计水印的核心思想是在生成时<strong>偏移 token 的概率分布</strong>，嵌入一个统计信号。检测时分析文本的统计特征，判断是否包含水印。代表方法是 Google DeepMind 的 <strong>SynthID</strong>，以及学术界经典的"绿名单（green-list）"水印（Kirchenbauer 等，2023）。后者用一个巧妙的技巧：对每个生成位置，根据前文哈希把词表划分为"绿名单"和"红名单"，生成时给绿名单 token 的概率加偏置，使采样偏向绿名单；检测时统计全文绿名单 token 的占比，用假设检验判断其是否"显著偏多"。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  subgraph 嵌入["水印嵌入（生成时）"]
+    G1["模型输出 logits"] --> G2["水印函数<br/>绿名单加偏置"]
+    G2 --> G3["采样 token<br/>偏向绿名单"]
+  end
+  subgraph 检测["水印检测（验证时）"]
+    D1["输入待检文本"] --> D2["统计检验<br/>绿名单占比 z 检验"]
+    D2 --> D3{"显著偏多？"}
+    D3 -->|是| D4["判定为 AI 生成"]
+    D3 -->|否| D5["判定为人类撰写"]
+  end
+  style G2 fill:#fef3c7,stroke:#f59e0b
+  style D2 fill:#e6f1fb,stroke:#185fa5
+  style D4 fill:#fef2f2,stroke:#dc2626
+  style D5 fill:#dcefc8,stroke:#4a7318
+            </div>
+            <figcaption>绿名单统计水印的双阶段流程：生成时给绿名单加偏置，检测时用 z 检验判断绿名单 token 是否显著偏多</figcaption>
+          </figure>
+
+          <p>下面是一段刻意简化的 Python 实现，演示绿名单水印的"生成偏置"与"检测 z 检验"两个核心步骤。真实系统会处理词表大小、温度、批处理、流式解码等大量工程细节，但底层统计思想是一致的：</p>
+
+          <pre><code class="language-python">import hashlib, random
+
+# 简化版"绿名单（green-list）"水印：把每个位置的候选 token 按 (前文, 位置, token)
+# 哈希分成绿/红名单，生成时偏向绿名单；检测时用 z 检验看绿名单 token 是否显著偏多。
+SEED = b"demo-watermark"
+GREEN_RATIO = 0.5  # 绿名单占比基线（随机情形下的期望）
+
+def is_green(prev_id, position, tok, vocab_size=1000):
+    h = hashlib.sha256(SEED + str(prev_id).encode()
+        + str(position).encode() + str(tok).encode()).digest()
+    return h[0] % 2 == 0  # 用哈希低位奇偶性划分，示意
+
+def watermark_logits(logits, prev_id, position, gamma=0.25):
+    # 绿名单加偏置、红名单减偏置，使采样偏向绿名单
+    for tok in range(len(logits)):
+        logits[tok] += gamma if is_green(prev_id, position, tok) else -gamma
+    return logits
+
+def detection_score(tokens):
+    n = len(tokens)
+    if n == 0:
+        return 0.0, 0.0
+    green = sum(1 for i, tok in enumerate(tokens)
+                if is_green(tokens[i - 1] if i else 0, i, tok))
+    p = GREEN_RATIO
+    z = (green / n - p) / (p * (1 - p) / n) ** 0.5  # 单侧正态近似
+    return green / n, z
+
+random.seed(0)
+sample = [random.randint(0, 999) for _ in range(200)]
+ratio, z = detection_score(sample)
+print(f"绿名单占比={ratio:.3f}  z={z:.2f}")
+</code></pre>
+
+          <p>统计水印的关键权衡是<strong>质量 vs 鲁棒性 vs 可检测性</strong>：</p>
+          <ul>
+            <li><strong>质量</strong>：偏移概率分布会影响生成质量。偏移太小，水印检测不出来；偏移太大，文本变得不自然。</li>
+            <li><strong>鲁棒性</strong>：改写、翻译、总结会破坏水印信号。一段被充分改写的 AI 文本，统计水印可能完全失效。</li>
+            <li><strong>可检测性</strong>：检测需要一定长度的文本——太短的文本（如一两句话）统计样本不足，无法可靠检测。</li>
+          </ul>
+
+          <details class="deep">
+            <summary>深读：检测为什么用 z 检验，以及它的失效边界</summary>
+            <p>绿名单水印的检测本质是<strong>假设检验</strong>。零假设 H<sub>0</sub> 是"文本由人类（或普通模型）生成，绿名单 token 占比服从基线概率 p（约 0.5）"；备择假设是"生成时偏向绿名单，占比显著高于 p"。若一篇 n 个 token 的文本中绿名单 token 数为 G，则在 H<sub>0</sub> 下 G 近似服从二项分布 B(n, p)，其均值 np、方差 np(1-p)。标准化分数</p>
+            <p style="text-align:center">z = (G/n - p) / &radic;( p(1-p)/n )</p>
+            <p>在 H<sub>0</sub> 下近似服从标准正态分布。z 越大，越有理由拒绝 H<sub>0</sub>、判定为带水印文本。工程上通常设阈值（如 z &gt; 4）来平衡漏报与误报。</p>
+            <p>但 z 检验有明显的<strong>失效边界</strong>：</p>
+            <ul>
+              <li><strong>样本量太小</strong>：n 越小，方差越大，z 越容易被噪声主导。一句 10 个 token 的话基本无法可靠检测。</li>
+              <li><strong>改写攻击</strong>：只要把足够多 token 替换成非绿名单词（同义改写、翻译后回译），G/n 就会回落到基线附近，z 不再显著。</li>
+              <li><strong>基线估计偏差</strong>：真实人类文本的"绿名单占比"不一定恰好等于 0.5，若基线选错，检验会系统性偏向误报或漏报。实际系统需要用真实语料校准基线。</li>
+            </ul>
+            <p>因此统计水印是"<strong>提高大规模滥用门槛</strong>"的工具，而不是"绝对鉴别器"。它擅长批量筛查海量内容，但不擅长对单条被精心改写的内容下结论。</p>
+          </details>
+
+          <h3>语义水印：改内容结构</h3>
+          <p>语义水印不打概率分布的主意，而是在<strong>内容结构</strong>上做文章——比如同义词替换、句式选择、段落组织方式中嵌入信号。优势是抗改写（因为改的是语义不是表面词），劣势是可能影响文本质量和连贯性，并且更难做到"不可感知"。它和统计水印是互补而非替代关系。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">文本水印的根本困难</span>
+            文本水印面对一个图像水印不需要面对的问题：<strong>文本可以无损复制粘贴并改写</strong>。一张图片加水印后，JPEG 压缩、裁剪、缩放都不会完全破坏水印。但一段文本被人类翻译、改写、总结后，任何水印都可能消失。没有绝对鲁棒的文本水印——只有"攻击成本足够高"的水印。所以合规上，文本往往更依赖"生成方主动声明 + 元数据携带"的组合，而不是单靠嵌入信号。
+          </div>
+
+          <h2>图像水印技术</h2>
+          <p>图像水印比文本水印成熟得多——因为图像像素是连续的，可以做微小调整而不影响视觉质量。主要分两类：</p>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">可见水印</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">直接在图像上叠加标识（角落 logo、半透明文字）。用户一眼可见，但<strong>可被裁剪或遮挡</strong>。这就是 GB 45438-2025 的显式标识路线——简单有效，但不能单独依赖。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">不可见水印</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">在像素值中嵌入不可见信号，人眼看不到但机器可检测。抗裁剪、抗压缩。代表产品如 SynthID-Image。这是隐式标识的技术底座——但也有攻击面。</p>
+            </div>
+          </div>
+
+          <h3>水印攻击</h3>
+          <p>不可见水印不是无敌的。已知的攻击方式包括：</p>
+          <ul>
+            <li><strong>降噪攻击</strong>：对图像做轻微的高斯模糊或 JPEG 压缩，可能破坏水印信号。</li>
+            <li><strong>spoofing 攻击</strong>：在非 AI 生成的图像上伪造水印信号，让检测器误判。</li>
+            <li><strong>scrubbing 攻击</strong>：用特定算法去除水印而不显著降低图像质量。</li>
+            <li><strong>重压缩 / 缩放</strong>：反复格式转换与尺寸变换，累积破坏水印。</li>
+          </ul>
+          <p>研究表明，一些"被认为安全"的水印方案可以用不到 50 美元的成本被攻破。这意味着<strong>水印不是安全边界——它是合规标记</strong>。它的作用不是"防止伪造"，而是"满足法定标识义务"和"提高大规模滥用的门槛"。把水印当加密防线来设计，是本末倒置。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root((水印攻击面))
+    文本水印
+      改写攻击
+      翻译/回译
+      总结攻击
+      短文本检测失效
+    图像水印
+      降噪攻击
+      Scrubbing
+      Spoofing
+      重压缩缩放
+    元数据路线
+      元数据剥离
+      Manifest 删除
+    系统性风险
+      跨平台不兼容
+      标准缺失
+      基线误校准
+            </div>
+            <figcaption>水印攻击分类脑图：从文本、图像到元数据路线，每个环节都有对应的绕过手段</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">对抗视角下怎么选方案</span>
+            如果你的目标是"合规标记 + 批量筛查"，那么"元数据 + 轻量不可见水印"组合足够，且工程成本低。如果你的目标是"对抗高动机伪造者"，那单靠水印不现实——应该把重心放在<strong>生成方身份绑定</strong>（C2PA 签名链）和<strong>平台侧核验</strong>上。先想清楚威胁模型，再选技术，而不是反过来。
+          </div>
+
+          <h2>C2PA 内容凭证</h2>
+          <p><strong>C2PA</strong>（Coalition for Content Provenance and Authenticity）是由 Adobe 和 Microsoft 联合发起的内容来源标准。它不是水印——它是<strong>内容凭证（Content Credentials）</strong>，记录内容从创建到编辑到发布的完整历史。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  C["创建<br/>相机/AI 生成"] --> S["签名<br/>加密签名绑定"]
+  S --> E["编辑<br/>每次编辑追加记录"]
+  E --> P["发布<br/>凭证随内容传播"]
+  P --> V["验证<br/>接收方查验签名链"]
+  C --> CR["Content Credentials<br/>包含：创建者/工具/时间/编辑历史"]
+  CR --> P
+  style C fill:#dcefc8,stroke:#4a7318
+  style S fill:#e6f1fb,stroke:#185fa5
+  style E fill:#fef3c7,stroke:#f59e0b
+  style P fill:#e6f1fb,stroke:#185fa5
+  style V fill:#dcefc8,stroke:#4a7318
+            </div>
+            <figcaption>C2PA 内容凭证的信任链：创建→签名→编辑→发布→验证，每一步都追加加密签名</figcaption>
+          </figure>
+
+          <p>C2PA 和水印是互补关系：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>数字水印</th><th>C2PA 内容凭证</th></tr></thead>
+              <tbody>
+                <tr><td>嵌入方式</td><td>修改像素/采样值</td><td>文件元数据中的 Manifest</td></tr>
+                <tr><td>记录内容</td><td>"这是 AI 生成的"（布尔）</td><td>创建者、工具、时间、编辑历史</td></tr>
+                <tr><td>抗篡改</td><td>依赖算法鲁棒性</td><td>依赖加密签名链</td></tr>
+                <tr><td>局限</td><td>可被攻击去除</td><td>元数据可被剥离</td></tr>
+                <tr><td>法律对应</td><td>GB 45438 隐式标识</td><td>GB 45438 隐式标识（元数据路线）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">C2PA 的核心价值</span>
+            水印只告诉你"这是 AI 的"，C2PA 告诉你"这是谁在什么时候用什么工具生成的，经过哪些编辑"。对于深度伪造的溯源——"这段视频是真是假、从哪来的"——C2PA 提供的信息比水印丰富得多。但 C2PA 依赖参与者的自愿签名，如果生成工具不支持 C2PA，信任链就断了。
+          </div>
+
+          <h3>跨平台核验流程</h3>
+          <p>隐式标识与 C2PA 要真正发挥作用，靠的不是生成方"打了标"就完事，而是传播链上每个节点都参与核验。下面用一张时序图说明一次典型的内容流转：用户从生成平台拿到带标识内容，转发到传播平台，平台先核验隐式标识完整性，再校验 C2PA 签名链，最后向接收方展示来源标记。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant U as 用户
+  participant P as 生成平台
+  participant V as 传播平台
+  participant R as 接收方
+  U->>P: 请求生成内容
+  P->>P: 嵌入显式+隐式标识<br/>附加 C2PA Manifest
+  P-->>U: 返回带标识内容
+  U->>V: 上传/转发内容
+  V->>V: 核验隐式标识完整性
+  alt 标识完整
+    V->>V: 校验 C2PA 签名链
+    V->>R: 展示"AI 生成"标记
+  else 标识缺失/被篡改
+    V->>V: 拦截或补充标识
+    V->>R: 标注"疑似 AI 生成"
+  end
+  R->>R: 查看内容凭证溯源
+            </div>
+            <figcaption>跨平台核验时序：生成方打标、传播方核验、接收方溯源，三个角色构成协作闭环</figcaption>
+          </figure>
+
+          <p>这张时序图最值得记住的不是每个箭头，而是「三个角色、三个义务」的划分：生成方负责打标，传播方负责核验，接收方负责溯源。任何一方偷懒，链条就断了——生成方只打显式标不嵌元数据，传播方就无从核验；传播方核验了却不留痕，接收方就查不到凭证。所以落地 C2PA 这类方案时，真正要建设的不是单一的水印算法，而是整条链路上各方的协作协议。</p>
+
+          <h2>机器可读标识的法定义务</h2>
+          <p>把技术放到法律框架里看，机器可读标识（隐式标识的另一种说法）现在是<strong>两个司法辖区的法定义务</strong>：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>司法辖区</th><th>法律依据</th><th>义务</th><th>生效日期</th></tr></thead>
+              <tbody>
+                <tr><td><strong>中国</strong></td><td>GB 45438-2025（强制性国标）</td><td>AI 生成内容须嵌入隐式标识</td><td>2025-09-01（已实施）</td></tr>
+                <tr><td><strong>欧盟</strong></td><td>EU AI Act Art.50(2)</td><td>生成式 AI 须输出机器可读标记</td><td>2026-08-02（已生效）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>两者的技术要求不完全一致，但核心思路相同：<strong>AI 生成的输出必须带有机器可检测的标识</strong>。如果你同时面向中国和欧盟市场，需要确保你的水印/标识方案同时满足两套要求。好消息是，两者的技术路线（元数据 + 水印）是兼容的——一套实现可以同时满足两套义务。</p>
+
+          <p>落到工程上，同时满足两套义务通常意味着要建立一条「双写」的标识流水线。生成时，在输出内容上做三件事：一是附加用户可感知的显式标记（图片角标、文本提示），二是写入包含生成方信息的 C2PA Manifest 元数据，三是对图像或音频嵌入不可见水印信号。前两件是所有方案的地基，第三件是保证「元数据被剥离后仍可溯源」的兜底。这里有一个常见的错误认知：很多人以为「水印」和「元数据」只要做一个就够了，但恰恰相反，这两条子路线面对的攻击面不同——元数据怕剥离，水印怕改写，而标准要求的是「核验标识完整性」，只有二者配合，标识才不依赖单一技术的存亡。</p>
+
+          <p>另一个容易被忽略的工程点是把「核验」也做成产品的一部分。GB 45438 把核验义务放在传播平台上，所以如果你的服务同时是内容传播方（比如一个允许用户上传图片再分享的社区），就要在接收侧实现标识核验逻辑：读取元数据、检测水印、比对签名，然后决定「放行」「标注疑似」还是「拦截」。这个核验动作不能是事后补丁，而应作为上传管线的固定环节——否则平台很容易在不知情的情况下成了"无标识 AI 内容"的中转站，把自己置于连带责任之下。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">合规陷阱</span>
+            很多团队以为"加个'AI 生成'的文字提示就够了"——这只满足显式标识，不满足隐式标识。GB 45438 要求两者同时做。如果你的 AI 服务只加了文字提示但没有嵌入机器可读的元数据或水印，从 2025 年 9 月 1 日起就不合规了。欧盟 Art.50(2) 的过渡期到 2026 年 12 月 2 日，但新上市系统从 2026 年 8 月 2 日起就要立即合规。
+          </div>
+
+          <h2>工程落地清单</h2>
+          <p>把上述内容落到工程上，一个合规的标识流水线至少应包含以下环节。这既是技术清单，也是审计时的证据链：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>环节</th><th>做什么</th><th>对应义务</th><th>审计证据</th></tr></thead>
+              <tbody>
+                <tr><td>生成打标</td><td>输出时同时附加显式提示与隐式标识</td><td>GB 45438 双轨</td><td>生成日志、标识配置</td></tr>
+                <tr><td>元数据写入</td><td>把生成方、工具、时间写入 C2PA/EXIF</td><td>隐式标识（元数据路线）</td><td>Manifest 样例</td></tr>
+                <tr><td>水印嵌入</td><td>对图像/音频嵌入不可见信号</td><td>隐式标识（水印路线）</td><td>水印算法说明</td></tr>
+                <tr><td>传播核验</td><td>平台转发前校验标识完整性</td><td>平台连带责任</td><td>核验接口记录</td></tr>
+                <tr><td>用户告知</td><td>显著展示"AI 生成"标记</td><td>显式标识显著性</td><td>前端截图</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">和版权、隐私的关系</span>
+            标识义务的"上游"是训练数据与版权（见 <a href="data-copyright.html">训练数据与版权</a>）：如果模型训练就侵权，打标救不了根。标识义务的"下游"是用户隐私（见 <a href="privacy-security.html">隐私与安全</a>）：在元数据里写太多生成者信息本身可能构成个人信息暴露。标识不是孤立功能，要在整条治理链里设计。
+          </div>
+
+          <h2>新手练习：三层检查一张图片的来源</h2>
+          <p>把内容来源想成快递单：显式标识像包装上的「易碎品」标签，用户一眼能看到；元数据像运单字段，机器可以读取；数字水印像藏在物品本体里的暗号，即使换了外包装仍有机会核验。三者不是互相替代，而是面对不同的丢失和篡改方式。新手最容易把「看到了 AI 生成」误认为「已经证明来源真实」，两者必须分开。</p>
+          <p>手算一个核验例子：一张图片上传时有显式标识、C2PA Manifest 和不可见水印；平台缩略图处理后，显式角标仍在，但元数据被剥离，水印检测分数低于阈值。此时正确结果不是直接判定「人类生成」，而是记录「来源凭证缺失，无法确认」，进入补标或人工复核。来源核验的输出应至少有 verified、missing、tampered、unknown 等明确状态，而不是只有一个真假布尔值。</p>
+          <div class="callout warn"><span class="callout-t">新手最容易搞错</span>水印检测通过不等于内容一定真实，检测失败也不等于内容一定由人类创作。水印和 Manifest 都是证据链的一部分；产品文案要使用「已检测到来源凭证」「未找到可验证凭证」这类谨慎表述，避免把概率检测包装成绝对鉴定。</div>
+          <details class="deep">
+            <summary>深读：如何选择水印阈值而不把检测器当法官</summary>
+            <div class="deep-body">
+              <p>阈值选择本质是误报与漏报的权衡。阈值太低，普通人类图片可能被误判为带水印，平台会失去信任；阈值太高，经过压缩、裁剪或格式转换的真实 AI 内容又会被漏掉。新手应先用真实业务流量和已知正负样本校准，而不是直接照搬论文或供应商的一个阈值。</p>
+              <p>报告检测结果时，应同时给出样本长度、媒体格式、压缩链路、阈值版本和校准集。对图片、音频、文本分别建立基线，因为模态不同，信号强度和攻击面不同。若结果用于合规处置，最终动作最好由「凭证检查 + 规则 + 人工复核」共同决定；水印算法只提供证据，不独自承担法律判断。</p>
+            </div>
+          </details>
+          <figure class="paper-figure">
+            <img src="../../assets/figures/13-evaluation/contamination/fig1.png" alt="相关论文原图：通过来源语料检索识别评测数据污染" loading="lazy" style="max-width:560px">
+            <figcaption><span class="pf-title">相关论文原图：用来源语料库检索与题面重叠来识别数据污染，展示「内容—来源—核验」的追踪思路</span><span class="pf-src">相关论文原图 · Xu 等，<em>Benchmark Data Contamination of Large Language Models: A Survey</em>，2024，Figure 1 · <a href="https://arxiv.org/abs/2406.04244" target="_blank" rel="noopener">arXiv:2406.04244</a></span></figcaption>
+          </figure>
+          <p>逐块看图左侧：待检内容需要与来源语料建立可重复的比对流程，而不是凭肉眼猜测。迁移到来源溯源场景，就是为每个文件保存创建者、工具、时间、编辑动作和凭证摘要，并在接收侧重新计算或验证，而不是只相信上传者填写的一行文字。</p>
+          <p>再看右侧的识别结果：它展示的是「匹配程度与证据」的关系，而非绝对真伪。水印、Manifest 和元数据核验也应返回证据强度、失败原因和处理建议。原图讨论的是评测污染，不是水印算法；这里引用它是为了说明可审计的来源核验方法，真正的水印设计仍应结合 <a href="https://arxiv.org/abs/2301.10226" target="_blank" rel="noopener">绿名单水印论文</a>、<a href="https://c2pa.org/specifications/specifications/2.2/index.html" target="_blank" rel="noopener">C2PA 规范</a>和官方标准文本。</p>
+          <div class="callout tip"><span class="callout-t">更新日期</span>2026-08。GB 45438-2025 与欧盟 Art.50 的适用状态、标准版本和平台实现应在上线前再次核对官方来源。</div>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>GB 45438-2025《网络安全技术 人工智能生成合成内容标识方法》 — 强制性国家标准，2025-09-01 实施 · <a href="https://std.samr.gov.cn/gb/search/gbDetailed?id=301E0388CB75788DE06397BE0A0AE1B4" target="_blank" rel="noopener">全国标准信息公共服务平台</a></li>
+            <li>《人工智能生成合成内容标识办法》 — 网信办等四部门联合发布，2025-09-01 生效 · <a href="https://www.cac.gov.cn/2025-09/05/c_1758792061408012.htm" target="_blank" rel="noopener">网信办专家解读</a></li>
+            <li>Kirchenbauer J. 等, A Watermark for Large Language Models, ICML 2023 — 绿名单统计水印的奠基性论文 · <a href="https://arxiv.org/abs/2301.10226" target="_blank" rel="noopener">arXiv:2301.10226</a></li>
+            <li>SynthID: Identifying AI-generated content — Google DeepMind 的文本与图像水印技术 · <a href="https://deepmind.google/science/blog/synthid/" target="_blank" rel="noopener">DeepMind Blog</a></li>
+            <li>C2PA Specification — 内容来源与真实性联盟的技术规范 · <a href="https://c2pa.org/" target="_blank" rel="noopener">c2pa.org</a></li>
+            <li>EU AI Act Article 50 — 透明度义务原文，机器可读标记义务 · <a href="https://artificialintelligenceact.eu/transparency-rules-article-50" target="_blank" rel="noopener">AI Act Explorer</a></li>
+          </ul>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>双轨义务</strong>：GB 45438-2025 要求显式标识（用户可感知）+ 隐式标识（机器可读）同时做，缺一不可；隐式标识内部再分元数据与水印两条子路线。</li>
+            <li><strong>强制性</strong>：GB 45438-2025 是强制性国家标准（GB，非 GB/T），2025-09-01 已实施，不是建议。</li>
+            <li><strong>文本水印</strong>：统计水印（改概率分布，如 SynthID / 绿名单）vs 语义水印（改内容结构）——根本困难是文本可无损改写，检测依赖 z 检验且对短文本与改写敏感。</li>
+            <li><strong>图像水印</strong>：可见水印（可裁剪）+ 不可见水印（可攻击）——水印是合规标记不是安全边界，对抗高动机伪造者要靠 C2PA 身份绑定。</li>
+            <li><strong>C2PA</strong>：不是水印，是内容凭证——记录创建者、工具、时间、编辑历史的加密签名链，比水印信息更丰富，但依赖参与者自愿签名。</li>
+            <li><strong>双重义务</strong>：中国 GB 45438（已实施）和欧盟 Art.50(2)（已生效）都要求机器可读标识，技术路线兼容。</li>
+            <li><strong>合规陷阱</strong>：只加文字提示不够——必须同时嵌入机器可读的元数据或水印，且传播平台要参与核验。</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            内容标识解决了"标记 AI 生成内容"的问题，但更根本的问题是 AI 生成内容本身是否安全。看 <a href="safety-redteam.html">安全与红队</a> 了解越狱手法分类与防护栏评测，看 <a href="bias-ethics.html">偏见、公平与伦理</a> 了解训练数据偏见如何影响输出公平性，看 <a href="governance.html">全球监管框架</a> 了解完整的合规义务全景，看 <a href="data-copyright.html">训练数据与版权</a> 与 <a href="privacy-security.html">隐私与安全</a> 理解标识义务在治理链上下游的位置。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

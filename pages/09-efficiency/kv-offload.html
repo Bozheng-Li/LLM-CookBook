@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KV 分级存储与卸载 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="09-efficiency" data-topic="kv-offload">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>KV 分级存储与卸载</h1>
+            <p class="lead">KV Cache 是推理的「隐形显存黑洞」：上下文越长占得越多，并发一高就 OOM。分级存储的思路很直白——<strong>不常用的数据搬到便宜的地方</strong>。把 KV 从 HBM 挪到 DRAM 甚至 SSD，配合前缀复用，是长上下文与高并发推理绕不开的工程。本节从 KV 的显存公式出发，拆解三级存储、前缀复用、量化压缩、淘汰策略和代表性系统。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>KV 缓存按「被再次访问的可能性」分层：热数据留在最快但最贵的 HBM，温数据放 DRAM，冷数据落 SSD。访问时先查 HBM，未命中再逐级向上取——本质上就是给 KV 做了一层「内存换页」。加上前缀复用和量化，整个系统的目标是在有限显存下服务更多并发、更长的上下文。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  subgraph HBM["HBM 最快 · 最贵"]
+    H1["热 KV<br/>正在解码的序列"]
+  end
+  subgraph DRAM["DRAM 中等"]
+    D1["温 KV<br/>活跃前缀 / 最近请求"]
+  end
+  subgraph SSD["SSD 最慢 · 最便宜"]
+    S1["冷 KV<br/>历史对话 / 长尾请求"]
+  end
+  H1 -->|"换出"| D1
+  D1 -->|"换出"| S1
+  S1 -->|"按需换入"| D1
+  D1 -->|"命中回读"| H1
+              </div>
+              <figcaption>KV 三级存储：热数据驻留 HBM，冷数据落 SSD，按需换入</figcaption>
+            </figure>
+          </div>
+
+          <h2>一、为什么 KV 是瓶颈</h2>
+          <p>KV Cache 的大小随「层数 × 头数 × 头维度 × 上下文长度 × 并发数」线性增长，且不受权重量化的影响——量化的是权重，缓存是运行时产生的。先来看一个精确的显存估算公式。</p>
+
+          <p>对于标准多头注意力模型，单条请求的 KV Cache 大小为：</p>
+          <p style="text-align:center;font-size:1.1em">$$M_{\text{KV}} = 2 \times n_{\text{layers}} \times n_{\text{heads}} \times d_{\text{head}} \times L \times \text{sizeof(dtype)}$$</p>
+          <p>其中 $L$ 是序列长度（token 数），系数 2 是因为 K 和 V 各一份。以 Llama-2-70B 为例：80 层、64 头、128 维、FP16（2 字节）：</p>
+          <p style="text-align:center">$$M_{\text{KV}} = 2 \times 80 \times 64 \times 128 \times L \times 2 = 2{,}621{,}440 \times L \text{ 字节} \approx 2.5 \text{ MB} \times L$$</p>
+          <p>也就是说，<strong>每增加 1000 token 的上下文，KV 就多吃约 2.5 GB 显存</strong>。一条 128K 上下文的请求，KV 就要占约 320 GB——远超单卡 80GB HBM 的容量。再加上并发，显存压力更加严峻。</p>
+
+          <p>「KV 到底占了多少」这个问题，与其空想，不如直接看论文里的实证数据。下面这张图来自专门做 KV 卸载的 InfiniGen（OSDI 2024），它把 KV Cache 和模型权重的体积画在同一张图上，一眼就能看出「KV 什么时候反超权重」。</p>
+
+          <figure class="paper-figure">
+            <img src="https://arxiv.org/html/2406.19707v1/x2.png" alt="论文原图：OPT-30B 的 KV Cache 与模型权重体积随序列长度与 batch 大小增长的对比——虚线为权重体积，KV 增长远超权重" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：KV Cache 与权重的体积赛跑——横轴分别取序列长度与 batch 大小，虚线标出模型权重体积，KV Cache 的增长曲线很快越过了虚线</span>
+              <span class="pf-src">论文原图 · Lee et al., <em>InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management</em>, 2024, Figure 2 · <a href="https://arxiv.org/abs/2406.19707" target="_blank" rel="noopener">arXiv:2406.19707</a></span>
+            </figcaption>
+          </figure>
+
+          <p>读这张图，先找<strong>那条虚线</strong>——它标的是模型权重的体积（图中用 OPT-30B）。然后看 KV Cache 的体积曲线：随着横轴（子图 (a) 是序列长度，子图 (b) 是 batch 大小）增长，KV 曲线一路爬升，很快越过虚线。这就是本页核心论点的第一手证据：<strong>KV Cache 不是「一点点额外开销」，它会在长上下文或高并发下超过权重本身，成为显存的第一大项</strong>。要注意图的量级：OPT-30B 权重大约 60 GB（FP16），而 KV 曲线在序列长度和 batch 都增大时可以涨到数百 GB——这正是「一张 80GB 的卡装不下」的由来。</p>
+          <p>第二，注意两个子图分别证明了什么。<strong>子图 (a) 证明「长度维度」</strong>：固定 batch=16，序列长度从几千涨到几万，KV 线性上升，越过权重虚线；<strong>子图 (b) 证明「并发维度」</strong>：固定序列长度=2048，batch 从 1 涨到几十，KV 同样线性上升。两条增长曲线意味着：无论你是「一个超长请求」还是「一批普通请求」，KV 都会成为瓶颈——这解释了为什么 KV 管理是推理系统绕不开的工程问题，而不是某个特定场景的偶发困难。第三，结合本页主题看：<strong>图里 KV 曲线越过虚线的那个「交叉点」位置，就是分级存储应该开始发力的位置</strong>——在交叉点之前权重是显存大头（量化权重更划算），交叉点之后 KV 才是大头（量化 KV、分级卸载更划算）。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Weights["权重显存（固定）"]
+    W1["70B × FP16 ≈ 140 GB<br/>INT4 ≈ 35 GB"]
+  end
+  subgraph KV["KV Cache 显存（随上下文增长）"]
+    K1["单条 4K 上下文 ≈ 10 GB"]
+    K2["单条 32K 上下文 ≈ 80 GB"]
+    K3["单条 128K 上下文 ≈ 320 GB"]
+    K4["10 条并发 × 4K ≈ 100 GB"]
+  end
+  subgraph Activ["激活显存（随 batch 增长）"]
+    A1["通常较小<br/>但 batch 大时不可忽视"]
+  end
+  Weights --> Total["总显存需求"]
+  KV --> Total
+  Activ --> Total
+  Total --> OOM["单卡 80GB HBM<br/>→ 必须分级"]
+            </div>
+            <figcaption>显存构成拆解：权重是固定的，但 KV Cache 随上下文和并发线性增长，是 OOM 的主要来源</figcaption>
+          </figure>
+
+          <p><a href="../04-modern-arch/kv-cache.html">KV Cache</a> 一节讲清了它怎么来，本节讲怎么把它放得下。核心矛盾是：<strong>HBM 极快但极小，SSD 极大但极慢，中间需要一个智能的搬运系统</strong>。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">关键区分</span>
+            权重显存是「静态」的——模型加载后就固定了，可以用量化来压缩。KV Cache 显存是「动态」的——每个请求、每个 token 都在增长，量化只能减缓但无法阻止增长。这就是为什么 KV 管理是推理系统的核心工程问题。
+          </div>
+
+          <h2>二、分级存储：三种介质怎么分工</h2>
+          <p>分级存储的核心原理与操作系统的虚拟内存如出一辙：CPU cache → DRAM → swap 的层级结构，对应到 GPU 推理就是 HBM → DRAM → SSD。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph OS["操作系统虚拟内存"]
+    direction TB
+    C1["L1/L2 Cache<br/>KB 级 · ns 级"]
+    C2["DRAM<br/>GB 级 · 100ns"]
+    C3["Swap / SSD<br/>TB 级 · 10μs"]
+    C1 --> C2 --> C3
+  end
+  subgraph GPU["GPU 推理 KV 存储"]
+    direction TB
+    G1["HBM<br/>数十 GB · 数百 ns"]
+    G2["Host DRAM<br/>数百 GB · μs 级"]
+    G3["NVMe SSD<br/>数 TB · 数十 μs"]
+    G1 --> G2 --> G3
+  end
+  OS -.->|"类比"| GPU
+            </div>
+            <figcaption>操作系统虚拟内存与 GPU KV 分级存储的类比：同样的金字塔结构，不同的物理介质</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层级</th><th>带宽</th><th>延迟</th><th>容量</th><th>适合放什么</th><th>换入代价</th></tr></thead>
+              <tbody>
+                <tr><td>HBM</td><td>~3 TB/s</td><td>~200 ns</td><td>单卡 80-192 GB</td><td>正在解码序列的活跃 KV</td><td>—（已在位）</td></tr>
+                <tr><td>Host DRAM</td><td>~50-100 GB/s</td><td>~1-5 μs</td><td>数百 GB-1 TB</td><td>共享前缀、近期请求的 KV</td><td>PCIe 传输 ~2 μs/GB</td></tr>
+                <tr><td>NVMe SSD</td><td>~3-7 GB/s</td><td>~10-50 μs</td><td>数 TB</td><td>冷对话、可延迟恢复的 KV</td><td>SSD→DRAM→HBM 两跳</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>关键取舍：KV 卸载的「省显存」是用「读回延迟」换的。因此工程上只卸载<strong>近期用不到</strong>的 KV——否则每次解码都要等 SSD，延迟直接崩。延迟差异是数量级的：HBM 200ns vs SSD 50μs，差 250 倍。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">真实坑</span>
+            分级存储不是「开了就省钱」。它的前提是<strong>访问模式可预测、可复用</strong>：如果请求前缀几乎不重复（如纯个性化生成），前缀缓存命中率趋近于 0，DRAM/SSD 这层只会带来额外读回延迟而毫无收益。更糟的是把<strong>正在解码的热 KV 也错误地换出</strong>——下一步 Decode 就得从 SSD 搬回来，单步延迟从 200ns 暴涨到 50μs，吞吐直接腰斩。正确做法是：热数据只在容量真的吃紧时才向 DRAM 沉降，且优先保留当前活跃序列的 KV。
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Req["新请求到达"] --> Q1{"前缀 KV<br/>是否在 HBM?"}
+  Q1 -->|"是"| Fast["直接续算<br/>延迟最低"]
+  Q1 -->|"否"| Q2{"是否在<br/>Host DRAM?"}
+  Q2 -->|"是"| Read1["从 DRAM 读回 HBM<br/>~μs 级延迟"]
+  Q2 -->|"否"| Q3{"是否在<br/>SSD?"}
+  Q3 -->|"是"| Read2["从 SSD 读到 DRAM<br/>再搬到 HBM<br/>~数十 μs 延迟"]
+  Q3 -->|"否"| Compute["全量重新计算<br/>最慢但最省存储"]
+  Fast --> Decode["开始解码"]
+  Read1 --> Decode
+  Read2 --> Decode
+  Compute --> Decode
+            </div>
+            <figcaption>KV 缓存查找的四级路径：HBM 命中 → DRAM 回读 → SSD 回读 → 全量重算，延迟逐级升高</figcaption>
+          </figure>
+
+          <h2>三、前缀复用与缓存命中率</h2>
+          <p>KV 分级存储真正的价值杠杆是<strong>前缀复用</strong>：多个请求共享同一段前缀（系统提示词、文档上下文、Agent 的固定历史），这段前缀的 KV 只需算一次，之后所有请求直接命中。在 RAG 和 Agent 场景中，前缀复用可以把 prefill 阶段的计算量砍掉 60-90%。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph R1["请求 1"]
+    direction LR
+    R1A["系统提示 + 文档 + Q1"]
+  end
+  subgraph R2["请求 2"]
+    direction LR
+    R2A["系统提示 + 文档 + Q2"]
+  end
+  subgraph R3["请求 3"]
+    direction LR
+    R3A["系统提示 + 文档 + Q3"]
+  end
+  R1A -.->|"相同前缀"| C["共享 KV 缓存<br/>只算一次"]
+  R2A -.-> C
+  R3A -.-> C
+  C --> O["只算增量部分<br/>命中率 ↑ 延迟 ↓"]
+            </div>
+            <figcaption>共享前缀复用：公共部分只算一次，后续请求只算差异部分</figcaption>
+          </figure>
+
+          <p>前缀复用的实现核心是<strong>前缀哈希 + 块级索引</strong>。把输入序列切成固定大小的 block（如 16 token），每个 block 的 KV 缓存以「block 内容的哈希」为 key 存储。新请求到达时，逐 block 查哈希，命中的 block 直接复用，未命中的才需要计算。</p>
+
+          <pre><code class="language-python">import hashlib
+from dataclasses import dataclass
+
+@dataclass
+class KVBlock:
+    """一个 KV 缓存块"""
+    block_id: str        # 内容哈希
+    tokens: list         # 这个 block 对应的 token
+    k_cache: object      # K 缓存（tensor）
+    v_cache: object      # V 缓存（tensor）
+    access_count: int    # 访问次数（用于淘汰策略）
+    last_access: float   # 最后访问时间戳
+
+class PrefixKVCache:
+    """前缀感知的 KV 缓存管理器"""
+    
+    def __init__(self, block_size=16, max_hbm_blocks=1000, 
+                 max_dram_blocks=5000):
+        self.block_size = block_size
+        self.hbm_cache = {}    # 热：HBM 上的 block
+        self.dram_cache = {}   # 温：DRAM 上的 block
+        self.max_hbm = max_hbm_blocks
+        self.max_dram = max_dram_blocks
+    
+    def _block_hash(self, tokens):
+        """计算 token 序列的哈希作为 block ID"""
+        return hashlib.md5(
+            str(tokens).encode()
+        ).hexdigest()
+    
+    def get_or_compute(self, tokens, compute_fn):
+        """获取 KV 缓存：先查缓存，未命中则计算
+        
+        Args:
+            tokens: 完整 token 序列
+            compute_fn: 计算指定范围 KV 的函数
+            
+        Returns:
+            (hit_blocks, miss_blocks) 命中和未命中的 block 列表
+        """
+        hits, misses = [], []
+        
+        # 按 block_size 切分
+        for i in range(0, len(tokens), self.block_size):
+            block_tokens = tokens[i:i + self.block_size]
+            block_id = self._block_hash(block_tokens)
+            
+            if block_id in self.hbm_cache:
+                # HBM 命中：最快路径
+                self.hbm_cache[block_id].access_count += 1
+                hits.append(("hbm", block_id))
+            elif block_id in self.dram_cache:
+                # DRAM 命中：需要搬回 HBM
+                block = self.dram_cache.pop(block_id)
+                self._put_hbm(block_id, block)
+                hits.append(("dram", block_id))
+            else:
+                # 未命中：需要计算
+                k, v = compute_fn(i, i + len(block_tokens))
+                block = KVBlock(
+                    block_id=block_id,
+                    tokens=block_tokens,
+                    k_cache=k, v_cache=v,
+                    access_count=1,
+                    last_access=time.time()
+                )
+                self._put_hbm(block_id, block)
+                misses.append(block_id)
+        
+        return hits, misses
+    
+    def _put_hbm(self, block_id, block):
+        """放入 HBM 缓存，满了则淘汰到 DRAM"""
+        if len(self.hbm_cache) >= self.max_hbm:
+            # LRU 淘汰：找最久未访问的 block
+            oldest = min(self.hbm_cache.values(), 
+                        key=lambda b: b.last_access)
+            # 淘汰到 DRAM
+            self.dram_cache[oldest.block_id] = oldest
+            del self.hbm_cache[oldest.block_id]
+            # 如果 DRAM 也满了，继续淘汰到 SSD（省略）
+            if len(self.dram_cache) >= self.max_dram:
+                oldest_dram = min(self.dram_cache.values(),
+                                 key=lambda b: b.last_access)
+                del self.dram_cache[oldest_dram.block_id]
+        self.hbm_cache[block_id] = block</code></pre>
+
+          <p>这段代码展示了前缀复用的核心逻辑。实际生产系统中（如 vLLM 的 RadixAttention、SGLang 的 RadixCache），实现要复杂得多——需要处理并发安全、GPU 显存对齐、block 粒度的 LRU/LFU 淘汰策略、以及与前缀树的结合。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>含义</th><th>目标值</th><th>影响</th></tr></thead>
+              <tbody>
+                <tr><td>前缀命中率</td><td>请求的前缀 KV 已在缓存中的比例</td><td>＞80%</td><td>直接决定 prefill 延迟</td></tr>
+                <tr><td>HBM 命中率</td><td>在 HBM 中命中的比例（不需跨介质读取）</td><td>＞95%</td><td>决定解码延迟稳定性</td></tr>
+                <tr><td>换入延迟</td><td>从 DRAM/SSD 搬回 HBM 的时间</td><td>＜5 ms</td><td>影响首 token 延迟 TTFT</td></tr>
+                <tr><td>换出频率</td><td>单位时间内 KV block 被淘汰出 HBM 的次数</td><td>越低越好</td><td>频繁换出说明缓存太小</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            分级存储解决「放不下」，前缀复用解决「重复算」。两者配合，长上下文从「每次全量重算」变成「首请求全算、后续增量算」。命中率就是生命线——80% 的命中率意味着 80% 的 prefill 计算被省掉了。
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            新手容易把分级存储理解成「把 KV 搬到便宜介质 = 省显存」，于是以为卸载这一步本身就是收益。<strong>实际上卸载这一步是纯开销</strong>——把 KV 搬出 HBM 要花带宽，之后读回还要花延迟和带宽，两笔账加起来都是负的。整套系统真正的收益来源只有一处：<strong>命中率</strong>。卸载后腾出的 HBM 空间被「更热的 KV」占用，而热 KV 被反复命中、反复省下重复计算，这部分才是赚的。所以评估一套分级存储方案，不要盯「显存少了多少」，要盯两个数字：<strong>命中率</strong>（越高越好）和<strong>换入延迟</strong>（越低越好）。命中率上不去，卸载就是白折腾——这个反直觉结论，是理解整个 KV 分级存储的前提。
+          </div>
+
+          <h2>四、KV 量化：缓存也要瘦身</h2>
+          <p>除了搬位置，另一个直接手段是<strong>压缩 KV 本身</strong>。KV 量化把 FP16 的 K 和 V 压到 INT8 甚至 INT4，直接砍掉 2-4 倍空间。与权重量化不同，KV 量化对精度的影响更小——因为 KV 是中间状态而非最终输出，误差不会像权重那样累积放大。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Before["量化前：FP16"]
+    B1["KV Cache: 320 GB<br/>（128K 上下文 · 70B 模型）"]
+  end
+  subgraph INT8["INT8 量化"]
+    I1["KV Cache: 160 GB<br/>精度损失 <1%"]
+  end
+  subgraph INT4["INT4 量化"]
+    I2["KV Cache: 80 GB<br/>精度损失 1-3%"]
+  end
+  Before -->|"×0.5"| INT8
+  Before -->|"×0.25"| INT4
+  INT8 --> Benefit1["并发数翻倍"]
+  INT4 --> Benefit2["并发数 ×4<br/>或支持更长上下文"]
+            </div>
+            <figcaption>KV 量化的效果：从 FP16 到 INT4，KV 占用减少 75%，精度损失可控</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>量化精度</th><th>每 token KV 大小</th><th>128K 上下文占用</th><th>精度损失</th><th>适用场景</th></tr></thead>
+              <tbody>
+                <tr><td>FP16</td><td>2.5 MB</td><td>~320 GB</td><td>0%</td><td>精度敏感场景</td></tr>
+                <tr><td>INT8</td><td>1.25 MB</td><td>~160 GB</td><td>＜1%</td><td>推荐默认选择</td></tr>
+                <tr><td>INT4</td><td>0.625 MB</td><td>~80 GB</td><td>1-3%</td><td>高并发 / 超长上下文</td></tr>
+                <tr><td>FP8</td><td>1.25 MB</td><td>~160 GB</td><td>＜0.5%</td><td>新一代硬件支持</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：KV 量化的实现与精度实测经验</summary>
+            <div class="deep-body">
+              <p>KV 量化的实现比权重量化简单，因为它只需要在把 K/V 写入缓存前做线性映射。下面是一个最小可运行的 INT8 量化示例（伪代码，示意映射逻辑，所有张量运算以官方引擎实现为准）：</p>
+              <pre><code class="language-python">import numpy as np
+
+def quantize_kv_fp16_to_int8(kv_fp16, axis=-1):
+    """把 FP16 的 K 或 V 张量线性量化到 INT8。
+
+    Args:
+        kv_fp16: shape (batch, n_heads, seq, d_head) 的 FP16 张量
+    Returns:
+        kv_int8: 量化后的 INT8 张量
+        scale:   每组的缩放因子
+        zero:    零点（对称量化时为 0）
+    """
+    # 按 head 维度分组求范围（per-head 量化最常用）
+    qmax = 127.0
+    amax = np.max(np.abs(kv_fp16), axis=-1, keepdims=True)
+    scale = amax / qmax                       # 缩放因子
+    kv_int8 = np.round(kv_fp16 / scale).clip(-qmax, qmax).astype(np.int8)
+    return kv_int8, scale, 0.0
+
+def dequantize_kv_int8(kv_int8, scale, zero=0.0):
+    """反量化：乘回 scale 还原到 FP16 空间"""
+    return kv_int8.astype(np.float32) * scale + zero
+
+# 注意：Key 比 Value 更敏感，因为注意力分数 softmax(Q·K) 直接依赖 Key。
+# 实践中常对 Key 用更高精度（如 FP8）或对 Value 用更激进的 INT4。</code></pre>
+              <p style="margin-bottom:0">实测经验（社区与论文一致）：把 KV 从 FP16 压到 INT8，在多数生成任务上精度损失 <code>&lt;1%</code>，几乎无损；压到 INT4 损失约 1-3%，在长上下文、检索增强场景更明显。因此<strong>默认选 INT8</strong>，只有显存真的扛不住（超长上下文、超高并发）才上 INT4。Key 通道建议保留更高精度。</p>
+            </div>
+          </details>
+
+          <h2>五、代表性系统深度解析</h2>
+
+          <h3>5.1 Mooncake：以 KV 为中心的推理架构</h3>
+          <p>Mooncake 是 Kimi（月之暗面）的推理架构，把「以 KV 为中心的推理」推到极致。传统推理中，KV 是每个 GPU 节点的私有数据；Mooncake 把 KV 变成<strong>集群级共享资源</strong>，通过分布式缓存层让任意节点都能访问任意请求的 KV。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Traditional["传统架构：节点私有 KV"]
+    direction LR
+    T1["GPU 节点 1<br/>KV = 私有"] 
+    T2["GPU 节点 2<br/>KV = 私有"]
+    T1 x--x T2
+    T_Note["请求只能路由到<br/>持有 KV 的节点"]
+  end
+  subgraph Mooncake["Mooncake：集群级 KV"]
+    direction LR
+    M_KV["分布式 KV 缓存池<br/>（DRAM + SSD）"]
+    M1["GPU 节点 1"] <--> M_KV
+    M2["GPU 节点 2"] <--> M_KV
+    M3["GPU 节点 N"] <--> M_KV
+    M_Note["任意节点可访问任意 KV<br/>请求路由更灵活"]
+  end
+  Traditional -->|"演进"| Mooncake
+            </div>
+            <figcaption>Mooncake 的核心创新：KV 从节点私有变为集群级共享资源，打破数据局部性约束</figcaption>
+          </figure>
+
+          <p>Mooncake 的关键设计点：</p>
+          <ul>
+            <li><strong>全局 KV 池</strong>：所有节点的 DRAM 和 SSD 组成一个统一的 KV 存储池，按 block 粒度管理。</li>
+            <li><strong>预取机制</strong>：请求到达前，提前把对应 KV 从 SSD 搬到 DRAM，再从 DRAM 搬到 HBM，隐藏跨介质延迟。</li>
+            <li><strong>与 PD 分离深度配合</strong>：Prefill 节点算完 KV 后直接写入全局池，Decode 节点从池中读取——KV 的「搬家」和「计算」完全解耦。</li>
+            <li><strong>弹性扩缩容</strong>：因为 KV 不绑定节点，加机器就能扩容，不需要数据迁移。</li>
+          </ul>
+
+          <h3>5.2 LMCache：可插拔的缓存层</h3>
+          <p>LMCache 聚焦「模型无关的 KV 缓存层」：提供统一 API 把 KV 存到 GPU/DRAM/远端，支持前缀复用、块级存储与跨请求共享，已适配多种推理引擎。它的设计哲学是「缓存逻辑从引擎里抽出来，变成独立基础设施」。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Engine["推理引擎层"]
+    E1["vLLM"]
+    E2["SGLang"]
+    E3["TGI"]
+    E4["其他引擎"]
+  end
+  subgraph LMCache["LMCache 中间层"]
+    L1["统一 KV API"]
+    L2["前缀匹配引擎"]
+    L3["多级存储管理器"]
+  end
+  subgraph Storage["存储后端"]
+    S1["GPU HBM"]
+    S2["Host DRAM"]
+    S3["远端 Redis / SSD"]
+  end
+  Engine --> LMCache --> Storage
+            </div>
+            <figcaption>LMCache 架构：作为推理引擎和存储之间的中间层，提供统一的多级缓存能力</figcaption>
+          </figure>
+
+          <h3>5.3 两种系统的对比</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>Mooncake</th><th>LMCache</th></tr></thead>
+              <tbody>
+                <tr><td>定位</td><td>完整推理架构</td><td>可插拔缓存中间件</td></tr>
+                <tr><td>目标场景</td><td>大规模共享集群（Kimi）</td><td>通用推理引擎增强</td></tr>
+                <tr><td>KV 共享范围</td><td>集群级（跨节点）</td><td>单节点 + 可选远端</td></tr>
+                <tr><td>与 PD 分离</td><td>深度集成</td><td>可配合但不强依赖</td></tr>
+                <tr><td>接入成本</td><td>高（需整体架构改造）</td><td>低（作为库接入）</td></tr>
+                <tr><td>核心创新</td><td>KV 即集群资源</td><td>缓存逻辑独立化</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>六、淘汰策略：KV 的「垃圾回收」</h2>
+          <p>当缓存满了，必须淘汰一部分 KV block。淘汰策略直接影响命中率和性能，是分级存储系统最微妙的设计点。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Full["缓存已满"] --> Q1{"淘汰策略"}
+  Q1 --> LRU["LRU<br/>最近最少使用"]
+  Q1 --> LFU["LFU<br/>最不常用"]
+  Q1 --> Priority["优先级淘汰<br/>按业务规则"]
+  Q1 --> Token["Token 重要性<br/>按注意力分数"]
+  
+  LRU --> LRU_D["淘汰 last_access 最早的<br/>简单 · 适合通用场景"]
+  LFU --> LFU_D["淘汰 access_count 最低的<br/>适合热点集中的场景"]
+  Priority --> P_D["按业务规则淘汰<br/>如：免费用户先淘汰"]
+  Token --> T_D["淘汰注意力权重低的 token<br/>精度最高 · 计算开销大"]
+            </div>
+            <figcaption>四种 KV 淘汰策略：LRU 最通用，Token 重要性最精确但最贵</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>策略</th><th>原理</th><th>优点</th><th>缺点</th><th>计算开销</th></tr></thead>
+              <tbody>
+                <tr><td>LRU</td><td>淘汰最久未访问的 block</td><td>实现简单，对突发访问友好</td><td>不区分访问频率</td><td>O(1)</td></tr>
+                <tr><td>LFU</td><td>淘汰访问次数最少的 block</td><td>保留高频 block</td><td>老 block 永远不被淘汰</td><td>O(log n)</td></tr>
+                <tr><td>优先级</td><td>按业务规则分配优先级</td><td>灵活可控</td><td>规则需人工设计</td><td>O(1)</td></tr>
+                <tr><td>注意力分数</td><td>淘汰注意力权重低的 token 的 KV</td><td>精度最高，对效果影响最小</td><td>需要额外计算注意力分数</td><td>O(n²)</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>七、与 PD 分离的协同</h2>
+          <p>KV 分级存储与 PD 分离（Prefill-Decode Disaggregation）是天然搭档。PD 分离把 prefill 和 decode 分到不同节点，中间通过 KV 传输衔接。KV 分级存储正好解决「KV 在节点间怎么传、怎么存」的问题。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph P["Prefill 节点"]
+    P1["处理新请求<br/>计算完整 KV"]
+    P2["KV 写入<br/>全局缓存池"]
+  end
+  subgraph KVPool["KV 缓存池"]
+    K1["HBM（热）"]
+    K2["DRAM（温）"]
+    K3["SSD（冷）"]
+  end
+  subgraph D["Decode 节点"]
+    D1["从缓存池<br/>读取 KV"]
+    D2["逐 token 解码<br/>追加新 KV"]
+  end
+  P1 --> P2 --> KVPool
+  KVPool --> D1 --> D2
+  D2 -.->|"新 KV 回写"| KVPool
+            </div>
+            <figcaption>KV 分级存储与 PD 分离的协同：Prefill 节点算完 KV 写入缓存池，Decode 节点从池中读取</figcaption>
+          </figure>
+
+          <p>这种架构的优势在于：<strong>Prefill 节点不需要保留 KV，可以立即处理下一个请求；Decode 节点不需要重算 prefill，直接从池中读取</strong>。KV 缓存池成为了两个阶段之间的「消息队列」和「状态存储」。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant P as Prefill 节点
+  participant Pool as KV 缓存池
+  participant D as Decode 节点
+  P->>P: 计算完整 KV
+  P->>Pool: 写入 KV（含 block 元数据）
+  D->>Pool: 请求 session 的 KV
+  alt KV 在池中存在
+    Pool-->>D: 直接返回 KV
+  else 不存在
+    Pool-->>D: 触发重算或跨节点拉取
+  end
+  D->>D: 逐 token 解码，新 KV 回写池
+            </div>
+            <figcaption>KV 缓存池衔接 PD 两阶段：Prefill 写入、Decode 读取，命中则复用、未命中则重算</figcaption>
+          </figure>
+
+          <h2>八、工程决策清单</h2>
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Start["KV 管理决策"] --> Q1{"KV 是否<br/>量化?"}
+  Q1 -->|"是"| Q1a["INT8 默认<br/>INT4 激进"]
+  Q1 -->|"否"| Q1b["FP16 精度优先<br/>需更多介质"]
+  Q1a --> Q2
+  Q1b --> Q2
+  
+  Q2{"是否有<br/>共享前缀?"} -->|"是"| Q2a["启用前缀哈希<br/>最大化命中"]
+  Q2 -->|"否"| Q2b["跳过前缀复用<br/>关注淘汰策略"]
+  Q2a --> Q3
+  Q2b --> Q3
+  
+  Q3{"是否需要<br/>跨节点共享?"} -->|"是"| Q3a["部署分布式 KV 池<br/>如 Mooncake"]
+  Q3 -->|"否"| Q3b["单机多级缓存<br/>如 LMCache"]
+  Q3a --> Q4
+  Q3b --> Q4
+  
+  Q4{"监控<br/>三个核心指标"} --> M1["前缀命中率 >80%"]
+  Q4 --> M2["HBM 命中率 >95%"]
+  Q4 --> M3["换入延迟 <5ms"]
+            </div>
+            <figcaption>KV 管理的工程决策树：量化 → 前缀复用 → 跨节点共享 → 监控指标</figcaption>
+          </figure>
+
+          <ul>
+            <li><strong>先量化</strong>：KV 是否量化（如 INT8）能直接砍掉一半空间，配合卸载更省；</li>
+            <li><strong>再共享</strong>：把系统提示词/公共文档设为共享前缀，最大化命中；</li>
+            <li><strong>后卸载</strong>：只有「命中可预期」的 KV 才值得落 DRAM/SSD，冷数据直接丢弃可能更划算；</li>
+            <li><strong>选淘汰</strong>：通用场景用 LRU，热点集中用 LFU，精度敏感用注意力分数；</li>
+            <li><strong>监控</strong>：盯缓存命中率、换入延迟、OOM 次数三个指标，而不是只看显存占用。</li>
+          </ul>
+
+          <details class="deep">
+            <summary>展开：KV 分级存储的运维监控清单</summary>
+            <div class="deep-body">
+              <p>分级存储上线后，真正的工程难点从「能不能放下」变成「放得对不对」。一份可落地的监控清单：</p>
+              <ul>
+                <li><strong>命中率三件套</strong>：前缀命中率（目标 &gt;80%）、HBM 命中率（目标 &gt;95%）、DRAM 命中率。三者逐级下降是正常，但 HBM 命中率掉到 90% 以下就要警惕——说明热 KV 正在被错误淘汰。</li>
+                <li><strong>换入延迟分布</strong>：盯 p99 而非平均。偶发的 SSD→HBM 长尾（&gt;10ms）会直接体现在 TTFT 抖动上，用户能感知。</li>
+                <li><strong>OOM 次数与触发频率</strong>：分级存储的目的就是消灭 OOM，如果还 OOM，说明淘汰策略太保守或介质容量规划不足。</li>
+                <li><strong>冷数据回读比</strong>：如果大量请求都触发 SSD 回读，说明前缀命中率没做起来，或者卸载策略过激——回头检查路由和共享前缀设计。</li>
+                <li><strong>容量水位告警</strong>：HBM/DRAM/SSD 各自保留 10-15% 余量，避免在峰值流量下缓存被瞬间打满导致雪崩式淘汰。</li>
+              </ul>
+              <p style="margin-bottom:0">一个常被忽略的点：<strong>监控要和 PD 分离、推理引擎一起看</strong>。KV 命中率掉，可能是 Decode 节点路由变了（缓存亲和失效），也可能是前缀缓存被关闭了。把 KV 指标和引擎的 TTFT/TPOT 曲线叠在同一张 Grafana 面板上，定位最快。</p>
+            </div>
+          </details>
+
+          <h2>显存、带宽、延迟三者的权衡：一组合账</h2>
+          <p>分级存储的全部决策，最后都落在一个账上：把 KV 挪去更慢的地方省下的显存，到底值不值回读时付出的延迟。这需要同时算三笔账——显存账、带宽账、延迟账。</p>
+          <p><strong>显存账</strong>：卸载的收益是「省下 HBM 空间」。前面算过，70B 模型 FP16 下每 1000 token 的 KV 约 2.5 GB，一条 32K 上下文的请求就要吃掉 80 GB——几乎是整卡显存。如果 10 条这样的请求并发，光 KV 就 800 GB，单机无论如何放不下，必须靠分级存储摊到 DRAM 和 SSD 上。这一层没有选择余地：要么卸载，要么减并发。</p>
+          <p><strong>带宽账</strong>：但卸载的代价不只是延迟，还有带宽。每次把 KV 从 DRAM 读回 HBM，要占用 PCIe 带宽；从 SSD 读回则要先过 PCIe 再进 DRAM。NVMe SSD 的带宽约 3-7 GB/s，而推理引擎在 Decode 阶段本身就要以 2 TB/s 的量级读权重——两者差两三个数量级。换句话说，<strong>卸载一次的带宽开销，足够权重读几百次</strong>。因此「命中一次缓存就够本」的直觉在这里不成立：如果 KV 命中后只被读一两次，省下的显存还不如花掉的带宽值钱。</p>
+          <p><strong>延迟账</strong>：延迟的代价是数量级的。HBM 访问约 200 ns，DRAM 约 1-5 μs，SSD 约 10-50 μs。如果一次 Decode 步骤恰好在等一个被错误换出的 KV 从 SSD 回读，单步延迟会从几十微秒暴涨到毫秒级——TPOT 直接翻倍甚至更多，用户立刻感觉到卡顿。所以正确的卸载对象是「确认短期不会被访问」的冷 KV，而不是「可能还会用」的温 KV。</p>
+          <p>把三笔账合起来，可以得到一个实用判断准则：<strong>只有当「KV 的再次访问次数 × 单次访问的权重读取时间」超过「卸载 + 回读的总耗时」时，卸载才划算</strong>。换句话说，命中率越高、复用次数越多的 KV 越值得放进更便宜的层级；命中率低的一次性 KV，宁可占用 HBM 或直接丢弃，也不要走卸载流程。这也是为什么所有分级存储系统都强调命中率指标——它直接决定了这套账是正还是负。</p>
+
+          <h2>前缀复用与分级存储的配合：命中率从哪来</h2>
+          <p>上一节说了「命中率高才值得卸载」，那命中率本身从哪来？答案不是靠运气，而是靠<strong>共享前缀的设计</strong>。在 RAG 场景，所有用户查询同一份文档库，检索出的上下文 chunk 高度重叠；在 Agent 场景，同一套系统提示词和工具定义反复出现。这些重复出现的前缀，就是命中率的来源。</p>
+          <p>工程上有两种把命中率「做出来」的方法。一种是<strong>内容寻址</strong>：把前缀的 token 序列做哈希，相同内容的 block 天然共享同一个缓存条目，无论来自哪个用户。这正是 SGLang 的 RadixCache、vLLM 前缀缓存和 LMCache 的公共思路。另一种是<strong>长度阈值</strong>：对短前缀不做缓存（命中也省不了多少），只对超过一定长度（如 64 token）的前缀做缓存索引，避免大量短小、互不重叠的 block 塞满索引表。</p>
+          <p>需要注意，前缀复用和 KV 量化、分级存储是<strong>三个可以叠加的杠杆</strong>：前缀复用减少「要算的 KV」，量化减少「每个 KV 的字节数」，分级存储解决「算完的 KV 放哪里」。举个例子，一段 4096 token 的共享系统提示，三个杠杆叠起来：前缀复用省掉 80% 的重复 prefill，INT8 量化把每 token 体积砍半，热 KV 留 HBM、冷 KV 沉 SSD——三者相乘，显存压力和 prefill 计算量同时下降一个数量级。这就是为什么生产系统从来不是单用某一种手段，而是组合拳。</p>
+          <p>最后提醒一个容易反噬的做法：<strong>不要为了提升命中率而牺牲正确性</strong>。前缀缓存的前提是「相同 token 序列产生相同 KV」——如果前缀里混入了随机数、时间戳或用户特定状态（如「当前日期：2026-08-08」），看似相同的前缀实际每次都在变，缓存不仅命中不了，还会持续写入垃圾条目、污染索引表。生产上要对这类动态前缀做规范化处理，或在路由层把它们排除在缓存键之外。</p>
+
+          <h2>什么时候不该用 KV 卸载</h2>
+          <p>分级存储不是免费的，有几种场景下「不卸载」反而是正确的选择。</p>
+          <p>第一种是<strong>短序列、高并发</strong>的在线聊天场景。每条请求的 KV 只有几 MB，但并发上百条。此时 KV 总量虽然不小，但每条都是「正在解码的热 KV」，命中复用率极低（每个用户聊的内容不同），卸载只会引入大量回读延迟，而省下的显存有限。这类场景的正确优化方向是 KV 量化 + PagedAttention 的显存复用，而不是分级存储。</p>
+          <p>第二种是<strong>单机部署、显存刚好够</strong>的场景。如果当前负载下 KV 全放 HBM 也不 OOM，分级存储就是在为一个并不存在的容量问题引入系统复杂度——多一层缓存逻辑、多一组监控指标、多一批潜在的延迟抖动源。工程上有个朴素的检验：先看 KV 量化（INT8 直接把体积砍半）能不能解决问题，不能了再考虑卸载。</p>
+          <p>第三种是<strong>对延迟极度敏感</strong>的在线推理。分级存储即使命中率 95%，那 5% 的未命中请求也要付出跨介质回读的代价。对于 TPOT 必须稳定在 50ms 以内的服务，任何一次 SSD 回读都可能违约。这类服务要么把所有 KV 留在 HBM 并接受较低的并发，要么用 PD 分离架构把 KV 的「搬运」交给专门的基础设施（见 <a href="pd-disaggregation.html">PD 分离</a>），让推理路径上尽量不出现跨介质访问。</p>
+          <p>一句话总结选型：<strong>KV 卸载是为「容量不够、复用可控、延迟容忍」的场景设计的</strong>——典型代表是离线批处理、长文档 RAG、Agent 的多轮状态恢复。实时短对话优先量化，延迟敏感服务优先留 HBM，容量真的失控时再上分级存储，并用命中率指标验证这套账是赚的。</p>
+          <p>补充一个容易被漏掉的运维细节：分级存储引入后，显存占用不再等于「KV 总量」，而是「留在 HBM 的那部分」。如果监控只看总显存占用，往往会误判「没 OOM 就是没问题」，实则热 KV 正在被频繁换入换出，吞吐已经在悄悄劣化。正确的做法是同时盯三个分层指标——HBM 水位、换入换出频率、以及最关键的命中率，三者联动才看得出系统的真实健康度。这套监控体系一旦搭好，分级存储就从「赌命中」变成了「可验证、可调优」的确定性工程。</p>
+          <p>如果确认要走卸载路线，建议从小规模试点开始：先只对最长的那批冷请求启用，观测命中率与 TTFT p99 的变化，再逐步放开。一次全量上线容易让系统在流量高峰暴露隐藏问题，而分阶段灰度能让你在每一档都有足够的数据修正策略。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：KV 分级存储 = 按访问热度把 KV 分布到 HBM/DRAM/SSD，以延迟换容量；前缀复用让「共享前缀只算一次」。</li>
+            <li><strong>显存公式</strong>：$M_{\text{KV}} = 2 \times n_{\text{layers}} \times n_{\text{heads}} \times d_{\text{head}} \times L \times \text{sizeof(dtype)}$。70B 模型每 1000 token 约 2.5 GB。</li>
+            <li><strong>三级介质</strong>：HBM（~3 TB/s，80GB）→ DRAM（~100 GB/s，数百 GB）→ SSD（~7 GB/s，数 TB），延迟从 200ns 到 50μs。</li>
+            <li><strong>前缀复用</strong>：前缀哈希 + 块级索引，命中率 80%+ 可省 80% 的 prefill 计算。</li>
+            <li><strong>KV 量化</strong>：INT8 砍半、INT4 砍到 1/4，精度损失可控（＜3%）。</li>
+            <li><strong>淘汰策略</strong>：LRU 最通用，LFU 适合热点集中，注意力分数最精确但最贵。</li>
+            <li><strong>关键指标</strong>：前缀命中率（＞80%）、HBM 命中率（＞95%）、换入延迟（＜5ms）、OOM 次数。</li>
+            <li><strong>常见坑</strong>：把热 KV 卸载导致每步都等 SSD；忽视前缀哈希实现；缓存淘汰策略与业务访问模式不匹配；只看显存占用不看命中率。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management — KV 卸载与按需预取的专门研究，本页论文原图来源 · <a href="https://arxiv.org/abs/2406.19707" target="_blank" rel="noopener">arXiv:2406.19707</a></li>
+            <li>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving — 以 KV 为中心的推理架构论文 · <a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener">arXiv:2407.00079</a></li>
+            <li>LLM in a flash: Efficient Large Language Model Inference with Limited Memory — 把模型按需加载进 DRAM 的苹果端侧研究，理解「卸载」机制的起点 · <a href="https://arxiv.org/abs/2312.11514" target="_blank" rel="noopener">arXiv:2312.11514</a></li>
+            <li>Efficient Streaming Language Models with Attention Sinks — StreamingLLM，KV 窗口管理与注意力汇 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></li>
+            <li>LMCache 官方仓库 — 模型无关的 KV 缓存层实现 · <a href="https://github.com/LMCache/LMCache" target="_blank" rel="noopener">GitHub</a></li>
+            <li>Attention Store: Cost-effective Attention Reuse — 注意力缓存复用的研究 · <a href="https://arxiv.org/abs/2403.19708" target="_blank" rel="noopener">arXiv:2403.19708</a></li>
+            <li>vLLM PagedAttention — 最早的 KV 内存管理创新 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a></li>
+            <li>KVQuant: Towards 10-bit KV Cache — KV 量化方法 · <a href="https://arxiv.org/abs/2310.06224" target="_blank" rel="noopener">arXiv:2310.06224</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            先搞懂 KV 是怎么产生和增长的：<a href="../04-modern-arch/kv-cache.html">KV Cache</a>；分级存储常与推理引擎配合，看 <a href="pd-disaggregation.html">PD 分离</a> 和 <a href="inference-engines.html">推理引擎</a>；KV 量化相关技术见 <a href="quantization.html">量化 Quantization</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

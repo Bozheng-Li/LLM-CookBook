@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>强化学习基础 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="01-foundations" data-topic="rl-basics">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>强化学习基础</h1>
+            <p class="lead">大模型的后训练绕不开强化学习：RLHF 用它把人类偏好烙进权重，GRPO/RLVR 用它训出长思维链，Agentic RL 用它训会做事的 Agent。但 RL 的完整理论很重，本节只挑后训练真正要用到的四块拼图——MDP、策略梯度、优势估计、PPO 目标函数——讲透，其余概念碰到时再回查。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>强化学习的世界观极简：一个<strong>智能体</strong>（Agent）在某个<strong>状态</strong>下选一个<strong>动作</strong>，环境给它一个<strong>奖励</strong>并把它带到新状态，如此循环。四块拼图分别回答四个问题：MDP 定义这个循环，策略梯度说"让好动作出现概率变大"，优势估计说"什么叫好"，PPO 说"更新别太猛，免得把已学会的能力改崩"。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  S["状态 s"] --> A["智能体选动作 a"]
+  A --> R["环境给奖励 r"]
+  R --> S2["新状态 s'"]
+  S2 --> A
+  A -.->|"1 MDP<br/>定义这套循环"| NOTE1["世界观"]
+  A -.->|"2 策略梯度<br/>让好动作概率变大"| NOTE2["怎么学"]
+  R -.->|"3 优势估计<br/>好多少才算好"| NOTE3["评价标准"]
+  A -.->|"4 PPO<br/>约束更新别太猛"| NOTE4["稳定性"]
+              </div>
+              <figcaption>RL 循环与四块拼图的对应：每块回答一个核心问题</figcaption>
+            </figure>
+          </div>
+
+          <h2>MDP：强化学习的世界观</h2>
+          <p>马尔可夫决策过程（MDP）是给 RL 建模的标准框架，由五元组 $\langle S, A, P, R, \gamma\rangle$ 组成：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>符号</th><th>含义</th><th>在大模型 RL 里对应什么</th></tr></thead>
+              <tbody>
+                <tr><td>$S$</td><td>状态空间</td><td>对话上下文 / 已生成的 prompt+前文</td></tr>
+                <tr><td>$A$</td><td>动作空间</td><td>词表，每步选一个 token</td></tr>
+                <tr><td>$P$</td><td>状态转移</td><td>由环境（接码器/沙箱/对话系统）决定，通常确定性</td></tr>
+                <tr><td>$R$</td><td>奖励函数</td><td>奖励模型打分 / 规则验证器 / 人类偏好</td></tr>
+                <tr><td>$\gamma$</td><td>折扣因子</td><td>未来奖励的衰减权重，控制多看重长远</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>关键是"马尔可夫"三个字：下一个状态只依赖当前状态和动作，不依赖更早的历史。这个假设让数学变得可处理——不需要记住全部历史，只看"现在在哪个状态、做了什么"。在大模型 RL 里它部分成立：接码器、数学题验证器这种有明确环境反馈的任务，马尔可夫性较强；而开放对话里"状态"可能依赖很长的上下文，严格说已退化成 POMDP（部分可观测），这是 <a href="../07-posttraining/agentic-rl.html">Agentic RL</a> 要专门处理的问题。</p>
+          <p>智能体的行为由<strong>策略</strong> $\pi(a|s)$ 描述：在状态 $s$ 下选动作 $a$ 的概率。RL 的目标就是找一个策略，让累计奖励的期望最大。在语言模型里，策略就是当前模型参数下生成各 token 的概率分布，和 <a href="probability-info.html">概率与信息论</a> 里的预测分布是同一个东西。</p>
+
+          <p>五元组里的 $P$（转移概率）和 $R$（奖励）到底长什么样？教科书喜欢用一张「转移图」把它们画出来。下面这张图来自强化学习标准教材 Sutton &amp; Barto《Reinforcement Learning: An Introduction》第二版电子书的 recycling robot（回收机器人）例子，是教材官方页里的原图：</p>
+
+          <figure class="paper-figure">
+            <img src="http://incompleteideas.net/book/ebook/figtmp9.png" alt="教材原图：recycling robot 例子的马尔可夫转移图——节点是状态（电池高/低），有向边是动作，边上的数字是转移概率与即时奖励" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：recycling robot 例子的转移图——每个节点是一个状态，每条边是一个「动作 + 转移概率 + 即时奖励」三元组，整张图就是 MDP 的 $P$ 与 $R$ 的可视化</span>
+              <span class="pf-src">教材原图 · Sutton &amp; Barto, <em>Reinforcement Learning: An Introduction</em>, 2nd ed., 2018, Figure 3.3 · <a href="http://incompleteideas.net/book/RLbook2020.pdf" target="_blank" rel="noopener">教材电子版 PDF</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，记住三个记号就够了。① <strong>圆角矩形是状态</strong>：回收机器人电池电量只有「高」和「低」两档。② <strong>有向边是动作及后果</strong>：从「高」出发做「搜索」有 0.6 概率回到「高」（得 1 分），有 0.4 概率掉到「低」（得 1 分）；做「等待」则稳稳留在「高」。③ <strong>边上的数字是 $(p, r)$ 对</strong>：前一个是转移到目标状态的概率，后一个是这次转移的即时奖励——奖励有正有负（充电要 -3，代表成本）。</p>
+          <p>把这张图翻译成大模型语言，对应关系非常直接：<strong>状态 = 已生成的上下文，动作 = 选哪个 token，转移 = 选定后把 token 接上（通常是确定性的），奖励 = 句子结束时验证器 / 奖励模型给的总分</strong>。recycling robot 图里的「概率」在多数字验证任务里会退化成确定性的，但 MDP 的五元组骨架不变——这也是为什么一整条 RLHF 流水线，起点只是这张小图。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            MDP 把"做事"抽象成"在状态里选动作、拿奖励、进新状态"。语言模型 RL 的状态就是上文，动作就是下一个 token。
+          </div>
+
+          <h2>策略梯度：让"好动作"概率变大</h2>
+          <p>策略梯度（policy gradient）是一类直接对策略本身求梯度的方法。最朴素的版本叫 REINFORCE，目标函数是"策略下累计奖励的期望"，对策略参数 $\theta$ 求导后得到一个极其优雅的形式：</p>
+          <div class="figure" style="text-align:center">
+            $$\nabla_\theta J(\theta) = \mathbb{E}_{\tau\sim\pi_\theta}\left[\sum_{t=0}^{T} \nabla_\theta \log \pi_\theta(a_t|s_t)\; G_t\right]$$
+          </div>
+          <p>这个公式看着吓人，拆开却极好理解：$G_t$ 是从第 $t$ 步起的累计奖励（叫"回报"），$\log \pi_\theta(a_t|s_t)$ 是策略给这个动作的对数概率。整个梯度期望等于"每个动作的对数概率梯度，乘以该动作带来的回报"。做一步参数更新后，效果就是——<strong>回报大的动作，对数概率被往上抬；回报小的动作，被往下压</strong>。</p>
+          <p>这里的对数概率 $\log\pi_\theta(a_t|s_t)$ 对语言模型来说，就是生成该 token 的对数概率，和预训练交叉熵里那个 $-\log q_{token}$ 是同一个量（见 <a href="probability-info.html">概率与信息论</a>）。所以策略梯度在 LLM 上落地很自然：用奖励替代了预训练的交叉熵信号。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            <strong>reward（单步奖励）和 return（累计回报）不是一回事</strong>。reward 是环境在每一步给的那个数；return $G_t$ 是从当前步开始、把未来所有奖励按折扣 $\gamma$ 加权加起来的累计值。策略梯度公式里乘的是 return，不是单步 reward——所以一个动作「现在得 0 分但通向高分结局」，它的 return 照样很大，策略会去学它。另一个高频困惑是折扣因子 $\gamma$：它不是在「惩罚延迟奖励」，而是让无限长的未来求和变成一个有限、可算的数，$\gamma$ 越接近 1 越「看得长远」。语言模型 RL 里常见的做法是只在句子结束时给一次非零奖励、中间每步为 0——这时每个 token 的 return 都是「同一个总分」，只是距终点越远的 token 被 $\gamma$ 折扣得越狠。</div>
+
+          <div class="callout warn">
+            <span class="callout-t">朴素策略梯度的硬伤</span>
+            $G_t$ 是一条轨迹上采样来的回报，方差极大——同一起点不同采样，累计奖励可以差几个数量级。梯度被这种噪声主导，训练几乎没法稳。下一块拼图优势估计就是来治这个的。
+          </div>
+
+          <h2>策略梯度为什么可行：从一次掷骰子说起</h2>
+          <p>策略梯度公式看着抽象，但它的直觉可以用一个掷骰子的例子讲清楚。想象你在训练一个掷骰子模型：状态固定（就一次掷骰），动作是 1 到 6，策略给出每个点数被选中的概率。你不知道规律，只能反复掷，然后从环境拿回奖励——掷出 6 得 +10，其余得 0。</p>
+          <p>刚开始策略是均匀的：每个点数概率都是六分之一。你掷了很多次，统计发现掷出 6 的那几次，动作是"6"，奖励是 +10；其余动作奖励是 0。策略梯度做的事，就是根据"这个动作历史上带来的平均奖励"调整概率：奖励为正的动作，把它的概率往上抬一点；奖励为零或为负的动作，把概率往下压一点。几轮之后，策略会逐渐偏向"6"，直到几乎每次都能掷出它。</p>
+          <p>为什么"按回报调概率"在数学上是对的呢？关键在期望这个动作上。策略的总体表现是"所有动作的概率 × 对应回报"的期望；想让这个期望变大，就应该把概率往"回报高的动作"那边挪。而"挪多少"的梯度，恰好就是每个动作的对数概率梯度乘以回报——这就是策略梯度公式的本质：它不是在猜，而是在精确计算"把概率往哪个方向调，期望奖励会涨得最快"。更新得越多，期望上升得越快，收敛到最优策略就有了数学保证。</p>
+          <p>再补一句为什么梯度里出现的是 $\log\pi$ 而不是 $\pi$ 本身。直接对 $\pi(a|s)$ 求期望的梯度，会遇到"期望里带着策略、没法直接采样"的麻烦；把 $\pi$ 写成 $\log\pi$，利用 $\mathrm{d}\log\pi=\mathrm{d}\pi/\pi$ 这个恒等式，梯度就变成了"可以采样估计"的形式——这就是公式里 $\log$ 的来历。它不改变梯度方向（只是乘了个正因子 $1/\pi$），却让"用采样数据估计梯度"变得可行。这条技巧叫对数似然技巧，是策略梯度能被工程化的关键一步。</p>
+          <p>在语言模型里，同一个逻辑套在 token 上：每个 token 就是一次掷骰子，回报就是整句话拿到的奖励（通常延迟到句子结束才给）。策略梯度把"让好 token 概率变大"和"让坏 token 概率变小"统一成一个信号——预训练时这个信号是交叉熵（答案已知），RL 时它换成了奖励（答案未知，只有事后反馈）。理解了这个对应关系，你就明白为什么后训练可以"接着预训练继续练"：它们改的是同一个分布，只是换了监督信号。</p>
+          <p>最后澄清一个常见误解：策略梯度并不是"随机试错"的玄学。掷骰子例子里"掷很多次再统计"是采样估计，而策略梯度公式本身是精确的数学对象——它告诉我们期望奖励关于策略参数的导数方向，采样只是用来估计这个导数的工具。方向是确定的，噪声来自估计，这正是一节更比一节稳的改进（优势估计、PPO）一直在压缩的部分。</p>
+
+          <h2>一个数字算例：把一次策略更新算到底</h2>
+          <p>把上面的直觉落到具体数字上。假设词表只有两个 token，"对"和"错"，当前策略给出 $P(\text{对})=0.7$、$P(\text{错})=0.3$。这一轮采了两条轨迹：第一条选了"对"，事后奖励 $+2$；第二条选了"错"，事后奖励 $-1$。</p>
+          <p>先算策略梯度要用的量。对数概率：$\log 0.7\approx-0.357$，$\log 0.3\approx-1.204$。策略梯度告诉我们，更新方向是"对数概率梯度 × 回报"：对"对"这个 token，回报是 $+2$，方向是抬升它的概率；对"错"，回报是 $-1$，方向是压低。用学习率 $\eta=0.1$ 走一步后，归一化得到的新策略大致是 $P(\text{对})\approx0.75$、$P(\text{错})\approx0.25$——好的动作概率上升，坏的下降，方向完全符合直觉。</p>
+          <p>再补一条关键细节：这一步更新用的是"回报"，而不是"优势"。如果这里换成优势（比如把基线 0.5 扣掉），"对"的优势是 $+2-0.5=+1.5$，"错"的是 $-1-0.5=-1.5$——信号方向一致，但幅度更集中、方差更小。这正是下一节优势估计的价值：它不改变更新的方向，只把噪声压下来。回报是"绝对好坏"，优势是"相对好坏"，后者在多变环境中稳定得多。</p>
+          <p>算例还顺带暴露了朴素策略梯度的一个真实问题：如果这一轮只采到了一条轨迹、且恰好是"错"（奖励 $-1$），你会得到"压低'错'"的信号，却完全不知道"对"该不该抬——单次采样噪声大、覆盖不全。工程上通过批量采样、多次复用、优势估计和 clip 约束四件事一起来对付它，这也正好预告了后面 PPO 要做的全部工作。</p>
+
+          <h2>优势估计：好多少才算好</h2>
+          <p>方差大的根源之一是 $G_t$ 把"基线"也包含进去了：一个动作拿了 10 分奖励，到底是好还是差？如果平均水平能拿 8 分，那是好动作；如果平均能拿 50 分，那 10 分是差动作。把基线扣掉，剩下的"比平均好多少"才是真正有信号的量——这就是<strong>优势函数</strong> $A(s,a)$。</p>
+          <div class="figure" style="text-align:center">
+            $$A(s,a) = Q(s,a) - V(s)$$
+          </div>
+          <p>其中 $Q(s,a)$ 是"在 $s$ 做 $a$ 之后能拿到的期望累计奖励"，$V(s)$ 是"在 $s$ 这个状态本身平均能拿到的期望累计奖励"（基线）。两者的差就是"做了 $a$ 相比随便做平均能好多少"。把策略梯度里的 $G_t$ 换成 $A(s,a)$，信号不变但方差大幅下降——这就是优势估计的价值。</p>
+          <p>实际工程里 $V(s)$ 由一个独立的价值网络（critic）估计，$Q(s,a)$ 常用一条轨迹上的实际回报来估计，这就引出了 GAE（广义优势估计）这类技巧，对多步回报做指数加权平滑，在偏差和方差间折中。后训练里 GRPO 这类方法之所以不训显式 critic，是用同一 prompt 采多条轨迹互为基线来估计优势——这是它和 PPO 路线的核心差异，见 <a href="../07-posttraining/grpo-rlvr.html">推理强化学习</a>。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  TRAJ["采一条轨迹<br/>s,a,r,s',a,r..."] --> G["算回报 G_t"]
+  G --> Q["估计 Q<br/>做了 a 后的累计收益"]
+  TRAJ --> V["价值网络 V<br/>状态本身平均收益"]
+  Q --> A["优势 A = Q − V<br/>比平均好多少"]
+  A --> PG["策略梯度<br/>用 A 替代 G_t 降方差"]
+              </div>
+              <figcaption>优势估计在策略梯度里的位置：用基线 V 把绝对回报变成相对优势，方差骤降</figcaption>
+          </figure>
+
+          <h2>PPO 目标函数：约束更新别太猛</h2>
+          <p>策略梯度还有个隐患：每步更新都是沿当前策略的梯度方向走，但更新完策略就变了，旧梯度对新策略可能已经不准。如果一步走太猛，新策略可能偏离旧策略一大截，性能突然崩盘——RL 训练里常见的"策略崩溃"。PPO（Proximal Policy Optimization）就是为约束这个"别走太猛"设计的。</p>
+          <p>PPO 的核心是<strong>重要性比</strong> $r_t(\theta) = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{old}}(a_t|s_t)}$，即新策略给该动作的概率除以旧策略的。$r_t=1$ 说明新旧策略在这个动作上一致；$r_t$ 偏离 1 越多，说明新策略相对旧策略改动越大。PPO 用一个 clip 操作把这种偏离限制住：</p>
+          <div class="figure" style="text-align:center">
+            $$L^{PPO}(\theta) = \mathbb{E}_t\left[\min\!\left(r_t(\theta)\,A_t,\;\; \mathrm{clip}(r_t(\theta),\,1-\epsilon,\,1+\epsilon)\,A_t\right)\right]$$
+          </div>
+          <p>拆解它在做什么：取 $r_t A_t$ 和"被裁剪到 $[1-\epsilon, 1+\epsilon]$ 区间后的 $r_t A_t$"两者的<strong>较小值</strong>。$\epsilon$ 常取 0.2，意思是新策略对任一动作的概率，相对旧策略放大或缩小不超过约 20%。</p>
+          <ul>
+            <li><strong>当动作是好的（$A_t&gt;0$）</strong>：策略想把它的概率往上抬，$r_t$ 增大。但 clip 把它卡在 $1+\epsilon$ 上，再涨也拿不到更多收益——防止过犹不及。</li>
+            <li><strong>当动作是差的（$A_t&lt;0$）</strong>：策略想往下压，$r_t$ 减小。clip 把它卡在 $1-\epsilon$ 上，防止一下子压到几乎不出现、把已学能力改崩。</li>
+          </ul>
+          <p>这个"取较小值"是个精妙设计：当新旧策略偏离不大、min 取未裁剪项时，梯度正常更新；当偏离超出 clip 范围、min 取裁剪项时，梯度对该参数趋于零——<strong>策略偏离越大，越不让你继续往那个方向走</strong>。这就是 PPO 既允许更新又约束更新的机制。</p>
+
+          <div class="callout">
+            <span class="callout-t">PPO 在 RLHF 里的角色</span>
+            RLHF 的第二阶段就是用 PPO 微调语言模型：用奖励模型给生成打分当 $R$，用未对齐的参考模型做 KL 约束防漂移，用 PPO 目标函数保证每步更新不破坏已有能力。这套流程是 ChatGPT 的关键一步，详见 <a href="../07-posttraining/rlhf.html">RLHF</a>。
+          </div>
+
+          <details class="deep">
+            <summary>展开：手算一遍——clip 是怎么拦住「一步更新太猛」的</summary>
+            <div class="deep-body">
+              <p>设 $\epsilon = 0.2$，那么重要性比 $r_t$ 只允许落在 $[0.8,\, 1.2]$。看两种情形。</p>
+              <p><strong>好动作（$A_t = +1$），旧策略概率 $0.5$，新策略想抬到 $0.9$</strong>：$r = 0.9/0.5 = 1.8$，未裁剪项 $rA = 1.8$；裁剪后 $r_{\mathrm{clip}} = 1.2$，裁剪项 $= 1.2$。取 min 得 $1.2$。含义：新策略把概率从 $0.5$ 抬到 $0.6$（$r$ 从 1.0 到 1.2）的过程中，每抬一点都有奖励激励；但从 $0.6$ 再往上涨，目标卡在 $1.2$ 不再增加——<strong>超过 clip 区间的收益被截断，防止「一步把概率翻三倍」</strong>。</p>
+              <p><strong>坏动作（$A_t = -1$），旧策略概率 $0.5$，新策略想压到 $0.1$</strong>：$r = 0.1/0.5 = 0.2$，未裁剪项 $rA = -0.2$；裁剪后 $r_{\mathrm{clip}} = 0.8$，裁剪项 $= -0.8$。取 min 得 $-0.8$。含义：把概率从 $0.5$ 压到 $0.4$（$r$ 从 1.0 到 0.8）时，目标一路下降、激励明显；压到 $0.8$ 以下后，目标稳定在 $-0.8$ 不再更低——<strong>防止把坏动作的概率一下压到几乎为 0、把已学能力改崩</strong>。</p>
+              <p style="margin-bottom:0">两个方向的数字合起来就是 PPO 的设计哲学：<strong>允许更新，但只允许「温和地」更新</strong>。$\epsilon$ 就是这段温和区的宽度，调大更激进、调小更保守。这也解释了为什么 PPO 相比朴素策略梯度能稳稳地迭代很多步——它的每一步都被 clip 上了一道「单步保险」。</p>
+            </div>
+          </details>
+
+          <div class="callout warn">
+            <span class="callout-t">真实坑：KL 散度漂移</span>
+            RL 微调最怕的是策略漂移过远——模型为了拿高分，可能钻奖励函数的空子输出非自然语言。PPO 的 clip 是一种软约束，RLHF 通常还会再加一项显式的 KL 惩罚，把新策略和参考策略的 KL 散度压住（见 <a href="probability-info.html">概率与信息论</a>）。这两个机制目标相近但机制不同，不要混为一谈。
+          </div>
+
+          <h2>价值函数：V、Q、A 三兄弟</h2>
+          <p>优势估计里出现了 $Q(s,a)$ 和 $V(s)$，它们都属于"价值函数"家族，都是从某个状态或动作出发、对未来累计奖励的期望估计，只是条件不同。把这三个量放在一起看才清楚各自角色：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>符号</th><th>输入</th><th>回答的问题</th><th>在 RL 里的用途</th></tr></thead>
+              <tbody>
+                <tr><td><strong>$V(s)$</strong></td><td>只看状态 $s$</td><td>从 $s$ 出发，平均能拿多少累计奖励？</td><td>作基线，扣掉它得到优势，降方差</td></tr>
+                <tr><td><strong>$Q(s,a)$</strong></td><td>状态 $s$ + 动作 $a$</td><td>在 $s$ 做了 $a$ 之后，平均能拿多少？</td><td>选动作的依据；离线 Q-learning 直接学它</td></tr>
+                <tr><td><strong>$A(s,a)$</strong></td><td>$s$ + $a$</td><td>做了 $a$ 比"随便做平均"好多少？</td><td>策略梯度与 PPO 的实际更新信号</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>三者的关系很简单：$A(s,a) = Q(s,a) - V(s)$。$V$ 是"平均水位"，$Q$ 是"某个动作的水位"，$A$ 是"相对水位差"。在 LLM 后训练里，我们通常不直接去学一个庞大的 $Q$ 网络，而是用一条轨迹上的真实回报去近似 $Q$，再用 critic 估 $V$，两者相减得 $A$——这正是优势估计落地的方式。</p>
+
+          <h2>GAE：把多步回报平滑成优势</h2>
+          <p>理论上，优势可以用"从 $t$ 步起的实际回报"减去 $V(s_t)$ 直接算。但一条轨迹上的回报方差很大，且离当前步越远的奖励噪声越大。GAE（Generalized Advantage Estimation，广义优势估计）的做法是：用两个折扣因子 $\gamma$（对未来的重视）和 $\lambda$（对多步回报的信任），把"一步优势、两步优势、三步优势……"做指数加权平均，在偏差和方差之间折中。</p>
+          <p>直觉上，$\lambda$ 接近 0 时只看一步 TD 误差（偏差低、方差低但信息少）；$\lambda$ 接近 1 时近乎用整条蒙特卡洛回报（方差高但无偏）。工程上常取 $\lambda\approx 0.95$，配 $\gamma\approx 0.99$。下面用图把 GAE 的递归结构画出来：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  D1["TD误差 δ1 = r1 + γV(s2) − V(s1)"] --> A["优势 Â1"]
+  D2["TD误差 δ2 = r2 + γV(s3) − V(s2)"] --> AGG["指数加权"]
+  D1 --> AGG
+  AGG --> A
+  AGG --> NOTE["Ât = δt + (γλ)·Ât+1"]
+  NOTE --> A
+            </div>
+            <figcaption>GAE 用递归把多步 TD 误差指数加权，得到偏差-方差折中的优势估计</figcaption>
+          </figure>
+
+          <h2>on-policy 与 off-policy：数据能复用吗</h2>
+          <p>还有一个工程上绕不开的维度：收集数据用的策略，和更新目标的策略，是不是同一个？这决定了"采到的数据能用几遍"，直接影响训练效率。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>类别</th><th>定义</th><th>代表算法</th><th>数据复用</th></tr></thead>
+              <tbody>
+                <tr><td><strong>on-policy</strong></td><td>用当前策略 $\pi_\theta$ 采样，更新后旧数据作废</td><td>PPO、REINFORCE</td><td>每批数据只用 1 次，样本效率较低</td></tr>
+                <tr><td><strong>off-policy</strong></td><td>可用别的策略（含历史或旧策略）采的数据更新</td><td>Q-learning、DQN</td><td>经验回放可复用多次，样本效率高</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>为什么提这个？因为 PPO 是 on-policy：它依赖"重要性比 $r_t$"来校正新旧策略的偏差，而重要性比只在新旧策略差别不大时可靠（这正是 clip 在保护的）。GRPO 这类方法也是 on-policy 思路，只是用"同 prompt 多采样"替代显式 critic 来估优势。后训练里你几乎全程在 on-policy 范式下工作，理解它才能明白"为什么不能无限复用旧样本"。</p>
+          <div class="callout">
+            <span class="callout-t">探索与利用的取舍</span>
+            强化学习本质上要在"利用已知好动作"和"探索可能更好的动作"之间平衡。语言模型 RL 里探索主要来自采样温度；太冷（温度低）模型只会重复最高概率 token、学不到新东西，太热则输出噪声淹没信号。后训练通常用一个可控、偏低的采样温度来探索。
+          </div>
+
+          <h2>RLHF 训练循环全景</h2>
+          <p>把四块拼图加上价值网络、KL 约束、奖励模型，就是一条完整的 RLHF 训练循环。下面用时序图把它和前面各块一一对上号——可以看到，PPO 目标函数只是这条链里"更新参数"那一步的具体算法：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant P as 提示 prompt
+  participant Pol as 策略模型 πθ
+  participant RM as 奖励模型
+  participant C as 价值网络 critic
+  participant PPO as PPO 更新
+  P->>Pol: 采样生成回答
+  Pol->>RM: 回答送奖励模型打分
+  Pol->>C: 各状态估 V(s)
+  RM->>PPO: 奖励 r 加 KL 惩罚
+  C->>PPO: 优势 A = Q − V
+  PPO->>Pol: clip 约束下更新 θ
+  Pol->>P: 用新策略采下一批
+            </div>
+            <figcaption>RLHF 训练循环：采样到打分到估优势到 PPO 约束更新，四块拼图在此闭环</figcaption>
+          </figure>
+          <p>这条循环的稳定性是个老难题，常见三种结局，对应一个状态机：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> Train
+  state "正常训练 reward 升 KL 受控" as Train
+  Train --> Collapse: 更新太猛或奖励 hacking
+  state "策略崩溃 输出退化或重复" as Collapse
+  Collapse --> Train: 降学习率或加 KL 约束
+  Train --> Hack: 奖励模型被钻空子
+  state "reward hacking 高分低质" as Hack
+  Hack --> Train: 修奖励或加正则
+  Train --> Converge: reward 平稳
+  state "收敛 能力稳定" as Converge
+  Converge --> [*]
+            </div>
+            <figcaption>PPO 训练的状态机：正常训练可能被"崩溃"或"奖励 hacking"打断，各有对策</figcaption>
+          </figure>
+
+          <h2>奖励信号从哪来：RLHF 与 RLVR 的差异</h2>
+          <p>四块拼图里的"优势"最终都来自奖励 $R$，但奖励由谁提供，决定了这条 RL 路线能走多远、能用在什么任务上。后训练里大致有三类奖励来源：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>奖励来源</th><th>怎么得到</th><th>优点</th><th>局限</th></tr></thead>
+              <tbody>
+                <tr><td><strong>奖励模型（RM）</strong></td><td>先用人类偏好数据训一个打分模型，再用它给生成打分</td><td>能刻画"主观好坏"，适合对话、助手势</td><td>奖励模型本身可被钻空子（reward hacking），且偏好数据贵</td></tr>
+                <tr><td><strong>规则 / 验证器</strong></td><td>用可执行检查（单测通过、答案匹配、格式合规）给 0/1 或分段分</td><td>客观、免费、可扩展，适合数学 / 代码</td><td>只覆盖"有标准答案"的任务，难刻画开放质量</td></tr>
+                <tr><td><strong>执行反馈</strong></td><td>让模型真的去跑一步（调 API、用工具），用结果成败当奖励</td><td>最贴近真实任务成败</td><td>环境搭建与成本控制复杂，见 <a href="../11-agents/agent.html">Agent 基础范式</a></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这三类对应了后训练的三条主线：RM 主导的就是 RLHF，规则验证器主导的叫 RLVR（可验证奖励强化学习，数学 / 代码场景），执行反馈则是 Agentic RL 的核心。它们共用本节的四块拼图，只是奖励来源不同——所以理解了 MDP、策略梯度、优势估计与 PPO，你就握住了所有后训练 RL 的共同底座。具体差异与 reward hacking 的应对，见 <a href="../07-posttraining/grpo-rlvr.html">推理强化学习</a> 与 <a href="../07-posttraining/agentic-rl.html">Agentic RL</a>。</p>
+          <div class="callout tip">
+            <span class="callout-t">一句话区分</span>
+            RLHF 的奖励是"人觉得好不好"，RLVR 的奖励是"答案对不对"，Agentic RL 的奖励是"事做成没成"。后两类因为可自动验证，往往比 RLHF 更稳、更易规模化，也是 2025-2026 年强化学习落地的主力方向。
+          </div>
+
+          <h2>四块拼图怎么拼到一起</h2>
+          <p>把四块拼图串起来，一次后训练 RL 的最小流程是：用当前策略 $\pi_\theta$ 采一批轨迹 $\to$ 用奖励信号算每步优势 $A_t$ $\to$ 算重要性比 $r_t$ $\to$ 代入 PPO 目标函数求梯度更新 $\theta$ $\to$ 用新策略重采下一批。如此循环，直到策略收敛或达到算力预算。RLHF、GRPO/RLVR、Agentic RL 的骨架都是这套循环，差别在奖励来源、优势估计方式和约束细节。</p>
+
+          <details class="deep">
+            <summary>展开：PPO 目标函数的最小骨架代码</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def ppo_loss(logp_new, logp_old, adv, eps=0.2):
+    # 重要性比 r = exp(logp_new - logp_old)
+    ratio = torch.exp(logp_new - logp_old)         # r_t
+
+    # 未裁剪项：r * A
+    obj_unclipped = ratio * adv
+
+    # 裁剪项：把 r 卡在 [1-eps, 1+eps] 后再乘 A
+    ratio_clipped = torch.clamp(ratio, 1 - eps, 1 + eps)
+    obj_clipped = ratio_clipped * adv
+
+    # 取两者较小值，再取负号变最小化（因为是梯度下降）
+    loss = -torch.min(obj_unclipped, obj_clipped).mean()
+    return loss
+
+# adv 是预先算好的优势（用价值网络或同 prompt 多采样估计）
+# logp_new / logp_old 是新旧策略对同一批动作的对数概率</code></pre>
+              <p style="margin-bottom:0">几行就是 PPO 的全部核心。框架实现里还会加价值函数的拟合 loss、KL 惩罚、熵正则等项，但目标函数的主干始终是这个 min + clip。把它和上面的公式对照一遍，PPO 就不再神秘。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>MDP</strong>：状态—动作—奖励—新状态的循环，$\langle S,A,P,R,\gamma\rangle$。LLM 里状态=上文，动作=token。</li>
+            <li><strong>策略梯度</strong>：$\nabla J = \mathbb{E}[\nabla\log\pi(a|s)\,G_t]$，让回报大的动作概率变大。$\log\pi$ 就是生成 token 的对数概率。</li>
+            <li><strong>优势估计</strong>：$A(s,a)=Q(s,a)-V(s)$，扣基线降方差。PPO 路线用价值网络估 $V$，GRPO 用同 prompt 多采样互为基线。</li>
+            <li><strong>PPO 目标</strong>：$\min(r_t A_t,\;\mathrm{clip}(r_t,1\pm\epsilon)A_t)$，$\epsilon$ 常 0.2，约束新策略不偏离旧策略太远。</li>
+            <li><strong>防漂移</strong>：clip 是软约束，RLHF 常再加 KL 惩罚作显式约束，两者机制不同别混。</li>
+            <li><strong>常见坑</strong>：不扣基线方差爆炸、一步更新太猛策略崩溃、奖励 hacking 让模型钻空子。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Sutton &amp; Barto《Reinforcement Learning: An Introduction》— RL 的标准教材，MDP、策略梯度、价值函数等概念的系统出处，第二版在线免费 · <a href="http://incompleteideas.net/book/RLbook2020.pdf" target="_blank" rel="noopener">incompleteideas.net</a></li>
+            <li>Schulman 等《Proximal Policy Optimization Algorithms》— PPO 的原始论文，clip 目标函数的出处，是 RLHF 的核心算法组件 · <a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">arXiv:1707.06347</a></li>
+            <li>Williams《Simple Statistical Gradient-Following Algorithms for Connectionist Reinforcement Learning》— 策略梯度 / REINFORCE 的开山之作，策略梯度公式的原始来源 · <a href="https://link.springer.com/article/10.1007/BF00992696" target="_blank" rel="noopener">Springer 链接</a>（搜索 REINFORCE 1992 可获取）</li>
+            <li>Schulman 等《High-Dimensional Continuous Control Using Generalized Advantage Estimation》— GAE 的原始论文，本页「用 TD 误差指数加权估优势」一节的出处 · <a href="https://arxiv.org/abs/1506.02438" target="_blank" rel="noopener">arXiv:1506.02438</a></li>
+            <li>Schulman 等《Trust Region Policy Optimization》— PPO 的前身，讲清「用信任域约束每步更新」的完整动机，PPO 是对它的简化工程实现 · <a href="https://arxiv.org/abs/1502.05477" target="_blank" rel="noopener">arXiv:1502.05477</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            四块拼图备齐，就可以进入真正的后训练环节了。首选 <a href="../07-posttraining/rlhf.html">RLHF</a>——看奖励模型、PPO 流程与人类反馈闭环如何把基座变成可用助手；之后到 <a href="../07-posttraining/grpo-rlvr.html">推理强化学习</a>——看 GRPO / RLVR 如何用可验证奖励训出长思维链、并正面处理 reward hacking。这两条都建立在本节的 MDP、策略梯度、优势估计与 PPO 目标函数之上。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

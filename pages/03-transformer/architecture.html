@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Transformer 完整架构 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="03-transformer" data-topic="architecture">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>Transformer 完整架构</h1>
+            <p class="lead">前面几节讲了注意力、多头、位置编码——这些都是零件。把零件组装起来得到完整的 Transformer 层，再把层堆叠成不同形态（Encoder-only / Encoder-Decoder / Decoder-only），才是真正可用的模型。三种形态的对决结果是：Decoder-only 一统天下。这一节把整条数据流拉通，算清参数账，并教你怎么只看一份 config.json 就把一个陌生模型读明白。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>一条完整的 Transformer 数据流：词嵌入 → 位置编码 → 堆叠 N 层 Block（每层包含多头注意力 + 前馈网络）→ 输出头 → 概率分布。整条链路没有循环，所有 token 并行流过。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  IN["输入 Token IDs<br/>batch × n"] --> EMB["词嵌入 Embedding<br/>n × d_model"]
+  EMB --> PE["+ 位置编码 PE"]
+  PE --> B1["Block 1"]
+  B1 --> B2["Block 2"]
+  B2 --> BD["……"]
+  BD --> BN["Block N"]
+  BN --> LN["最终 LayerNorm"]
+  LN --> LM["LM Head<br/>d_model → vocab_size"]
+  LM --> OUT["Logits<br/>n × vocab_size"]
+
+  subgraph BLOCK["单个 Transformer Block"]
+    direction LR
+    A1["多头注意力<br/>Multi-Head Attention"] --> A2["Add and Norm"]
+    A2 --> F1["前馈网络<br/>FFN"]
+    F1 --> F2["Add and Norm"]
+  end
+
+  BN -.展开.-> BLOCK
+              </div>
+              <figcaption>从输入 token 到输出 logits 的完整通路，每个 Block 内部是 Attention → Add&amp;Norm → FFN → Add&amp;Norm</figcaption>
+            </figure>
+          </div>
+
+          <div class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root((Transformer))
+    零件
+      自注意力
+      多头注意力
+      位置编码
+      前馈网络 FFN
+      归一化 LayerNorm/RMSNorm
+      残差连接
+    形态
+      Encoder-only 双向
+      Encoder-Decoder 双塔
+      Decoder-only 因果
+    关键超参
+      词表大小 V
+      隐藏维度 d_model
+      层数 N
+      头数 H
+      前馈倍率 d_ff
+            </div>
+            <figcaption>把全篇的零件、三种形态、关键超参收进一张图：下游所有模型都只是这套骨架的变体</figcaption>
+          </div>
+
+          <h2>一个 Block 里到底有什么</h2>
+          <p>把 Transformer 层的两个子模块拆开写出，一次前向就是这四步：</p>
+
+          <div class="figure" style="text-align:center">
+            $$\begin{aligned}
+            H_1 &amp;= \text{Norm}_1(X)                                               &amp;&amp;\text{(1) 归一化}\\
+            A   &amp;= \text{MHA}(H_1) + X                                          &amp;&amp;\text{(2) 多头注意力 + 残差}\\
+            H_2 &amp;= \text{Norm}_2(A)                                               &amp;&amp;\text{(3) 归一化}\\
+            Y   &amp;= \text{FFN}(H_2) + A                                           &amp;&amp;\text{(4) 前馈网络 + 残差}
+            \end{aligned}$$
+          </div>
+
+          <p>注意每一步的输出维度始终是 $n \times d_{model}$。注意力层改变的是 token 之间的交互，FFN 层改变的是每个 token 内部的表示——两个子模块分工明确：<strong>注意力负责"交流"，FFN 负责"思考"</strong>。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">维度守恒是整个架构的地基</span>
+            为什么 Block 的输入输出维度必须一样？因为残差连接要做 $X + \text{SubLayer}(X)$ 这个加法，两边形状必须对齐。维度守恒带来一个巨大的好处：<strong>层是可以任意增删的乐高块</strong>。想加深就多堆几层，想剪枝就删掉几层，不需要改动任何其他部分。这也是为什么从 6 层的原版 Transformer 到 80 层的 70B 模型，代码几乎不用改，只改一个数字。
+          </div>
+
+          <h3>Pre-Norm vs Post-Norm</h3>
+          <p>上面写的顺序是把 Norm 放在子模块<strong>前面</strong>，这叫 <strong>Pre-Norm</strong>。原始论文写的顺序是把 Norm 放在子模块<strong>后面</strong>，叫 <strong>Post-Norm</strong>：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th></th><th>Pre-Norm（现代默认）</th><th>Post-Norm（原始论文）</th></tr></thead>
+              <tbody>
+                <tr><td>计算顺序</td><td>Norm → Attention → +X</td><td>Attention + X → Norm</td></tr>
+                <tr><td>残差路径</td><td>绕过 Norm 和 Attention 两者</td><td>只绕过 Attention</td></tr>
+                <tr><td>训练稳定性</td><td>无需 warmup 即可收敛</td><td>需要学习率 warmup，否则初期梯度爆炸</td></tr>
+                <tr><td>深层时表现</td><td>对层数不敏感，可堆上百层</td><td>深层时残差积累导致规范化失效，极深时不稳定</td></tr>
+                <tr><td>下游微调</td><td>略有轻微退化（可接受）</td><td>略好（但付出的训练成本更高）</td></tr>
+                <tr><td>代表</td><td>GPT-2 及之后几乎所有模型</td><td>原始 Transformer、BERT</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>Pre-Norm 的胜出是工程实践的选择：省掉 warmup、在更深的网络上更稳定，这两点对 scaling 来说比微调那点微小差异重要得多。今天读到任何"Transformer Block"，默认就是 Pre-Norm。</p>
+
+          <p>具体使用的归一化算子也在进化。原始论文用的是 <a href="normalization.html">LayerNorm</a>，而 Llama 等现代模型已统一迁移到计算更快的 <a href="normalization.html">RMSNorm</a>。FFN 侧同样：从 ReLU → <a href="ffn-activation.html">GELU → SwiGLU</a>，每一次替换都带来可测量的质量提升。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            Pre-Norm 就是把"整理桌面"放在"干活"之前，而不是干完活再整理。这个顺序的微调，决定了模型能不能顺利地堆到 100 层。
+          </div>
+
+          <h3>残差是怎么"粘"住梯度的</h3>
+          <p><a href="residual.html">残差连接</a> 在 Block 里不止出现一次，而是两次——注意力输出和 FFN 输出之后各加一次。它的作用不仅是"防退化"：从反向传播的角度看，残差提供了一条<strong>绕过子模块的梯度直达路径</strong>。</p>
+          <p>对于 Pre-Norm 下的第 $L$ 个 Block，输入到输出的梯度可以被分解为两条路径的和——一条穿过 MHA/FFN 的非线性变换，另一条直接原封不动地传回输入。深层训练中，后面那条"直通"路径的梯度不会衰减，<strong>保证了即使 MHA 或 FFN 的梯度近乎消失，信号仍然能传到网络浅层</strong>。这就是为什么 Pre-Norm 下 model depth 可以从 6 层一路堆到 100+ 层而不崩——不是因为子模块变得更"好用"了，而是因为残差保证了一部分梯度永远不断地流到底。</p>
+
+          <h3>用 40 行代码把一个 Block 写出来</h3>
+          <p>把上面四个公式翻译成代码，一个现代 Pre-Norm Block 大致长这样（省略了掩码和 KV Cache 的细节）：</p>
+
+          <pre><code class="language-python">import torch
+import torch.nn as nn
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(d_model)          # 也可用 nn.LayerNorm
+        self.attn  = MultiHeadAttention(d_model, n_heads)
+        self.norm2 = nn.RMSNorm(d_model)
+        self.ffn   = SwiGLU_FFN(d_model, d_ff)
+
+    def forward(self, x, mask=None):
+        # 子层一：先归一化，算注意力，再加回残差
+        x = x + self.attn(self.norm1(x), mask=mask)
+        # 子层二：先归一化，算 FFN，再加回残差
+        x = x + self.ffn(self.norm2(x))
+        return x                                   # 形状与输入完全一致
+
+class DecoderOnlyLM(nn.Module):
+    def __init__(self, vocab, d_model, n_heads, d_ff, n_layers):
+        super().__init__()
+        self.embed  = nn.Embedding(vocab, d_model)
+        self.blocks = nn.ModuleList(
+            [Block(d_model, n_heads, d_ff) for _ in range(n_layers)])
+        self.norm_f = nn.RMSNorm(d_model)          # Final Norm，别漏
+        self.head   = nn.Linear(d_model, vocab, bias=False)
+
+    def forward(self, ids, mask=None):
+        x = self.embed(ids)                        # (B, n, d)
+        for blk in self.blocks:
+            x = blk(x, mask)                       # 维度始终不变
+        return self.head(self.norm_f(x))           # (B, n, vocab)</code></pre>
+
+          <p>整个 Decoder-only 语言模型的骨架就这么多。<strong>值得注意的是 <code>for blk in self.blocks</code> 这一行——所有层结构完全相同、只是参数不同，这正是"维度守恒"带来的简洁性</strong>。真正的复杂度不在架构本身，而在位置编码怎么施加、KV Cache 怎么管理、以及分布式训练怎么切分。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">代码里的三个易漏点</span>
+            ① <code>norm_f</code>（Final Norm）经常被漏掉，Pre-Norm 架构没有它输出尺度会漂；② <code>head</code> 通常不带 bias；③ 上面代码没写位置编码——现代模型用 <a href="positional-encoding.html">RoPE</a> 时是在每层的注意力内部对 Q/K 施加旋转，而不是在 embedding 之后加一次，这与原版正弦编码的做法不同，初次实现时极易搞错。
+          </div>
+
+          <h2>三种形态：同一套零件，不同拼法</h2>
+          <p>Transformer 论文最初提出的是一套 Encoder-Decoder 架构，但后来社区发现——根本不需要两个塔都搭。根据"用不用 Encoder、用不用 Decoder"，演化出三种形态：</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  subgraph EO["Encoder-only（双向自注意力）"]
+    E_IN["input"] --> E_B1["Block 1<br/>双向 自注意力"]
+    E_B1 --> E_BN["Block N<br/>双向 自注意力"]
+    E_BN --> E_OUT["输出表示"]
+  end
+
+  subgraph ED["Encoder-Decoder"]
+    E2_IN["input"] --> E2_ENC["Encoder<br/>双向 自注意力"]
+    E2_ENC --> E2_OUT["编码输出"]
+    D_IN["input"] --> D_DEC["Decoder<br/>单向因果 + 交叉注意力"]
+    E2_OUT --> D_DEC
+    D_DEC --> D_OUT["输出"]
+  end
+
+  subgraph DO["Decoder-only（单向因果注意力）"]
+    D2_IN["input"] --> D2_B1["Block 1<br/>单向因果 自注意力"]
+    D2_B1 --> D2_BN["Block N<br/>单向因果 自注意力"]
+    D2_BN --> D2_OUT["下一个 token 预测"]
+  end
+            </div>
+            <figcaption>三种 Transformer 形态的对比：从左到右分别是 BERT 式、原始 T5 式、GPT 式</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>Encoder-only</th><th>Encoder-Decoder</th><th>Decoder-only</th></tr></thead>
+              <tbody>
+                <tr><td><strong>注意力方向</strong></td><td>双向（每个 token 看所有 token）</td><td>Encoder 双向 + Decoder 单向因果</td><td>单向因果（只看左边）</td></tr>
+                <tr><td><strong>核心操作</strong></td><td>自注意力</td><td>自注意力 + 交叉注意力</td><td>自注意力 + 因果掩码</td></tr>
+                <tr><td><strong>训练目标</strong></td><td>掩码语言建模 MLM（完形填空）</td><td>seq2seq（输入 → 输出）</td><td>自回归 LM（逐 token 预测下一个）</td></tr>
+                <tr><td><strong>一次前向得到</strong></td><td>每个位置的上下文表示</td><td>一条完整的输出序列</td><td>每个位置预测的下一个 token</td></tr>
+                <tr><td><strong>典型任务</strong></td><td>文本分类、NER、句子相似度</td><td>翻译、摘要、有监督文本生成</td><td>开放式文本生成、对话、代码补全</td></tr>
+                <tr><td><strong>代表模型</strong></td><td>BERT、RoBERTa</td><td>T5、原始 Transformer、BART</td><td>GPT 系列、Llama、Qwen、DeepSeek</td></tr>
+                <tr><td><strong>现状</strong></td><td>垂直理解类任务仍在使用</td><td>罕见，已被 Decoder-only 覆盖</td><td><strong>绝对主流，新模型几乎全部选它</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+timeline
+  title 三种形态的此消彼长
+  2017 : 原版 Transformer 以 Encoder-Decoder 形态用于机器翻译
+  2018 : BERT 走 Encoder-only 路线刷榜理解任务 : GPT-1 选择 Decoder-only
+  2019 : T5 把一切任务统一为文本到文本 Encoder-Decoder 达到巅峰 : GPT-2 证明纯生成范式的潜力
+  2020 : GPT-3 用 Decoder-only 展示上下文学习能力 格局开始倾斜
+  2023 : LLaMA 等开源模型全面采用 Decoder-only : Encoder-only 退守判别式垂直任务
+  2025 : 新发布的通用大模型几乎清一色 Decoder-only
+            </div>
+            <figcaption>形态之争的时间线：不是某一年突然分出胜负，而是随着"规模+生成"范式确立而逐步倾斜。</figcaption>
+          </figure>
+
+          <h2>为什么 Decoder-only 赢了</h2>
+          <p>这个问题的答案不是"Decoder-only 更强"，而是<strong>"在给定的算力预算下，Decoder-only 更高效地利用了训练信号"</strong>。</p>
+
+          <h3>训练效率：不浪费任何一个 token</h3>
+          <p>对比三种形态的训练密度：</p>
+          <ul>
+            <li><strong>Encoder-only（BERT）</strong>：随机盖住 15% 的 token，只用这些位置计算损失。一句话 100 个 token，只有 15 个产生训练信号。剩下 85% 的算力打了水漂。</li>
+            <li><strong>Encoder-Decoder（T5）</strong>：类似，输入和输出各有一部分被掩码，利用率介于两者之间。且输入和输出的注意力掩码不同，增加了实现复杂度。</li>
+            <li><strong>Decoder-only（GPT）</strong>：<strong>每个位置都预测下一个 token</strong>。加上 <a href="multi-head.html">因果掩码</a> 让 $n$ 个位置的损失一次前向全算出来，信号利用率 100%。</li>
+          </ul>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            同样的数据、同样的算力，Decoder-only 从每 batch 中榨出的训练信号数量是 BERT 式掩码语言建模的数倍。在 scaling law 主导的时代，这就是护城河。
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">不要理解成"BERT 就不好"</span>
+            这是一道分工题，不是一道谁更好的题。Encoder-only 在需要双向上下文的判别式任务（如文本蕴含、信息抽取）上有天然的表示优势——它能看到完整的句子结构。今天的文本向量化/重排模型仍大量使用 Encoder-only 骨架，因为它们要的是"整句的表示"而非"下一个词"。但在生成、通用对话和 scaling 的时代，Decoder-only 的范式统一性带来了压倒性的工程效率和生态惯性。
+          </div>
+
+          <h3>任务统一：一切皆生成</h3>
+          <p>Encoder-only 模型做分类要加分类头，做 NER 要做序列标注头——每个任务都要单独训练或微调，架构不统一。Decoder-only 把一切任务都统一为<strong>"给定上文，续写下文"</strong>：</p>
+          <ul>
+            <li>翻译 = "将以下英文翻译成中文：【文本】→"</li>
+            <li>摘要 = "请概括以下内容：【文本】→"</li>
+            <li>问答 = "回答问题：【问题】+ 参考：【文档】→"</li>
+            <li>代码 = "写一个 Python 函数，输入 list 返回最大值 →"</li>
+          </ul>
+          <p>同一套架构、同一套训练范式、同一套推理代码，通过 prompt 在不同任务间切换。这种统一性对 scaling 至关重要——<strong>不需要为每个新任务重新设计输出层，直接用更多的数据和算力砸同一个模型即可</strong>。</p>
+
+          <h3>Scaling 表现更稳定</h3>
+          <p>另一条暗线：双向注意力在极大规模下的训练稳定性不如因果注意力。双向意味着每个位置受所有位置影响，梯度依赖图是全连接的——噪声从任意位置传遍全图。因果掩码把梯度图剪成了下三角，依赖更稀疏、传播路径更短。经验上，Decoder-only 在堆到 100+ 层、模型到千亿参数时，训练比 Encoder-only 容易不少。这在架构选择时或许不是决定性因素，但在工程实践中是真实存在的加分项。</p>
+
+          <h3>还有一条工程暗线：KV Cache</h3>
+          <p>因果掩码带来一个 Encoder 永远拿不到的红利：<strong>已经算过的 token，它的 K 和 V 永远不会再变</strong>。因为每个位置只看左边，新增一个 token 不会影响此前任何位置的表示。于是推理时可以把历史的 K/V 缓存下来，生成第 $t+1$ 个 token 时只算一个新位置，把复杂度从"每步 $O(t^2)$"降到"每步 $O(t)$"。</p>
+          <p>双向注意力做不到这一点——新增 token 会改变所有位置的表示，缓存直接失效。这条性质深刻影响了整个推理栈的设计，详见 <a href="../04-modern-arch/kv-cache.html">KV Cache</a>。<strong>换句话说，Decoder-only 的胜出不只是训练效率，也包括推理效率</strong>。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as 用户
+  participant T as 分词器
+  participant M as Transformer 主干
+  participant H as LM Head
+  participant S as 采样器
+  U->>T: 输入提示词
+  T->>M: token ids 一次性送入
+  Note over M: Prefill 阶段<br/>所有位置并行前向 建立 KV Cache
+  M->>H: 最后一个位置的隐状态
+  H->>S: 词表上的 logits
+  S->>U: 吐出第 1 个新 token
+  loop Decode 阶段 逐 token 生成
+    S->>M: 把刚生成的 token 送回
+    Note over M: 只算 1 个新位置<br/>复用已有 KV Cache
+    M->>H: 新位置隐状态
+    H->>S: 新的 logits
+    S->>U: 吐出下一个 token
+  end
+            </div>
+            <figcaption>推理的两个阶段：Prefill 一次性并行处理整个提示词，Decode 逐 token 串行生成。同一套权重，两种截然不同的计算特征——前者算力受限，后者访存受限。</figcaption>
+          </figure>
+
+          <div class="callout">
+            <span class="callout-t">训练与推理的不对称</span>
+            训练时整条序列一次前向、所有位置并行算损失，这是 Transformer 相对 RNN 的最大优势。但<strong>推理时的 Decode 阶段又变回了严格串行</strong>——必须先生成第 $t$ 个 token 才能算第 $t+1$ 个。这个"训练并行、推理串行"的不对称，正是<a href="../09-efficiency/speculative-decoding.html">投机解码</a>等一系列推理加速技术要攻克的目标。
+          </div>
+
+          <h2>从上到下看一个完整模型</h2>
+          <figure class="paper-figure">
+            <img src="../../assets/figures/03-transformer/architecture-fig1.png"
+                 alt="论文原图：Transformer 模型架构（Vaswani et al., 2017, Figure 1）"
+                 loading="lazy" style="max-width:440px">
+            <figcaption>
+              <span class="pf-title">图：Transformer 原始论文中的模型架构图（左侧为编码器堆叠，右侧为解码器堆叠）</span>
+              <span class="pf-src">论文原图 · Vaswani et al., <em>Attention Is All You Need</em>, 2017, Figure 1 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></span>
+            </figcaption>
+          </figure>
+          <figure class="figure">
+            <img src="../../assets/img/transformer-architecture.png" alt="Transformer 完整架构图(编码器 + 解码器)" style="max-width:520px;height:auto;border-radius:8px;margin:0 auto">
+            <figcaption>Transformer 完整架构全景。图作者 dvgodoy · CC BY 4.0 · 来源 Wikimedia Commons</figcaption>
+          </figure>
+          <p>把架构拉通一遍可以建立清晰的参数量直觉。以 Llama-2-7B 为例：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>组件</th><th>配置</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>词嵌入</td><td>$V=32000$, $d=4096$</td><td>约 131M 参数</td></tr>
+                <tr><td>Block 数 $N$</td><td>32 层</td><td>每层结构完全一致，依次堆叠</td></tr>
+                <tr><td>注意力</td><td>$d=4096$, $H_Q=32$, $H_{kv}=32$, $d_h=128$</td><td>纯 MHA，未使用 GQA</td></tr>
+                <tr><td>FFN</td><td>$d_{ff}=11008$（约 $2.69d$）</td><td>SwiGLU，gate / up / down 三个矩阵</td></tr>
+                <tr><td>Norm</td><td>RMSNorm</td><td>Pre-Norm 位置，无可学习 bias</td></tr>
+                <tr><td>PE</td><td>RoPE, base=10000</td><td>每层对 Q/K 施加，$d_h=128$ 即 64 对频率</td></tr>
+                <tr><td>LM Head</td><td>$4096 \times 32000$</td><td>Llama-2 <strong>不</strong>与词嵌入共享权重，独立约 131M 参数</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>一行一行核对这个配置表是读懂任何开源模型 config.json 的最佳练习。核心变化点也一目了然：<strong>换 GQA 就是在 KV 头数上减量，换 MoE 就是在 FFN 侧扩路由，换长上下文就是动 RoPE base</strong>。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">权重共享（Weight Tying）不是默认开启的</span>
+            很多资料想当然地认为所有模型都共享词嵌入和 LM Head，这是错的。GPT-2 确实共享，Llama-1/2 则是<strong>两个独立矩阵</strong>——这一点直接体现在参数量上（见下文核算）。判断方法很简单：看 config.json 里的 <code>tie_word_embeddings</code> 字段。小模型（词表相对参数量占比大）更倾向于开启共享，大模型则常常关闭。
+          </div>
+
+          <h2>把 7B 这个数字算出来</h2>
+          <p>"7B 参数"到底是怎么来的？用上面的配置手算一遍，你会对模型规模建立起真正的直觉。逐项累加：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>组件</th><th>公式</th><th>参数量</th><th>占比</th></tr></thead>
+              <tbody>
+                <tr><td>词嵌入</td><td>$V \times d = 32000\times4096$</td><td>131.1M</td><td>1.9%</td></tr>
+                <tr><td>注意力（32 层合计）</td><td>$N \times 4d^2$</td><td>2147.5M</td><td>31.9%</td></tr>
+                <tr><td>FFN（32 层合计）</td><td>$N \times 3 d\, d_{ff}$</td><td>4328.5M</td><td><strong>64.2%</strong></td></tr>
+                <tr><td>各层 RMSNorm + Final Norm</td><td>$(2N+1)\times d$</td><td>0.27M</td><td>&lt;0.01%</td></tr>
+                <tr><td>LM Head</td><td>$d \times V$</td><td>131.1M</td><td>1.9%</td></tr>
+                <tr><td><strong>合计</strong></td><td>—</td><td><strong>约 6.74B</strong></td><td>100%</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>所以"7B"是个约数，实际是 6.74B——而且这个数字只有在<strong>不共享</strong>词嵌入与 LM Head 时才对得上。如果按共享算，结果是 6.61B，与官方公布值有明显偏差。这个小小的核对，正好反向验证了 Llama-2 没有做权重共享。</p>
+
+          <div class="chart-box"><canvas id="chart-arch-params"></canvas></div>
+          <p style="font-size:13px;color:var(--text-3);margin-top:-4px">Llama-2-7B 参数构成（单位：百万），按上表公式直接计算得出。归一化层因数值过小未单独绘制。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一个能记住的估算公式</span>
+            忽略词嵌入和归一化，主干参数约为 $N\times(4d^2 + 3d\,d_{ff})$。当 $d_{ff}\approx\frac{8}{3}d$ 时，这个式子约等于 $12Nd^2$。代入 $N=32$、$d=4096$ 得约 6.44B，与真实的 6.74B 相差约 5%——<strong>"$12Nd^2$"是估算 Transformer 规模最快的心算公式</strong>，值得记住。
+          </div>
+
+          <details class="deep">
+            <summary>展开：从参数量推显存与算力预算</summary>
+            <div class="deep-body">
+              <p>知道了参数量，几个关键的工程数字就可以顺着推出来。仍以 6.74B 为例：</p>
+              <ul>
+                <li><strong>权重显存</strong>：FP16/BF16 每参数 2 字节，$6.74\times10^9 \times 2 \approx 13.5$ GB（按 $10^9$ 计）。这就是"7B 模型 FP16 大约 14GB"这个常见说法的来源。换成 INT8 约 6.7GB，INT4 约 3.4GB——这正是<a href="../09-efficiency/quantization.html">量化</a>能让 7B 模型跑进消费级显卡的原因。</li>
+                <li><strong>训练显存</strong>：远不止权重。用 Adam 优化器时，还要存 FP32 主权重、一阶动量、二阶动量，加起来通常是权重的数倍；再加上激活值。所以"能推理"和"能全参微调"是完全不同的显存量级。</li>
+                <li><strong>前向算力</strong>：一个常用的粗略估计是每个 token 的前向浮点运算量约为 $2\times$ 参数量，训练时因为还要反向传播，通常按 $6\times$ 参数量估算。据此可以反推训练一个模型需要多少 GPU 小时，详见 <a href="../05-systems/compute-budget.html">算力预算</a> 与 <a href="../06-pretraining/scaling-laws.html">规模律</a>。</li>
+              </ul>
+              <p style="margin-bottom:0">这些换算的精确值取决于框架实现、并行策略和优化器配置，<strong>具体以实测为准</strong>，但数量级判断在选型时非常有用。</p>
+            </div>
+          </details>
+
+          <h2>参数都去哪了</h2>
+          <p>一个 Transformer Block 的参数量分布值得看一遍，因为它直接关系到优化方向——想压缩模型时先砍哪里最划算。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>子模块</th><th>参数矩阵</th><th>形状</th><th>参数量</th><th>占比</th></tr></thead>
+              <tbody>
+                <tr><td>注意力 Q/K/V 投影</td><td>$W^Q, W^K, W^V$</td><td>$d \times d$ 各一个</td><td>$3d^2$</td><td rowspan="2" style="text-align:center;vertical-align:middle">~1/3</td></tr>
+                <tr><td>注意力输出投影</td><td>$W^O$</td><td>$d \times d$</td><td>$d^2$</td></tr>
+                <tr><td>FFN 第一层</td><td>$W_1$</td><td>$d \times d_{ff}$</td><td>$d \cdot d_{ff}$</td><td rowspan="2" style="text-align:center;vertical-align:middle">~2/3</td></tr>
+                <tr><td>FFN 第二层</td><td>$W_2$</td><td>$d_{ff} \times d$</td><td>$d_{ff} \cdot d$</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>通常 $d_{ff} = 4d$（SwiGLU 等门控变体下取 $\approx\frac{8}{3}d$ 但多一个矩阵，参数量等效）。取 $d=4096$ 的典型配置，一个 Block 约 200M 参数，其中约 135M 在 FFN 侧。<strong>这是为什么模型压缩的研究对 FFN 更有兴趣：砍掉一个头的 QK 投影只能省一点，而稀疏掉一个 FFN 神经元能实实在在省不少</strong>。</p>
+
+          <p>这个分布也解释了 <a href="../04-modern-arch/moe.html">MoE 混合专家</a> 的设计动机：既然 FFN 占了大头，那就在 FFN 侧做稀疏激活，让总参数暴涨但激活参数几乎不变。反过来，如果注意力占的是大头，那 MoE 就要做成"多组注意力"而非"多组 FFN"，但现实是另一种情况。</p>
+
+          <h3>词嵌入与输出头</h3>
+          <p>Block 之外还有两个容易被忽视的大矩阵：</p>
+          <ul>
+            <li><strong>词嵌入矩阵</strong>（输入）：$V \times d_{model}$，将 token ID 映射到初始向量。$V$ 是词表大小，通常 32K 到 256K。以 $V=128\text{K}$、$d=4096$ 计，嵌入层就有约 524M 参数——对 7B 量级的模型来说已占到相当比重。</li>
+            <li><strong>LM Head 矩阵</strong>（输出）：$d_{model} \times V$，将最后一层输出映射回词表空间的 logits。形状完全对称。</li>
+          </ul>
+          <p>部分模型会<strong>共享词嵌入和 LM Head 的权重</strong>（Weight Tying）。理由很朴素：如果一个 token 的输入表示和输出表示是同一个空间，那模型输出 "dog" 这个词应该和输入 "dog" 使用相同的向量基底。这种做法能省掉约 $V \times d$ 个参数，对小模型尤其重要。GPT-2 采用了这一策略；Llama-1/2 则没有。<strong>词表越大、模型越小，共享的收益越明显</strong>——这也是端侧小模型几乎都开启共享的原因，见 <a href="../09-efficiency/on-device-slm.html">端侧小模型</a>。</p>
+
+          <h2>动手：只看 config.json 读懂一个陌生模型</h2>
+          <p>拿到一个没见过的开源模型，最快的了解方式不是读代码，而是读它的 config.json。下面这张对照表把常见字段翻译成本篇讲过的概念：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>配置字段</th><th>对应本篇概念</th><th>Llama-2-7B 取值</th><th>看到它你该想到什么</th></tr></thead>
+              <tbody>
+                <tr><td><code>vocab_size</code></td><td>词表大小 $V$</td><td>32000</td><td>越大则嵌入层越重，也越可能开启权重共享</td></tr>
+                <tr><td><code>hidden_size</code></td><td>$d_{model}$</td><td>4096</td><td>参数量对它是平方关系，最敏感的旋钮</td></tr>
+                <tr><td><code>num_hidden_layers</code></td><td>Block 数 $N$</td><td>32</td><td>参数量线性相关；也决定推理延迟</td></tr>
+                <tr><td><code>num_attention_heads</code></td><td>Query 头数 $H_Q$</td><td>32</td><td>除以它得到每头维度 $d_h = 128$</td></tr>
+                <tr><td><code>num_key_value_heads</code></td><td>KV 头数</td><td>32</td><td>若小于 Q 头数即为 <a href="../04-modern-arch/attention-variants.html">GQA</a>，KV Cache 会大幅变小</td></tr>
+                <tr><td><code>intermediate_size</code></td><td>$d_{ff}$</td><td>11008</td><td>除以 hidden_size 看倍率，判断是否门控 FFN</td></tr>
+                <tr><td><code>max_position_embeddings</code></td><td>训练时的上下文长度</td><td>4096</td><td>超出它就需要<a href="positional-encoding.html">长度外推</a>手段</td></tr>
+                <tr><td><code>rope_theta</code></td><td>RoPE 的 base</td><td>10000</td><td>被调大通常意味着做过长上下文扩展</td></tr>
+                <tr><td><code>rms_norm_eps</code></td><td>归一化的 $\epsilon$</td><td>—</td><td>存在这个字段说明用的是 RMSNorm 而非 LayerNorm</td></tr>
+                <tr><td><code>tie_word_embeddings</code></td><td>是否权重共享</td><td>false</td><td>决定算总参数量时 LM Head 要不要重复计一次</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：一段脚本，输入 config 直接输出参数量与结构判断</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">def analyze(cfg):
+    d   = cfg["hidden_size"]
+    N   = cfg["num_hidden_layers"]
+    V   = cfg["vocab_size"]
+    dff = cfg["intermediate_size"]
+    hq  = cfg["num_attention_heads"]
+    hkv = cfg.get("num_key_value_heads", hq)
+    tied = cfg.get("tie_word_embeddings", False)
+    gated = cfg.get("gated_ffn", True)      # Llama 系默认 SwiGLU
+
+    head_dim = d // hq
+    d_kv = hkv * head_dim
+    attn = 2 * d * d + 2 * d * d_kv         # W_Q, W_O 满维；W_K, W_V 按 KV 头数
+    ffn  = (3 if gated else 2) * d * dff
+    body = N * (attn + ffn)
+    emb  = V * d
+    total = emb + body + (0 if tied else V * d) + (2 * N + 1) * d
+
+    print(f"每头维度       : {head_dim}")
+    print(f"注意力类型     : {'MHA' if hkv == hq else f'GQA（{hq}:{hkv}）'}")
+    print(f"FFN 倍率       : {dff / d:.2f}x")
+    print(f"单层参数       : {(attn + ffn) / 1e6:.1f}M  "
+          f"（FFN 占 {ffn / (attn + ffn) * 100:.1f}%）")
+    print(f"总参数量       : {total / 1e9:.2f}B")
+    print(f"FP16 权重显存  : {total * 2 / 1024 ** 3:.1f} GB")
+
+analyze({"hidden_size": 4096, "num_hidden_layers": 32, "vocab_size": 32000,
+         "intermediate_size": 11008, "num_attention_heads": 32,
+         "num_key_value_heads": 32, "tie_word_embeddings": False})</code></pre>
+              <p style="margin-bottom:0">把任何一个 HuggingFace 模型的 config.json 内容贴进去，几秒钟就能知道它的规模、注意力类型和显存需求。<strong>这是评估"我这张卡能不能跑得动"的最快路径</strong>。注意字段名以各模型的官方配置为准，不同模型族偶有差异。</p>
+            </div>
+          </details>
+
+          <h2>数字核对：用一个小模型验证 $12Nd^2$</h2>
+          <p>「7B」级别的模型算起来有点大，那先从一个小模型开始核对公式。设一个 6 层、$d = 512$、$d_{ff} = 2048$、$V = 32000$ 的迷你 Transformer——这正是原版 Transformer base 量级的配置：</p>
+          <ul>
+            <li>单层主干：注意力四个方阵共 $4 \times 512^2 \approx 1.05$M，标准 FFN 两个矩阵共 $2 \times 512 \times 2048 \approx 2.10$M，合计约 3.15M。</li>
+            <li>六层主干合计约 18.9M。用近似公式 $12Nd^2 = 12 \times 6 \times 512^2 \approx 18.9$M——这里 $d_{ff}$ 恰为 $4d$，近似公式退化成精确公式，两者分毫不差。</li>
+            <li>词嵌入与 LM Head 各为 $32000 \times 512 \approx 16.4$M。共享时只算一份，总参数约 35.3M；不共享时两份都算，总参数约 51.7M。</li>
+          </ul>
+          <p>这个练习的价值在于：<strong>你能一眼看出「规模从哪里来」</strong>。$d$ 翻倍，主干参数变 4 倍；层数翻倍，主干参数变 2 倍；词表翻倍，嵌入层线性增加。所谓「参数量暴增」，几乎都能拆成这几个乘法因子，任何一个规模数字都逃不出这几个因子的组合。反过来，如果手算结果和官方对不上，多半是「FFN 是两个矩阵还是三个矩阵」「词嵌入与输出头是否共享」这两个细节出了偏差——而这两处恰恰是新手最容易搞错的地方。</p>
+          <p>把这个流程走熟之后，看到一个开源模型的 config.json，你就能在十秒内估出规模、显存和大致架构：<code>hidden_size</code>、<code>num_hidden_layers</code>、<code>intermediate_size</code>、<code>vocab_size</code>、<code>tie_word_embeddings</code>，五个字段足够。看到 <code>hidden_size=4096</code>、<code>num_hidden_layers=32</code>，本能反应出「大概 7B 级」——这比背数字有用得多，因为它建立在你自己算过的账上，而账本一旦建立，就再也不会忘。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>Block 内部顺序</strong>：Norm → Attention → +残差 → Norm → FFN → +残差（Pre-Norm，现代默认）。</li>
+            <li><strong>维度守恒</strong>：整个 Block 输入输出都是 $n \times d_{model}$，这是残差加法的要求，也让层可以像乐高一样任意堆叠。</li>
+            <li><strong>Pre-Norm vs Post-Norm</strong>：Pre-Norm 把 Norm 放在子模块之前，训练更稳定、无需 warmup、可堆更深；Post-Norm 微调略好但训练成本更高，已被淘汰。</li>
+            <li><strong>三种形态</strong>：Encoder-only（双向，BERT 式，理解类）→ Encoder-Decoder（双塔，T5 式，序列转换）→ Decoder-only（单向因果，GPT 式，生成类）。</li>
+            <li><strong>Decoder-only 胜出原因</strong>：训练信号利用率 100%（vs BERT 的 15%）；一切任务统一为 next-token prediction；因果掩码在大规模下更稳定；且天然支持 KV Cache 加速推理。</li>
+            <li><strong>参数量分布</strong>：FFN 占 ~2/3，注意力占 ~1/3。压缩优先动 FFN（MoE 正是利用了这一点）。</li>
+            <li><strong>心算公式</strong>：主干参数约 $12Nd^2$；Llama-2-7B 实际为 6.74B，FP16 权重约 13.5GB。</li>
+            <li><strong>推理两阶段</strong>：Prefill 并行处理提示词（算力受限），Decode 逐 token 串行生成（访存受限）——同一套权重，两种优化目标。</li>
+            <li><strong>常见坑</strong>：漏掉 Final Norm；想当然认为所有模型都做权重共享（Llama-1/2 并没有）；RoPE 是在每层注意力内部施加而非 embedding 后加一次；$d_{ff}$ 与 $d_{model}$ 的倍数关系不是标准化的。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：Pre-Norm 和 Post-Norm 有什么区别？为什么现代模型更常用 Pre-Norm？</h3>
+              <p><span class="answer-label">标准回答：</span>Pre-Norm 先做 Norm，再进入 Attention 或 FFN，残差路径可以直接绕过子层；Post-Norm 则先做子层和残差，再归一化。Pre-Norm 的梯度直通路径更清晰，深层训练通常更稳定，工程上更容易扩展到大深度模型。</p>
+              <p><span class="pitfall-label">常见误区：</span>不能简单说 Post-Norm“被淘汰”。它在部分设置下可能有优化优势，但通常需要更谨慎的初始化、学习率和 warmup 配置。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：Encoder-only、Encoder-Decoder、Decoder-only 分别适合什么任务？</h3>
+              <p><span class="answer-label">标准回答：</span>Encoder-only 使用双向上下文，适合分类、抽取和表示学习；Encoder-Decoder 把输入编码后再条件生成，适合翻译、摘要等序列到序列任务；Decoder-only 使用因果掩码，统一建模“给定前文预测后文”，适合开放式生成和统一的指令跟随。</p>
+              <details class="deep">
+                <summary>追问：为什么 Decoder-only 后来成为通用大模型主流？</summary>
+                <div class="deep-body">
+                  <p>它把训练目标统一成 next-token prediction，每个位置都能提供训练信号；不同任务可以通过文本格式统一；推理生态围绕因果生成、KV Cache 和连续批处理高度成熟。这个结论是规模化和工程生态共同作用的结果，不意味着 Encoder 或 Encoder-Decoder 在所有任务上都更差。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：如何只看 config.json 粗略估算模型参数量？</h3>
+              <p><span class="answer-label">标准回答：</span>先取层数 $N$、隐藏维度 $d$、FFN 维度 $d_{ff}$ 和词表大小 $V$。每层 Attention 约为 $4d^2$，标准两矩阵 FFN 约为 $2dd_{ff}$；总量再加 Embedding、LM Head、归一化和 bias。若 $d_{ff}\approx 8d/3$ 的 SwiGLU 结构，主干常可用约 $12Nd^2$ 做数量级估算。</p>
+              <pre class="mini-code"><code>main ≈ N * (4 * d * d + 3 * d * d_ff)
+embedding ≈ vocab_size * hidden_size</code></pre>
+              <p><span class="follow-label">面试追问：</span>还要确认 FFN 是两矩阵还是 SwiGLU 的三矩阵、词嵌入是否与输出头共享，以及注意力是否使用 GQA；否则仅凭“7B”标签不能反推出完整显存。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q4：为什么 Transformer Block 的输入输出维度通常保持不变？</h3>
+              <p><span class="answer-label">标准回答：</span>因为残差连接要计算 $X + F(X)$，两者形状必须一致。维度守恒让 Block 可以重复堆叠，新增或删除层时不需要重写相邻模块；Attention 负责 token 之间的信息交换，FFN 在同一维度上做逐位置的非线性变换。</p>
+              <p><span class="pitfall-label">常见误区：</span>FFN 的中间维度 $d_{ff}$ 可以扩大，但 FFN 的最终输出必须投影回 $d_{model}$，否则无法与残差相加。</p>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Attention Is All You Need — Transformer 原始论文，给出 Encoder-Decoder 完整架构与 Post-Norm 设计 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></li>
+            <li>BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding — Encoder-only 路线的代表作，掩码语言建模的出处 · <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">arXiv:1810.04805</a></li>
+            <li>Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer — T5 论文，Encoder-Decoder 形态的巅峰与"一切皆文本到文本"的思想 · <a href="https://arxiv.org/abs/1910.10683" target="_blank" rel="noopener">arXiv:1910.10683</a></li>
+            <li>Language Models are Few-Shot Learners — GPT-3 论文，用 Decoder-only 展示上下文学习能力，奠定当前范式 · <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener">arXiv:2005.14165</a></li>
+            <li>Llama 2: Open Foundation and Fine-Tuned Chat Models — 本页参数核算所依据的公开配置来源 · <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">arXiv:2307.09288</a></li>
+            <li>On Layer Normalization in the Transformer Architecture — Pre-Norm 与 Post-Norm 的理论分析 · <a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener">arXiv:2002.04745</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            到这里 Transformer 的"经典时代"已经讲完了。但这个架构没有停在 2017 年——它的注意力、FFN 和整个 Block 都在持续进化。下一篇 <a href="../04-modern-arch/index.html">现代架构演进</a> 里，你会看到 <a href="../04-modern-arch/attention-variants.html">MQA / GQA / MLA 这些注意力变体</a> 和 <a href="../04-modern-arch/moe.html">MoE 混合专家</a> 如何在 Transformer 骨架上演进出更强的形态。想亲手把本节的代码骨架跑起来，见 <a href="../15-practice/build-minigpt.html">实战：手写一个 MiniGPT</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+  (function(){
+    if (typeof Chart === 'undefined') return;
+    var ctx = document.getElementById('chart-arch-params');
+    if (!ctx) return;
+    var C = window.CB_COLORS || {};
+    var ch = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: ['词嵌入', '注意力（32 层）', 'FFN（32 层）', 'LM Head'],
+        datasets: [{
+          label: 'Llama-2-7B 参数量 / 百万',
+          data: [131.1, 2147.5, 4328.5, 131.1],
+          backgroundColor: [C.graySoft, C.blueSoft, C.greenSoft, C.graySoft],
+          borderColor: [C.gray, C.blue, C.green, C.gray],
+          borderWidth: 1.5
+        }]
+      },
+      options: { responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true, title: { display: true, text: '参数量（百万）' } } } }
+    });
+    if (window.CB_CHARTS) window.CB_CHARTS.push(ch);
+  })();
+  </script>
+</body>
+</html>

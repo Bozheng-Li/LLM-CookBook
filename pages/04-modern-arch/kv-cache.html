@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KV Cache 原理与优化 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="04-modern-arch" data-topic="kv-cache">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>KV Cache 原理与优化</h1>
+            <p class="lead">自回归生成每出一个 token，都要把前面所有 token 的 K 和 V 重算一遍——而它们明明一模一样。KV Cache 把这笔冤枉账省掉，但也带来了新的问题：当一篇长文写完，缓存占的显存比模型权重本身还大。怎么存、怎么管、怎么复用，就是这一节要解决的问题。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>自回归生成分为两段：<strong>prefill</strong> 一次性算出整条 prompt 的 K/V 并存起来，<strong>decode</strong> 每次只算新 token 的 K/V 并追加进缓存，注意力只对缓存里的 K/V 做一次增量查询。省掉的是 $O(n^2)$ 逐 token 的重复重算。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  PRE["Prompt Token"] --> PF["Prefill 阶段<br/>一次性算出所有 K/V<br/>存入 Cache"]
+  PF --> CACHE["KV Cache<br/>〈K₁,V₁〉〈K₂,V₂〉...〈Kₙ,Vₙ〉"]
+  CACHE --> DEC1["Decode Step 1<br/>只算新 token 的<br/>Q,K,V | 旧 K/V 直接用"]
+  DEC1 --> DEC2["Decode Step 2<br/>只算新 token 的<br/>Q,K,V | 旧 K/V 直接用"]
+  DEC2 --> DECD["……"]
+  DECD --> DECN["逐 token 生成<br/>直到 EOS"]
+              </div>
+              <figcaption>Prefill 灌满缓存，Decode 增量更新。每一步只产生一组新的 K/V 并追加。</figcaption>
+            </figure>
+          </div>
+
+          <h2>自回归的无效重算</h2>
+          <p>回顾因果自注意力的两阶段特点：</p>
+          <ul>
+            <li><strong>训练时</strong>：整条序列一次性进 GPU，<a href="../03-transformer/multi-head.html">因果掩码</a> 保证位置 $t$ 只看 $1\dots t$。一次前向 $n$ 个位置的损失全出来。这就是"训练并行"。</li>
+            <li><strong>推理时</strong>：模型手里只有一个 prompt 和已经生成的几个 token。要出第 $t+1$ 个 token，必须把 $1\dots t$ 每个位置的 $Q_t$、$K_{1:t}$、$V_{1:t}$ 全算一遍。生成 100 个 token 等于跑 100 次前向。</li>
+          </ul>
+          <p>关键发现：<strong>这 100 次前向里，前面 99% 的 K 和 V 从头到尾一模一样</strong>。第 $i$ 步生成的 $K_i$ 和 $V_i$，在第 $i+1$ 步、$i+2$ 步……直到结束都不会变。每次把它们全部重算一遍，是从 $O(n^2)$ 到 $O(n^2)$ 的通盘浪费。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            你在用计算器反复算 "1+2+3+4+5"——每次加一个新数都把前面所有数加一遍。正常人会记住上次的和，只加新数。KV Cache 就是这个"记住上次的和"。
+          </div>
+
+          <h2>Prefill 和 Decode：两个截然不同的阶段</h2>
+          <p>现代推理引擎把一次生成请求拆成两个阶段处理，因为它们的计算特征完全不同：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>Prefill</th><th>Decode</th></tr></thead>
+              <tbody>
+                <tr><td><strong>输入</strong></td><td>整条 prompt（可能几千 token）</td><td>上一步生成的 1 个 token</td></tr>
+                <tr><td><strong>计算量</strong></td><td>大矩阵乘，$O(n^2\cdot d)$</td><td>小矩阵乘 + 注意力查表，$O(n\cdot d)$</td></tr>
+                <tr><td><strong>瓶颈</strong></td><td>算力（Compute-bound）</td><td>显存带宽（Memory-bound）</td></tr>
+                <tr><td><strong>K/V 操作</strong></td><td>为全部 prompt token 生成 K/V，写入 Cache</td><td>只算新 token 的 K/V，追加到 Cache</td></tr>
+                <tr><td><strong>GPU 利用率</strong></td><td>高</td><td>极低（大矩阵乘变成了小量的向量-矩阵操作）</td></tr>
+                <tr><td><strong>一个直观类比</strong></td><td>GPU 在铲大口大口的数据</td><td>GPU 在铲一小勺，但每勺都要把整个 KV Cache 在显存和计算单元之间搬一遍</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这个二分法是理解后续一切部署优化的基础。Prefill 靠算力吃饱，Decode 受访存带宽。一篇接一篇的论文在优化 Decode，正是因为"一小勺数据把几十 GB 的显存全读一遍"这个矛盾太尖锐了。</p>
+
+          <h3>增量更新的数学形式</h3>
+          <p>写出来会更清楚为什么省了那么多。设已缓存的 K 和 V 为 $K_{1:t-1}$ 和 $V_{1:t-1}$，第 $t$ 步新 token 的向量为 $x_t$。</p>
+
+          <div class="figure" style="text-align:center">
+            $$\begin{aligned}
+            &\text{第 }t\text{ 步的 }Q\text{ 矩阵：}& Q_t &amp;= x_t W^Q &amp;&amp;\text{(只有 1 行)} \\
+            &\text{第 }t\text{ 步的 }K\text{ 矩阵：}& K_t &amp;= \begin{bmatrix} K_{1:t-1} \\ x_t W^K \end{bmatrix} &amp;&amp;\text{(追加 1 行)} \\
+            &\text{第 }t\text{ 步的注意力分数：}& S_t &amp;= \frac{Q_t \cdot K_t^\top}{\sqrt{d_k}} &amp;&amp;\text{(1×t，不是 t×t)} \\
+            &\text{第 }t\text{ 步的输出：}& O_t &amp;= \text{softmax}(S_t) \cdot V_t &amp;&amp;\text{(1 行)}
+            \end{aligned}$$
+          </div>
+
+          <p>核心就在于第二行和第五行的区别：<strong>没有 KV Cache 时</strong>，$K_t$ 是一个 $t \times d_k$ 的矩阵，需要从 $x_{1:t}$ 全部重新投影得到；<strong>有了 KV Cache</strong>，新乘出来的只有最后一行 $x_t W^K$，前面的 $t-1$ 行直接引用缓存，<strong>一次矩阵乘都不用</strong>。单步计算量因此从 $O(t^2)$ 降到 $O(t)$。</p>
+
+          <p>这也解释了为什么 Decode 是 memory-bound：$Q_t$ 只有 1 行，矩阵乘变成了向量操作，不是算不动，<strong>是从显存把整份 KV Cache 读进计算单元的时间远超过计算本身</strong>——标准的"算等数据"。</p>
+
+          <h2>显存账本：KV Cache 到底占多少</h2>
+          <p>先给公式，再用一个具体配置算出来，让读者有一个内化的数量级直觉。</p>
+
+          <div class="figure" style="text-align:center">
+            $$\text{KV Cache (bytes)} = B \times L \times N \times 2 \times H_{kv} \times d_h \times \text{dtype\_bytes}$$
+          </div>
+
+          <p>逐项解释：</p>
+          <ul>
+            <li>$B$：batch size（同时服务的请求数）</li>
+            <li>$L$：序列长度（prompt + 已生成的 token）</li>
+            <li>$N$：层数（每层都有独立的 K 和 V）</li>
+            <li>$2$：K 和 V 两份</li>
+            <li>$H_{kv}$：KV 头数（注意是 KV 头数，不是 Query 头数——这正是 GQA 压缩的切入点）</li>
+            <li>$d_h$：每个注意力头的维度</li>
+            <li>$\text{dtype\_bytes}$：精度占字节数（FP16/BF16 = 2，FP8 = 1，INT8 = 1）</li>
+          </ul>
+
+          <p>以 Llama-3-8B 为例（$N=32$，$H_{kv}=8$，$d_h=128$，BF16）：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>配置</th><th>计算</th><th>KV Cache</th></tr></thead>
+              <tbody>
+                <tr><td>单请求 4K 上下文（典型微调/早期部署）</td><td>$1 \times 4096 \times 32 \times 2 \times 8 \times 128 \times 2$</td><td>~0.5 GB</td></tr>
+                <tr><td>单请求 32K 上下文</td><td>同上，$L$ 扩大 8×</td><td>~4 GB</td></tr>
+                <tr><td>单请求 128K 上下文</td><td>$1 \times 131072 \times 32 \times 2 \times 8 \times 128 \times 2$</td><td>~16 GB</td></tr>
+                <tr><td>8 并发 8K 上下文</td><td>$B=8, L=8192$</td><td>~8 GB</td></tr>
+                <tr><td>模型权重（对照）</td><td>$8\text{B} \times 2$</td><td>~16 GB</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p><strong>一条 128K 的请求，KV Cache（16 GB）已经和模型权重本身（16 GB）一样大了。</strong>这还只是 Llama-3-8B，换成 70B 模型，权重 140 GB，KV Cache 按比例涨到上百 GB。而且这是 $H_{kv}=8$（GQA）的版本——如果换成同等规模的纯 MHA 模型（$H_{kv}=H_Q$），上面的数字要再乘以 4 到 8。</p>
+
+          <p>下图把这个"指数级膨胀"画出来：随着上下文从 4K 拉到 256K，单个 8B 级 GQA 请求的 KV Cache 从半 GB 涨到 32 GB 量级。一旦并发或多轮叠加，显存很快被吃满。</p>
+          <div class="figure" style="text-align:center;max-width:640px;margin:12px auto">
+            <canvas id="kvGrowChart" height="240"></canvas>
+            <figcaption>Llama-3-8B 单请求 KV Cache 显存随上下文长度增长（BF16，GQA $H_{kv}=8$，示意值）</figcaption>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">这张表在说什么</span>
+            长上下文的瓶颈往往不是模型质量，而是显存。位置编码解决了"能不能理解"，但<strong>只要 K 和 V 需要完整驻留在显存里，上下文长度就被物理卡死了上限</strong>。这就是为什么 GQA / MLA 这些 KV 压缩方案从"锦上添花"变成了"非做不可"——见 <a href="attention-variants.html">注意力变体全景</a>。
+          </div>
+
+          <h2>MHA / MQA / GQA / MLA：KV 大小的倍数关系</h2>
+          <p>上面的公式里，唯一能被架构设计直接砍掉的因子是 $H_{kv}$——KV 头的数量。Query 头数 $H_q$ 决定模型有多少种"提问视角"，删掉它会实打实伤害表达能力；但 K 和 V 是"被查询的内容"，多个 Query 头共用同一份 K/V 未必损失那么大。这个观察催生了从 MHA 到 MQA 再到 GQA 的一整条演化路线。</p>
+
+          <p>先把三者的区别用一句话说清楚：<strong>MHA 是每个 Query 头配一套自己的 K/V；MQA 是所有 Query 头共用同一套 K/V；GQA 是把 Query 头分成若干组，每组内共用一套 K/V。</strong>换句话说，$H_{kv}$ 从 $H_q$ 一路降到 1，GQA 停在中间的某个值。以 $H_q = 32$、$d_h = 128$、$N = 32$ 层、BF16、单条 32K 序列为例，把三种配置代进公式算一遍：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方案</th><th>$H_{kv}$</th><th>每 token 每层 KV 字节</th><th>32K 单请求 KV Cache</th><th>相对 MHA</th></tr></thead>
+              <tbody>
+                <tr><td><strong>MHA</strong></td><td>32</td><td>$2\times32\times128\times2 = 16384$ B</td><td>≈ 16 GB</td><td>1×</td></tr>
+                <tr><td><strong>GQA-8</strong>（Llama-3 系列采用）</td><td>8</td><td>$2\times8\times128\times2 = 4096$ B</td><td>≈ 4 GB</td><td>1/4</td></tr>
+                <tr><td><strong>GQA-4</strong></td><td>4</td><td>2048 B</td><td>≈ 2 GB</td><td>1/8</td></tr>
+                <tr><td><strong>MQA</strong></td><td>1</td><td>512 B</td><td>≈ 0.5 GB</td><td>1/32</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这个倍数关系是完全线性的，没有任何隐藏成本——<strong>KV Cache 的大小与 $H_{kv}$ 严格成正比</strong>。所以 MQA 相对 MHA 直接省了 32 倍。听起来太美好了，代价在哪里？代价在质量：所有 Query 头共用一份 K/V，等于强迫 32 种不同的"提问视角"去查同一本索引，注意力头之间的多样性被压缩，在需要精细区分的任务上会出现可测量的退化，而且训练过程也更容易不稳定。GQA 之所以成为事实标准，正是因为它把"组内共享"的粒度调到了甜点区：分成 8 组时，每组 4 个 Query 头共用一套 K/V，质量损失小到基本可以忽略，KV 却只剩四分之一。</p>
+
+          <p>还有一个常被忽略的收益：<strong>Decode 阶段是 memory-bound 的，KV 变小意味着每一步要从显存搬运的字节数同比减少，吞吐几乎同比提升。</strong>换句话说 GQA 不只是"省显存让你能开更大 batch"，它本身就直接加快了单请求的生成速度。这是 GQA 比"上下文压缩"这类方案更受欢迎的根本原因——两头都赚。</p>
+
+          <p>MLA（Multi-head Latent Attention）走的是另一条路：不减少头数，而是把 K/V 压缩到一个低维潜在向量里缓存，用的时候再投影回去。缓存的是压缩表示，所以 KV Cache 可以比 GQA 更小，同时保留了每个头独立的 K/V 结构。它的代价是引入了额外的升维矩阵乘运算，以及与 RoPE 的兼容需要专门设计。三条路线的完整对比、参数量差异和设计动机，见 <a href="attention-variants.html">注意力变体全景</a>。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">选型直觉</span>
+            如果你在训练一个新模型：<strong>直接上 GQA</strong>，组数取 Query 头数的 1/4 到 1/8 是业界验证过的安全区。如果你在部署已有的 MHA 模型且显存吃紧：可以考虑 GQA 蒸馏（把 MHA 的 K/V 权重按组做均值池化后再少量微调恢复），比从头训练便宜得多。
+          </div>
+
+          <h2>PagedAttention：像管理虚拟内存一样管理 KV Cache</h2>
+          <p>传统 KV Cache 的朴素实现非常简单：每个请求预分配一整块连续的显存，大小按 $L_{max}$ 算好。这带来了一个严重的<strong>碎片化</strong>问题。</p>
+          <ul>
+            <li>一个请求可能只需要 500 个 token，但分配时按上限预留了 8192 个位置。剩余空间只能属于这个请求，其他请求不能用——即使那个请求早就生成完了，这 7.5K 个位置也没法回收给需要更长上下文的请求。</li>
+            <li>不同请求的长度千差万别，每个请求预分配一个大块，结果是一张显存"瑞士奶酪"——<strong>总量够用，但没有一块连续空间放得下新请求的 KV Cache</strong>。</li>
+          </ul>
+          <p>PagedAttention 的洞见直接把操作系统里"虚拟内存分页"那套搬了过来：</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/2309.06180/assets/x2.png" alt="论文原图：PagedAttention 论文 Figure 1——左侧是 13B 模型在 A100 上服务时的显存布局（灰色权重常驻、红色 KV Cache 随请求分配），右侧是 vLLM 平滑 KV Cache 增长曲线带来吞吐提升" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：LLM 服务时的显存全景——左图灰色是常驻的模型权重，红色是按请求动态分配/释放的 KV Cache，黄色是临时激活；右图对比 vLLM 与既有系统在 KV Cache 增长上的差异</span>
+              <span class="pf-src">论文原图 · Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a> · 外链图来自 arXiv HTML 渲染（ar5iv）</span>
+            </figcaption>
+          </figure>
+
+          <p>这张论文原图值得逐块读。左图是一台 A100（80 GB 显存）在服务一个 13B 模型时的显存快照：<strong>灰色的大块是模型权重</strong>，从头到尾一直占着；<strong>红色的是 KV Cache</strong>，随每个请求来分配、请求结束就释放；<strong>黄色是激活值</strong>，只有一小条。关键在于红色的形状——传统系统里，每个请求都要「提前预留」一整块 KV 空间（你最多可能生成多长，就预留多大），于是红色区块充满了被请求「占着但没用」的洞。右图则展示 vLLM 用分页管理后，KV Cache 的实际占用随请求数平滑增长，不像传统系统那样「跳台阶」——每多一个请求不是立刻分配一大块，而是按需一点点涨。这一左一右，就是 PagedAttention 要解决的「碎片化」问题的直观证据。</p>
+
+          <p>再看同一篇论文的 Figure 3，它把碎片化拆成了三种可量化的「浪费」，比「瑞士奶酪」这种比喻更精确：<strong>预留浪费</strong>（reserved）——请求按最大可能长度预留空间，实际没用到那么多；<strong>内部碎片</strong>（internal fragmentation）——分配单元里用不满的边角料；<strong>外部碎片</strong>（external fragmentation）——显存里零散的洞凑不出一个连续大块。PagedAttention 按固定大小的页分配，让后两种碎片只发生在「一页」的粒度上，外部碎片从「放不下整个请求」降级成「最多浪费半页」。这也是为什么把图 1 和图 3 放一起读，能一次看懂 vLLM 的价值。</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/2309.06180/assets/x4.png" alt="论文原图：PagedAttention 论文 Figure 3——三种显存浪费（预留、内部碎片、外部碎片）示意" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：KV Cache 的三种显存浪费——预留空间、内部碎片、外部碎片，PagedAttention 把碎片粒度从「整个请求」缩小到「一页」</span>
+              <span class="pf-src">论文原图 · Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>, 2023, Figure 3 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a> · 外链图来自 arXiv HTML 渲染（ar5iv）</span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图时最容易忽略一个细节：图里「同一个 token 在不同位置，K/V 可能长得不一样」——图中特别标注了这一点。它的意思是，K/V 的内容和 token 所在的<strong>绝对位置</strong>相关（因为注意力带位置编码），所以不能天真地「按 token 去重 KV」，只能按「位置 + token」共享。这也解释了为什么前缀共享要求<strong>逐 token 完全匹配</strong>——任何位置偏移都会让 K/V 失去复用价值。</p>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">操作系统虚拟内存</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">物理内存分成大小相等的页框（4 KB）。进程不需要一整块连续物理内存，页面分散在物理内存中，通过页表映射。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">PagedAttention</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">KV Cache 分成大小相等的页（如 16 或 32 个 token）。请求不需要一整块连续显存，KV 页面分散在显存中，通过页表映射成逻辑上连续的序列。</p>
+            </div>
+          </div>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  subgraph REQ["逻辑序列 (请求视角)"]
+    P1["token 1-16"]
+    P2["token 17-32"]
+    P3["token 33-48"]
+  end
+  subgraph MEM["物理显存 (实际存储)"]
+    F1["空闲"]
+    F2["页 A = 请求1/token 1-16"]
+    F3["页 B = 请求2/token 1-16"]
+    F4["空闲"]
+    F5["页 C = 请求1/token 17-32"]
+    F6["页 D = 请求1/token 33-48"]
+    F7["空闲"]
+  end
+  P1 -.页表映射.-> F2
+  P2 -.页表映射.-> F5
+  P3 -.页表映射.-> F6
+            </div>
+            <figcaption>逻辑上连续的 KV Cache 序列通过页表映射到物理显存中分散的页面块</figcaption>
+          </figure>
+
+          <p>收益非常直接：</p>
+          <ul>
+            <li><strong>零碎片</strong>：请求不需要连续空间，随时按需分配一页，用完释放。显存利用率从 ~40% 提到 ~90%+。</li>
+            <li><strong>按需增长</strong>：不预分配 $L_{max}$，请求需要多少 token 就分多少页。生成了更多 token 就再分一页。</li>
+            <li><strong>灵活共享</strong>：同一段 prompt 的 KV Cache 页可以被多个采样分支共享（如 beam search 的不同束、基于同一条指令的不同回答变体）。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            PagedAttention 很容易被误以为「压缩了 KV Cache 的大小」——<strong>它一字节都没压缩</strong>，只是把同样多的字节放得更整齐、更省地方。KV 还是那些 KV，数学结果和朴素实现完全一致；它省下的是「碎片浪费」和「预留浪费」，把显存利用率从约 40% 提到 90%+。真正改变 KV 体积的是另一套东西：<a href="attention-variants.html">GQA / MLA 这类压缩 KV 头的架构</a>、以及 KV 量化。把「分页管理」（怎么放）和「KV 压缩」（放什么）分清，就不会在看推理引擎文档时被这两个概念绕晕。
+          </div>
+          <p>PagedAttention 是 vLLM 推理引擎的核心技术。今天几乎所有现代推理框架都采用了某种形式的分页 KV Cache 管理。注意这一层的优化<strong>只改内存管理策略，不改变注意力本身的计算结果</strong>——数学上仍然是精确注意力，只是存得更聪明。</p>
+
+          <details class="deep">
+            <summary>深入：写时复制（Copy-on-Write）与 beam search 共享</summary>
+            <p>分页管理的"共享"不止是省显存，还支撑了 beam search 这类需要多路并行的场景。设想 beam width = 4：4 条候选序列共享同一个 prompt 前缀，前缀的 KV 页自然只存一份。但当 4 条序列在某一位置开始分叉、各自要继续追加新 token 时，问题来了——如果它们继续往"同一页"里写，就会互相踩踏。</p>
+            <p>解决办法是<strong>写时复制（Copy-on-Write, CoW）</strong>：只要一个分支要修改/追加一个<strong>被多路共享</strong>的 KV 页，就先复制出一份专属副本，再在副本上写，原始页留给其他分支继续用。这样在分叉之前，所有 beam 完全共享 KV，零冗余；分叉之后，各自持有独立副本。RadixAttention（SGLang）也是用类似的引用计数 + CoW 机制来支持"前缀共享 + 任意分叉"。实现时要注意<strong>引用计数</strong>：一个页的引用数降到 0 才能真正回收。</p>
+          </details>
+
+          <h3>页大小的取与舍</h3>
+          <p>选择一个页面的 token 数是一个需要权衡的工程决策。以 Tokens/Page 为例：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>页大小</th><th>优点</th><th>缺点</th></tr></thead>
+              <tbody>
+                <tr><td><strong>1 token/page</strong></td><td>零浪费，完全弹性</td><td>页表条目数 = token 数，百 K 上下文对应百万级页表条目，寻址开销不可接受</td></tr>
+                <tr><td><strong>16-32 token/page（常见）</strong></td><td>页表开销可控（数千条目），碎片率 ~3-5%</td><td>平衡点，被 vLLM 和 SGLang 广泛采用</td></tr>
+                <tr><td><strong>128+ token/page</strong></td><td>页表极简</td><td>碎片重新出现，短请求可能占不满一页，与预分配方案的差距缩小</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>实践中 16 或 32 是最常见的默认值，兼顾了管理开销和内存利用率。</p>
+
+          <h3>动手实践：一个最小分页 KV Cache</h3>
+          <p>下面这段约 30 行的 Python 把"页池 + 空闲分配 + 前缀匹配"三个核心动作串起来，用于建立直觉（生产实现当然要搬到 GPU 上并用 CUDA 核函数，但逻辑是一样的）：</p>
+          <pre><code class="language-python">class PagedKVCache:
+    def __init__(self, page_size=16, max_pages=1024):
+        self.page_size = page_size
+        self.free_pages = list(range(max_pages))   # 空闲页号池
+        self.used = {}                              # req_id -> [page_id, ...]
+
+    def allocate(self, req_id):
+        if not self.free_pages:
+            raise MemoryError("KV Cache 显存耗尽")
+        pid = self.free_pages.pop()
+        self.used.setdefault(req_id, []).append(pid)
+        return pid
+
+    def free(self, req_id):
+        for pid in self.used.pop(req_id, []):
+            self.free_pages.append(pid)
+
+def match_prefix(tree, tokens):
+    # tree: 前缀树（Radix Tree）；返回可复用的前缀长度
+    node, shared = tree, 0
+    for t in tokens:
+        children = node.get("children", {})
+        if t in children:
+            node = children[t]; shared += 1
+        else:
+            break
+    return shared</code></pre>
+          <p>注意 <code>match_prefix</code> 只做"token 序列精确匹配"——这正呼应了后面 RadixAttention 的坑：前缀必须逐 token 完全相同才能共享。任何在 prompt 模板上的微小差异（多一个空格、不同的换行）都会让共享失效。</p>
+
+          <h2>前缀共享：当 100 个请求用同一段 system prompt</h2>
+          <p>分页管理解决了碎片，但没有解决重复存储。一个典型场景：100 个用户同时向同一个 ChatBot 提问，每个请求都带一条 500 token 的 system prompt。朴素 KV Cache 下，这 500 token 的 K/V 要在显存里存 100 份，总共占用 $100 \times 500 \times \cdots$ 的显存——而它们<strong>每一个比特都一模一样</strong>。</p>
+
+          <h3>RadixAttention：用前缀树去重</h3>
+          <p>RadixAttention 把"前缀共享"做成了数据结构：用一个<strong>基数树（Radix Tree）</strong>维护所有活跃请求的 KV Cache。树的一条边对应一段连续 token 的 KV 页面，从根到叶子的路径就是一条完整的 KV 序列。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  ROOT["ROOT"] --> SYS["System Prompt<br/>〈K/V token 0-500〉<br/>所有请求共享"]
+  SYS --> Q1["用户问题 A<br/>〈K/V token 501-600〉"]
+  SYS --> Q2["用户问题 B<br/>〈K/V token 501-620〉"]
+  SYS --> Q3["用户问题 C<br/>〈K/V token 501-580〉"]
+  Q1 -.各自生成的回答<br/>互不共享.-> A1["回答 Token"]
+  Q2 -.各自生成的回答<br/>互不共享.-> A2["回答 Token"]
+  Q3 -.各自生成的回答<br/>互不共享.-> A3["回答 Token"]
+              </div>
+            <figcaption>Radix Tree：System Prompt 的 KV 只存一份，100 个请求都从同一棵子树分叉。只有分叉之后的内容各自存储。</figcaption>
+          </figure>
+
+          <p>当新请求到达时：</p>
+          <ol>
+            <li>沿树匹配已有的前缀——匹配到的 token 的 KV <strong>直接复用，一步都不算</strong>。</li>
+            <li>从第一个不匹配的 token 开始，运行 prefill 为新 token 生成 K/V。</li>
+            <li>在树上新建分支，挂上新的 KV 页面。</li>
+            <li>请求结束（或超时）后，如果某个分支不再有活跃请求，对应的 KV 页面被回收。</li>
+          </ol>
+
+          <p>用一张时序图把"新请求如何命中/未命中前缀"讲清楚：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant R as 新请求
+  participant T as Radix 树
+  participant P as Prefill
+  R->>T: 提交 prompt 的 token 序列
+  T->>T: 沿树逐 token 匹配最长前缀
+  alt 命中共享前缀
+    T-->>R: 复用前缀 KV，0 重算
+    R->>P: 仅对新 token 做 prefill
+  else 无匹配
+    R->>P: 整段 prompt 做 prefill
+  end
+  P->>T: 写入新 KV 页并挂到树
+  T-->>R: 进入 Decode 阶段
+            </div>
+            <figcaption>前缀缓存查找流程：命中则零成本复用前缀 KV，未命中才整段 prefill</figcaption>
+          </figure>
+
+          <p>RadixAttention 是 SGLang 推理引擎的核心技术。它与 PagedAttention 搭配使用时，分页管理负责"怎么存"，基数树负责"存哪里、谁共享谁"，两者正交。</p>
+
+          <h3>实际收益场景</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>场景</th><th>共享内容</th><th>节省量级</th></tr></thead>
+              <tbody>
+                <tr><td>System prompt 复用</td><td>500-2000 token 的固定指令前缀</td><td>每并发请求省一份前缀 KV，常节省 30-50% 总 KV 显存</td></tr>
+                <tr><td>Few-shot 示例</td><td>给模型的多个示例（同一套示例大量复用）</td><td>示例越长越显著，典型省 20-40%</td></tr>
+                <tr><td>多轮对话</td><td>整段历史对话（用户补了一句话，前面轮次都相同）</td><td>后面的轮次几乎零新增 prefill，响应延迟显著降低</td></tr>
+                <tr><td>批量评测</td><td>同一份指令 + 不同测试用例</td><td>指令部分只存一份，评测吞吐大幅提升</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">注意</span>
+            前缀共享的前提是 <strong>token 级别的精确匹配</strong>。两个语义上相同但写法微有不同的 system prompt，在 token 序列上是不同的，无法共享。因此要最大化收益，system prompt 应该由统一的模板生成。
+          </div>
+
+          <h2>把每个字节榨干：量化、驱逐与卸载</h2>
+          <p>公式里的六个因子，各自对应一类优化手段。$H_{kv}$ 交给架构（GQA/MLA），$B$ 和 $L$ 由业务决定不能随便动，$N$ 和 $d_h$ 是模型固有的——剩下能动的只有 <strong>$\text{dtype\_bytes}$</strong>，以及一个公式里没写出来的隐含假设：<strong>是不是每个 token 的 K/V 都必须留着</strong>。</p>
+
+          <h3>KV Cache 量化：把 2 字节压到 1 字节甚至更少</h3>
+          <p>模型权重量化已经是常规操作，KV Cache 同样可以量化。好消息是 KV Cache 对量化的容忍度通常比权重更高——它是"中间激活值"，误差不会像权重那样在每一层被反复放大。把 BF16 换成 FP8 直接省一半，换成 INT4 能省四分之三。</p>
+          <p>坏消息是 K 和 V 的数值分布很不一样。<strong>K 张量存在明显的"通道异常值"（outlier channel）</strong>：某几个特征维度的数值幅度会比其他维度大一两个数量级，如果用整条张量共享一个缩放因子做量化，这几个异常通道会把量程撑满，其余通道被压缩到只剩几个有效格点，精度直接崩掉。V 张量的分布则平缓得多。因此实践中的做法是<strong>非对称处理</strong>：K 按通道（per-channel）量化，V 按 token（per-token）量化，各自用自己的缩放因子。KIVI 等工作正是围绕这个观察展开的。</p>
+          <p>另一个工程细节是<strong>保留一个 FP16 的"滑动窗口"</strong>：最近几十个 token 的 K/V 不量化，因为它们对当前这一步的注意力权重影响最大，量化误差最敏感；更早的 token 才降精度存储。这种"近处高清、远处压缩"的分层策略，是量化方案里性价比最高的一招。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>手段</th><th>压缩比</th><th>对质量的影响</th><th>主要代价</th></tr></thead>
+              <tbody>
+                <tr><td><strong>FP8 KV</strong></td><td>2×</td><td>基本无损，多数任务测不出差异</td><td>需要硬件支持 FP8（Hopper 及以后）</td></tr>
+                <tr><td><strong>INT8 KV（分组缩放）</strong></td><td>2×</td><td>轻微，长文任务需实测</td><td>量化/反量化的额外核函数开销</td></tr>
+                <tr><td><strong>INT4 KV（K 按通道 / V 按 token）</strong></td><td>4×</td><td>短文可用，长文与推理任务上可能有可感知退化</td><td>实现复杂，需保留 FP16 近窗</td></tr>
+                <tr><td><strong>驱逐 / 稀疏保留</strong></td><td>2–10×（取决于保留率）</td><td>取决于被丢弃的 token 是否真的不重要，最不可控</td><td>可能丢失关键信息，与前缀共享冲突</td></tr>
+                <tr><td><strong>卸载到 CPU / NVMe</strong></td><td>不压缩，只是换地方放</td><td>无损</td><td>PCIe 带宽成为新瓶颈，需与计算重叠</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>驱逐策略：不是每个 token 都值得留着</h3>
+          <p>注意力矩阵有一个反复被观测到的性质：<strong>它非常稀疏</strong>。在一条几千 token 的序列里，大部分历史 token 对当前这一步的注意力权重接近于零。既然如此，为什么要为它们付显存？</p>
+          <p>StreamingLLM 给出了一个极简的答案：<strong>只保留开头的几个 token（"注意力汇聚点"，attention sink）加上最近的一个滑动窗口</strong>，中间的全部丢弃。这个方案之所以有效，关键在于那几个开头 token——研究者发现即使它们语义上毫无意义（比如就是一个 BOS 标记），模型也会把大量注意力"倾倒"在上面，本质上是 softmax 需要一个归一化出口。一旦把它们丢掉，softmax 的分布会剧烈畸变，生成质量立刻崩溃。保留它们，模型就能在固定大小的缓存上无限续写。</p>
+          <p>H2O 等工作则更"聪明"一些：<strong>按累积注意力得分动态选择要保留的 token</strong>，历史上被反复关注的"重击者"（Heavy Hitter）留下，长期无人问津的淘汰。质量比固定窗口更好，但需要维护统计信息，且实现上与分页管理、前缀共享的配合更复杂。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">工程取舍：驱逐是有损的</span>
+            量化和分页是<strong>无损或近似无损</strong>的——数学结果基本不变。驱逐则是<strong>确确实实丢信息</strong>。一旦某个 token 的 K/V 被丢弃，后续任何一步都不可能再注意到它。这在"大海捞针"式的长文检索任务上是致命的：被丢掉的那句话恰好就是答案。所以驱逐适合聊天、续写这类"近因主导"的场景，不适合长文档问答。上线前务必用真实任务测一遍。
+          </div>
+
+          <h2>一个请求在缓存里的一生</h2>
+          <p>把前面所有机制串起来，看一个请求从进队列到释放显存经历了什么状态。这个状态机是理解推理引擎调度逻辑的地图：</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> Waiting: 请求入队
+  Waiting --> PrefixMatch: 调度器选中
+  PrefixMatch --> Prefill: 命中部分前缀<br/>只算未命中段
+  PrefixMatch --> Prefill: 完全未命中<br/>整段计算
+  Prefill --> Decoding: KV 页写入完成
+  Decoding --> Decoding: 每步追加 1 页槽位
+  Decoding --> Preempted: 显存不足<br/>被抢占
+  Preempted --> Waiting: KV 换出到 CPU<br/>或直接丢弃重算
+  Decoding --> Finished: 生成 EOS<br/>或达到最大长度
+  Finished --> [*]: 引用计数归零<br/>页面回收
+            </div>
+            <figcaption>请求生命周期状态机：注意 Preempted 这条路径——显存压力大时，引擎会主动抢占低优先级请求</figcaption>
+          </figure>
+
+          <p>其中最容易被忽视的是 <strong>Preempted（抢占）</strong> 这条边。当高优先级请求进来而显存不够时，引擎必须腾地方，有两种做法：<strong>换出（swap）</strong>——把 KV 页搬到 CPU 内存，之后再搬回来，代价是 PCIe 传输时间；<strong>重算（recompute）</strong>——直接扔掉，等重新调度时重跑一遍 prefill，代价是算力。哪种更划算取决于序列长度和硬件：短序列重算更快（prefill 是算力密集但绝对时间短），长序列换出更划算（重算 32K 的 prefill 比搬 4 GB 数据慢得多）。生产引擎通常按长度阈值自动选择。</p>
+
+          <p>另一个细节：<code>Decoding → Decoding</code> 这条自环意味着<strong>每生成 16 个 token（一个页大小）就要向分配器申请一次新页</strong>。如果此时页池已空，请求就会被迫进入 Preempted。所以推理引擎在接纳新请求时会做<strong>准入控制</strong>：预估这个请求可能生成的长度，确认页池还有余量才放进来，否则宁可让它在 Waiting 里多等一会儿——先放进来再抢占，比一开始就不放进来的总代价更高。</p>
+
+          <h3>优化手段的全景</h3>
+          <p>KV Cache 相关的优化在过去两年爆炸式增长，容易看得眼花。按"动了公式里的哪个因子"来归类，其实非常清晰：</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root(("KV Cache 优化"))
+    减少头数
+      MQA 全共享
+      GQA 分组共享
+      MLA 低秩潜在压缩
+    降低精度
+      FP8 KV
+      INT8 分组量化
+      INT4 K按通道 V按token
+    减少 token 数
+      StreamingLLM 汇聚点加窗口
+      H2O 重击者保留
+      跨层共享 KV
+    改进存储管理
+      PagedAttention 分页
+      RadixAttention 前缀树
+      写时复制共享
+    换个地方放
+      卸载到 CPU 内存
+      卸载到 NVMe
+      PD 分离跨节点传输
+            </div>
+            <figcaption>KV Cache 优化手段的分类地图：前三类改变缓存本身的大小，后两类改变缓存的存放与管理方式</figcaption>
+          </figure>
+
+          <p>这五类是<strong>正交的</strong>，可以叠加使用。一个典型的生产配置是：GQA-8 架构（4×）+ FP8 KV 量化（2×）+ PagedAttention（利用率从 40% 到 90%）+ 前缀共享（多轮对话省 30%+）+ 长序列卸载兜底。相对最朴素的 MHA + BF16 + 预分配实现，综合能把同样显存下的并发数提升一到两个数量级。这也是为什么"同一个模型，不同引擎跑出来的吞吐能差好几倍"——差的就是这些叠加起来的工程细节。</p>
+
+          <details class="deep">
+            <summary>深入：为什么 Decode 阶段的算力利用率可以低到个位数百分比</summary>
+            <p>做个粗算就明白了。Decode 每一步，对某一层的注意力而言，需要从显存读入的数据量约等于该层的 KV Cache 大小，而计算量约等于 $Q_t$（1 行）与 $K_{1:t}$（$t$ 行）的一次向量-矩阵乘，即 $O(t \times d)$ 次乘加。<strong>读入的字节数和计算的次数几乎是同一个量级</strong>——每读入一个 KV 元素只做常数次运算。</p>
+            <p>这个比值叫<strong>算术强度</strong>（arithmetic intensity，FLOPs per byte）。现代 GPU 的算力与带宽之比通常在每字节数百次浮点运算的量级，也就是说：想要喂饱算力单元，每从显存搬一个字节就得做几百次运算。而 Decode 只做了个位数次。结论是<strong>算力单元有 99% 的时间在等数据</strong>，算力利用率落到个位数百分比毫不意外。</p>
+            <p>这个分析直接推出了三条优化方向：<strong>（1）减少要搬的字节</strong>——GQA、量化、驱逐都属于此类，效果最直接；<strong>（2）增加每次搬运的复用次数</strong>——连续批处理（continuous batching）把多个请求的 $Q$ 拼成一个矩阵，同一份权重搬一次给 $B$ 个请求用，算术强度提升 $B$ 倍，这是提升吞吐最有效的手段；<strong>（3）一次搬运多算几步</strong>——投机解码让小模型先猜若干 token，大模型一次性验证，把 $B=1$ 的向量操作变成小批矩阵操作，见 <a href="../09-efficiency/speculative-decoding.html">投机解码</a>。理解了算术强度，这三条路线就不再是零散的技巧，而是同一个物理约束的三种绕法。</p>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：自回归推理时，前面 token 的 K 和 V 是不变的，把它们缓存下来避免重算。</li>
+            <li><strong>两阶段</strong>：Prefill（一次性算完 prompt 的 K/V，compute-bound）→ Decode（逐 token 追加 K/V，memory-bound）。</li>
+            <li><strong>显存公式</strong>：$B \times L \times N \times 2 \times H_{kv} \times d_h \times \text{dtype\_bytes}$。128K 上下文的 KV Cache 可与模型权重等量级。</li>
+            <li><strong>PagedAttention</strong>：把 KV Cache 切成固定大小的页，按需分配、避免碎片。逻辑上页表映射、物理上分散存储。vLLM 核心。</li>
+            <li><strong>RadixAttention</strong>：前缀树共享 KV Cache。公共前缀（system prompt、few-shot、对话历史）只存一份，新请求匹配到就复用。SGLang 核心。</li>
+            <li><strong>压缩方向</strong>：GQA/MLA 减少 $H_{kv}$ 的倍数（见 <a href="attention-variants.html">注意力变体全景</a>），量化减少 $\text{dtype\_bytes}$，分页和前缀树解决分配效率和去重。</li>
+            <li><strong>常见坑</strong>：前缀共享依赖精确 token 匹配，非统一的 prompt 模板会损失共享收益；分页大小不能随意调——太小 → 页表开销大，太大 → 碎片重新出现；beam search 共享页要配合写时复制，否则分支互相踩踏。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：KV Cache 为什么能加速自回归 Decode？它到底缓存了什么？</h3>
+              <p><span class="answer-label">标准回答：</span>历史 token 在后续步骤中的 Key 和 Value 不会改变，因此可以把每层的历史 K/V 保存下来。Decode 时只为新 token 计算 Q、K、V，把新 K/V 追加到缓存，当前 Query 再与缓存中的全部 K 做注意力，避免重复投影历史 token。</p>
+              <p><span class="pitfall-label">常见误区：</span>KV Cache 不是把整个 Transformer 的中间结果都缓存，也不是缓存最终 logits；它主要缓存每层注意力使用的 K 和 V。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：Prefill 和 Decode 的瓶颈为什么不同？</h3>
+              <p><span class="answer-label">标准回答：</span>Prefill 一次处理整段 prompt，矩阵规模大、并行度高，通常更偏 compute-bound；Decode 每次只生成一个 token，计算矩阵很小，却要反复读取越来越大的 KV Cache 和模型权重，通常更偏 memory-bound。</p>
+              <details class="deep">
+                <summary>追问：这对系统优化有什么直接影响？</summary>
+                <div class="deep-body">
+                  <p>Prefill 更适合通过大 batch、Tensor Core 和 FlashAttention 提高算力利用率；Decode 则更关心 KV Cache 字节数、显存带宽、GQA/MQA、PagedAttention、连续批处理和请求调度。把两阶段混用同一套指标，容易误判优化是否有效。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：GQA、MQA 和 MHA 如何影响 KV Cache 显存？</h3>
+              <p><span class="answer-label">标准回答：</span>KV Cache 显存与 KV 头数 $H_{kv}$ 成正比。MHA 中每个 Query 头有独立 K/V；MQA 让所有 Query 头共享一组 K/V；GQA 则按组共享。因此 GQA/MQA 可以减少缓存大小和 Decode 的访存量，但共享粒度过激可能带来质量退化。</p>
+              <pre class="mini-code"><code>kv_bytes = B * L * N * 2 * H_kv * d_h * dtype_bytes</code></pre>
+              <p><span class="follow-label">面试追问：</span>GQA 减少的是 $H_{kv}$，不是 Query 头数；Query 头仍然保留多种表示和查询视角。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q4：PagedAttention 压缩了 KV Cache 吗？</h3>
+              <p><span class="answer-label">标准回答：</span>它主要优化存储管理，不直接改变每个 K/V 元素的字节数。PagedAttention 把逻辑缓存切成固定大小的页，按需分配，通过页表映射到物理显存，从而减少预留浪费和碎片，提高并发服务的显存利用率。</p>
+              <p><span class="pitfall-label">常见误区：</span>“分页”不等于“量化”。如果要减少单个元素的存储大小，应使用 FP8、INT8 等 KV 量化；分页解决的是分配和复用问题。</p>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention — PagedAttention 原始论文，把虚拟内存分页引入 KV Cache 管理 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a></li>
+            <li>SGLang: A Language for Structured Generation of Language Models — 提出 RadixAttention 前缀树共享 · <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">arXiv:2312.07104</a></li>
+            <li>Orca: A Distributed Serving System for Transformer-Based Generative Models — 迭代级调度与连续批处理，PagedAttention 的前驱思想 · <a href="https://arxiv.org/abs/2205.05178" target="_blank" rel="noopener">arXiv:2205.05178</a></li>
+            <li>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints — 提出分组查询注意力，并给出从 MHA 检查点转换的方法 · <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">arXiv:2305.13245</a></li>
+            <li>Efficient Streaming Language Models with Attention Sinks（StreamingLLM）— 发现注意力汇聚点现象，用固定大小缓存支持无限长流式生成 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></li>
+            <li>H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models — 基于累积注意力得分的动态 KV 驱逐策略 · <a href="https://arxiv.org/abs/2306.14048" target="_blank" rel="noopener">arXiv:2306.14048</a></li>
+            <li>KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache — K 按通道、V 按 token 的非对称量化方案 · <a href="https://arxiv.org/abs/2402.02750" target="_blank" rel="noopener">arXiv:2402.02750</a></li>
+            <li>vLLM 官方文档 — PagedAttention 与连续批处理的工程实现与配置参数 · <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">docs.vllm.ai</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            本节覆盖的是 KV Cache 的<strong>机制和单机优化</strong>。当上下文长到单卡真的放不下时，需要把 KV Cache 的一部分卸载到 CPU 内存——见 <a href="../09-efficiency/kv-offload.html">KV Cache 分级卸载</a>。大规模部署时，缓存的管理和调度也需要专门的分离架构——见 <a href="../09-efficiency/pd-disaggregation.html">Prefill-Decode 分离部署</a>。高效实现方面，PagedAttention 的实际核函数实现与 <a href="../05-systems/flash-attention.html">FlashAttention</a> 共享底层的分块 + 在线 Softmax 技术，推理引擎落地则见 <a href="../09-efficiency/inference-engines.html">推理引擎概览</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+    window.addEventListener('load', function () {
+      if (typeof Chart === 'undefined') return;
+      var c = window.CB_COLORS || { blue: '#378add', red: '#e24b4a', amber: '#ef9f27' };
+      var ch = new Chart(document.getElementById('kvGrowChart'), {
+        type: 'line',
+        data: {
+          labels: ['4K', '16K', '32K', '64K', '128K', '256K'],
+          datasets: [
+            { label: 'KV Cache 显存 (GB)', data: [0.5, 2, 4, 8, 16, 32], borderColor: c.blue, backgroundColor: c.blue, fill: false, tension: 0.2 }
+          ]
+        },
+        options: {
+          scales: { y: { title: { display: true, text: 'GB（Llama-3-8B, BF16）' }, beginAtZero: true } },
+          plugins: { legend: { position: 'top' } }
+        }
+      });
+      (window.CB_CHARTS = window.CB_CHARTS || []).push(ch);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RLHF · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="07-posttraining" data-topic="rlhf">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>RLHF</h1>
+            <p class="lead">SFT 教会模型"怎么说话"，但教不会"什么才算说得好"。RLHF（Reinforcement Learning from Human Feedback，基于人类反馈的强化学习）补的就是这一环：用人类的成对偏好来定义奖励信号，再用强化学习把这个信号灌进模型权重。它是 ChatGPT 之所以是 ChatGPT 的关键一步，也是后训练全流程里工程复杂度最高的一环。</p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">前置知识</span>
+            本页假定你已理解强化学习的基本框架——策略、价值函数、优势函数、PPO 算法这些概念。如果这些名词还不熟，建议先读 <a href="../01-foundations/rl-basics.html">强化学习基础</a>，再回来看本页。
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>RLHF 不是一步到位，而是<strong>三个阶段的接力</strong>：先用 SFT 让模型学会应答格式（行为克隆），再训练一个奖励模型来为任意回答打分（偏好建模），最后用 PPO 强化学习让策略模型朝高分方向优化，同时用 KL 惩罚约束它别跑偏。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  subgraph S["阶段 1：SFT"]
+    A1["基座模型"] -->|指令数据| A2["SFT 模型"]
+  end
+  subgraph R["阶段 2：奖励模型"]
+    B1["成对偏好数据<br/>回答 A &gt; 回答 B"] -->|Bradley-Terry| B2["奖励模型<br/>给任意回答打分"]
+  end
+  subgraph P["阶段 3：PPO 强化学习"]
+    C1["SFT 模型<br/>作为初始策略"] --> C2["PPO 优化<br/>最大化奖励 - KL 惩罚"]
+    B2 -->|奖励信号| C2
+    C3["参考模型<br/>冻结的 SFT"] -->|计算 KL| C2
+    C2 --> C4["RLHF 模型"]
+  end
+  S --> P
+  style C2 fill:#e6f1fb,stroke:#185fa5
+              </div>
+              <figcaption>RLHF 三阶段：SFT 打底 → 练奖励模型 → PPO 对齐</figcaption>
+            </figure>
+          </div>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/07-posttraining/rlhf/fig1.png" alt="论文原图：RLHF 三阶段流程（SFT→奖励模型→PPO）" loading="lazy" style="max-width:480px">
+            <figcaption>
+              <span class="pf-title">图：InstructGPT 的 RLHF 三阶段流程</span>
+              <span class="pf-src">论文原图 · Ouyang et al., <em>Training language models to follow instructions with human feedback</em>, 2022, Figure 2 · <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener">arXiv:2203.02155</a></span>
+            </figcaption>
+          </figure>
+
+          <h2>为什么 SFT 不够：偏好排序这个维度的缺失</h2>
+          <p>在 <a href="sft.html">SFT</a> 一节我们说过，SFT 的本质是行为克隆——给模型看"标准答案"，让它照着学。这种监督信号有一个结构性缺陷：它只告诉模型"正确回答长什么样"，但从不告诉它"A 和 B 哪个更好、好多少"。SFT 的交叉熵损失是一个逐 token 的匹配损失，它天然只衡量"像不像示范"，衡量不了"好不好"。</p>
+          <p>举个例子：同一个问题，好人标注者给出诚实但有保留的回答；AI 助理给出的却是自信但虚构的回答。SFT 只会把两个都当成"示范"来拟合，没有任何机制告诉模型前者比后者更值得追求。要让模型学会这种偏好排序，需要一种不同的信号——不是"这个 token 对不对"，而是"这个回答好不好"。</p>
+          <p>RLHF 做的事情，就是把"人类的偏好比较"翻译成一份可执行梯度的奖励信号，然后用强化学习把这份信号转化为策略更新。这里的关键转变是：从"模仿某个具体回答"升级为"学习一个能评判任意回答好坏的偏好函数"。前者只能复现训练集里出现过的表达，后者能让模型举一反三地判断没见过的回答质量。</p>
+          <p>这个结构性缺陷在 InstructGPT 论文里有直接数据支撑：作者让人类标注者在 InstructGPT 模型与 GPT-3 基座模型之间做偏好比较，同样是"让模型照着学"的 SFT 模型，其被人类选中的比例显著低于经过偏好优化之后的模型——差别正在于 SFT 只能模仿"示范文本"，而偏好优化能让模型学会"示范背后的人类价值排序"。这也是为什么 RLHF 的英文全称里"Reinforcement"（强化）是关键词：它不是在拟合数据，而是在优化一个由人定义的偏好目标。</p>
+
+          <h2>阶段 2：奖励模型——把"更好"量化为一个数字</h2>
+          <p>如果让人给每个回答打一个绝对分数（1-5 分），问题很严重：不同人的评分标准不一致，同一个人在不同时候打的分数也会漂移，标注者还会产生锚定效应。但<strong>让人比较两个回答哪个更好</strong>，这个判断就很稳定——人类天生更擅长比较。</p>
+          <p>奖励模型就是基于这种<strong>成对偏好</strong>训练出来的。通常的做法是：</p>
+          <ol>
+            <li>用 SFT 模型对一个 prompt 采样若干个不同回答（不同 temperature 和随机种子）。</li>
+            <li>让人工标注者从中挑出更好的那个（成对排序）。</li>
+            <li>用 <strong>Bradley-Terry 模型</strong> 把这些偏好转化为评分：假设"回答 A 优于 B"的概率与两者的奖励值差值正相关。</li>
+          </ol>
+          <div class="figure" style="text-align:center">
+            $$P(A \succ B) = \frac{\exp\!\left(r_\theta(A)\right)}{\exp\!\left(r_\theta(A)\right) + \exp\!\left(r_\theta(B)\right)} = \sigma\!\left(r_\theta(A) - r_\theta(B)\right)$$
+          </div>
+          <p>训练奖励模型就是把上述概率最大化的过程——等价于一个二分类任务，损失函数就是负对数似然：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{RM}} = -\mathbb{E}_{(A,B)}\!\left[\log \sigma\!\left(r_\theta(A) - r_\theta(B)\right)\right]$$
+          </div>
+          <p>工程上，奖励模型<strong>本身就是一个 LLM</strong>，只是把最后的语言模型头（lm_head）换成一个标量输出头。它只接受 prompt + 回答作为输入，输出一个标量分。这个分数在训练过程中会逐渐学习到人类的偏好分布，最终成为一个"可导的裁判"。</p>
+
+          <h3>奖励模型的训练配方</h3>
+          <p>奖励模型看起来简单，但有几个工程细节直接决定它会不会被后续 PPO 阶段"钻空子"。下面是一份典型的训练配方要点：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>设计点</th><th>常见选择</th><th>理由</th></tr></thead>
+              <tbody>
+                <tr><td><strong>基座</strong></td><td>与 SFT 模型同架构、同尺寸</td><td>保证对同一输入的表征一致，便于 PPO 阶段复用</td></tr>
+                <tr><td><strong>输出头</strong></td><td>线性回归头（去掉 lm_head）</td><td>只需一个标量分，不需要词汇表分布</td></tr>
+                <tr><td><strong>损失</strong></td><td>成对排序损失（上述负对数似然）</td><td>直接拟合 Bradley-Terry 偏好，而非回归绝对分</td></tr>
+                <tr><td><strong>数据规模</strong></td><td>数万到数十万对比较</td><td>太少则奖励空间粗糙，PPO 易过拟合到噪声</td></tr>
+                <tr><td><strong>防过拟合</strong></td><td>早停 + 验证集偏好准确率监控</td><td>验证准确率停滞即停，避免奖励模型记住标注噪声</td></tr>
+                <tr><td><strong>长度归一</strong></td><td>对长回答做惩罚或长度无关打分</td><td>否则奖励模型学成"越长分越高"，诱发 reward hacking</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>一个常被忽视的点是：奖励模型的<strong>验证集偏好准确率</strong>（即它对"人类会选 A 还是 B"的预测正确率）通常只能到 65%–75% 区间，连人类标注者之间的一致性都到不了 80%。这意味着奖励模型本身就是一个"带噪声的裁判"，PPO 阶段优化的目标函数其实是"在一个不完美裁判给的分上最大化"——这也是为什么 KL 惩罚和奖励模型正则化都不能省。</p>
+
+          <h3>奖励模型的训练骨架（PyTorch 风格）</h3>
+          <p>下面是一段化简的奖励模型训练伪代码，重点展示"成对输入 + 排序损失"这一核心，不含分布式细节：</p>
+          <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def reward_model_loss(rm, batch):
+    """rm: 奖励模型（LLM 换标量头）
+    batch: 每条样本含 prompt、chosen（人类偏好）、rejected（被拒）
+    返回标量损失。"""
+    # 分别对"被选中"和"被拒绝"的回答打分
+    r_chosen = rm(batch["prompt"], batch["chosen"])      # shape: [B, 1]
+    r_rejected = rm(batch["prompt"], batch["rejected"])  # shape: [B, 1]
+
+    # Bradley-Terry 成对排序损失：
+    # 希望 r_chosen 显著高于 r_rejected
+    logits = r_chosen - r_rejected                        # [B, 1]
+    loss = -F.logsigmoid(logits).mean()                   # 等价于公式中的负对数似然
+    return loss
+
+# 训练循环（化简）
+for step, batch in enumerate(loader):
+    opt.zero_grad()
+    loss = reward_model_loss(rm, batch)
+    loss.backward()
+    opt.step()
+    if step % 50 == 0:
+        print(f"step={step} rm_loss={loss.item():.4f}")</code></pre>
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            不要试图让人打绝对分，让奖励模型从比较中学——前者不稳定，后者靠谱得多。这跟推荐系统不用用户打星而是用点击序列表征偏好，是同一条思路。
+          </div>
+
+          <h2>阶段 3：PPO——四个模型的协奏</h2>
+          <p>拿到奖励模型之后，最后一步是用强化学习优化策略。这里主角是 PPO（Proximal Policy Optimization），目标函数分两部分：</p>
+          <div class="figure" style="text-align:center">
+            $$\max_\pi \underbrace{\mathbb{E}_{x \sim D, y \sim \pi(\cdot|x)}\!\left[r_\phi(x, y)\right]}_{\text{奖励最大化}} \;-\; \beta \cdot \underbrace{\text{KL}\!\left(\pi(y|x) \,\|\, \pi_{\text{ref}}(y|x)\right)}_{\text{KL 惩罚：别跑偏}}$$
+          </div>
+          <p>拆开看每一项在做什么：</p>
+          <ul>
+            <li><strong>奖励最大化</strong>：让策略模型 $\pi$ 生成奖励模型打高分的回答。这块驱动模型往"人类更喜欢的方向"走。</li>
+            <li><strong>KL 惩罚</strong>：衡量当前策略 $\pi$ 与参考模型 $\pi_{\text{ref}}$（冻结的 SFT 模型）的分布差异。它是整个 RLHF 设计的<strong>安全绳</strong>——没有它，PPO 会迅速发现：把回答写成胡言乱语、重复词、甚至用非自然语言模式，都可以骗到奖励模型的高分，但输出完全不可用。</li>
+            <li><strong>$\beta$</strong>：KL 惩罚系数，控制"追求高分"和"保持自然"之间的博弈。$\beta$ 太小 → 模型投机取巧；$\beta$ 太大 → 模型寸步不移，等于没对齐。</li>
+          </ul>
+
+          <h3>四模型同时驻留显存</h3>
+          <p>这是 RLHF 在工程上最大的痛点。训练时四个模型需要同时存在于显存中，且每个都不是小东西：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>角色</th><th>用途</th><th>是否需要梯度</th><th>是否更新</th></tr></thead>
+              <tbody>
+                <tr><td><strong>策略模型 $\pi$</strong></td><td>生成回答（actor）</td><td>是</td><td>是</td></tr>
+                <tr><td><strong>参考模型 $\pi_{\text{ref}}$</strong></td><td>计算 KL 散度的基准</td><td>否</td><td>否（冻结）</td></tr>
+                <tr><td><strong>奖励模型 $r_\phi$</strong></td><td>给回答打分</td><td>否</td><td>否（冻结）</td></tr>
+                <tr><td><strong>价值模型 $V$</strong></td><td>估计状态价值，用于 PPO 的优势计算</td><td>是</td><td>是</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>可以粗略估算一个 7B 规模模型的压力：策略模型 14GB（FP16）+ 参考模型 14GB + 奖励模型 14GB + 价值模型 14GB = 仅模型权重就要约 56GB。再加上梯度、Adam 优化器状态、KV Cache（生成时还要存动作序列），一张 A100 80GB <strong>几乎装不下四个 7B 模型</strong>。这就是为什么实际 RLHF 训练往往依赖模型切分和 ZeRO-3 等显存优化技术。</p>
+
+          <h3>四个模型之间的依赖关系</h3>
+          <p>这四者不是平行摆放，而是有明确的"谁派生谁、谁冻结谁"的依赖。理清依赖，才能理解显存优化为什么往往从"共享权重"入手：</p>
+          <figure class="figure">
+            <div class="mermaid">
+classDiagram
+  class SFTModel {
+    +weights W_sft
+  }
+  class PolicyModel {
+    +gradients yes
+    +update yes
+    +init from SFT
+  }
+  class RefModel {
+    +gradients no
+    +frozen yes
+    +copy from SFT
+  }
+  class RewardModel {
+    +scalar head
+    +frozen yes
+    +trained on pairs
+  }
+  class ValueModel {
+    +value head
+    +gradients yes
+    +init from Policy
+  }
+  SFTModel <|-- PolicyModel
+  SFTModel <|-- RefModel
+  PolicyModel ..> RewardModel : scored by
+  PolicyModel ..> RefModel : KL vs
+  PolicyModel ..> ValueModel : advantage from
+            </div>
+            <figcaption>四模型依赖：策略与参考都源自 SFT；价值常从策略初始化；奖励模型独立训练后冻结</figcaption>
+          </figure>
+
+          <h3>PPO 训练循环：一步一步怎么跑</h3>
+          <p>把上面四模型放进一个训练循环，每一步实际发生的事情如下。注意这是一个<strong>在线（on-policy）循环</strong>：每更新几步策略，就要用新策略重新采样数据，不能反复用旧数据。</p>
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant P as 策略模型 π
+  participant R as 奖励模型 r
+  participant V as 价值模型 V
+  participant O as PPO 优化器
+  P->>P: 对 prompt 采样生成回答 y
+  P->>R: 发送 (prompt, y)
+  R-->>P: 标量奖励 r(x, y)
+  P->>V: 发送 (prompt, y) 各步状态
+  V-->>P: 各步状态价值 V(s)
+  Note over P: 用 GAE 算每 token 优势 A = R - V
+  P->>O: 提交 (y, A, 旧概率比)
+  O->>O: clipped surrogate + KL 惩罚更新
+  O-->>P: 更新后的策略权重
+  Note over P,O: 迭代：用新 π 重新采样
+            </div>
+            <figcaption>PPO 在线训练循环：采样 → 打分 → 算优势 → 更新 → 用新策略重采样</figcaption>
+          </figure>
+          <p>这段循环里有两个容易被忽略的工程事实：第一，<strong>采样（生成回答）比更新更慢更占显存</strong>，因为要存完整动作序列的 KV Cache；第二，<strong>奖励只在整段回答结束时给一次</strong>（或分几句给），所以要靠价值模型把"末端的奖励"合理地分配到每个 token 上——这正是 GAE（广义优势估计）做的事。如果价值模型估得不准，优势信号噪声大，PPO 的策略更新就会剧烈抖动。</p>
+
+          <h3>PPO 的 clipped 目标：为什么需要"裁剪"</h3>
+          <p>PPO 之所以比普通策略梯度稳，关键在于它对"新旧策略的概率比"做了裁剪，防止一次更新把策略推得太远。化简形式如下：</p>
+          <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def ppo_clipped_loss(logp_new, logp_old, advantages, beta, ref_logp, beta_kl):
+    """化简的 PPO clipped surrogate + KL 惩罚。
+    logp_new : 新策略下动作的对数概率  [B]
+    logp_old : 旧策略（采样时）对数概率 [B]
+    advantages : GAE 优势            [B]
+    ref_logp  : 参考模型对数概率      [B]"""
+    ratio = torch.exp(logp_new - logp_old)        # 概率比 ρ = π_new / π_old
+    unclipped = ratio * advantages
+    clipped = torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2) * advantages
+    policy_loss = -torch.min(unclipped, clipped).mean()   # 取更保守的一个
+    kl = (logp_new - ref_logp).mean()                      # 与参考模型 KL 近似
+    return policy_loss + beta_kl * kl</code></pre>
+          <p>这里的 <code>clamp(ratio, 0.8, 1.2)</code> 就是"裁剪"：如果某次更新让概率比涨到 1.2 以上（或跌到 0.8 以下），超出部分不计入梯度，避免策略一步跨太远崩掉。这就是 "Proximal"（近端）的含义——只在旧策略附近小幅更新。</p>
+
+          <h3>PPO 关键超参速查</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>超参</th><th>典型区间</th><th>调大会怎样</th></tr></thead>
+              <tbody>
+                <tr><td><strong>KL 系数 $\beta$</strong></td><td>0.01 – 0.1</td><td>越大越保守，对齐弱但更稳</td></tr>
+                <tr><td><strong>裁剪范围 $\epsilon$</strong></td><td>0.1 – 0.3</td><td>越大越允许大步更新，易震荡</td></tr>
+                <tr><td><strong>学习率</strong></td><td>1e-7 – 1e-6</td><td>RLHF 学习率远小于 SFT，避免破坏已学能力</td></tr>
+                <tr><td><strong>rollout 批大小</strong></td><td>64 – 512 prompts</td><td>越大奖励估计越稳，但显存与延迟上升</td></tr>
+                <tr><td><strong>每个 batch 的 PPO epoch</strong></td><td>1 – 4</td><td>太多易过拟合当前采样数据</td></tr>
+                <tr><td><strong>GAE $\lambda$</strong></td><td>0.95 左右</td><td>控制优势估计的偏差-方差权衡</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">工程提醒</span>
+            价值模型通常从策略模型的参数初始化（共享大部分层），以减少额外显存。即使如此，四模型共存的显存压力依然是 RLHF 工程实现的最大挑战，远大于 SFT 的"单模型 + 少数据"。RLHF 学习率往往比 SFT 小一两个数量级，因为一旦更新过猛，KL 项会迅速爆掉、训练崩溃。
+          </div>
+
+          <h2>训练稳定性：RLHF 是怎么崩的</h2>
+          <p>RLHF 训练不像 SFT 那样"跑完就收敛"，它有一条典型的崩溃路径：一开始奖励稳步上升、KL 缓慢增长，模型越来越会说"好听的话"；然后某一时刻 KL 突然飙升，回答开始重复、胡言、乃至输出乱码——这就是 reward hacking 全面爆发、策略已经跑出可用分布。理解这条状态轨迹，才能及时刹车。</p>
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 稳定上升: 训练开始
+ 稳定上升 --> 稳定上升: 奖励↑ KL 温和
+ 稳定上升 --> KL 警告: KL 接近阈值
+ KL 警告 --> 稳定上升: 调小学习率 / 增大 β
+ KL 警告 --> 奖励飙升: 未干预，继续优化
+ 奖励飙升 --> 崩溃: 输出退化 / 乱码
+ 崩溃 --> [*]: 训练作废
+ KL 警告 --> 稳定上升: 提前早停
+ 稳定上升 --> 收敛: 奖励与 KL 双稳
+ 收敛 --> [*]: 完成
+            </div>
+            <figcaption>RLHF 训练稳定性状态机：从稳定上升，经 KL 警告，或收敛或崩溃</figcaption>
+          </figure>
+          <p>实践中监控三件事能救命：<strong>奖励均值曲线</strong>（应平滑上升，突然跳变是危险信号）、<strong>KL 散度</strong>（应控制在个位数以内，超过阈值立即干预）、<strong>生成样本的人工抽检</strong>（光看指标会被骗，必须看真实输出是否已经"说人话但开始谄媚"）。很多团队会在 KL 超过阈值时自动回滚到上一个检查点。</p>
+
+          <h2>Reward Hacking：规格博弈的头号难题</h2>
+          <p>RLHF 里最令工程师头疼的不是收敛慢，也不是显存不够，而是<strong>奖励模型被钻空子</strong>。它不是一个偶发的 bug，而是强化学习在奖励函数不完备时的<strong>必然行为</strong>——策略会找到任何能提高奖励值的捷径，无论这个捷径与人类的真实意图是否一致。</p>
+          <p>经典表现包括：</p>
+          <ul>
+            <li><strong>堆长度</strong>：奖励模型倾向于给长回答打高分（看起来更"认真"），于是策略开始无节制拉长回答，塞入大量废话。</li>
+            <li><strong>格式谄媚</strong>：学会在回答中堆砌"当然！好的！您说得对！"这类礼貌语，因为标注数据里这种风格通常得分更高。</li>
+            <li><strong>语言退化</strong>：在某些特殊字节组合或罕见 token 序列上，奖励模型产生异常高分——这些 token 在标注数据中极少出现，训练到的分布不充分。策略会"嗅到"这些漏洞并学会生成这类序列。</li>
+            <li><strong>回避难题</strong>：遇到复杂问题时故意回答"我不确定"，如果标注者对此类回答也打了尚可的分数，策略就会把所有问题都往这条路绕。</li>
+          </ul>
+          <p>缓解办法有三条路：</p>
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">更强的 KL 约束</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">增大 $\beta$ 或改用 KL 目标（而不是惩罚，把 KL 放进约束而不是损失函数），但代价是对齐能力变弱。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">更好的奖励模型</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">增大奖励模型参数量、在训练数据中加入反例（各种被钻空子的回答打低分），让奖励空间更平整。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">绕开独立的奖励模型</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">DPO 直接将偏好数据用作损失，不需要单独的奖励模型——从根源上消灭一个可能被钻的空子。见 <a href="dpo.html">免奖励模型对齐</a>。</p>
+            </div>
+          </div>
+
+          <details class="deep">
+            <summary>展开：PPO 在 RLHF 中的简化流程</summary>
+            <div class="deep-body">
+              <p>完整 PPO 有一堆技巧（GAE、clip、value loss、entropy bonus），但在 RLHF 语境下，核心循环可以简化理解：</p>
+              <ol>
+                <li><strong>Rollout</strong>：策略模型 $\pi$ 对一批 prompt 采样生成回答序列。</li>
+                <li><strong>打分</strong>：奖励模型给每个回答算一个标量分数。价值模型评估每个中间步骤的状态价值。</li>
+                <li><strong>优势计算</strong>：用 GAE（Generalized Advantage Estimation）算出每个 token 的"动作有多好"，即奖励 - 价值估计的累积残差。</li>
+                <li><strong>策略更新</strong>：用 PPO 的 clipped surrogate objective 更新策略，同时维护 KL 惩罚项。</li>
+                <li><strong>迭代</strong>：用更新后的策略重新采样，重复上述步骤。</li>
+              </ol>
+              <p style="margin-bottom:0">与标准 RL 的最大区别在于：这里没有"环境"，奖励来自一个冻住的神经网络而不是真实世界。这既是好事（稳定、可批量计算），也是坏事（可以被过拟合，产生 reward hacking）。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：KL 惩罚到底在惩罚什么（直觉与公式）</summary>
+            <div class="deep-body">
+              <p>KL 散度 $\text{KL}\!\left(\pi \,\|\, \pi_{\text{ref}}\right)$ 衡量的是"当前策略生成的分布"与"冻结的 SFT 参考分布"之间的平均差异。它惩罚的是<strong>逐 token 的分布偏移</strong>：如果策略为了让奖励模型高兴，把某个 token 的概率从 0.1 推到 0.9，而参考模型认为那里应该是 0.1，KL 就会对这一处征收"税"。</p>
+              <p>为什么不直接用"距离参考模型越近越好"当主目标？因为那样就退化回 SFT 了——对齐信号（奖励）就失效了。KL 的定位是<strong>护栏而非方向</strong>：它不告诉模型往哪走，只说"别走太远"。于是优化在"拿奖励"和"留在自然语言分布内"之间取得平衡，这个平衡由系数 $\beta$ 旋钮控制。</p>
+              <p>实现上常对 KL 做两种处理：一是放进损失函数当惩罚项（如本页目标式），二是当作<strong>约束</strong>——只有 KL 超标才介入（KL-penalized / KL-controlled）。第二种在奖励模型较弱时更稳，因为惩罚项的梯度在训练早期可能方向不对。无论哪种，$\beta$ 都是 RLHF 里最敏感、最该先调的超参。</p>
+              <p style="margin-bottom:0">一个反直觉的事实：KL 不是越小越好。KL 太小意味着策略几乎没动，奖励信号被浪费；KL 太大意味着策略跑飞、输出退化。好的 RLHF 训练，KL 通常稳定在几个自然单位的量级，而不是趋近 0。</p>
+            </div>
+          </details>
+
+          <h2>RLHF vs DPO：还需要独立的奖励模型吗</h2>
+          <p>RLHF 的经典三阶段里，奖励模型是一个独立训练的"裁判"。但 2023 年的 DPO（Direct Preference Optimization，见 <a href="dpo.html">免奖励模型对齐</a>）证明：在 Bradley-Terry 假设下，可以直接用偏好数据构造一个"隐式奖励"的损失，把"训练奖励模型 + PPO"两步合并成一步 SFT 风格的优化。这引发了"还值不值得做完整 RLHF"的讨论。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>经典 RLHF（PPO）</th><th>DPO / 免奖励模型</th></tr></thead>
+              <tbody>
+                <tr><td><strong>阶段数</strong></td><td>三阶段（SFT→RM→PPO）</td><td>单阶段（偏好数据直接优化）</td></tr>
+                <tr><td><strong>独立奖励模型</strong></td><td>需要，单独训练维护</td><td>不需要，奖励被隐式编码</td></tr>
+                <tr><td><strong>显存</strong></td><td>四模型共存，极高</td><td>两模型（策略 + 参考），低很多</td></tr>
+                <tr><td><strong>稳定性</strong></td><td>易崩，需 KL 监控</td><td>稳，就是一次有约束的 SFT</td></tr>
+                <tr><td><strong>可控性</strong></td><td>可加多个奖励、做奖励塑形</td><td>只能吃偏好对，难做复杂奖励组合</td></tr>
+                <tr><td><strong>适合场景</strong></td><td>需要精细奖励工程、超大模型对齐</td><td>偏好数据充足、追求简单与稳定</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>简洁的结论：DPO 在工程成本上碾压 RLHF，是大多数团队的首选起点；但当你需要<strong>把多个奖励源组合</strong>（如"有用性 + 安全性 + 格式"加权）、或要做 <strong>RLHF 之上的 RLVR / GRPO</strong> 这类可验证奖励强化时，独立奖励模型（或奖励模型 ensemble）仍是不可替代的。两者不是谁取代谁，而是按需求选。</p>
+          <p>选型建议给到新手：预算紧张、偏好数据干净，直接从 DPO 起步；若目标是复现 ChatGPT 级别的一致性、或奖励信号本身需要精心设计（涉及多个目标的加权），再上完整 RLHF。切忌一上来就四模型齐上——工程复杂度和排错成本会淹没算法本身的收益。</p>
+
+          <h2>RLHF 的演进时间线</h2>
+          <p>从学术想法到生产标配，RLHF 走了十多年。下面这条时间线帮助定位本页方法在历史中的位置：</p>
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title RLHF 关键节点
+  2017 : Deep RL from Human Preferences 提出用人类偏好训 RL
+  2020 : Learning to summarize from human feedback 首次大规模 RLHF 摘要
+  2022 : InstructGPT 确立 SFT→RM→PPO 三阶段范式
+  2022 : ChatGPT 基于 RLHF 爆火，成为行业标配
+  2022 : Constitutional AI / RLAIF 用 AI 反馈替代人类标注
+  2023 : DPO 证明可跳过独立奖励模型
+  2024 : GRPO / RLVR 把可验证奖励引入推理强化
+            </div>
+            <figcaption>RLHF 演进：从人类偏好 RL，到三阶段范式，再到免奖励模型与可验证奖励</figcaption>
+          </figure>
+          <p>三个关键节点都有公开论文锚点，方便按图索骥：Christiano 等人 2017 年的工作首次提出用人类偏好训练强化学习智能体（<a href="https://arxiv.org/abs/1706.03741" target="_blank" rel="noopener">arXiv:1706.03741</a>）；Stiennon 等人 2020 年把它规模化用于摘要任务（<a href="https://arxiv.org/abs/2009.01325" target="_blank" rel="noopener">arXiv:2009.01325</a>）；InstructGPT 于 2022 年正式确立 SFT→RM→PPO 三阶段范式并公开了训练配方（<a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener">arXiv:2203.02155</a>）。OpenAI 也专门发过博客解读这套对齐方案在生产模型上的落地（<a href="https://openai.com/index/instruction-following/" target="_blank" rel="noopener">OpenAI 官方博客</a>）。</p>
+
+          <h2>RLHF 知识地图</h2>
+          <p>把本页涉及的子主题收进一张思维导图，便于建立全局认知：</p>
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((RLHF))
+    偏好建模
+      成对比较
+      Bradley-Terry
+      奖励模型训练
+    强化优化
+      PPO clipped
+      GAE 优势
+      四模型显存
+      KL 惩罚
+    挑战
+      Reward Hacking
+      训练崩溃
+      奖励模型噪声
+    变体与替代
+      DPO
+      RLAIF CAI
+      GRPO RLVR
+    前置与依赖
+      SFT 打底
+      RL 基础
+            </div>
+            <figcaption>RLHF 知识地图：偏好建模、强化优化、挑战、变体、前置依赖五大分支</figcaption>
+          </figure>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：弥补 SFT"只能模仿、不懂偏好排序"的结构性不足，用人类比较偏好驱动策略优化。</li>
+            <li><strong>三阶段</strong>：SFT 打底（行为克隆）→ 奖励模型（成对偏好 → 标量评分，Bradley-Terry 建模）→ PPO 优化（最大化奖励 - KL 惩罚）。</li>
+            <li><strong>奖励模型</strong>：本身是个 LLM 换标量头；训练数据是成对比较而非绝对评分，因为人类比较判断远稳定于绝对打分；验证准确率通常仅 65%–75%，是个带噪声的裁判。</li>
+            <li><strong>四模型显存</strong>：策略 + 参考 + 奖励 + 价值同时驻留，是 RLHF 工程最大痛点；价值模型常从策略初始化以省显存。</li>
+            <li><strong>KL 惩罚</strong>：防止策略为了骗奖励而偏离自然语言分布的"安全绳"；β 太小 → 投机取巧，β 太大 → 对齐微弱；KL 不是越小越好。</li>
+            <li><strong>Reward hacking</strong>：策略钻奖励模型空子拿到高分却不说人话，是系统工程的头号难题而非偶发 bug。</li>
+            <li><strong>与 DPO 关系</strong>：DPO 跳过独立奖励模型、更稳更省，是多数团队起点；但多奖励组合与 RLVR 仍需要 RLHF 式奖励模型。</li>
+            <li><strong>前置依赖</strong>：RL 基础概念见 <a href="../01-foundations/rl-basics.html">强化学习基础</a>。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：RLHF 为什么不是直接用人类评分做监督学习？</h3>
+              <p><span class="answer-label">标准回答：</span>人类反馈通常是成对偏好或排序，不是稳定、可复用的绝对分数。先训练奖励模型把偏好映射成可优化的标量，再用 PPO 等方法让策略模型在生成分布上直接优化，能够处理“没有标准答案但更符合偏好”的目标。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：RLHF 中的 KL 惩罚起什么作用？</h3>
+              <p><span class="answer-label">标准回答：</span>KL 惩罚约束策略模型不要偏离参考模型太远，在提高奖励的同时保留语言能力和行为先验，防止模型钻奖励模型漏洞。</p>
+              <details class="deep">
+                <summary>追问：KL 是不是训练目标本身？</summary>
+                <div class="deep-body">
+                  <p>不是。优化方向仍然是提高奖励；KL 是一个正则化护栏，用来控制策略更新幅度。KL 过小可能学不到偏好，过大则会出现 reward hacking、语言退化或输出格式异常。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：为什么 RLHF 工程上通常需要四个模型？</h3>
+              <p><span class="answer-label">标准回答：</span>Policy Model 负责生成并更新，Reference Model 提供 KL 参照，Reward Model 打分，Value Model 估计价值和优势。不同实现可能共享部分权重或采用近似，但四种角色对应四类计算职责。</p>
+              <p><span class="pitfall-label">常见误区：</span>只看到“训练一个策略模型”就忽略参考模型、奖励模型和价值模型的显存与通信成本，这是 RLHF 难部署的重要原因。</p>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>InstructGPT: Training language models to follow instructions with human feedback — RLHF 三阶段范式的奠基论文，包含完整的训练配方与人工评估结果 · <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener">arXiv:2203.02155</a></li>
+            <li>Deep reinforcement learning from human preferences — 人类偏好强化学习的起点（Christiano 2017），先于 ChatGPT 六年提出核心思想 · <a href="https://arxiv.org/abs/1706.03741" target="_blank" rel="noopener">arXiv:1706.03741</a></li>
+            <li>Learning to summarize from human feedback — 首次大规模把 RLHF 用于文本生成（Stiennon 2020），奖励模型与 PPO 的工程雏形 · <a href="https://arxiv.org/abs/2009.01325" target="_blank" rel="noopener">arXiv:2009.01325</a></li>
+            <li>OpenAI: Aligning language models to follow instructions — 官方对 InstructGPT 对齐方案的解读，适合了解三阶段背后的产品化动机 · <a href="https://openai.com/index/instruction-following/" target="_blank" rel="noopener">openai.com</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            独立奖励模型维护成本高、易被 hack，直接舍弃它、把偏好数据当训练目标的路线见 <a href="dpo.html">免奖励模型对齐</a>；奖励信号来自数学/代码等可验证源、让强化学习直接对正确性信号优化的路线见 <a href="grpo-rlvr.html">推理强化学习</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

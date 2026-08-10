@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>合成数据与数据飞轮 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="06-pretraining" data-topic="synthetic-data">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>合成数据与数据飞轮</h1>
+            <p class="lead">真实语料终归是有限的——互联网上的高质量文本迟早要被「吃完」。合成数据是对这条路终点的回答：用模型生成数据来训练模型。它既是能力放大器（让小模型继承大模型的能力），也是一把双刃剑——用不好就是模型坍缩的催化剂。</p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">本页定位</span>
+            承接 <a href="data-engineering.html">数据工程</a> 的另一条路线：前者处理真实语料，本页处理合成语料。合成数据的方法论横跨 SFT、GRPO-RLVR 与 Agent 训练——任何需要高质量训练样本但人工标注太贵的场景，都在用某种形式的合成数据。
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>合成数据的核心循环：<strong>用强模型生成候选 → 质量过滤 → 去污染 → 训练目标模型 → 目标模型变强后成为新的生成器</strong>。这就是「数据飞轮」。如果飞轮转得好，模型一代比一代强；如果转不好——过滤不严、去重不彻底——就会发生<strong>模型坍缩</strong>，一代比一代差。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  T["教师模型<br/>强模型"] --> G["生成候选数据"]
+  G --> Q["质量过滤<br/>拒绝采样或评分"]
+  Q --> D["去污染<br/>与评测集比对"]
+  D --> S["训练学生模型"]
+  S -->|"飞轮 变强后<br/>成为新教师"| T
+  Q -.过滤掉的.-> X["丢弃"]
+  style T fill:#e3f2fd,stroke:#1976d2
+  style S fill:#e8f5e9,stroke:#4a4
+  style X fill:#fde8e8,stroke:#c44
+              </div>
+              <figcaption>数据飞轮：强模型生成 → 过滤 → 去污染 → 训练弱模型 → 弱模型变强后接力生成。飞轮可持续旋转的前提是每一步的质量控制到位</figcaption>
+            </figure>
+          </div>
+
+          <h2>为什么需要合成数据</h2>
+          <p>真实语料的瓶颈已经逼近：有研究对公开网络中的高质量文本存量做过估算，量级在 10T 到 20T tokens 之间，而前沿模型的训练数据量已经达到 15T 以上。除了「数据用完」的物理限制，还有几个场景<strong>只能用合成数据</strong>：</p>
+          <ul>
+            <li><strong>能力迁移</strong>：让 7B 模型获得 70B 模型的推理能力——用 70B 生成高质量推理链，训练 7B。这就是蒸馏。</li>
+            <li><strong>长尾覆盖</strong>：某些领域（如罕见编程语言、特定专业领域）真实数据太少，用模型生成补充。</li>
+            <li><strong>格式控制</strong>：后训练需要特定格式的指令-回复对，真实对话数据难以满足格式要求。</li>
+            <li><strong>安全对齐</strong>：生成安全/不安全对话样本用于对齐训练，不需要人工暴露在有害内容中。</li>
+            <li><strong>过程监督</strong>：真实语料里只有答案没有推理过程。数学题的解题步骤、代码的调试轨迹、Agent 的工具调用序列，这些「过程」几乎不存在于互联网上，只能生成。</li>
+          </ul>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            合成数据不是在「凭空造信息」，而是在<strong>把已有信息重新组织成模型更好学的形态</strong>。教师模型脑子里的知识来自真实语料，它只是把这些知识改写成了带推理过程、带标准格式、难度可控的习题。信息量的上限没变，学习效率变了。
+          </div>
+
+          <h2>关键问题：过滤信号从哪来</h2>
+          <p>在展开具体方法之前，先抓住这条主线。所有合成数据方法的差异，其实都可以归结为一个问题：<strong>你凭什么判断这条生成的数据是好是坏？</strong> 生成本身很便宜，判断才是稀缺资源。判断信号越硬，合成数据的价值越高，坍缩的风险越低。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            「合成数据」不等于「AI 生成的任何文本」。模型随口编出来的一段话，不经过任何验证和过滤，直接当训练数据——那不是合成数据，是<strong>噪声注入</strong>。合成数据的定义性特征不是「谁生成的」，而是「<strong>经过了怎样的验证和筛选流程</strong>」：规则验证、执行器反馈、评分器打分，至少要走一道硬关卡。很多初学的人把「用 ChatGPT 批量生成样本」直接当合成数据用，结果模型越训越差——问题不在「生成」，而在缺了「过滤信号」这一环。这也是下面这张表要回答的核心问题。
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>过滤信号</th><th>怎么判断</th><th>信号硬度</th><th>成本</th><th>适用场景</th></tr></thead>
+              <tbody>
+                <tr><td><strong>规则可验证</strong></td><td>数学答案是否等于标准答案、格式是否合法</td><td><strong>最硬</strong>，几乎无噪声</td><td>极低</td><td>数学、结构化输出</td></tr>
+                <tr><td><strong>执行器反馈</strong></td><td>代码能否编译、单元测试是否通过、工具调用是否成功</td><td><strong>硬</strong>，但只覆盖被测到的行为</td><td>低（需沙箱）</td><td>代码、Agent 轨迹</td></tr>
+                <tr><td><strong>奖励模型打分</strong></td><td>训一个 RM 给回复打分，取高分</td><td>中，可能被 reward hacking</td><td>中（要先训 RM）</td><td>开放域对话、写作</td></tr>
+                <tr><td><strong>更强模型评判</strong></td><td>让更强的模型当裁判做成对比较</td><td>中，带裁判自身的偏好偏差</td><td>中到高（推理开销）</td><td>难以规则化的主观质量</td></tr>
+                <tr><td><strong>启发式与去重</strong></td><td>长度、格式、相似度、拒答检测</td><td>软，只能筛掉明显垃圾</td><td>极低</td><td>所有场景的第一道关卡</td></tr>
+                <tr><td><strong>人工标注</strong></td><td>人来读、人来判</td><td>最贴近真实目标，但有标注噪声</td><td>最高</td><td>校准其他信号、做小规模金标准</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这张表能解释很多现象。为什么数学和代码是合成数据最先跑通的两个领域？因为它们有<strong>免费且几乎无噪声的验证信号</strong>——答案对不对、测试过不过，不需要人也不需要模型来判断。而为什么开放域写作的合成数据一直不温不火？因为你没有可靠的裁判，只能用奖励模型，而奖励模型本身就是从有限人类偏好数据里学来的近似。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("合成数据方法族"))
+    造问题
+      Self-Instruct
+        种子指令自举扩写
+      Evol-Instruct
+        深度进化加约束
+        广度进化换领域
+      Persona 驱动
+        用人格设定拉开视角
+    造答案
+      教师蒸馏采样
+        直接采教师输出
+      CoT 蒸馏
+        连推理过程一起学
+      拒绝采样 RFT
+        多采样后择优
+      STaR 式自举
+        用正确答案反推理由
+    造过程
+      Agent 轨迹合成
+        工具调用序列
+      执行反馈修复
+        错了再改的对话
+    造语料
+      教科书式改写
+        把网页重写成讲义
+      领域数据扩增
+            </div>
+            <figcaption>合成数据方法族：按「造的是问题、答案、过程还是语料」来分，比按论文名字来分更容易记住。</figcaption>
+          </figure>
+
+          <h2>Self-Instruct：让模型自己教自己</h2>
+          <p><strong>Self-Instruct</strong>（Wang et al., 2022）是合成指令数据的奠基方法，核心思路极其简洁：用少量人工种子指令（如 175 条）让语言模型自动生成更多指令-回复对。</p>
+          <p>先看论文原图。它把 Self-Instruct 的循环画得比任何文字都清楚：模型如何从一个很小的种子任务池出发，一步步长出几千条可用的指令数据。</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/2212.10560/assets/x2.png" alt="论文原图：Self-Instruct 方法概览——从种子任务池采样指令，让 LM 生成新指令与实例，过滤低质量或相似项后加回任务池，如此循环扩增指令集" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：Self-Instruct 的完整循环——种子任务池 → 采样 → LM 生成新指令与对应实例 → 过滤低质量/重复 → 加回任务池，循环扩增指令集</span>
+              <span class="pf-src">论文原图 · Wang et al., <em>Self-Instruct: Aligning Language Models with Self-Generated Instructions</em>, 2022, Figure 2 · <a href="https://arxiv.org/abs/2212.10560" target="_blank" rel="noopener">arXiv:2212.10560</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，按四个方块走：<strong>① 最上面是任务池（Task Pool）</strong>——一开始只有 175 条人工种子指令，它是整个循环的「发源地」。<strong>② 左边是「采样 + 提示」</strong>——从任务池里随机抽若干条指令，拼成一段提示语（prompt），交给语言模型。<strong>③ 中间是「生成」</strong>——模型根据提示产出新的指令，以及对应的输入-输出实例（instance）。<strong>④ 最下面是「过滤 + 回收」</strong>——新生成的指令要经过两关：一关是检查是否与已有指令重复（用 ROUGE 相似度），另一关是检查指令是否「真的能回答」（是不是格式合法的任务）；通过过滤的指令加回任务池，于是任务池从 175 条变成几百条、几千条……循环往复。</p>
+          <p>把这张图和上面那幅自制 Mermaid 对照着看会发现：<strong>Mermaid 画的是「流程骨架」，论文原图画的是「数据流动」</strong>——尤其画出了「过滤掉的不要」「过滤不过的丢弃」这些细节，以及「加回任务池」这个递归的关键动作。理解了「生成 → 过滤 → 回收」这个闭环，就理解了后面几乎所有合成数据方法（Evol-Instruct、RFT）都是在这条主线上做变体。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  A["175 条人工种子指令"] --> B["模型生成新指令"]
+  B --> C{"质量过滤"}
+  C -->|"去重 / 格式检查"| D["保留的指令"]
+  C -->|"重复 / 不合法"| E["丢弃"]
+  D --> F["模型生成回复"]
+  F --> G["指令-回复对集合"]
+  G --> H["微调模型"]
+  style A fill:#e3f2fd,stroke:#1976d2
+  style H fill:#e8f5e9,stroke:#4a4
+            </div>
+            <figcaption>Self-Instruct 流程：种子指令 → 模型生成 → 过滤 → 微调。后续几乎所有合成数据方法都是这个流程的变体</figcaption>
+          </figure>
+
+          <p>Self-Instruct 的关键不在「生成」本身——大模型天然就能生成文本——而在于<strong>质量控制</strong>：</p>
+          <ul>
+            <li><strong>去重</strong>：生成的新指令可能与种子或已有指令重复，用 ROUGE 相似度过滤。</li>
+            <li><strong>格式校验</strong>：生成的指令是否真的是一个可回答的指令，而非一段随机文本。</li>
+            <li><strong>过滤低质量回复</strong>：模型有时会生成「我无法回答」或重复指令本身的回复，这些需要丢弃。</li>
+          </ul>
+          <p>Alpaca、Vicuna 等早期开源模型的指令数据都用 Self-Instruct 的变体生成。它的价值在于证明了<strong>用极少量人工种子就能启动一个可扩展的合成数据管线</strong>。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">一个必须留意的坑</span>
+            Self-Instruct 生成的指令分布，本质上是<strong>种子指令分布的放大</strong>。如果 175 条种子里没有一条涉及多轮对话或长文档处理，生成出来的几万条也几乎不会有。「种子决定天花板」这句话在实践中一次次被验证——扩大规模解决不了覆盖面问题，只能靠重新设计种子集合。
+          </div>
+
+          <h2>Evol-Instruct：让数据逐渐变难</h2>
+          <p>Self-Instruct 生成的指令往往偏简单、同质化。<strong>Evol-Instruct</strong>（WizardLM 提出）的改进是让指令<strong>进化</strong>：对每个指令做深度或广度的演化。</p>
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">深度进化</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">给指令增加约束、增加推理步骤、提高难度。如「写一首诗」→「写一首关于秋天的七言律诗，第二句必须包含『落叶』，且押韵」。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">广度进化</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">改变指令的领域或主题，增加多样性。如「写一首诗」→「写一段 Python 代码实现快速排序」。</p>
+            </div>
+          </div>
+          <p>Evol-Instruct 的思路本质上是<strong>数据课程</strong>在合成数据上的应用——通过控制进化方向，让生成的指令覆盖更广的难度和领域空间。但要注意两个失败模式：进化过程可能产生<strong>无效指令</strong>（约束互相矛盾、条件无法满足），以及<strong>难度虚高</strong>（指令看起来很复杂，其实只是堆了一串无关的限定词，并没有增加真正的推理负担）。过滤步骤不能省，而且要能区分这两种情况。</p>
+
+          <h2>拒绝采样 RFT：只留好的回复</h2>
+          <p><strong>拒绝采样微调</strong>（Rejection Sampling Fine-Tuning, RFT）是另一种核心方法，广泛用于强化学习阶段的初始策略改进。思路：<strong>让模型对同一问题生成多个回复，只保留最好的那些来训练</strong>。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant P as 问题池
+  participant M as 当前策略模型
+  participant V as 验证器或奖励模型
+  participant B as 训练样本缓冲区
+  participant F as SFT 训练
+  P->>M: 取一批问题 x
+  M->>M: 对每个问题采样 N 个回复
+  M->>V: 提交 N 个候选
+  V->>V: 打分或判定对错
+  V-->>B: 通过阈值的回复写入缓冲区
+  V-->>M: 全部失败的问题标记为过难 单独处理
+  B->>B: 同一问题内部去重 保留互不相同的解法
+  B->>F: 组成 x 与最优回复的配对
+  F->>M: 微调更新 进入下一轮
+            </div>
+            <figcaption>RFT 一轮的完整时序。注意两个常被省略的环节：全采样失败的难题要单独处理，以及同一问题内部要去重，否则训练集会被少数「好答」的题目淹没。</figcaption>
+          </figure>
+
+          <p>写成代码骨架，核心只有二十行左右：</p>
+
+          <pre><code class="language-python">def rejection_sampling_round(model, problems, verifier, n=8,
+                             max_keep=2, sim_threshold=0.9):
+    """对每个问题采样 n 个回复，保留通过验证且互不重复的前 max_keep 条"""
+    sft_pairs, too_hard = [], []
+    for x in problems:
+        cands = model.generate(x, n=n, temperature=0.8)
+        passed = [y for y in cands if verifier(x, y)]
+        if not passed:
+            too_hard.append(x)              # 全错：单独攒起来，别丢
+            continue
+        # 同题去重：解法雷同的只留一条，避免训练集被简单题淹没
+        kept = []
+        for y in sorted(passed, key=len):   # 偏好更简洁的解
+            if all(similarity(y, k) &lt; sim_threshold for k in kept):
+                kept.append(y)
+            if len(kept) &gt;= max_keep:
+                break
+        sft_pairs.extend((x, y) for y in kept)
+    return sft_pairs, too_hard</code></pre>
+
+          <p>DeepSeek-R1 的训练管线中就用了这一步：先在 GRPO 之前用拒绝采样收集高质量推理链做 SFT，让模型有较好的初始推理能力，再用 RL 进一步优化。这比直接从基座模型开始 RL 更稳定——RL 需要一个「差不多」的初始策略才能有效探索。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">与 RL 的关系</span>
+            拒绝采样可以看作 RL 的一种退化形式：不做梯度更新，只做采样和选择。它的优势是不需要训练 reward model 的梯度反传、更稳定、更容易并行。劣势是无法优化连续的策略分布——只能离散地选好样本。实际中常作为 RL 之前的 warmup 步骤，详见 <a href="../07-posttraining/grpo-rlvr.html">推理强化学习</a>。
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">采样温度的两难</span>
+            温度太低，$N$ 个采样几乎一模一样，拒绝采样退化成「采一次」，白花 $N$ 倍算力；温度太高，通过率暴跌，同样浪费。一个实用做法是<strong>按题目难度自适应</strong>：先用中等温度试采几条，全对的简单题不再多采，全错的难题加大 $N$ 或提高温度重试。这能把算力压在真正有信息量的中间难度带上。
+          </div>
+
+          <h2>教师蒸馏采样：把大模型「蒸馏」到小模型</h2>
+          <p>用教师模型（大而强）生成回复，训练学生模型（小而快），这是<strong>知识蒸馏</strong>在数据层面的体现。与传统的 logits 蒸馏不同，这里蒸馏的是<strong>生成的文本本身</strong>——学生模型看到的是教师的高质量输出。</p>
+          <p>关键细节在于<strong>采样策略</strong>：</p>
+          <ul>
+            <li><strong>温度控制</strong>：低温度（如 0.3）让教师输出更确定、更高质量，但多样性低。高温度（如 0.8）反之。通常在质量与多样性之间取平衡（如 0.5-0.7）。</li>
+            <li><strong>多候选 + 过滤</strong>：每个问题让教师生成多个回复，用奖励模型或规则选最好的。这本质上就是拒绝采样 RFT，只是生成器从「自己」变成了「教师」。</li>
+            <li><strong>CoT 蒸馏</strong>：让教师输出完整思维链，学生学的不只是答案，还有推理过程。这是推理模型能力迁移的核心方法。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">蒸馏的隐性上限</span>
+            学生学的是<strong>教师的输出分布</strong>，不是教师的能力本身。教师答错的题，学生会一模一样地答错，而且因为训练数据里没有任何纠错信号，学生学得比教师还笃定。所以蒸馏出来的小模型经常呈现一种特征：<strong>风格像大模型，错误也像大模型</strong>，但缺乏「不确定时应该收敛到谨慎」的能力。加入可验证过滤能显著缓解这个问题，这也是数学、代码领域蒸馏效果远好于开放域的原因之一。
+          </div>
+
+          <h2>Persona 驱动多样性</h2>
+          <p>合成数据最大的风险之一是<strong>同质化</strong>——同一个模型生成的数据天然带着模型的「口味」和偏见。Persona 驱动的方法通过给模型设定不同「人格」来增加多样性：</p>
+          <pre><code class="language-python"># Persona 驱动生成示例
+personas = [
+    "你是一位有 20 年经验的资深数据库工程师，擅长性能调优",
+    "你是一位刚入门的编程学习者，回答时注重基础概念解释",
+    "你是一位技术写作专家，善于用类比解释复杂概念",
+    "你是一位安全工程师，总是从安全角度审视代码",
+]
+
+for persona in personas:
+    prompt = f"{persona}\n\n请解释什么是数据库索引，并给出一个优化示例。"
+    response = teacher_model.generate(prompt, temperature=0.7)
+    # 收集不同 persona 的回复，增加数据多样性
+    dataset.add(prompt, response)</code></pre>
+          <p>Persona 的作用不只是换语气——不同 persona 会引导模型从不同角度回答同一问题，覆盖不同的知识角落。把这个思路做到极致，就是构建规模庞大的 persona 集合（从网页里挖出上亿个「人物画像」），再把每个 persona 与任务模板做笛卡尔积，用组合爆炸换取覆盖面。这是近两年大规模合成语料常用的一条路子。</p>
+          <p>Persona 在诊断上也有用：如果不同 persona 的回复过于相似，可能说明模型对这个话题的「知识空间」太窄，再生成多少条也是同一份信息的复读。</p>
+
+          <h2>质量过滤与去污染</h2>
+          <p>合成数据管线和真实数据管线一样需要质量过滤（见 <a href="data-engineering.html">数据工程</a>），但多了一个特殊步骤：<strong>去污染</strong>。</p>
+          <p><strong>去污染</strong>（Decontamination）是确保合成数据<strong>不包含评测集的内容</strong>。如果教师模型在训练时见过 MMLU 的题目，它生成的推理链可能「泄露」了 MMLU 的答案——用这些数据训练学生模型，学生模型在 MMLU 上的分数会虚高，但这不是真实能力。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>去污染方法</th><th>怎么做</th><th>能抓到什么</th><th>抓不到什么</th></tr></thead>
+              <tbody>
+                <tr><td><strong>n-gram 精确匹配</strong></td><td>对评测题建 8-gram 或 13-gram 索引，扫描合成样本</td><td>原样照抄、轻微改动</td><td>换个说法的同义改写</td></tr>
+                <tr><td><strong>embedding 语义检索</strong></td><td>用向量检索找 Top-K 最相近的评测题，超阈值即丢</td><td>同义改写、翻译后的题目</td><td>只泄漏答案不泄漏题干的情况</td></tr>
+                <tr><td><strong>模型判定</strong></td><td>让一个模型直接判断「这两条是不是同一道题」</td><td>结构变形的改编题</td><td>成本高，且判据不可复现</td></tr>
+                <tr><td><strong>来源隔离</strong></td><td>从源头上确保种子问题不来自任何评测集</td><td>最彻底的预防</td><td>管不了教师模型自己记住的内容</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>最基础的 n-gram 去污染实现起来很短，但有两个细节容易做错：一是要先做归一化（大小写、空白、标点），否则一个多余空格就漏掉；二是要同时扫题干和答案：</p>
+
+          <pre><code class="language-python">import re
+
+def normalize(s):
+    s = s.lower()
+    s = re.sub(r"[^\w\u4e00-\u9fff]+", " ", s)   # 去标点，保留中英文字符
+    return re.sub(r"\s+", " ", s).strip()
+
+def ngrams(s, n=13):
+    toks = normalize(s).split()
+    return {" ".join(toks[i:i + n]) for i in range(max(len(toks) - n + 1, 0))}
+
+# 一次性把所有评测题干与答案建成索引
+banned = set()
+for item in eval_sets:
+    banned |= ngrams(item["question"]) | ngrams(item["answer"])
+
+def is_contaminated(sample, n=13):
+    return bool(ngrams(sample, n) &amp; banned)
+
+clean = [s for s in synthetic_samples if not is_contaminated(s)]
+print(f"污染率 {1 - len(clean) / len(synthetic_samples):.2%}")</code></pre>
+
+          <div class="callout warn">
+            <span class="callout-t">为什么合成数据的去污染更难</span>
+            真实数据的去重是「文档 vs 文档」的直接比较。合成数据的去污染是「生成内容 vs 评测题」的间接比较——你不知道教师模型生成某段文本时是否「记得」了评测题。n-gram 匹配能抓到直接泄漏，但抓不到「换了个说法」的间接泄漏。这也是为什么合成数据训练的模型，benchmark 分数要打一个问号。相关的评估可信度讨论见 <a href="../13-evaluation/contamination.html">数据污染与评估可信度</a>。
+          </div>
+
+          <h2>反面：模型坍缩与合成数据自污染</h2>
+          <p>合成数据最大的风险——也是<strong>必须正面处理</strong>的问题——是<strong>模型坍缩（Model Collapse）</strong>。</p>
+          <p>Shumailov et al. (2023) 从理论和实验上证明：如果用模型生成的数据训练下一代模型，再让下一代生成数据训练第三代……如此循环，模型会逐渐<strong>丢失长尾分布</strong>，输出的多样性持续下降，最终退化到只生成少数几个「安全」回复。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">模型坍缩的直觉</span>
+            模型学到的分布是真实分布的近似。用这个近似分布再生成数据，等于在近似上再加一层近似——误差累积。具体表现：罕见模式（少数群体的语言、小众领域知识）在每一代中概率递减，最终消失。模型变得越来越「平庸」，越来越趋同。
+          </div>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 真实数据
+  真实数据 --> 模型Gen1: 训练
+  模型Gen1 --> 合成数据Gen1: 生成
+  合成数据Gen1 --> 模型Gen2: 训练
+  模型Gen2 --> 合成数据Gen2: 生成
+  合成数据Gen2 --> 模型Gen3: 训练
+  模型Gen3 --> 坍缩: 多样性持续下降
+  坍缩 --> [*]: 长尾消失<br/>输出趋同
+  note right of 模型Gen3
+    每一代都丢失
+    部分长尾信息
+  end note
+            </div>
+            <figcaption>模型坍缩过程：纯合成数据循环训练导致多样性逐代下降，长尾分布逐渐消失</figcaption>
+          </figure>
+
+          <details class="deep">
+            <summary>展开：模型坍缩的数学直觉——两种误差是怎么累积的</summary>
+            <div class="deep-body">
+              <p>不需要完整推导也能看清机制。设真实分布为 $p_0$，第 $k$ 代模型学到的分布为 $p_k$。每一代之间发生了两件事，各自贡献一种误差：</p>
+              <ul>
+                <li><strong>统计误差（有限采样）</strong>：你不可能从 $p_k$ 里采出无穷多样本，只采了 $n$ 条。概率低于 $1/n$ 量级的事件，大概率<strong>一条都没被采到</strong>。这些尾部事件在下一代的训练集里概率直接变成 0，而模型学不到它没见过的东西。这是不可逆的信息丢失。</li>
+                <li><strong>近似误差（模型容量与优化）</strong>：模型不可能完美拟合训练分布，总会把概率质量往高密度区域挪一点。这一点点系统性偏移每代都发生，方向一致，于是逐代累加。</li>
+              </ul>
+              <p>用一个最简单的例子体会：假设真实分布是一维高斯 $\mathcal{N}(\mu, \sigma^2)$，每代从上一代拟合出的高斯里采 $n$ 个样本再重新做极大似然估计。样本方差的期望是 $\frac{n-1}{n}\sigma^2$，也就是<strong>每一代方差都会平均缩小到上一代的 $\frac{n-1}{n}$ 倍</strong>。$k$ 代之后方差约为 $\left(\frac{n-1}{n}\right)^{k}\sigma^2$，指数衰减到 0——分布最终坍缩成一个点。</p>
+              <p>这个玩具例子解释了两件事：第一，坍缩是<strong>数学必然</strong>而不是工程失误，只要是「纯自采样循环」就一定发生；第二，$n$ 越大衰减越慢，所以扩大生成规模能延缓但不能阻止坍缩。</p>
+              <p style="margin-bottom:0">真正能阻止它的只有一件事：<strong>每一代都注入不来自模型自身的信息</strong>——真实数据、人类反馈、或者可验证的环境奖励。这就是下面「飞轮 vs 坍缩」那条判据的数学来源。</p>
+            </div>
+          </details>
+
+          <h3>如何避免坍缩</h3>
+          <p>模型坍缩不是「合成数据不能用」的判决书，而是「纯合成数据循环」的警告。避免坍缩的关键原则：</p>
+          <ul>
+            <li><strong>始终保持真实数据混合</strong>：每一代训练数据中都混入一定比例的真实数据。真实数据是「长尾的锚」，防止分布漂移。业界经验是合成数据占比不超过 50-70%。</li>
+            <li><strong>累积而不是替换</strong>：把历代数据<strong>叠加</strong>起来训练，而不是每代只用最新一批。有研究指出，只要保留住原始真实数据、让数据集是累积的，坍缩会被显著抑制。</li>
+            <li><strong>不要让模型学自己的输出</strong>：教师模型和学生模型应该是不同的模型。如果一个模型只学自己生成的东西，等于自反馈放大——这是坍缩的最快路径。</li>
+            <li><strong>严格去重</strong>：合成数据之间的重复比真实数据更隐蔽（模型倾向于生成相似的回复），需要更强的去重——用语义级去重而非仅 n-gram 去重。</li>
+            <li><strong>多样性监控</strong>：持续监控合成数据的 n-gram 多样性、词汇丰富度、主题分布。如果指标在逐代下降，飞轮在往错误方向转。</li>
+            <li><strong>用更强的模型做教师</strong>：教师越强，合成数据质量越高，坍缩风险越低。如果教师和学生一样强，飞轮没有增量。</li>
+          </ul>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>监控指标</th><th>怎么算</th><th>健康的样子</th><th>报警信号</th></tr></thead>
+              <tbody>
+                <tr><td><strong>去重后留存率</strong></td><td>生成 $N$ 条，语义去重后剩多少</td><td>各代之间基本稳定</td><td>逐代下降 = 模型越来越只会说同一句</td></tr>
+                <tr><td><strong>distinct-n</strong></td><td>不重复 n-gram 数 ÷ 总 n-gram 数</td><td>与真实语料同一量级</td><td>持续走低</td></tr>
+                <tr><td><strong>回复长度分布</strong></td><td>长度的分位数与方差</td><td>保持宽分布</td><td>方差收窄，所有回复趋于同一长度</td></tr>
+                <tr><td><strong>主题 / 领域覆盖</strong></td><td>用聚类或分类器统计各领域占比</td><td>与目标分布接近</td><td>少数几个主题占比越来越高</td></tr>
+                <tr><td><strong>held-out 真实数据困惑度</strong></td><td>在从未参与训练的真实文本上算 PPL</td><td>随训练下降</td><td>合成数据加得越多反而上升</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">数据飞轮 vs 模型坍缩</span>
+            数据飞轮和模型坍缩是同一枚硬币的两面——都是「用模型输出训练模型」的循环。区别在于：飞轮有<strong>外部信号注入</strong>（真实数据混合、人类反馈、可验证奖励），每轮都引入新的信息；坍缩是<strong>封闭循环</strong>，只在模型自身输出上打转。判断你的管线是飞轮还是坍缩，看一个指标：<strong>每轮训练是否有新的、非模型自身生成的信息进入</strong>。
+          </div>
+
+          <h2>合成数据在不同训练阶段的应用</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>训练阶段</th><th>合成数据用法</th><th>典型方法</th><th>主要过滤信号</th></tr></thead>
+              <tbody>
+                <tr><td>预训练</td><td>补充特定领域数据（代码、数学），或把网页改写成更易学的形态</td><td>教师模型生成领域文本 + 质量过滤</td><td>启发式 + 质量分类器</td></tr>
+                <tr><td>SFT</td><td>指令-回复对生成</td><td>Self-Instruct / Evol-Instruct + 拒绝采样</td><td>奖励模型 / 更强模型评判</td></tr>
+                <tr><td>RLVR（如 GRPO）</td><td>RL 前的 warmup + 问题集生成</td><td>拒绝采样 SFT → GRPO；教师生成数学/代码题</td><td>规则可验证 / 执行器</td></tr>
+                <tr><td>Agent 训练</td><td>合成轨迹与工具调用</td><td>教师模拟 Agent 轨迹 + 执行验证过滤</td><td>执行器反馈（任务是否真的完成）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>合成数据方法论横跨训练全流程——这也是为什么它编排在预训练篇而非后训练篇。后训练篇的九条统一在「训练算法」维度上，合成数据作为「数据方法论」与其不在同一维度。具体应用场景的细节参见 <a href="../07-posttraining/sft.html">SFT</a>、<a href="../07-posttraining/grpo-rlvr.html">推理强化学习</a> 和 <a href="../07-posttraining/agentic-rl.html">Agentic RL</a>；模型层面的蒸馏技术见 <a href="../07-posttraining/distillation.html">知识蒸馏</a>。</p>
+
+          <h2>方法演进：从「造指令」到「造过程」</h2>
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 合成数据方法的演进
+  2022 : Self-Instruct 用少量种子自举出指令集 : STaR 用正确答案反推理由再自训练
+  2023 : Alpaca 与 Vicuna 让开源社区低成本复现指令跟随 : Evol-Instruct 引入难度进化 : 教科书式改写证明高质量小语料的威力
+  2024 : 大规模 persona 集合换取覆盖面 : 可验证奖励让数学与代码的合成闭环跑通
+  2025 : 推理链蒸馏成为小模型获得长思维链的主路径 : Agent 轨迹与执行反馈成为新的数据来源
+            </div>
+            <figcaption>合成数据的重心迁移：早期在造「问题和答案」，近年重心转向造「推理过程与交互轨迹」——因为这部分数据在真实语料里几乎不存在。</figcaption>
+          </figure>
+
+          <p>这条线索里最值得注意的转折是<strong>可验证奖励的引入</strong>。在此之前，合成数据的质量上限被「谁来当裁判」卡死；有了自动验证之后，数学和代码这两个领域第一次实现了「生成—验证—训练」的完全自动闭环，飞轮才真正转了起来。这也解释了为什么当前推理模型的能力提升高度集中在这两个领域——不是因为它们更重要，而是因为它们<strong>恰好有免费的裁判</strong>。</p>
+
+          <details class="deep">
+            <summary>展开：动手 20 分钟——用一个小实验看见多样性衰减</summary>
+            <div class="deep-body">
+              <p>模型坍缩听起来很抽象，但你可以在不训练任何模型的前提下，用「纯采样循环」把它复现出来。这个实验只需要一个可调用的模型和几十行代码：</p>
+              <ol>
+                <li><strong>第 0 代</strong>：准备 50 条真实的、风格各异的问题（从公开数据集抄或自己写）。</li>
+                <li><strong>迭代</strong>：让模型读第 $k$ 代的问题，仿照它们生成 50 条新问题，作为第 $k{+}1$ 代。<strong>只给它看上一代，不给看真实数据。</strong></li>
+                <li><strong>测量</strong>：每一代都算三个指标——distinct-2（不重复 2-gram 占比）、平均长度、以及用 embedding 算出的两两平均余弦距离。</li>
+                <li><strong>跑 5 到 8 轮</strong>，把三条曲线画出来。</li>
+              </ol>
+              <p>你大概率会看到：distinct-2 单调下降，平均余弦距离收窄，长度方差变小，到后面几代问题开始出现明显的句式模板。这就是坍缩的可观测形态。</p>
+              <p>然后做对照组：<strong>每一代都从真实种子里再补 10 条进去</strong>，其他都一样。你会看到曲线明显被拉住。这个对照实验能让你对「外部信息注入」这句话产生真实的体感，比读十篇论文都管用。</p>
+              <p style="margin-bottom:0">如果想把实验做完整，可以把每代数据真的拿去微调一个小模型（见 <a href="../15-practice/finetune-practice.html">实战：微调一个模型</a>），观察下游指标而不只是文本统计量。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：用模型生成训练数据来训练模型。它不创造新信息，而是把已有信息重组成更易学的形态，是真实语料不足时的补充路线，也是能力迁移（蒸馏）的核心手段。</li>
+            <li><strong>关键变量是过滤信号</strong>：规则可验证 &gt; 执行器反馈 &gt; 奖励模型 &gt; 模型评判 &gt; 启发式。信号越硬，合成数据越值钱，坍缩风险越低。</li>
+            <li><strong>核心方法</strong>：Self-Instruct（种子自举）、Evol-Instruct（进化变难）、拒绝采样 RFT（多候选择优）、教师蒸馏采样（含 CoT 蒸馏）、Persona 驱动多样性。</li>
+            <li><strong>质量控制</strong>：与真实数据一样需要过滤和去重，额外需要去污染。n-gram 抓直接泄漏，embedding 抓改写泄漏，来源隔离是最彻底的预防。</li>
+            <li><strong>模型坍缩</strong>：纯自采样循环下，统计误差（尾部采不到）与近似误差（概率往高密度区挪）逐代累积，方差指数衰减。这是数学必然，不是工程失误。</li>
+            <li><strong>避坍缩四件事</strong>：混真实数据、数据累积而非替换、教师强于学生、持续监控多样性指标。</li>
+            <li><strong>飞轮 vs 坍缩</strong>：区别在于每轮是否有非模型自身生成的新信息进入。有则是飞轮，无则是坍缩。</li>
+            <li><strong>常见坑</strong>：种子决定天花板，扩规模解决不了覆盖面；蒸馏会把教师的错误一并继承；采样温度需按题目难度自适应。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Wang et al., "Self-Instruct: Aligning Language Models with Self-Generated Instructions" (2022) — Self-Instruct 方法的原始论文，合成指令数据的奠基工作 · <a href="https://arxiv.org/abs/2212.10560" target="_blank" rel="noopener">arXiv:2212.10560</a></li>
+            <li>Zelikman et al., "STaR: Bootstrapping Reasoning With Reasoning" (2022) — 用正确答案反推理由再自训练，「造过程」这一路的起点 · <a href="https://arxiv.org/abs/2203.14465" target="_blank" rel="noopener">arXiv:2203.14465</a></li>
+            <li>Xu et al., "WizardLM: Empowering Large Language Models to Follow Complex Instructions" (2023) — Evol-Instruct 的提出，指令进化策略的参考 · <a href="https://arxiv.org/abs/2304.12244" target="_blank" rel="noopener">arXiv:2304.12244</a></li>
+            <li>Gunasekar et al., "Textbooks Are All You Need" (2023) — 用高质量合成「教科书式」语料训小模型，说明数据形态比数据量更关键 · <a href="https://arxiv.org/abs/2306.11644" target="_blank" rel="noopener">arXiv:2306.11644</a></li>
+            <li>Shumailov et al., "The Curse of Recursion: Training on Generated Data Makes Models Forget" (2023) — 模型坍缩的理论与实验证明，合成数据循环训练的核心风险参考 · <a href="https://arxiv.org/abs/2305.17493" target="_blank" rel="noopener">arXiv:2305.17493</a></li>
+            <li>Gerstgrasser et al., "Is Model Collapse Inevitable? Breaking the Curse of Recursion by Accumulating Real and Synthetic Data" (2024) — 论证「数据累积而非替换」可以抑制坍缩 · <a href="https://arxiv.org/abs/2404.01413" target="_blank" rel="noopener">arXiv:2404.01413</a></li>
+            <li>Villalobos et al., "Will we run out of data? Limits of LLM scaling based on human-generated data" (2022) — 公开文本存量的估算，合成数据必要性的量化依据 · <a href="https://arxiv.org/abs/2211.04325" target="_blank" rel="noopener">arXiv:2211.04325</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            数据准备好了，下一步是确定「训多大模型、用多少数据」：<a href="scaling-laws.html">Scaling Laws</a>。想看合成数据在 SFT 和 RL 中的具体应用，跳转 <a href="../07-posttraining/sft.html">SFT 监督微调</a> 和 <a href="../07-posttraining/grpo-rlvr.html">推理强化学习</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>注意力机制 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="03-transformer" data-topic="attention">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>注意力机制</h1>
+            <p class="lead">为什么一句话里的每个词都要「回头看」别的词？注意力就是让模型学会：预测当前位置时，该给上下文里每个词分配多少关注。它是整个 Transformer 时代的第一块基石。这一节从 RNN 的痛点讲到 QKV 的直觉，从缩放点积公式讲到两条优化路线，配上完整代码和逐图讲解。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>注意力做的事只有一句话：<strong>用一个查询（Query）去匹配所有的键（Key），按匹配度加权汇总对应的值（Value）</strong>。就像你带着问题去图书馆——先看每本书的标签（Key）跟你的问题（Query）有多相关，再按相关度决定从每本书（Value）里抄多少内容。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  Q["查询 Query<br/>我在找什么"] --> M{{"打分<br/>Q · K"}}
+  K["键 Key<br/>每个词的标签"] --> M
+  M --> S["Softmax<br/>归一化为权重"]
+  S --> W["加权求和"]
+  V["值 Value<br/>每个词的内容"] --> W
+  W --> O["输出<br/>融合了上下文的新表示"]
+              </div>
+              <figcaption>注意力的数据流：Q 与 K 打分 → Softmax 归一 → 对 V 加权求和。整个 Transformer 的核心就这一个公式。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 1: 为什么需要注意力 ============ -->
+          <h2>为什么需要注意力：RNN 的两个硬伤</h2>
+          <p>在 Transformer 之前，处理序列靠的是 RNN/LSTM：一个词一个词按顺序读，把「记忆」压缩进一个固定大小的隐状态里向后传。这带来两个硬伤：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph RNN["RNN 模式: 传话游戏"]
+    direction LR
+    R1["词1<br/>h1"] --> R2["词2<br/>h2"] --> R3["词3<br/>h3"] --> R4["..."] --> R5["词N<br/>hN"]
+    R5 --> R6["输出"]
+    Note1["信息越传越糊<br/>长依赖丢失<br/>无法并行"]
+  end
+  subgraph Attn["注意力模式: 全体大会"]
+    direction TB
+    A1["词1"] --> AC["每个词直接看到<br/>所有其他词"]
+    A2["词2"] --> AC
+    A3["词3"] --> AC
+    A4["词N"] --> AC
+    AC --> A5["输出<br/>(所有位置同时计算)"]
+    Note2["距离恒为1跳<br/>长依赖不衰减<br/>完全并行"]
+  end
+
+  RNN -->|"Attention Is All You Need"| Attn
+
+  style RNN fill:#fde8e8,stroke:#c44
+  style Attn fill:#e8f5e9,stroke:#4a7
+            </div>
+            <figcaption>RNN 是「传话游戏」，信息越传越糊；注意力是「开全体大会」，每个词都能直接跟所有词对话。这正是《Attention Is All You Need》标题的底气。</figcaption>
+          </figure>
+
+          <ul>
+            <li><strong>长依赖丢失</strong>：句子开头的信息传到结尾时，往往已经被稀释甚至遗忘。</li>
+            <li><strong>无法并行</strong>：第 t 步必须等第 t-1 步算完，训练慢，吃不满 GPU。</li>
+          </ul>
+          <p>注意力换了个思路：<strong>不再顺序传递记忆，而是让每个位置直接「看到」序列里所有其他位置</strong>。任意两个词之间的距离都是 1 跳，长依赖不再衰减；而且所有位置可以一次性并行计算。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            RNN 是「传话游戏」，信息越传越糊；注意力是「开全体大会」，每个词都能直接跟所有词对话。前者信息会衰减，后者不会——但后者每个人都要跟所有人说话，所以人数一多就爆炸（$O(n^2)$ 复杂度）。
+          </div>
+
+          <!-- ============ Section 2: QKV 三角色 ============ -->
+          <h2>QKV：同一个词的三重身份</h2>
+          <p>注意力把每个输入词向量通过三个不同的线性变换，投影成三个角色。这是理解注意力的关键——<strong>同一个词，同时扮演三种身份</strong>：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  Input["输入词向量 x<br/>(如 'it' 的嵌入)"]
+  Input --> WQ["x · W_Q"]
+  Input --> WK["x · W_K"]
+  Input --> WV["x · W_V"]
+  WQ --> Q["Query<br/>'我想问什么'"]
+  WK --> K["Key<br/>'我的标签是什么'"]
+  WV --> V["Value<br/>'我的内容是什么'"]
+
+  Q --> Use1["用来匹配其他词的 Key"]
+  K --> Use2["被其他词的 Query 匹配"]
+  V --> Use3["被注意力权重加权求和"]
+
+  style Q fill:#e6f1fb,stroke:#185fa5
+  style K fill:#eaf3de,stroke:#639922
+  style V fill:#faeeda,stroke:#ba7517
+            </div>
+            <figcaption>QKV 变换：同一个输入词向量 x，通过三个不同的权重矩阵 $W_Q$、$W_K$、$W_V$ 投影成三个角色。这三个矩阵是训练学习的——模型自己决定每个词的「问题」「标签」「内容」分别是什么。</figcaption>
+          </figure>
+
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">Query 查询</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">当前词「想问的问题」。拿它去和所有词的 Key 匹配，决定该关注谁。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">Key 键</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">每个词对外展示的「标签/索引」，用来被 Query 检索、打相关度分。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">Value 值</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">每个词真正携带的「内容」。按注意力权重加权求和，得到输出。</p>
+            </div>
+          </div>
+
+          <p>用一个例子体会：在句子 <em>"The animal didn't cross the street because <strong>it</strong> was too tired"</em> 中，当模型处理 <code>it</code> 时，<code>it</code> 的 Query 会和 <code>animal</code>、<code>street</code> 等词的 Key 打分，发现和 <code>animal</code> 最相关，于是主要从 <code>animal</code> 的 Value 里取信息——模型由此「理解」了 it 指代 animal。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+pie showData
+  title "it 的注意力权重分布"
+  "animal" : 70
+  "street" : 10
+  "tired" : 5
+  "cross" : 5
+  "其他词" : 10
+            </div>
+            <figcaption>注意力权重示例（饼图直观显示分布）：「it」的 Query 与「animal」的 Key 匹配度最高（70%），所以 it 的新表示主要融合了 animal 的语义。这就是注意力解决指代消解的方式。</figcaption>
+          </figure>
+
+          <!-- ============ Section 3: 缩放点积注意力 ============ -->
+          <h2>缩放点积注意力：四步公式</h2>
+          <p>把上面的直觉写成公式，就是 Transformer 采用的<strong>缩放点积注意力（Scaled Dot-Product Attention）</strong>：</p>
+
+          <div class="figure" style="text-align:center">
+            $$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V$$
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant Q as Query 矩阵
+  participant S as 打分器
+  participant F as Softmax
+  participant V as Value 矩阵
+  participant O as 输出
+  Q->>S: 与每个 Key 做点积，得到 n×n 分数矩阵
+  S->>S: 除以 √d_k 防止数值过大
+  S->>F: 分数矩阵
+  F->>F: 每行归一化成权重（和为 1）
+  F->>V: 按权重加权求和
+  V->>O: 输出融合上下文的新表示
+            </div>
+            <figcaption>缩放点积注意力的四步（时序视角）：打分 → 缩放 → 归一 → 加权。每一步都有明确的数学意义和工程目的。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>步骤</th><th>运算</th><th>含义</th><th>形状</th></tr></thead>
+              <tbody>
+                <tr><td><strong>① 打分</strong></td><td>$QK^\top$</td><td>每个 Query 和每个 Key 做点积，得到相关度分数矩阵</td><td>$(n, d) \times (d, n) \to (n, n)$</td></tr>
+                <tr><td><strong>② 缩放</strong></td><td>$\div \sqrt{d_k}$</td><td>除以维度的平方根，防止点积过大导致 Softmax 梯度消失</td><td>$(n, n)$</td></tr>
+                <tr><td><strong>③ 归一</strong></td><td>$\text{softmax}$</td><td>把每一行分数变成和为 1 的权重分布</td><td>$(n, n)$</td></tr>
+                <tr><td><strong>④ 加权</strong></td><td>$\times V$</td><td>用权重对所有 Value 加权求和，得到融合上下文的新表示</td><td>$(n, n) \times (n, d) \to (n, d)$</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：为什么要除以 √dₖ？</summary>
+            <div class="deep-body">
+              <p>假设 Query 和 Key 的每个分量都是均值 0、方差 1 的独立随机变量，那么它们的点积 $q \cdot k = \sum_{i=1}^{d_k} q_i k_i$ 的方差会是 $d_k$。</p>
+              <p>当 $d_k$ 较大（比如 64、128），点积的数值范围会变得很大。Softmax 在输入值很大时会变得极度「尖锐」——几乎把全部权重压给一个位置，其余位置权重趋近 0，导致<strong>梯度趋近于 0，训练无法进行</strong>。</p>
+              <p>除以 $\sqrt{d_k}$ 正好把方差重新拉回到 1 量级，让 Softmax 保持在梯度健康的区间。这就是「缩放」二字的由来。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：最小代码实现（PyTorch 风格）</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def scaled_dot_product_attention(Q, K, V, mask=None):
+    """
+    Q, K, V: 形状 (batch, seq_len, d_k)
+    返回:    (batch, seq_len, d_k)
+    """
+    d_k = Q.size(-1)
+
+    # ① 打分 + ② 缩放
+    scores = Q @ K.transpose(-2, -1) / (d_k ** 0.5)   # (batch, seq, seq)
+
+    # 因果掩码:让每个位置只能看到自己和之前的词
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, float('-inf'))
+
+    # ③ 归一化为权重
+    weights = F.softmax(scores, dim=-1)               # (batch, seq, seq)
+
+    # ④ 对 Value 加权求和
+    output = weights @ V                               # (batch, seq, d_k)
+    return output, weights</code></pre>
+              <p style="margin-bottom:0">整个注意力的核心逻辑，就是这几行矩阵运算。真正的复杂度来自多头拆分、位置编码和高效实现（如 <a href="../05-systems/flash-attention.html">FlashAttention</a>），但数学骨架不变。</p>
+            </div>
+          </details>
+
+          <!-- ============ 论文原图：Scaled Dot-Product Attention 结构（Vaswani et al., 2017, Figure 2） ============ -->
+          <figure class="paper-figure">
+            <img src="../../assets/figures/03-transformer/attention-fig2.png"
+                 alt="论文原图：Scaled Dot-Product Attention 与 Multi-Head Attention 结构（Vaswani et al., 2017, Figure 2）"
+                 loading="lazy">
+            <figcaption>
+              <span class="pf-title">图：Scaled Dot-Product Attention（左）与 Multi-Head Attention（右）的官方结构图</span>
+              <span class="pf-src">论文原图 · Vaswani et al., <em>Attention Is All You Need</em>, 2017, Figure 2 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></span>
+            </figcaption>
+          </figure>
+
+          <!-- ============ Section 3b: 除以 √d_k 的数值算例 ============ -->
+          <h2>除以 √d_k 的数值算例：点积的方差是怎么涨起来的</h2>
+          <p>前面说了「不缩放会导致 Softmax 梯度消失」，但这句话到底意味着什么？与其停留在定性描述，不如把数字代进去算一遍。</p>
+          <p>假设训练初期 Query 和 Key 的每个分量都近似服从均值 0、方差 1 的分布（这是随机初始化后的常见情况），那么两个向量的点积 $q \cdot k = \sum_{i=1}^{d_k} q_i k_i$ 是 $d_k$ 个独立乘积之和。每个乘积的期望是 0，而两个方差为 1 的独立变量相乘，乘积的方差仍约 1，于是整个点积的方差是 $d_k$，标准差是 $\sqrt{d_k}$。也就是说，<strong>点积的典型大小会随维度一起涨</strong>：$d_k = 64$ 时标准差已经到 8，$d_k = 128$ 时约 11.3。</p>
+          <p>为了看清这个「涨」带来的后果，构造一个小例子。设 $d_k = 4$，某一行 Query 与四个 Key 算出的原始分数如下：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>步骤</th><th>分数 1</th><th>分数 2</th><th>分数 3</th><th>分数 4</th></tr></thead>
+              <tbody>
+                <tr><td>原始点积（未缩放）</td><td>3.5</td><td>1.0</td><td>-0.5</td><td>-2.0</td></tr>
+                <tr><td>除以 $\sqrt{4} = 2$ 之后</td><td>1.75</td><td>0.5</td><td>-0.25</td><td>-1.0</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>先看未缩放这行。对分数 $[3.5, 1.0, -0.5, -2.0]$ 做 Softmax，指数分别是 $e^{3.5} \approx 33.1$、$e^{1.0} \approx 2.72$、$e^{-0.5} \approx 0.61$、$e^{-2.0} \approx 0.135$，四项之和约 36.6，归一化后权重是 <strong>0.905、0.074、0.017、0.004</strong>——第一个位置拿走了 90.5% 的注意力，其余三个位置加起来不到 10%。</p>
+          <p>再看缩放后这行。对分数 $[1.75, 0.5, -0.25, -1.0]$ 做 Softmax，指数分别是 $e^{1.75} \approx 5.75$、$e^{0.5} \approx 1.65$、$e^{-0.25} \approx 0.78$、$e^{-1.0} \approx 0.37$，四项之和约 8.55，权重变成 <strong>0.673、0.193、0.091、0.043</strong>。同样是这组数据，缩放后第二个位置从 7.4% 涨到了 19.3%。</p>
+          <div class="callout tip">
+            <span class="callout-t">缩放改变的到底是什么</span>
+            缩放并没有改变排名——3.5 依然最大。它改变的是<strong>分布的形状</strong>：把「几乎全部押注一个位置」变成「几个位置都有机会」。权重太尖的后果是大多数位置的梯度接近 0，模型学不到东西；而且 $d_k$ 越大，原始点积越尖，所以必须用 $\sqrt{d_k}$ 把方差拉回 1 的量级。<strong>$\sqrt{d_k}$ 不是拍脑袋定的缩放因子，而是方差推导给出的精确答案</strong>——方差是 $d_k$，标准差是 $\sqrt{d_k}$，除以标准差就是把分布重新归一化到单位尺度。
+          </div>
+          <p>换一个角度记住这个结论：注意力分数的量级决定 Softmax 的「锐利程度」，而 Softmax 的锐利程度决定梯度的健康程度。缩放因子 $\sqrt{d_k}$ 保证的是，<strong>无论模型把注意力头维度设成 64 还是 128，初始阶段注意力分布的形状都大致一致</strong>——这让 $d_k$ 这个超参对训练稳定性的影响被削掉了。这也是为什么你几乎会在每一个 Transformer 实现里看到这一行，却很少有人注意到它。</p>
+
+          <!-- ============ Section 3c: Softmax 温度 ============ -->
+          <h2>Softmax 温度：注意力分布的锐化旋钮</h2>
+          <p>Softmax 的输入前面还可以挂一个旋钮——温度 $T$。带温度的 Softmax 写作 $\text{softmax}(x_i / T)$：$T < 1$ 时分数被放大，分布更「锐」；$T > 1$ 时分数被压缩，分布更「平」；$T = 1$ 就是标准情形。虽然训练时几乎总是用 $T=1$，但理解这个旋钮，能帮你把「注意力分布的形状」这件事彻底想明白。</p>
+          <p>用数字说话。设某一行有三个位置的原始分数 $[2.0, 1.0, 0.0]$，依次代入不同温度：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>温度 $T$</th><th>除以 $T$ 后的分数</th><th>位置 1 权重</th><th>位置 2 权重</th><th>位置 3 权重</th></tr></thead>
+              <tbody>
+                <tr><td>$0.5$</td><td>$[4.0, 2.0, 0.0]$</td><td>0.867</td><td>0.117</td><td>0.016</td></tr>
+                <tr><td>$1.0$</td><td>$[2.0, 1.0, 0.0]$</td><td>0.665</td><td>0.245</td><td>0.090</td></tr>
+                <tr><td>$2.0$</td><td>$[1.0, 0.5, 0.0]$</td><td>0.507</td><td>0.307</td><td>0.186</td></tr>
+                <tr><td>$5.0$</td><td>$[0.4, 0.2, 0.0]$</td><td>0.402</td><td>0.329</td><td>0.269</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>看第一行：$T = 0.5$ 时第一名拿到 86.7%，几乎一票定音；到 $T = 5$ 时只剩 40.2%，三个位置都「有得聊」。<strong>温度越低，注意力越像非此即彼的硬选择；温度越高，越像雨露均沾的软加权</strong>。极限情况：$T \to 0$ 时 Softmax 退化成取最大值，$T \to \infty$ 时退化成均匀分布。温度变化直接对应前一小节说的「锐利程度」——它给了我们一个旋钮，可以在同一组分数上任意调整分布形状。</p>
+          <p>温度在哪里真的有用？至少三个地方。<strong>其一，知识蒸馏</strong>：让学生模型学教师模型的输出概率时，通常把温度调高（如 $T = 2$ 到 $4$），让教师输出的第二名、第三名也给出足够信号，学生才能学到类间的细粒度差异。<strong>其二，调试注意力</strong>：如果怀疑某层注意力出现病态的尖峰（几乎所有权重压在一个位置），可以临时调高温度观察分布是否回到合理范围，用来排查数值或训练问题。<strong>其三，长上下文扩展</strong>：YaRN 等 RoPE 扩展方法会引入一个注意力缩放因子（本质就是调整有效温度），补偿插值后注意力分布变平的趋势——这一点在<a href="../04-modern-arch/long-context.html">长上下文技术</a>里会再次遇到。</p>
+          <div class="callout warn">
+            <span class="callout-t">别混淆：注意力温度 ≠ 采样温度</span>
+            生成时说的「temperature sampling」作用在词表上的 logits，决定采样时概率分布的尖锐程度；本节说的温度作用在注意力分数上，决定每个位置拿到的权重。两者都叫 temperature，但一个在注意力 Softmax 里、一个在采样器里，是完全不同的两处旋钮，不要混为一谈。
+          </div>
+          <p>用两张饼图直观对比同一组分数在 $T = 0.5$ 与 $T = 2.0$ 下的分布差异——同一份数据，温度决定它是「一骑绝尘」还是「三足鼎立」：</p>
+          <div class="grid g2">
+            <figure class="figure">
+              <div class="mermaid">
+pie showData
+  title "T=0.5：注意力锐化"
+  "位置1" : 86.7
+  "位置2" : 11.7
+  "位置3" : 1.6
+              </div>
+            </figure>
+            <figure class="figure">
+              <div class="mermaid">
+pie showData
+  title "T=2.0：注意力平滑"
+  "位置1" : 50.7
+  "位置2" : 30.7
+  "位置3" : 18.6
+              </div>
+            </figure>
+          </div>
+
+          <!-- ============ Section 3d: 掩码注意力 ============ -->
+          <h2>掩码注意力：解码时怎么做到「不偷看未来」</h2>
+          <p>自回归模型在预测第 $t$ 个位置时，只能依赖它左边（包括自己）的词，绝不能看到右边的未来词——否则训练和推理就「作弊」了：模型永远有标准答案可抄，学不到真正的生成能力。把这条纪律写进注意力，就是一张<strong>因果掩码（causal mask）</strong>。</p>
+          <p>实现上只有一步：<strong>在 Softmax 之前，把未来位置对应的分数填成 $-\infty$</strong>。因为 $e^{-\infty} = 0$，这些位置在 Softmax 之后权重恰好是 0，等于「假装它们不存在」。以 4 个 token 的序列为例，掩码矩阵是严格的下三角：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>（行 = 当前位置，列 = 可看位置）</th><th>词 1</th><th>词 2</th><th>词 3</th><th>词 4</th></tr></thead>
+              <tbody>
+                <tr><td><strong>词 1</strong></td><td>可见</td><td>掩掉</td><td>掩掉</td><td>掩掉</td></tr>
+                <tr><td><strong>词 2</strong></td><td>可见</td><td>可见</td><td>掩掉</td><td>掩掉</td></tr>
+                <tr><td><strong>词 3</strong></td><td>可见</td><td>可见</td><td>可见</td><td>掩掉</td></tr>
+                <tr><td><strong>词 4</strong></td><td>可见</td><td>可见</td><td>可见</td><td>可见</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>训练时整条序列并行前向，一张下三角掩码一次性作用在所有行上——这正是前面最小实现里 <code>scores.masked_fill(mask == 0, float('-inf'))</code> 那一行做的事。几个实现细节值得记住：</p>
+          <ul>
+            <li><strong>为什么用 $-\infty$ 而不是直接置 0</strong>：把分数设成 0 意味着「相关度为 0」，但 Softmax 之后这些位置仍会分到权重（因为 $e^0 = 1$），信息照样泄漏。只有 $-\infty$ 才能让 Softmax 输出严格为 0。</li>
+            <li><strong>别让整行都被掩掉</strong>：因果掩码保证每行至少对角线可见，Softmax 的分母恒大于 0。如果某个位置连自己都不能看，分子分母同时趋 0，会得到 NaN。</li>
+            <li><strong>掩码填在缩放之后、Softmax 之前</strong>：顺序是打分 → 除以 $\sqrt{d_k}$ → 填 $-\infty$ → Softmax。$-\infty$ 在指数函数下是 0，顺序上其实怎么放都对，但统一在 Softmax 前处理最清晰。</li>
+          </ul>
+          <p>推理 Decode 阶段则是另一副面孔：每生成一个新 token，只需拿它一个 Query 去和<strong>缓存里的历史 K/V</strong> 打分，未来词根本还没生成，不需要掩码——这恰恰是 <a href="../04-modern-arch/kv-cache.html">KV Cache</a> 能成立的先决条件。换句话说，<strong>掩码是训练期的纪律，缓存是推理期的红利</strong>，它们描述的是同一个「只看左边」的约束：训练时用掩码保证不偷看，推理时用缓存保证不重算。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 打分: 当前 Query 与全部 Key 点积
+  打分 --> 填掩码: 未来位置填入 -inf
+  填掩码 --> 归一化: Softmax 后权重和为 1
+  归一化 --> 加权: 权重只落在可见位置
+  加权 --> [*]
+            </div>
+            <figcaption>带因果掩码的注意力前向：打分 → 填 $-\infty$ → Softmax → 加权。掩码让未来位置的权重在数学上严格为 0。</figcaption>
+          </figure>
+
+          <!-- ============ Section 4: 自注意力 vs 交叉注意力 ============ -->
+          <h2>自注意力 vs 交叉注意力</h2>
+          <p>根据 Q、K、V 来自哪里，注意力分成两种常见形态：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Self["自注意力 Self-Attention"]
+    direction TB
+    S1["序列: 我 吃 苹果"] --> S2["每个词同时充当 Q/K/V"]
+    S2 --> S3["词内部互相理解"]
+  end
+  subgraph Cross["交叉注意力 Cross-Attention"]
+    direction TB
+    C1["解码器序列: I eat"] --> CQ["Q 来自解码器"]
+    C2["编码器序列: 我 吃 苹果"] --> CKV["K/V 来自编码器"]
+    CQ --> C3["解码器'看'编码器"]
+    CKV --> C3
+  end
+
+  style Self fill:#e6f1fb,stroke:#185fa5
+  style Cross fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>自注意力：Q/K/V 都来自同一序列，词与词内部互相理解。交叉注意力：Q 来自一个序列（解码器），K/V 来自另一个序列（编码器），用于跨序列对齐。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>类型</th><th>Q 来源</th><th>K / V 来源</th><th>典型场景</th></tr></thead>
+              <tbody>
+                <tr><td><strong>自注意力 Self-Attention</strong></td><td>当前序列</td><td>同一序列</td><td>让序列内部各词互相理解（GPT/BERT 主力）</td></tr>
+                <tr><td><strong>交叉注意力 Cross-Attention</strong></td><td>解码器序列</td><td>编码器序列</td><td>翻译时让目标语言「看」源语言（Encoder-Decoder）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- ============ Section 5: O(n²) 问题 ============ -->
+          <h2>O(n²) 代价：注意力的阿喀琉斯之踵</h2>
+          <p>标准注意力要计算 $n \times n$ 的分数矩阵——这意味着序列长度翻倍，计算量和显存都翻四倍。这就是长上下文的最大瓶颈：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Short["短序列 (n=512)"]
+    S1["分数矩阵: 512×512<br/>≈ 26万个元素<br/>轻松搞定"]
+  end
+  subgraph Medium["中等序列 (n=4096)"]
+    M1["分数矩阵: 4096×4096<br/>≈ 1677万个元素<br/>需要优化"]
+  end
+  subgraph Long["长序列 (n=32768)"]
+    L1["分数矩阵: 32768×32768<br/>≈ 10.7亿个元素<br/>必须用变体/FlashAttention"]
+  end
+
+  Short -->|"长度×8"| Medium
+  Medium -->|"长度×8"| Long
+
+  style S1 fill:#e8f5e9,stroke:#4a7
+  style M1 fill:#fef3c7,stroke:#d97706
+  style L1 fill:#fde8e8,stroke:#c44
+            </div>
+            <figcaption>O(n²) 复杂度的实际影响：序列从 512 增到 32768（64 倍），计算量增到 4096 倍。这就是为什么长上下文模型必须用注意力变体和 FlashAttention。</figcaption>
+          </figure>
+
+          <div class="callout warn">
+            <span class="callout-t">复杂度提醒</span>
+            标准注意力要计算 $n \times n$ 的分数矩阵，时间和显存都是 <strong>序列长度的平方 $O(n^2)$</strong>。这正是长上下文的最大瓶颈，催生了后续 GQA、MLA、稀疏注意力、KV Cache 等一系列优化。
+          </div>
+
+          <!-- ============ Section 6: 两条优化路线 ============ -->
+          <h2>两条优化路线：改算法 vs 改实现</h2>
+          <p>知道了 $O(n^2)$ 这个瓶颈，后续所有优化都能归到两条<strong>互相正交</strong>的路线上。很多人把它们混为一谈，但它们解决的根本不是同一个问题：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((O(n²) 瓶颈))
+    路线一 注意力变体
+      改变"算什么"
+      MQA / GQA：共享 K/V
+      MLA：低秩压缩
+      稀疏注意力：只算部分位置
+      输出会变（近似）
+      设计阶段决策
+    路线二 FlashAttention
+      改变"怎么算"
+      分块计算
+      避免 n×n 矩阵写回显存
+      IO 感知
+      输出不变（精确）
+      已成为默认后端
+            </div>
+            <figcaption>两条优化路线：注意力变体改变算法本身（输出会变），FlashAttention 改变内存访问方式（输出不变）。两者可以叠加使用。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>路线</th><th>解决的问题</th><th>做法</th><th>输出是否改变</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong><a href="../04-modern-arch/attention-variants.html">注意力变体</a></strong><br><span style="color:var(--text-3);font-size:12.5px">MQA / GQA / MLA / 稀疏注意力</span></td>
+                  <td><strong>算什么</strong></td>
+                  <td>改变算法本身：共享 K/V、低秩压缩、只算部分位置</td>
+                  <td><strong>会变</strong> —— 是近似，用可接受的精度损失换效率</td>
+                </tr>
+                <tr>
+                  <td><strong><a href="../05-systems/flash-attention.html">FlashAttention</a></strong><br><span style="color:var(--text-3);font-size:12.5px">IO 感知的精确注意力</span></td>
+                  <td><strong>怎么算</strong></td>
+                  <td>不改算法，只改内存访问顺序：分块计算、避免把 $n \times n$ 矩阵写回显存</td>
+                  <td><strong>完全不变</strong> —— 数学上等价，是精确计算</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话记住</span>
+            变体是<strong>换一种算法</strong>，FlashAttention 是<strong>换一种搬数据的方式</strong>。前者有精度取舍，后者没有——所以后者已经成为几乎所有主流框架的默认后端，而前者需要在模型设计阶段就做决策。两者可以叠加使用。
+          </div>
+
+          <!-- ============ Section 7: 注意力在 Transformer 中的位置 ============ -->
+          <h2>注意力在 Transformer 中的位置</h2>
+          <p>注意力不是孤立存在的——它是 Transformer 层的核心组件之一，和 FFN、残差连接、层归一化配合工作：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  Input["输入序列<br/>(batch, seq, d_model)"]
+  Input --> Attn["多头自注意力<br/>让词与词互相理解"]
+  Attn --> Add1["+ 残差连接"]
+  Add1 --> Norm1["层归一化"]
+  Norm1 --> FFN["前馈网络 FFN<br/>逐位置非线性变换"]
+  FFN --> Add2["+ 残差连接"]
+  Add2 --> Norm2["层归一化"]
+  Norm2 --> Output["输出序列<br/>(batch, seq, d_model)"]
+
+  style Attn fill:#e6f1fb,stroke:#185fa5
+  style FFN fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>一个 Transformer 层的结构：注意力 → 残差+归一化 → FFN → 残差+归一化。注意力负责「词与词的信息交换」，FFN 负责「每个词内部的非线性变换」。两者缺一不可。</figcaption>
+          </figure>
+
+          <p>注意力和 FFN 的分工很清晰：<strong>注意力让词与词互相理解（跨位置信息交换），FFN 让每个词的表示更丰富（逐位置非线性变换）</strong>。只靠注意力没有 FFN，模型缺乏非线性能力；只靠 FFN 没有注意力，词与词之间无法交流。这就是为什么 Transformer 层总是「注意力 + FFN」成对出现。</p>
+
+          <!-- ============ Section 8: 注意力的失败模式 ============ -->
+          <h2>注意力的失败模式：尖峰、坍塌与「不可解释」</h2>
+          <p>注意力机制并不总是「优雅地」工作。知道它有哪些典型故障，对排查训练问题和读懂注意力可视化都很有帮助。至少三种失败模式值得记住：</p>
+          <ul>
+            <li><strong>注意力尖峰（attentional spike）</strong>：某一行的权重几乎全部压在一个位置——比如一个特殊的开头 token（BOS 或分隔符）常年拿走一半以上的权重。2023 年的研究发现，这几乎是所有自回归模型的普遍现象，被称为「注意力汇聚」（attention sink）：模型发现在开头位置存一个「安全缓存」，把用不上的信息都堆进去。它本身不一定是坏事，但如果尖峰严重到挤占了真正相关的信息，就要警惕。</li>
+            <li><strong>注意力坍塌（attention collapse）</strong>：训练不稳时，多个头可能收敛到几乎相同的注意力分布——头与头之间不再有分工，多头的「多视角」红利消失。常见诱因是学习率过大、初始化不当或归一化设置不对。缓解手段包括更稳的初始化、层丢弃（layer drop）以及把学习率调小。</li>
+            <li><strong>可视化 ≠ 解释</strong>：很多人把注意力热力图当作「模型在思考什么」的证据，这个直觉要打折。权重高可能只是统计惯性的结果（比如总是看相邻词），并不代表模型在因果上依赖这个词。要真正回答「模型为什么这么预测」，需要干预实验（把某个词的表示改掉、看预测变不变），而不是盯着权重看。</li>
+          </ul>
+          <p>把这三种失败模式放在一起看，能得出一个务实的结论：<strong>注意力分布是模型训练出来的统计产物，而不是人为设计的解释工具</strong>。理解它有助于调试，但别把它神化。这也是为什么现代研究更多关注注意力「在哪一层、以什么模式被使用」，而不是单张热力图。</p>
+          <p>一个相关的工程细节是，「注意力汇聚」还与 KV Cache 压缩、流式生成有关：既然开头 token 吸收了那么多注意力，粗暴地删掉它会对后续生成造成不成比例的影响，所以在做流式 KV 淘汰时要格外小心保留开头位置——这也是 <a href="../04-modern-arch/kv-cache.html">KV Cache</a> 优化里的一个已知陷阱。</p>
+          <p>作为小结，给初学者一个务实的检查清单：训练时如果发现 loss 震荡剧烈或注意力权重异常集中，先看是不是学习率过大、再看归一化和初始化；阅读别人画的热力图时，先确认画的是哪个头、哪一层、哪个 token 的行为，再下结论；复现模型时，注意注意力实现里缩放、掩码、多头拼接的顺序有没有一致。注意力机制本身很简单，复杂的往往是对它的使用和解读——把这三个失败模式记在心里，能帮你少走很多弯路。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：Query 检索 Key，按相关度对 Value 加权求和。让每个位置直接「看到」所有其他位置。</li>
+            <li><strong>为什么取代 RNN</strong>：任意距离 1 跳直连（解决长依赖）+ 完全并行（吃满算力）。RNN 是传话游戏，注意力是全体大会。</li>
+            <li><strong>QKV</strong>：同一个词通过三个权重矩阵投影成三个角色——Query（我想问什么）、Key（我的标签）、Value（我的内容）。三个矩阵是学习的。</li>
+            <li><strong>公式</strong>：$\text{softmax}(QK^\top / \sqrt{d_k})\,V$，四步——打分、缩放、归一、加权。</li>
+            <li><strong>缩放</strong>：除 $\sqrt{d_k}$ 是为了稳住 Softmax 的梯度——点积方差随 $d_k$ 增长，不缩放会导致梯度消失。</li>
+            <li><strong>自注意力 vs 交叉注意力</strong>：Q/K/V 来自同一序列（自注意力）还是不同序列（交叉注意力）。</li>
+            <li><strong>代价</strong>：$O(n^2)$ 复杂度，长序列开销大。序列从 512 到 32768，计算量增 4096 倍。</li>
+            <li><strong>两条优化路线</strong>：注意力变体（改算法，输出会变）vs FlashAttention（改实现，输出不变）。可叠加。</li>
+            <li><strong>在 Transformer 中的角色</strong>：注意力负责跨位置信息交换，FFN 负责逐位置非线性变换。两者成对出现。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：为什么 Attention 要除以 $\sqrt{d_k}$？</h3>
+              <p><span class="answer-label">标准回答：</span>如果 Query 和 Key 的各维度方差约为 1，点积的方差会随维度 $d_k$ 增长。分数过大后，Softmax 会变得极尖锐，几乎只保留一个位置，其他位置的梯度接近 0。除以 $\sqrt{d_k}$ 可以把分数尺度拉回稳定范围。</p>
+              <details class="deep">
+                <summary>追问：为什么不能只说“防止数值溢出”？</summary>
+                <div class="deep-body">
+                  <p>数值溢出只是表面现象，真正重要的是<strong>梯度和优化尺度</strong>。即使实现使用了数值稳定的 Softmax，大幅分数仍会让概率分布饱和，导致学习信号集中在极少数位置。面试中最好同时说出“方差随 $d_k$ 增长”和“Softmax 梯度变小”两个因果环节。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：为什么说 Attention 能替代 RNN？它是不是所有方面都更好？</h3>
+              <p><span class="answer-label">标准回答：</span>训练时 Attention 可以让所有位置并行计算，任意两个 token 之间只需一跳信息交互，缓解长依赖和串行计算问题。但它要构造 $n\times n$ 的关系矩阵，时间和显存复杂度是 $O(n^2)$；序列很长时，RNN 的线性扫描反而可能更省资源。</p>
+              <p><span class="pitfall-label">常见误区：</span>不要把“并行”说成“推理也能完全并行”。Decoder-only 的生成仍然受因果约束，通常是逐 token Decode；并行优势主要体现在训练和 Prefill。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：因果 Mask 应该放在哪里？把未来位置填 0 可以吗？</h3>
+              <p><span class="answer-label">标准回答：</span>Mask 应在 Softmax 之前作用于注意力分数，把未来位置填成负无穷或该 dtype 的最小值，再做 Softmax。不能填 0，因为 0 仍会产生非零概率。</p>
+              <pre class="mini-code"><code>scores = scores.masked_fill(future_mask, torch.finfo(scores.dtype).min)
+weights = torch.softmax(scores, dim=-1)</code></pre>
+              <p><span class="follow-label">面试追问：</span>Softmax 通常沿最后一维做，因为最后一维对应当前 Query 对所有 Key 的候选位置；沿错维度会破坏“每行权重和为 1”的语义。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q4：注意力权重能不能直接当作模型的可解释性？</h3>
+              <p><span class="answer-label">标准回答：</span>不能直接等同。注意力权重描述的是信息汇聚时的加权关系，但不一定是输出对某个 token 的因果依赖。要验证解释，需要做遮挡、激活干预或输入替换等实验，再观察预测是否改变。</p>
+              <details class="deep">
+                <summary>追问：为什么一个高权重 token 可能并不重要？</summary>
+                <div class="deep-body">
+                  <p>不同头、不同层的表示会经过残差、FFN 和后续层继续变换；某个位置虽然被读取很多，但它的 Value 可能被后续线性组合抵消。反过来，低权重位置也可能通过其他路径影响结果。因此热力图适合做调试线索，不适合单独作为因果证明。</p>
+                </div>
+              </details>
+            </div>
+
+            <!-- ============ 面试主干深化：账本、稳定性、变体与长上下文 ============ -->
+            <div class="interview-q">
+              <h3>Q5：请手推一次 Attention 的 shape、复杂度和显存账本</h3>
+              <p><span class="answer-label">先统一符号：</span>批大小为 $B$，序列长度为 $S$，当前 Query 长度为 $T_q$，Key/Value 长度为 $T_k$，模型宽度为 $d_{model}$，Query 头数为 $H$，每头维度为 $d_h=d_{model}/H$，KV 头数为 $H_{kv}$。这套符号与 <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Transformer 原论文</a> 的多头拆分一致。</p>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>张量/账本</th><th>Prefill（一次喂入 $S$ 个 token）</th><th>Decode（每次生成 1 个 token）</th><th>面试要点</th></tr></thead>
+                  <tbody>
+                    <tr><td>输入 $X$</td><td>$(B,S,d_{model})$</td><td>$(B,1,d_{model})$</td><td>Decode 的 Query 长度是 1，不代表 KV 长度也是 1</td></tr>
+                    <tr><td>$Q,K,V$（MHA）</td><td>$Q:(B,H,S,d_h)$；$K,V:(B,H,S,d_h)$</td><td>$Q:(B,H,1,d_h)$；缓存 $K,V:(B,H,S+1,d_h)$</td><td>先线性投影，再 reshape/transpose</td></tr>
+                    <tr><td>分数 $QK^T$</td><td>$(B,H,S,S)$</td><td>$(B,H,1,S+1)$</td><td>训练/Prefill 才出现完整 $S\times S$ 关系</td></tr>
+                    <tr><td>注意力核心 FLOPs</td><td>约 $4BHS^2d_h$（$QK^T$ 与 $AV$ 各按乘加计 2 FLOPs）</td><td>约 $4BH(S+1)d_h$</td><td>Prefill 随 $S^2$ 增长，Decode 每 token 随上下文长度线性增长</td></tr>
+                    <tr><td>显式 score/prob 激活</td><td>每层约 $2BH S^2\times$ dtype_bytes（score 和概率各一份时）</td><td>临时矩阵约 $2BH(S+1)\times$ dtype_bytes</td><td>这是训练显存大头；<a href="../05-systems/flash-attention.html">FlashAttention</a> 通过分块避免完整矩阵落到 HBM</td></tr>
+                    <tr><td>KV Cache（每层）</td><td colspan="2">$2B(S_{cache})H_{kv}d_h\times$ dtype_bytes</td><td>MHA=$H_{kv}=H$；MQA=$1$；GQA=$G$。详情见 <a href="../04-modern-arch/kv-cache.html">KV Cache</a></td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <p><span class="follow-label">手推顺序：</span>先写 $Q:(B,H,T_q,d_h)$、$K^T:(B,H,d_h,T_k)$，所以 $QK^T:(B,H,T_q,T_k)$；再乘 $V:(B,H,T_k,d_h)$，输出回到 $(B,H,T_q,d_h)$，最后 transpose+concat 回 $(B,T_q,d_{model})$。训练时 $T_q=T_k=S$，Decode 时 $T_q=1$、$T_k=S_{cache}+1$。反向传播通常是同阶甚至更高的计算量，且要保存中间激活；推理若启用 KV Cache，则不重复计算旧 token 的 K/V。</p>
+              <div class="callout tip">
+                <span class="callout-t">一句话账本</span>
+                Prefill 是“宽而平方”：一次算完整 $S\times S$；Decode 是“窄而线性”：每个新 Query 扫过历史 KV。FlashAttention 主要省显存读写和峰值，不会把精确注意力的理论算术复杂度从 $O(S^2)$ 变成线性；KV Cache 则主要省重复的 K/V 投影计算和带宽。
+              </div>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q6：causal mask、数值稳定 Softmax 和 attention dropout 怎么追问？</h3>
+              <p><span class="answer-label">因果 mask：</span>在 Softmax 前将未来位置加上 $-\infty$（或该 dtype 的最小有限值），使其概率为 0；填 0 只表示“分数为 0”，仍会产生非零概率。对角线必须可见，否则整行全被 mask 会产生 NaN。PyTorch 的参考实现和参数语义见 <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">scaled_dot_product_attention 文档</a>。</p>
+              <p><span class="answer-label">数值稳定：</span>对每一行 logits $z$ 先减最大值 $m=\max_i z_i$，再计算 $p_i=\exp(z_i-m)/\sum_j\exp(z_j-m)$。减去同一个常数不改变 Softmax 结果，却避免 $\exp(z)$ 溢出；实现时还要确认 mask、dtype 和 Softmax 维度一致。可对照 <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.softmax.html" target="_blank" rel="noopener">PyTorch Softmax 文档</a>。</p>
+              <p><span class="answer-label">Dropout：</span>attention dropout 应作用在 Softmax 后的权重上（不是 Q/K/V 上），训练态随机丢弃部分边并做 inverted scaling $\tilde A=mask\odot A/(1-p)$；评估/推理态必须关闭。使用 PyTorch SDPA 时，<code>dropout_p</code> 不会自动读取模块是否在 eval，调用方应显式传 $0.0$，这是官方文档特别提醒的坑。</p>
+              <pre class="mini-code"><code>scores = (Q @ K.transpose(-2, -1)) * (d_h ** -0.5)
+scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
+weights = torch.softmax(scores, dim=-1)       # 行方向归一化
+weights = torch.dropout(weights, p=dropout_p, train=is_training)
+out = weights @ V</code></pre>
+              <details class="deep">
+                <summary>追问：为什么 dropout 不能放到 mask 之前随便做？</summary>
+                <div class="deep-body">
+                  <p>mask 的语义是“不可达边”，应在归一化前把它们从候选集合中移除；dropout 的语义是训练时随机稀疏化已归一化的概率边。两者混用可能让被禁止的位置重新获得概率，或改变行归一化语义。工程实现以 <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">PyTorch 官方伪代码</a> 为准。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q7：MHA、MQA、GQA、MLA 怎么选？</h3>
+              <p><span class="answer-label">先看 KV 头数：</span>MHA 每个 Query 头拥有独立 K/V；MQA 的所有 Query 头共享一组 K/V；GQA 将 Query 头分成 $G$ 组、每组共享一组 K/V；MLA 则把 KV 状态压到低维 latent，再在需要时恢复/解耦位置表示。原始定义分别见 <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener">MQA</a>、<a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA</a> 和 <a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">DeepSeek-V2 MLA</a>。</p>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>方案</th><th>$H_{kv}$ / Cache 规模</th><th>优点</th><th>代价与选型追问</th></tr></thead>
+                  <tbody>
+                    <tr><td><strong>MHA</strong></td><td>$H$，基线 100%</td><td>每个头有独立 K/V，表达能力和兼容性最直接</td><td>KV Cache、Decode 带宽最大；适合质量优先或已有模型兼容</td></tr>
+                    <tr><td><strong>MQA</strong></td><td>$1$，约 $1/H$</td><td>极省 Cache，Decode 读带宽低</td><td>共享 K/V 可能损失质量；需评估长上下文和任务退化</td></tr>
+                    <tr><td><strong>GQA</strong></td><td>$G$，约 $G/H$</td><td>在质量与 Cache/带宽之间折中，可由 MHA checkpoint 分组转换</td><td>多一个分组超参；$H$ 必须能被 $G$ 整除</td></tr>
+                    <tr><td><strong>MLA</strong></td><td>latent 维度决定，非简单按头复制</td><td>进一步压缩 KV，兼顾高效推理与位置编码设计</td><td>实现与 checkpoint 结构更复杂，需配套训练；不能把它当作“免费 MQA”</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <p><span class="follow-label">选型模板：</span>先问瓶颈是显存容量、Decode 带宽还是训练吞吐；若只想降低推理 Cache，优先 GQA/MQA；若接受更大架构改造并追求更高压缩比，再看 MLA；若瓶颈是 HBM 读写而不是算法输出，叠加 <a href="../05-systems/flash-attention.html">FlashAttention</a>。注意力变体的实现与更多边界见 <a href="../04-modern-arch/attention-variants.html">attention-variants</a>，KV 账本见 <a href="../04-modern-arch/kv-cache.html">kv-cache</a>。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q8：RoPE 为什么有效，长上下文外推为什么会坏？</h3>
+              <p><span class="answer-label">核心回答：</span>RoPE 将每个二维子空间中的 $q,k$ 按位置角度旋转，再做点积；旋转后 $q_m^T k_n$ 依赖相对位移 $m-n$，因此把位置信息直接注入注意力分数，而不额外增加可学习位置表。原始推导见 <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">RoFormer: Enhanced Transformer with Rotary Position Embedding</a>。</p>
+              <p><span class="answer-label">外推追问：</span>模型只在长度 $L_{train}$ 的位置频率上训练，推到远大于 $L_{train}$ 时，旋转相位分布和训练分布不匹配，可能导致注意力错位、困惑度升高。常见办法是位置插值或频率缩放（如 YaRN、LongRoPE），但会改变有效分辨率，通常需要校准/微调；不要笼统地说“把 max_position_embeddings 改大就行”。可查 <a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">YaRN</a>、<a href="https://arxiv.org/abs/2402.13753" target="_blank" rel="noopener">LongRoPE</a> 以及本站的<a href="../04-modern-arch/long-context.html">长上下文技术</a>。</p>
+              <ul>
+                <li><strong>频率/基底问题：</strong>检查 RoPE base、缩放因子、训练与推理的 position_ids 是否一致。</li>
+                <li><strong>长度问题：</strong>区分“模型支持的最大长度”“训练过的长度”和“评测长度”，三者不是同一个数字。</li>
+                <li><strong>系统问题：</strong>RoPE 改善的是位置表示，不会消除 $O(S^2)$；仍要结合 KV Cache、GQA 或 FlashAttention。</li>
+              </ul>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q9：FlashAttention 和稀疏/近似注意力的边界是什么？</h3>
+              <p><span class="answer-label">一句话：</span>FlashAttention 是“数学不变、IO 重排”：通过 tiling、片上 SRAM 和 online softmax，不把完整 $S\times S$ 分数/概率矩阵写回 HBM，仍计算精确的全注意力；论文明确将其定义为 IO-aware exact attention，见 <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention</a>。它降低的是显存峰值与内存访问，不改变全连接注意力的 $O(S^2)$ 算术依赖。</p>
+              <p><span class="answer-label">边界：</span>稀疏、局部、低秩或线性注意力改变了要计算的边集合/核函数，因此可能降低理论复杂度，但输出不再等于标准全注意力，存在质量、长程依赖或任务分布取舍。BigBird 的稀疏模式可作为代表性对照，见 <a href="https://arxiv.org/abs/2007.14062" target="_blank" rel="noopener">Big Bird</a>。面试时不要说“FlashAttention 是稀疏注意力”，也不要说“用了 FlashAttention 就把 $O(n^2)$ 变成 $O(n)$”。</p>
+              <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+                <div class="mermaid">
+flowchart LR
+  A[标准全注意力<br/>全 S×S 边] --> B{优化改变什么?}
+  B -->|只改搬运| C[FlashAttention<br/>分块 + online softmax<br/>输出精确不变]
+  B -->|改计算边/核函数| D[稀疏/近似注意力<br/>复杂度可能下降<br/>输出存在取舍]
+                </div>
+                <figcaption>面试判别图：FlashAttention 改“怎么算”，稀疏/近似方法改“算什么”。</figcaption>
+              </figure>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q10：给出一个可复用的面试回答模板和故障排查 checklist</h3>
+              <p><span class="answer-label">90 秒回答模板：</span>“我先给公式 $O=\mathrm{softmax}((QK^T+M)/\sqrt{d_h})V$；然后报 shape：$Q:(B,H,T_q,d_h)$、$K/V:(B,H_{kv},T_k,d_h)$，GQA 时按组广播；再区分 Prefill 的 $T_q=T_k=S$ 与 Decode 的 $T_q=1$；最后说明瓶颈是 $S^2$ 的全注意力、KV Cache 的 $2BSH_{kv}d_h$ 显存，以及 FlashAttention（精确 IO 重排）和 MQA/GQA/MLA（改变 KV 表示）的边界。”</p>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>现象</th><th>优先检查</th><th>最小验证</th><th>依据</th></tr></thead>
+                  <tbody>
+                    <tr><td>loss/输出出现 NaN</td><td>全 mask 行、Softmax dtype、logits 是否先减 max</td><td>断言每行至少一个可见位置；检查 <code>torch.isfinite</code></td><td><a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.softmax.html" target="_blank" rel="noopener">Softmax 文档</a></td></tr>
+                    <tr><td>未来信息泄漏</td><td>mask 是否在 Softmax 前；是否把 mask 误填 0；推理是否混用双向 mask</td><td>上三角权重应全为 0；逐 token 与全量结果对齐</td><td><a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">SDPA 文档</a></td></tr>
+                    <tr><td>Decode 变慢/显存爆</td><td>KV Cache 是否重复算；$H_{kv}$、dtype、序列长度和 batch 是否正确</td><td>按 $2BSH_{kv}d_h\times$ bytes 估算每层 Cache</td><td><a href="../04-modern-arch/kv-cache.html">本站 KV Cache</a></td></tr>
+                    <tr><td>换 FlashAttention 后结果差很多</td><td>dropout、causal、dtype、mask 语义及训练/eval 状态</td><td>关闭 dropout，固定 seed，对比同一输入的误差范围</td><td><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention 论文</a></td></tr>
+                    <tr><td>长上下文困惑度升高</td><td>RoPE base/position_ids/缩放策略与训练长度是否匹配</td><td>分桶评测 $L_{train}$ 内外，并检查不同位置的 attention 分布</td><td><a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">YaRN</a></td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <pre class="mini-code"><code># 复现时先做这三个不变量检查
+assert Q.shape[-1] == K.shape[-1] == V.shape[-1]
+assert scores.shape[-2:] == (T_q, T_k)
+assert torch.allclose(weights.sum(dim=-1), torch.ones_like(weights[..., 0]))</code></pre>
+              <p class="source-note">模板中的公式、shape 和 mask 语义可分别回溯到 <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Transformer 原论文</a> 与 <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">PyTorch SDPA 参考实现</a>；性能边界见 <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention</a>。</p>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Attention Is All You Need (Vaswani et al., 2017) — Transformer 的奠基论文，提出缩放点积注意力和多头机制，至今仍是理解注意力最好的原始文档 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></li>
+            <li>The Illustrated Transformer (Jay Alammar) — 用大量可视化图解拆解 Transformer 的每个组件，对建立直觉非常有帮助。适合在阅读原始论文后补充理解。</li>
+            <li>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness (Dao et al., 2022) — 不改算法、只改内存访问方式的精确加速方案，见 <a href="../05-systems/flash-attention.html">FlashAttention</a> · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></li>
+            <li>PyTorch 官方文档：scaled_dot_product_attention — 生产环境被广泛使用的标准注意力实现，内置 FlashAttention 后端 · <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">pytorch.org 文档</a></li>
+            <li>Efficient Streaming Language Models with Attention Sinks (Xiao et al., 2023) — 「注意力汇聚」现象的来源，解释开头 token 为何拿走大量注意力 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            单个注意力只能捕捉一种关系模式。下一节看 <a href="multi-head.html">多头注意力</a> 如何用多组 QKV 并行捕捉多种关系；之后再看它如何演化出 <a href="../04-modern-arch/attention-variants.html">MQA / GQA / MLA 等现代变体</a>（算法层），以及 <a href="../05-systems/flash-attention.html">FlashAttention</a> 如何在不改变结果的前提下把它算得更快（系统层）。如果你想亲手实现一个 FlashAttention kernel，看 <a href="../15-practice/build-flashattention.html">实战：手写 FlashAttention</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

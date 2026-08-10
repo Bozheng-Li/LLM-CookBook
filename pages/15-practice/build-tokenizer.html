@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实战：手写 BPE Tokenizer · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="15-practice" data-topic="build-tokenizer">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>实战：手写 BPE Tokenizer</h1>
+            <p class="lead">分词器是模型看待世界的「字母表」，但大多数人的认知停留在「用现成的 API」这一步。这一页我们从零训练一个可用的 BPE 分词器——先用纸笔手算五轮合并，再写出四十行可运行代码，接着补上字节级、正则预分词这些工业级细节，最后给出验证清单。走完之后，再看任何 tokenizer 都不会发怵。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>BPE 的思路像「组词游戏」：先把语料拆成单个字符，然后反复把出现频率最高的相邻字符对合并成一个新符号，合并多少次由词表大小决定。训练完成后，编码就是把新文本按学到的规则依次合并，解码则是反向拼回原文。整个算法没有神经网络、没有梯度，只有计数和排序。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  C["语料<br/>Corpus"] --> S["拆成字符<br/>初始化词表"] --> M{"找最高频<br/>相邻对"}
+  M -->|"合并它<br/>记一条规则"| M
+  M -->|"词表已满<br/>或无可合并"| E["训练结束<br/>产出合并规则 + 词表"]
+  E --> N["编码<br/>按规则顺序逐步合并"] --> D["解码<br/>拼接并还原字节"]
+
+  style E fill:#e6f1fb,stroke:#185fa5
+  style N fill:#eaf3de,stroke:#639922
+  style D fill:#faeeda,stroke:#ba7517
+              </div>
+              <figcaption>BPE 全流程：训练 = 反复合并最高频相邻对；推理 = 按学到的规则顺序做编码与解码。训练产物只有两样东西——一张有序的合并规则表和一张词表。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ 1 ============ -->
+          <h2>一、为什么要子词，而不是整词或单字</h2>
+          <p>先想清楚问题是什么。模型只会算数，不会读字，所以第一步必须把文本切成一串离散的编号（token id）。切法有三种极端选择，各有明显的失败方式。</p>
+
+          <h3>整词切分：词表爆炸 + 未登录词</h3>
+          <p>按整词建词表最直观：一个词一个编号。但英文词形变化极多——play、plays、played、playing、player、players 是六个完全不同的条目，而它们共享同一个词根。加上人名、地名、拼写错误、网络新词，一个覆盖真实互联网语料的整词词表轻易膨胀到几百万条。词表越大有两个坏处：<strong>嵌入矩阵占参数量的比例失控</strong>，以及<strong>长尾词出现次数太少、学不出好的向量</strong>。更要命的是「未登录词」（OOV）——遇到词表里没有的词，只能映射成一个统一的 <code>&lt;unk&gt;</code>，信息直接丢失。</p>
+
+          <h3>单字符切分：序列太长，语义太碎</h3>
+          <p>另一个极端是按字符切。英文只需要几十个符号就能覆盖一切，永远不会 OOV。但代价是序列长度暴涨：一句 20 词的英文句子，整词是 20 个 token，字符级要 100 个以上。注意力的开销是序列长度的平方，序列翻五倍意味着注意力计算量翻二十五倍。而且单个字母 <code>t</code> 本身几乎没有语义，模型必须把大量容量花在「先把字母拼成词」这件人类觉得理所当然的事上。</p>
+
+          <h3>子词：让数据自己决定粒度</h3>
+          <p>子词（Subword）是中间路线：<strong>常用词整体成一个 token，罕见词拆成几个有意义的片段</strong>。比如「unhappiness」可能被拆成「un」+「happi」+「ness」，既控制了词表规模，又能用已有的部件拼出任何新词——哪怕这个词训练时从没见过。这就是 BPE（Byte Pair Encoding）在语言模型里成为默认选择的原因。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>切分粒度</th><th>词表规模</th><th>序列长度</th><th>是否会 OOV</th><th>主要问题</th></tr></thead>
+              <tbody>
+                <tr><td><strong>整词</strong></td><td>几十万到几百万</td><td>最短</td><td><strong>会</strong></td><td>嵌入层过胖、长尾学不好、遇生词就丢信息</td></tr>
+                <tr><td><strong>子词</strong></td><td>约 3 万到 15 万</td><td>适中</td><td><strong>不会</strong>（字节级）</td><td>切分边界有时不符合语言学直觉</td></tr>
+                <tr><td><strong>单字符</strong></td><td>几十到几千</td><td>最长（约为整词的 4–5 倍）</td><td>基本不会</td><td>注意力开销随长度平方增长，语义颗粒度太细</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            BPE 就是在「词太大记不下」和「字太小没效率」之间，用<strong>数据统计</strong>自动找出的折中粒度——语料里经常一起出现的字符对，就合并成一个单元。它不需要任何语言学知识，中文、英文、代码、日志都是同一套算法。
+          </div>
+
+          <!-- ============ 2 ============ -->
+          <h2>二、手算一遍：五轮合并的完整推演</h2>
+          <p>不写代码，先用纸笔跑一遍，这是理解 BPE 最快的方式。取一份极小的语料，四个词带频次：</p>
+
+          <ul>
+            <li><code>low</code> 出现 5 次</li>
+            <li><code>lower</code> 出现 2 次</li>
+            <li><code>newest</code> 出现 6 次</li>
+            <li><code>widest</code> 出现 3 次</li>
+          </ul>
+
+          <p>第一步把每个词拆成字符，并在词尾加一个哨兵符号 <code>&lt;/w&gt;</code>（表示「词到此结束」）。为什么要这个哨兵？因为它能区分「est 出现在词尾」和「est 出现在词中间」——<code>est&lt;/w&gt;</code> 是英语最高级后缀，<code>est</code> 出现在 <code>estimate</code> 开头则完全是另一回事。没有边界标记，解码时也无法还原空格。</p>
+
+          <p>初始状态：</p>
+          <ul>
+            <li><code>l o w &lt;/w&gt;</code> ×5</li>
+            <li><code>l o w e r &lt;/w&gt;</code> ×2</li>
+            <li><code>n e w e s t &lt;/w&gt;</code> ×6</li>
+            <li><code>w i d e s t &lt;/w&gt;</code> ×3</li>
+          </ul>
+
+          <p>现在统计所有相邻对的加权频次。以 <code>(e, s)</code> 为例：它在 newest 里出现一次、在 widest 里出现一次，所以频次是 6 + 3 = 9。同理 <code>(l, o)</code> 在 low 和 lower 里各出现一次，频次 5 + 2 = 7。把所有对算完，最高的是 9，然后合并它。之后每一轮都重复这个动作。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>轮次</th><th>最高频相邻对</th><th>频次</th><th>新符号</th><th>合并后的语料变化</th></tr></thead>
+              <tbody>
+                <tr><td><strong>1</strong></td><td><code>(e, s)</code></td><td>9</td><td><code>es</code></td><td><code>n e w es t &lt;/w&gt;</code> / <code>w i d es t &lt;/w&gt;</code></td></tr>
+                <tr><td><strong>2</strong></td><td><code>(es, t)</code></td><td>9</td><td><code>est</code></td><td><code>n e w est &lt;/w&gt;</code> / <code>w i d est &lt;/w&gt;</code></td></tr>
+                <tr><td><strong>3</strong></td><td><code>(est, &lt;/w&gt;)</code></td><td>9</td><td><code>est&lt;/w&gt;</code></td><td>最高级后缀被整体收编为一个 token</td></tr>
+                <tr><td><strong>4</strong></td><td><code>(l, o)</code></td><td>7</td><td><code>lo</code></td><td><code>lo w &lt;/w&gt;</code> / <code>lo w e r &lt;/w&gt;</code></td></tr>
+                <tr><td><strong>5</strong></td><td><code>(lo, w)</code></td><td>7</td><td><code>low</code></td><td><code>low &lt;/w&gt;</code> / <code>low e r &lt;/w&gt;</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>注意第 1、2、3 轮频次都是 9，出现了平局。真实实现必须规定一个确定的<strong>平局打破规则</strong>（比如按字典序取最小、或按先出现顺序），否则同一份语料训两次会得到两套不同的词表，模型权重就对不上了。这是最容易被忽略、又最容易在复现实验时坑人的细节。</p>
+
+          <h3>用学到的规则编码一个新词</h3>
+          <p>训练语料里从没出现过 <code>lowest</code>。现在按上面五条规则依次尝试合并：</p>
+          <ul>
+            <li>起点：<code>l o w e s t &lt;/w&gt;</code></li>
+            <li>规则 1 <code>(e,s)→es</code>：<code>l o w es t &lt;/w&gt;</code></li>
+            <li>规则 2 <code>(es,t)→est</code>：<code>l o w est &lt;/w&gt;</code></li>
+            <li>规则 3 <code>(est,&lt;/w&gt;)→est&lt;/w&gt;</code>：<code>l o w est&lt;/w&gt;</code></li>
+            <li>规则 4 <code>(l,o)→lo</code>：<code>lo w est&lt;/w&gt;</code></li>
+            <li>规则 5 <code>(lo,w)→low</code>：<code>low est&lt;/w&gt;</code></li>
+          </ul>
+          <p>最终结果是两个 token：<code>["low", "est&lt;/w&gt;"]</code>。一个训练时压根没见过的词，被干净地切成了「词根 + 后缀」。<strong>这就是子词的全部魅力</strong>——用有限的部件覆盖无限的词形。</p>
+
+          <p>再看一个反例：编码 <code>newer</code>。它的字符序列是 <code>n e w e r &lt;/w&gt;</code>，五条规则没有一条能命中，结果是六个单字符 token。这说明 BPE 的能力完全取决于训练语料——<strong>语料里没有的模式，它就只能退化成字符级</strong>。这也解释了为什么后面要讲「训练语料必须覆盖你关心的所有领域」。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">顺序即一切</span>
+            合并规则是一个<strong>有序列表</strong>，不是一个集合。编码时必须严格按训练时的顺序尝试，顺序一乱，同一段文本会得到完全不同的切分，模型看到的输入分布就和训练时对不上，输出立刻退化。分发模型时 <code>merges.txt</code>（或等价文件）和权重同等重要，丢了它权重就是废的。
+          </div>
+
+          <!-- ============ 3 ============ -->
+          <h2>三、从零实现：四十行可运行代码</h2>
+          <p>把上面的推演写成代码。为了让逻辑清晰，这里用最朴素的「每轮全量重算」写法——不做任何性能优化，但每一行都对应推演里的一个动作。</p>
+
+          <details class="deep">
+            <summary>展开：完整 BPE 训练 / 编码 / 解码实现</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">from collections import Counter
+
+class BPE:
+    def __init__(self, vocab_size=80):
+        self.vocab_size = vocab_size          # 目标词表大小(含单字符)
+        self.merges = []                      # 有序合并规则 [(a, b), ...]
+        self.vocab = set()                    # 全部 token 集合
+
+    def _get_pairs(self, word):
+        """返回一个词内部的所有相邻对(去重,同一对在一个词里只记一次)"""
+        return set(zip(word, word[1:]))
+
+    def train(self, corpus):
+        # 1) 拆词为字符序列,词尾加哨兵符号
+        words = [list(w) + ['&lt;/w&gt;'] for w in corpus]
+        # 2) 初始化词表为所有出现过的单字符
+        chars = set(c for w in words for c in w)
+        self.vocab = set(chars)
+        # 3) 迭代合并,直到词表满或无对可合
+        while len(self.vocab) &lt; self.vocab_size:
+            pair_counts = Counter()
+            for w in words:
+                for pair in self._get_pairs(w):
+                    pair_counts[pair] += 1
+            if not pair_counts:
+                break
+            # 平局打破:先按频次降序,再按字典序升序,保证可复现
+            best = min(pair_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+            new_words = []
+            for w in words:
+                new_w, i = [], 0
+                while i &lt; len(w):
+                    if i + 1 &lt; len(w) and (w[i], w[i+1]) == best:
+                        new_w.append(best[0] + best[1])
+                        i += 2
+                    else:
+                        new_w.append(w[i])
+                        i += 1
+                new_words.append(new_w)
+            words = new_words
+            self.merges.append(best)
+            self.vocab.add(best[0] + best[1])
+        return self
+
+    def encode(self, text):
+        """按训练时的顺序逐条应用合并规则"""
+        tokens = list(text) + ['&lt;/w&gt;']
+        for a, b in self.merges:
+            new_tokens, i = [], 0
+            while i &lt; len(tokens):
+                if i + 1 &lt; len(tokens) and (tokens[i], tokens[i+1]) == (a, b):
+                    new_tokens.append(a + b)
+                    i += 2
+                else:
+                    new_tokens.append(tokens[i])
+                    i += 1
+            tokens = new_tokens
+        return tokens
+
+    def decode(self, tokens):
+        """把哨兵还原成空格,拼回原文"""
+        return ''.join(t.replace('&lt;/w&gt;', ' ') for t in tokens)
+
+
+# ---- 复现第二节的手算过程 ----
+bpe = BPE(vocab_size=16)
+bpe.train(["low"] * 5 + ["lower"] * 2 + ["newest"] * 6 + ["widest"] * 3)
+print(bpe.merges)               # 前几条应为 ('e','s'), ('es','t'), ...
+print(bpe.encode("lowest"))     # 期望切成 词根 + 后缀 两段
+print(bpe.encode("newer"))      # 规则命不中,退化为单字符
+print(bpe.decode(bpe.encode("lowest")))</code></pre>
+              <p style="margin-bottom:0">这段代码的复杂度是 $O(V \times N)$，$V$ 是合并轮数、$N$ 是语料总长度——每轮都要扫一遍全部语料。训练几百轮的玩具语料没问题，训练几万轮的真实语料会慢到不可接受。工业实现的三处关键优化见下一节。</p>
+            </div>
+          </details>
+
+          <h3>逐行看懂三个关键点</h3>
+          <ul>
+            <li><strong><code>_get_pairs</code> 用 <code>set</code> 去重</strong>：同一个词里 <code>(a,b)</code> 出现两次只算一次。这是简化写法；严格实现应按出现次数累加。两种口径都能训出可用的分词器，但会得到不同的合并顺序——所以复现别人的词表时，要确认对方用的是哪种。</li>
+            <li><strong><code>best</code> 的平局打破</strong>：<code>key=lambda kv: (-kv[1], kv[0])</code> 表示先按频次从高到低，频次相同时按字典序从小到大。加上这一行，同一份语料训一百次得到的都是同一套词表。</li>
+            <li><strong><code>encode</code> 是 $O(M \times L)$</strong>：$M$ 是规则条数、$L$ 是文本长度。真实实现会用优先队列或前缀树，把编码降到接近线性。</li>
+          </ul>
+
+          <!-- ============ 4 ============ -->
+          <h2>四、从玩具到工业级：三处必须补的改造</h2>
+          <p>上面的实现能跑，但不能上生产。真实的分词器（GPT 系列、Llama 系列用的那一套）在此基础上做了三处关键改造。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as 原始文本
+  participant P as 正则预分词
+  participant B as UTF-8 字节化
+  participant M as 合并规则表
+  participant V as 词表查表
+  U->>P: 送入一段文本
+  P->>B: 先按空格与标点粗切成片段
+  B->>M: 每个片段转成字节序列
+  M->>M: 按训练顺序在片段内部合并
+  M->>V: 得到 token 字符串序列
+  V-->>U: 返回 token id 列表
+              </div>
+            <figcaption>工业级编码流水线：正则预分词把合并限制在片段内部（防止跨词合并），字节化保证任何输入都不会 OOV，合并规则表只在片段内生效。三步缺一不可。</figcaption>
+          </figure>
+
+          <h3>改造一：从字符级到字节级（BBPE）</h3>
+          <p>玩具版按 Unicode 字符切，问题在于「字符」本身就有几十万个（整个 Unicode 空间），初始词表无法枚举，遇到没见过的生僻字仍会 OOV。<strong>字节级 BPE 的做法是先把文本编码成 UTF-8 字节流，初始词表固定为 256 个字节值</strong>。任何文本——中文、emoji、二进制乱码、还没被 Unicode 收录的新符号——都是字节序列，因此<strong>永远不会 OOV</strong>。GPT-2 起 OpenAI 系列一直用这套方案。</p>
+          <p>代价是中文这类多字节文字吃亏：一个常用汉字在 UTF-8 里占 3 个字节，如果这三个字节的组合在训练语料里不够高频、没有被合并成一个 token，那么一个汉字就要占 2–3 个 token。这直接影响两件事：<strong>上下文窗口的实际容纳量</strong>和<strong>按 token 计费的成本</strong>。中文语料占比高的模型（如国产开源模型）通常会针对性扩充中文词表来缓解这个问题。</p>
+
+          <h3>改造二：正则预分词</h3>
+          <p>如果不做任何预处理直接在整篇文本上跑 BPE，算法会学出跨越空格和标点的怪异 token，比如 <code>"。这个"</code> 或者 <code>"), 而"</code>。这些 token 只在特定语境有效，浪费词表容量还降低泛化。</p>
+          <p>解法是先用一条正则把文本粗切成片段——典型切法是把「前导空格 + 单词」当作一个片段、把连续数字切开、把标点单独切出——然后<strong>只允许在片段内部合并</strong>。GPT-2 与 tiktoken 使用的具体 pattern 比较长且各版本略有差异，<strong>以官方源码为准</strong>；理解它的目的比背下它更重要。</p>
+          <p>把数字切开是个值得单独一提的设计：如果不切，<code>2024</code> 可能是一个 token 而 <code>2025</code> 是另一个 token，模型很难学到「它们相差 1」。把数字强制切成单个数位（或固定长度的组），算术能力会明显更稳。</p>
+
+          <h3>改造三：用优先队列避免全量重算</h3>
+          <p>玩具版每轮都要重新扫描整个语料统计所有相邻对，这是最大的性能瓶颈。工业实现的做法是：<strong>只在第一次全量统计，之后每次合并只更新受影响位置附近的计数</strong>——合并 <code>(a,b)</code> 只会改变 <code>a</code> 左边和 <code>b</code> 右边那两个相邻对的计数，其余不变。配合一个最大堆维护当前最高频对，单轮开销从 $O(N)$ 降到接近 $O(1)$ 的摊还。</p>
+
+          <div class="callout">
+            <span class="callout-t">别重复造轮子</span>
+            理解原理请手写，真要训练请用 HuggingFace 的 <code>tokenizers</code> 库（Rust 实现）或 <code>sentencepiece</code>。它们把上面三处改造都做好了，还处理了归一化、特殊 token、并行训练、序列化格式等一堆琐碎事。手写版的价值在于让你看懂它们的配置项在说什么。
+          </div>
+
+          <h3>用 tokenizers 库训练一个真的分词器</h3>
+          <pre><code class="language-python">from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+
+# 1) 选择模型:字节级 BPE
+tokenizer = Tokenizer(models.BPE(unk_token=None))
+
+# 2) 预分词器:ByteLevel 同时完成"字节化"和"前导空格归属"
+tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
+tokenizer.decoder = decoders.ByteLevel()
+
+# 3) 训练器:指定词表大小、最低频次、特殊 token
+trainer = trainers.BpeTrainer(
+    vocab_size=32000,
+    min_frequency=2,              # 出现少于 2 次的合并直接丢弃
+    special_tokens=["&lt;|endoftext|&gt;", "&lt;|pad|&gt;"],
+    show_progress=True,
+)
+
+# 4) 从文件列表训练(逐行读取,内存友好)
+files = ["corpus_zh.txt", "corpus_en.txt", "corpus_code.txt"]
+tokenizer.train(files, trainer)
+
+# 5) 保存为单个 json,包含词表 + 合并规则 + 全部配置
+tokenizer.save("my-tokenizer.json")
+
+# 6) 立刻试一下
+enc = tokenizer.encode("大模型的分词器决定了它怎么看世界。")
+print(enc.tokens)
+print(enc.ids)
+print(tokenizer.decode(enc.ids))</code></pre>
+
+          <p>几个参数值得解释：<code>min_frequency=2</code> 会过滤掉只出现一次的合并，防止词表被「只在某一篇文档里出现过的长怪词」占满；<code>add_prefix_space=True</code> 让句首词和句中词的切分保持一致（否则 <code>"Hello"</code> 和 <code>" Hello"</code> 会是两套不同的 token，模型要重复学两遍）；<code>special_tokens</code> 声明的符号会被保留为原子单位，永远不会被拆开。</p>
+
+          <!-- ============ 5 ============ -->
+          <h2>五、BPE、WordPiece 与 Unigram 的分野</h2>
+          <p>子词算法不止 BPE 一种。它们的区别只在一处：<strong>决定「合并谁」或「保留谁」的评分标准不同</strong>。在展开对比之前，先看一眼这条技术线是怎么走过来的——你会发现十年间变化的主要是「词表多大」和「切在哪一层」，核心算法几乎没动过。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 子词分词技术的演进
+  2012 : WordPiece 被提出 用于语音搜索场景
+  2015 : BPE 论文上线 首次把字节对编码用于切分罕见词
+  2016 : Google NMT 采用 WordPiece 子词成为机器翻译标配
+  2018 : SentencePiece 发布 把空格当普通字符 免预分词
+       : BERT 采用 WordPiece 英文词表约 3 万
+  2019 : GPT-2 采用字节级 BPE 词表 50257 从此不再有未登录词
+  2023 : Llama 2 用 SentencePiece BPE 词表 32000
+  2024 : Llama 3 词表扩到约 12.8 万 压缩率提升但嵌入层变胖
+            </div>
+            <figcaption>子词分词的十余年演进：算法本身变化不大，真正在变的是两件事——切分层级从字符走到字节（彻底消灭 OOV），以及词表规模从 3 万级走向 10 万级（用参数换序列长度）。</figcaption>
+          </figure>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("子词分词算法"))
+    频率派 自底向上合并
+      BPE
+        按相邻对出现次数
+        字节级变体 BBPE
+        GPT 与 Llama 系
+      WordPiece
+        按合并后的似然增益
+        BERT 系
+    概率派 自顶向下剪枝
+      Unigram LM
+        先建超大候选集
+        按损失最小逐步剪掉
+        支持子词正则化
+    工具层 不是算法
+      SentencePiece
+        把空格当普通字符
+        可选 BPE 或 Unigram
+        T5 与多语言模型常用
+              </div>
+            <figcaption>三种算法族的分野：BPE 与 WordPiece 都是自底向上合并，区别在打分标准；Unigram 反过来自顶向下剪枝。SentencePiece 是工具库而非算法，它可以承载 BPE 也可以承载 Unigram——这一点最常被混淆。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>算法</th><th>决策依据</th><th>构建方向</th><th>代表使用者</th><th>特点与取舍</th></tr></thead>
+              <tbody>
+                <tr><td><strong>BPE</strong></td><td>相邻对出现<strong>频率</strong></td><td>自底向上合并</td><td>GPT 系列、Llama 系列</td><td>简单直接、可复现性好、生态最广；纯频率驱动，偶尔切出不符语言直觉的片段</td></tr>
+                <tr><td><strong>WordPiece</strong></td><td>合并后的<strong>似然增益</strong></td><td>自底向上合并</td><td>BERT 系列</td><td>比纯频率更「讲究」——优先合并那些互信息高的对；子词前缀常带 <code>##</code> 标记</td></tr>
+                <tr><td><strong>Unigram LM</strong></td><td>剪掉某子词后的<strong>似然损失</strong></td><td>自顶向下剪枝</td><td>T5、多语言模型</td><td>同时学出词表和每个子词的概率，可采样出多种切分（子词正则化），跨语言通常更稳</td></tr>
+                <tr><td><strong>SentencePiece</strong></td><td colspan="2">是<strong>工具库</strong>，内部可选 BPE 或 Unigram</td><td>T5、部分 Llama 变体</td><td>把空格当成普通字符（用 <code>▁</code> 表示），因此不依赖语言相关的预分词，天然适合中日韩等无空格语言</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：Unigram 为什么反着来，以及「子词正则化」是什么</summary>
+            <div class="deep-body">
+              <p>BPE 是「从少到多」：从单字符开始，一路合并到词表满。Unigram 反过来，是「从多到少」：先用启发式方法生成一个超大的候选子词集合（比如所有出现频次达标的子串），给每个子词一个概率，然后反复做这件事——</p>
+              <ol>
+                <li>用当前词表和概率，对语料算一次总体似然；</li>
+                <li>逐个试探「删掉这个子词，总似然会掉多少」；</li>
+                <li>把损失最小的那批（通常一次删 10%–20%）剪掉；</li>
+                <li>重新估计剩余子词的概率，回到第 1 步，直到词表达到目标大小。</li>
+              </ol>
+              <p>这样得到的不只是一张词表，还有<strong>每个子词的概率</strong>。于是同一个词可以有多种合法切分，各自有不同概率——「unhappiness」可以切成 <code>un|happiness</code>，也可以切成 <code>unhappy|ness</code>，还可以切成 <code>un|happy|ness</code>。</p>
+              <p><strong>子词正则化</strong>就是利用这一点：训练时每次随机采样一种切分，而不是永远用最优切分。效果类似给输入加噪声，能让模型对分词边界不那么敏感、鲁棒性更好，在低资源语言上收益尤其明显。BPE 因为切分是确定的，做不到这件事（有一个叫 BPE-Dropout 的变体通过随机跳过合并规则来模拟类似效果）。</p>
+              <p>代价是 Unigram 训练更慢、实现更复杂，而且切分不确定这件事在推理时要关掉——推理时固定用概率最高的那种切分，否则同一个问题问两次会得到不同输入。</p>
+            </div>
+          </details>
+
+          <!-- ============ 6 ============ -->
+          <h2>六、词表大小怎么定：一笔必须自己算的账</h2>
+          <p>「词表设多大」是训练分词器时唯一需要你拍板的核心参数，它同时影响三件事：序列长度、嵌入层参数量、以及长尾 token 的训练充分度。</p>
+
+          <p>先算参数量这笔账。嵌入矩阵的大小是 <code>vocab_size × d_model</code>，输出层（LM head）通常同样大小（若不做权重共享则要算两遍）。代入具体数字：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>词表大小</th><th>d_model</th><th>嵌入矩阵参数量</th><th>典型场景</th></tr></thead>
+              <tbody>
+                <tr><td>32,000</td><td>768</td><td>约 2,460 万</td><td>小模型 / 单语场景</td></tr>
+                <tr><td>32,000</td><td>4,096</td><td>约 1.31 亿</td><td>7B 级别、词表偏小的模型</td></tr>
+                <tr><td>128,000</td><td>4,096</td><td>约 5.24 亿</td><td>7B 级别、大词表多语言模型</td></tr>
+                <tr><td>128,000</td><td>8,192</td><td>约 10.5 亿</td><td>更大规模、大词表</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>看第二行和第三行的对比：词表从 3.2 万扩到 12.8 万，仅嵌入层就多了约 4 亿参数。对一个 7B 模型来说，这相当于把 5%–6% 的参数预算全花在了查表上。<strong>换来的是什么？</strong>是更短的序列——同样一篇文档，大词表可能只需要 80% 甚至 70% 的 token 数。序列短意味着注意力开销小、推理更快、上下文窗口装得下更多内容。</p>
+
+          <p>所以这是一个明确的权衡：<strong>大词表用参数换序列长度，小词表用序列长度换参数</strong>。经验上的落点：</p>
+
+          <ul>
+            <li><strong>单语、小模型（&lt; 1B）</strong>：8K–32K。参数预算紧张，嵌入层不能占太多。</li>
+            <li><strong>单语、中大模型（7B 以上）</strong>：32K–64K。这是长期以来的主流区间。</li>
+            <li><strong>多语言 / 含大量代码</strong>：64K–150K。语言种类多，小词表会让非英语语言的 token 数暴涨，得不偿失。</li>
+            <li><strong>再往上</strong>：收益迅速递减，而且长尾 token 在语料里出现次数太少，嵌入向量训不充分，反而成为噪声。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">词表里的「僵尸 token」</span>
+            如果训练分词器的语料和训练模型的语料<strong>不是同一批</strong>，会出现一类诡异问题：某些 token 存在于词表里，却在模型训练语料中几乎从不出现，它们的嵌入向量基本保持随机初始化状态。一旦被触发，模型行为会变得完全不可预测——早期 GPT 系列被社区发现的 SolidGoldMagikarp 一类「异常 token」就是这个成因。防御办法很朴素：<strong>分词器语料与模型语料尽量同源，并在训练后统计每个 token 的实际出现频次，把长期为零的清理掉</strong>。
+          </div>
+
+          <!-- ============ 7 ============ -->
+          <h2>七、中文、代码与数字：三类高频踩坑现场</h2>
+
+          <h3>中文：token 数不等于字数</h3>
+          <p>很多人默认「一个汉字一个 token」，这在字节级 BPE 下不成立。汉字在 UTF-8 里占 3 个字节，常用字因为高频通常会被合并成 1 个 token，但生僻字、少见词组可能占到 2–3 个 token。这带来两个实际后果：</p>
+          <ul>
+            <li><strong>成本估算失真</strong>：按「1 字 = 1 token」估算 API 账单，实际可能超出 30%–100%。上线前务必用目标模型的官方分词器实际跑一遍你的典型文本，别拍脑袋。</li>
+            <li><strong>上下文窗口缩水</strong>：标称 128K token 的窗口，装中文可能只相当于 6–9 万汉字，而不是 12.8 万。</li>
+          </ul>
+
+          <h3>代码：缩进与符号的组合爆炸</h3>
+          <p>代码语料有一个鲜明特点——大量重复的缩进空格。如果分词器没有专门处理，<code>"    "</code>（4 空格）、<code>"        "</code>（8 空格）、<code>"            "</code>（12 空格）会各自占据一个词表条目，甚至更多层级。好的代码分词器会显式把不同长度的空格串收进词表（这是有意为之，能显著缩短 Python 这类缩进敏感语言的序列），但要注意别让它们把词表吃掉太多。</p>
+          <p>另一个坑是常见符号组合：<code>=&gt;</code>、<code>-&gt;</code>、<code>::</code>、<code>!=</code>、<code>&amp;&amp;</code> 这些在代码里极高频，若训练语料不含代码，它们会被拆成单字符，代码任务的序列长度直接翻倍。</p>
+
+          <h3>数字：为什么模型算不对加法</h3>
+          <p>如果分词器把 <code>1234</code> 切成一个 token、<code>1235</code> 切成另一个 token，模型在表示层面就看不出它们的数值关系。而如果切成 <code>1|2|3|4</code>，模型至少能按位处理。现代分词器普遍采用「数字单独切分」的策略——把连续数字强制切成单位数或固定长度的组。这是一个纯粹为了下游能力做的<strong>反直觉设计</strong>：明知会让序列变长，还是要切。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>场景</th><th>典型症状</th><th>根因</th><th>处理办法</th></tr></thead>
+              <tbody>
+                <tr><td>中文成本超预算</td><td>实际账单是估算的 1.5–2 倍</td><td>按字数而非 token 数估算</td><td>用官方分词器实测典型样本，取 p95 而非均值</td></tr>
+                <tr><td>代码任务序列过长</td><td>同样的文件，token 数远超预期</td><td>分词器语料不含代码</td><td>训练语料混入代码；确认缩进空格串在词表里</td></tr>
+                <tr><td>数字计算不稳</td><td>多位数加减经常错位</td><td>整数被合并成单个 token</td><td>预分词阶段强制切分连续数字</td></tr>
+                <tr><td>切分结果不可复现</td><td>两次训练得到不同词表</td><td>平局打破规则不确定</td><td>显式指定确定性排序，固定随机种子与语料顺序</td></tr>
+                <tr><td>特殊 token 被拆开</td><td>对话模板标记失效、模型不停不下来</td><td>未声明为 special token</td><td>训练与推理都把它们注册为原子单位</td></tr>
+                <tr><td>句首句中切分不一致</td><td>同一个词两种切法，效果打折</td><td>未处理前导空格归属</td><td>开启 <code>add_prefix_space</code> 类选项</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- ============ 8 ============ -->
+          <h2>八、验证你的分词器：四个必做检查</h2>
+          <p>训练完不等于能用。上线前跑一遍下面四项，能挡掉绝大多数事故。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  Start["训练完成<br/>拿到 tokenizer 文件"] --> C1{"① 往返一致性<br/>decode encode x 等于 x"}
+  C1 -->|"失败"| F1["检查字节还原<br/>与空格归属"]
+  C1 -->|"通过"| C2{"② 压缩率<br/>token 数 除以 字符数"}
+  C2 -->|"偏高"| F2["语料覆盖不足<br/>补领域语料重训"]
+  C2 -->|"合理"| C3{"③ 覆盖率<br/>词表利用是否均衡"}
+  C3 -->|"大量零频 token"| F3["降低词表大小<br/>或清理僵尸 token"]
+  C3 -->|"通过"| C4{"④ 特殊 token<br/>是否保持原子"}
+  C4 -->|"被拆开"| F4["重新注册<br/>special tokens"]
+  C4 -->|"通过"| OK["可以交付"]
+
+  style OK fill:#eaf3de,stroke:#639922
+  style F1 fill:#fcebeb,stroke:#a32d2d
+  style F2 fill:#faeeda,stroke:#ba7517
+  style F3 fill:#faeeda,stroke:#ba7517
+  style F4 fill:#fcebeb,stroke:#a32d2d
+              </div>
+            <figcaption>分词器验收流水线：往返一致性是硬门槛（不通过绝不能上线），压缩率与覆盖率决定质量，特殊 token 检查防止对话模板失效。</figcaption>
+          </figure>
+
+          <pre><code class="language-python">from tokenizers import Tokenizer
+
+tok = Tokenizer.from_file("my-tokenizer.json")
+
+# ① 往返一致性:解码后必须与原文逐字节相同
+samples = [
+    "大模型的分词器决定了它怎么看世界。",
+    "def add(a, b):\n    return a + b  # 缩进与符号",
+    "Order #12345 shipped on 2024-03-15, total $1,299.00",
+    "emoji 也要能过: 🚀🔥  以及生僻字: 龘齉",
+]
+for s in samples:
+    back = tok.decode(tok.encode(s).ids)
+    assert back == s, f"往返失败:\n原文 {s!r}\n还原 {back!r}"
+print("① 往返一致性: 通过")
+
+# ② 压缩率:平均每个 token 覆盖多少字符,越高越省
+total_chars = sum(len(s) for s in samples)
+total_tokens = sum(len(tok.encode(s).ids) for s in samples)
+print(f"② 压缩率: {total_chars / total_tokens:.2f} 字符/token")
+
+# ③ 覆盖率:在真实语料上统计每个 token 的出现次数
+from collections import Counter
+freq = Counter()
+with open("corpus_zh.txt", encoding="utf-8") as f:
+    for line in f:
+        freq.update(tok.encode(line).ids)
+vocab_size = tok.get_vocab_size()
+zero = vocab_size - len(freq)
+print(f"③ 零频 token: {zero} / {vocab_size} ({zero / vocab_size:.1%})")
+
+# ④ 特殊 token 必须保持原子,不被拆开
+for sp in ["&lt;|endoftext|&gt;", "&lt;|pad|&gt;"]:
+    ids = tok.encode(sp).ids
+    print(f"④ {sp} -&gt; {len(ids)} 个 token", "OK" if len(ids) == 1 else "异常")</code></pre>
+
+          <p>四项指标怎么读：</p>
+          <ul>
+            <li><strong>往返一致性</strong>是硬门槛，一条都不能失败。失败通常出在字节还原（decoder 没配对）或空格归属（前导空格被吞掉）。</li>
+            <li><strong>压缩率</strong>要和你的对照组比，不要看绝对值。同一批文本，把你的分词器和一个成熟开源分词器各跑一遍，如果你的明显更差（token 更多），说明语料覆盖不足。</li>
+            <li><strong>零频 token 比例</strong>如果超过 10%，说明词表开大了或者语料太单一，该缩小词表或补语料。</li>
+            <li><strong>特殊 token</strong>必须每个都编码成恰好 1 个 id。这一项挂了，对话模板会失效，模型会停不下来或者把控制符当正文输出。</li>
+          </ul>
+
+          <div class="callout tip">
+            <span class="callout-t">一个便宜的对照实验</span>
+            拿你实际业务里的 100 段典型文本，同时用「自己训的分词器」和「目标基座模型自带的分词器」跑一遍，对比 token 总数。如果自己训的没有明显优势（比如少 15% 以上），那就<strong>直接用基座自带的</strong>——换分词器意味着嵌入层要重新训练，代价远大于收益。只有在目标语言/领域被基座严重低估时，扩充词表才划算。
+          </div>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/02-representation/embeddings/fig1.png" alt="论文原图：word2vec 中 CBOW 与 Skip-gram 的词表示学习架构" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：词表示学习的两种训练方向——CBOW 用上下文预测中心词，Skip-gram 用中心词预测上下文</span>
+              <span class="pf-src">论文原图 · Mikolov et al., <em>Efficient Estimation of Word Representations in Vector Space</em>, 2013, Figure 1 · <a href="https://arxiv.org/abs/1301.3781" target="_blank" rel="noopener">arXiv:1301.3781</a></span>
+            </figcaption>
+          </figure>
+          <p>这张图不是 BPE 合并规则图，而是分词之后“token 如何获得向量”的前置直觉图。左侧 CBOW 把上下文词向量汇总后预测中心词，右侧 Skip-gram 从中心词预测周围词；两者都说明 token id 只是查表入口，真正供模型计算的是训练得到的连续向量。</p>
+          <p>把它和本页的 BPE 串起来看：BPE 决定文本被切成哪些 token，embedding 训练决定这些 token 在向量空间中如何表达。若切分把一个常见词拆得过碎，模型就必须通过更多上下文重新组合语义；若词表包含大量低频 token，图中的预测信号会稀疏。因此分词器不是独立的字符串工具，而是表示学习的第一道接口。</p>
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            BPE 的 token 字符串、token id 和 embedding 向量是三个不同层次：合并规则产生字符串，词表把字符串映射成 id，模型 embedding 再把 id 映射成向量。只保存 merges.txt 而丢掉词表映射，或更换词表后继续使用旧模型权重，都会让输入完全错位。
+          </div>
+          <details class="deep">
+            <summary>展开：最小可运行版本、验证步骤与排查清单</summary>
+            <div class="deep-body">
+              <p>最小实验先用四个词和固定频次训练 5 轮，打印每轮的最高频 pair、合并后的词序列和最终 <code>encode/decode</code> 结果。验证至少覆盖一个训练中出现过的词、一个未出现但可由子词拼出的词、中文、emoji、连续数字和前后空格；每个样本都检查解码后是否与原始 UTF-8 字节一致。</p>
+              <p>排查顺序是：是否固定了平局排序，训练和编码是否使用同一套 merge 顺序，哨兵符号是否只在词尾参与合并，special token 是否被注册为原子，以及 decoder 是否正确还原空格。性能不够时不要先改算法语义，先换 <code>tokenizers</code> 的 Rust 实现；需要支持多语言和随机切分时，再评估 SentencePiece Unigram。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：BPE 用数据统计反复合并最高频相邻对，自动找到「词与字符之间」的折中粒度。没有神经网络，只有计数与排序。</li>
+            <li><strong>三种粒度</strong>：整词会 OOV 且词表爆炸，字符级序列太长语义太碎，子词是工程上的最优解。</li>
+            <li><strong>训练产物</strong>：一张<strong>有序</strong>的合并规则表 + 一张词表。顺序错了，编码结果就全错。</li>
+            <li><strong>手算能验证</strong>：low/lower/newest/widest 五轮合并后，训练时没见过的 lowest 会被切成「low + est」——这就是子词的核心价值。</li>
+            <li><strong>三处工业改造</strong>：字节级（永不 OOV）、正则预分词（防跨词合并、切开数字）、增量计数 + 优先队列（性能）。</li>
+            <li><strong>算法分野</strong>：BPE 按频率、WordPiece 按似然增益、Unigram 反向剪枝并支持子词正则化；SentencePiece 是工具库不是算法。</li>
+            <li><strong>词表大小的账</strong>：12.8 万词表 × 4096 维 ≈ 5.24 亿参数，是 3.2 万词表的四倍。用参数换序列长度，落点看语言数量与模型规模。</li>
+            <li><strong>三类坑</strong>：中文 token 数远大于字数（成本与窗口都要重估）、代码缩进与符号组合、数字被整体合并导致算术不稳。</li>
+            <li><strong>四项验收</strong>：往返一致性（硬门槛）、压缩率（对照比较）、零频 token 比例（&lt; 10%）、特殊 token 保持原子。</li>
+            <li><strong>什么时候不该自己训</strong>：如果压缩率相对基座自带分词器没有明显优势，直接沿用——换分词器等于嵌入层重训。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Neural Machine Translation of Rare Words with Subword Units（Sennrich et al.）— 把 BPE 引入 NLP 的原始论文，本页的算法框架和 low/lower/newest/widest 例子都来自这里 · <a href="https://arxiv.org/abs/1508.07909" target="_blank" rel="noopener">arXiv:1508.07909</a></li>
+            <li>SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing（Kudo &amp; Richardson）— SentencePiece 官方论文，讲清了「把空格当普通字符」为什么对无空格语言至关重要 · <a href="https://arxiv.org/abs/1808.06226" target="_blank" rel="noopener">arXiv:1808.06226</a></li>
+            <li>Subword Regularization: Improving Neural Network Translation Models with Multiple Subword Candidates（Kudo）— Unigram LM 与子词正则化的来源，解释了为什么「同一个词多种切分」能提升鲁棒性 · <a href="https://arxiv.org/abs/1804.10959" target="_blank" rel="noopener">arXiv:1804.10959</a></li>
+            <li>HuggingFace Tokenizers 文档 — 本页第四节代码所用库的官方文档，含 BPE / WordPiece / Unigram 各自的配置项说明。具体 API 以官方文档为准 · <a href="https://huggingface.co/docs/tokenizers" target="_blank" rel="noopener">huggingface.co/docs/tokenizers</a></li>
+            <li>tiktoken — OpenAI 的开源 BPE 库，可用来查看 GPT 系列各代词表的实际切分行为，是核对「中文到底占几个 token」最直接的工具（搜索获取）</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            亲手训练完分词器，再回头系统看一遍 <a href="../02-representation/tokenization.html">词元化 Tokenization</a> 的理论全貌；然后了解 token 如何变成模型能算的向量——<a href="../02-representation/embeddings.html">词嵌入与向量空间</a>。想把分词器接到一个真能训练的模型上，看 <a href="build-minigpt.html">实战：从零实现 miniGPT</a>；想知道词表大小如何影响推理成本，看 <a href="../09-efficiency/serving-cost.html">服务化与推理经济学</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

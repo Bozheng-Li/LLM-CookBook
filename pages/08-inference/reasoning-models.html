@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>推理模型 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="08-inference" data-topic="reasoning-models">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+              <span class="tag-frontier">2026 前沿</span>
+            </div>
+            <h1>推理模型</h1>
+            <p class="lead">2024 年 9 月，OpenAI 发布 o1，一个新模型类别诞生了：推理模型。它和此前的 LLM 最大的区别不是参数量更大或训练数据更多，而是在回答前会"想很久"——生成数千甚至数万 token 的内部思维链，然后才给出答案。DeepSeek-R1 用纯 RLVR 复现了这一能力并开源，证明了长思维链不需要海量人类标注的推理过程，可验证奖励本身就够。本页拆解推理模型的训练范式、行为特征，以及一个根本性的未解问题：模型写出来的思维链，真的是它内部计算过程的真实记录吗？</p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">前置知识</span>
+            本页假定你已理解推理时扩展的基本概念（CoT、Self-Consistency），见 <a href="inference-scaling.html">推理时扩展</a>；并了解 RLVR 和 GRPO 的训练机制，见 <a href="../07-posttraining/grpo-rlvr.html">推理强化学习</a>。
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>推理模型的核心变化是训练目标的转移：从"直接给答案"转向"先想再答"。训练上分两条路——OpenAI o1 用大量人类/合成推理轨迹做 SFT 再做 RL，DeepSeek-R1 纯靠可验证奖励的 RL 让长思维链自发涌现。行为上，推理模型表现出自我验证、反思、方向切换等此前只在 prompt 里才能激发的能力，且这些能力内化进了权重。推理时，思维链长度成为新的"思考预算"旋钮。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  subgraph Base["基座模型"]
+    B1["预训练 LLM"]
+  end
+  subgraph Cold["冷启动（可选）"]
+    C1["推理轨迹 SFT<br/>（o1 路线）"]
+  end
+  subgraph RL["RLVR 强化学习"]
+    R1["可验证奖励<br/>数学/代码/逻辑"]
+    R2["GRPO 训练"]
+    R1 --> R2
+  end
+  subgraph Emergent["涌现行为"]
+    E1["自我验证"]
+    E2["反思与回溯"]
+    E3["分而治之"]
+    E4["替代路径探索"]
+  end
+  Base --> Cold
+  Cold --> RL
+  Base --> RL
+  RL --> Emergent
+  style R2 fill:#e6f1fb,stroke:#185fa5
+  style Emergent fill:#e8f8e8,stroke:#27ae60
+              </div>
+              <figcaption>推理模型训练范式：基座 →（可选）推理 SFT → RLVR → 涌现长思维链行为</figcaption>
+            </figure>
+          </div>
+
+          <h2>从"快思考"到"慢思考"：推理模型的范式转换</h2>
+          <p>在 o1 之前，LLM 的推理模式可以类比为人类的"系统 1"——快速、直觉、一次过。模型看到问题，直接逐 token 生成答案，中间没有显式的"思考"步骤。即使加 CoT prompt，推理过程也是线性的、不回头的、不受训练信号直接强化的。</p>
+          <p>推理模型对应"系统 2"——慢速、审慎、可回溯。模型在给出最终答案前，先在一个"思考空间"里探索：尝试不同思路、检查中间结果、发现错误时回头重来。这个思考过程不是用户 prompt 出来的，而是训练时被奖励函数塑造出来的——RLVR 的奖励信号让模型发现："先想清楚再回答"比"直接回答"更容易拿到正确答案的奖励。</p>
+          <p>这个范式转换的关键不在于思维链本身（CoT 在 2022 年就有了），而在于：</p>
+          <ul>
+            <li><strong>思维链是训练出来的，不是 prompt 出来的</strong>。模型在训练中被奖励了有效推理，思维链行为被内化进权重，不需要用户加"Let's think step by step"。</li>
+            <li><strong>思维链可以极长</strong>。普通 CoT 通常几百 token，推理模型的思维链可以上万 token，甚至超过最终答案长度几十倍。</li>
+            <li><strong>思维链包含回溯和反思</strong>。不是线性地"一步步往下走"，而是"走到一半发现不对，退回来换个方向"。</li>
+          </ul>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/08-inference/chain-of-thought/fig1.png" alt="论文原图：思维链提示让模型在给出答案前先生成中间推理步骤" loading="lazy" style="max-width:480px">
+            <figcaption>
+              <span class="pf-title">图：思维链提示示例——通过"输入、思维链、输出"三段式引导模型逐步推理</span>
+              <span class="pf-src">论文原图 · Wei et al., <em>Chain-of-Thought Prompting Elicits Reasoning in Large Language Models</em>, 2022, Figure 3 · <a href="https://arxiv.org/abs/2201.11903" target="_blank" rel="noopener">arXiv:2201.11903</a></span>
+            </figcaption>
+          </figure>
+
+          <h2>训练范式：两条路殊途同归</h2>
+          <p>推理模型的训练有两条主要路线，它们在"是否需要人类推理轨迹"上有根本区别。</p>
+
+          <h3>路线 A：推理 SFT + RL（o1 路线）</h3>
+          <p>OpenAI o1 的训练（根据公开信息推断，o1 技术细节未完全公开）大致分两步：</p>
+          <ol>
+            <li><strong>冷启动 SFT</strong>：用大量高质量的推理轨迹（包含思维过程和答案）做监督微调，让模型学会"先想再答"的格式和基本推理模式。这些推理轨迹可能是人类标注的、也可能是更强的模型合成的。</li>
+            <li><strong>RLVR 强化学习</strong>：在 SFT 基础上用可验证奖励做 RL，进一步优化推理质量。RL 阶段让模型自主探索更有效的推理策略，突破 SFT 数据的质量上限。</li>
+          </ol>
+          <p>这条路线的好处是冷启动 SFT 提供了一个好的初始点——模型从一开始就知道"怎么写推理过程"，RL 只需要优化"怎么想得更好"。代价是需要高质量的推理轨迹数据，这些数据的获取成本不低。</p>
+
+          <h3>路线 B：纯 RLVR（DeepSeek-R1 路线）</h3>
+          <p>DeepSeek-R1-Zero 做了一个更激进的实验：<strong>跳过冷启动 SFT，直接在基座模型上做 RLVR</strong>。结果令人震惊——长思维链行为自发涌现了。模型在"答对有奖励"的压力下，自主发现了"先推理再回答"比"直接回答"更有效，思维链的长度和复杂度在训练过程中持续增长。</p>
+          <p>R1-Zero 的涌现行为包括：</p>
+          <ul>
+            <li>思维链长度从训练初期的几百 token 增长到后期的数千 token。</li>
+            <li>自发出现"Wait, let me reconsider..."（等等，让我重新想想）这类反思行为。</li>
+            <li>自发出现分而治之策略：将复杂问题拆解为子问题。</li>
+            <li>自发出现替代路径探索：一条思路走不通时自动切换。</li>
+          </ul>
+
+          <p>「思维链长度自发增长」不是一句比喻，它是 DeepSeek-R1 论文里用训练日志直接画出来的实测曲线。下面这张论文原图横轴是 RL 训练步数，纵轴是训练集上采样的平均响应长度（平均响应长度在训练前期几乎全来自思维链，因为此时回答已经收敛）——你可以清楚地看到它在一路向上爬，没有任何人规定「你要想更久」，模型就是自己学会了这个策略。</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/2501.12948/assets/figures/plot_length.png" alt="论文原图：DeepSeek-R1-Zero 在强化学习训练过程中，训练集上的平均响应长度（思维链长度）持续增长" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：R1-Zero 训练中「平均响应长度」一路爬升——模型自发学会了用更长的思考时间换正确率</span>
+              <span class="pf-src">论文原图 · DeepSeek-AI, <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>, 2025, Figure 3 · <a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener">arXiv:2501.12948</a></span>
+            </figcaption>
+          </figure>
+
+          <p>读这张图要抓住两点。第一，<strong>曲线单调向上，说明「多想」这个行为在训练中被奖励信号不断强化</strong>——因为想得长的那些回答拿到了更高的正确率奖励，于是模型朝着「更长」的方向越走越远，这是 RL 最本能的自我强化。第二，<strong>曲线没有收敛迹象，训练后期仍在上升</strong>——这既是好事（说明推理潜力还没用完）也是隐患：它意味着「什么时候该想、想多久」完全由奖励主导，模型没有学到一个「难度感知」的开关。后面 <a href="hybrid-reasoning.html">混合推理与思考预算</a> 里讲的 overthinking 现象，根源就在这里——<em>奖励信号教会了模型「多想能拿奖励」，但没教会它「简单题不用多想」</em>。</p>
+
+          <p>但 R1-Zero 也有问题：输出格式不稳定、可读性差、有时中英文混杂。所以最终发布的 DeepSeek-R1 在 R1-Zero 基础上做了一轮冷启动 SFT + 多阶段 RL 来修复这些问题——实际上是路线 A 和路线 B 的混合。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TD
+  subgraph A["路线 A：o1 风格"]
+    A1["基座模型"] --> A2["推理轨迹 SFT<br/>学会推理格式"]
+    A2 --> A3["RLVR<br/>优化推理质量"]
+    A3 --> A4["推理模型"]
+  end
+  subgraph B["路线 B：R1 风格"]
+    B1["基座模型"] --> B2["直接 RLVR<br/>无冷启动"]
+    B2 --> B3["思维链自发涌现"]
+    B3 --> B4["R1-Zero<br/>能力够但格式差"]
+    B4 --> B5["冷启动 SFT<br/>+ 多阶段 RL"]
+    B5 --> B6["R1<br/>生产可用"]
+  end
+  style A2 fill:#e6f1fb,stroke:#185fa5
+  style B2 fill:#e8f8e8,stroke:#27ae60
+            </div>
+            <figcaption>两条训练路线对比：o1 先 SFT 再 RL，R1 先纯 RL 涌现再 SFT 修复</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            R1-Zero 证明了一个深刻的事情：模型"先想再答"的能力不需要人教——只要奖励信号对（答对有奖励），模型自己会发现"多想想"更划算。这暗示着推理能力可能不是需要被"注入"的外部知识，而是被奖励信号"解锁"的内在潜能。
+          </div>
+
+          <h2>推理模型与通用模型的定位差异</h2>
+          <p>把推理模型和通用模型摆在同一张表里对照，能更清楚地看出这个新类别到底"新"在哪里。下面的对比基于实际部署中反复观察到的行为差异，而不是纸面参数：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>通用模型</th><th>推理模型</th></tr></thead>
+              <tbody>
+                <tr><td>回答方式</td><td>一次过，直接给答案</td><td>先生成思维链，再给答案</td></tr>
+                <tr><td>典型输出长度</td><td>几十到几百 token</td><td>数千到数万 token</td></tr>
+                <tr><td>简单问题</td><td>快而准，性价比高</td><td>同样走思维链，浪费算力</td></tr>
+                <tr><td>复杂推理</td><td>容易跳步、出错</td><td>可回溯、可自我验证，显著更准</td></tr>
+                <tr><td>自我纠错</td><td>几乎不会</td><td>会反思并切换方向</td></tr>
+                <tr><td>延迟</td><td>低（秒级以内）</td><td>高（需生成完整思维链）</td></tr>
+                <tr><td>适用场景</td><td>对话、摘要、翻译、创意写作</td><td>数学、代码、逻辑、科学研究</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这张表揭示了一个工程判断：推理模型不是"更强的模型"，而是"换了一种能力曲线的模型"。在简单问题上它的优势几乎为零甚至为负——更慢、更贵、输出也更啰嗦；只有在问题复杂度超过某个阈值之后，多花的算力才开始"回本"。这个阈值在哪里，取决于具体任务、基座能力和思维链质量，必须在自己的业务数据上实测，而不是凭直觉拍板。也正因为如此，推理模型的典型部署方式不是"全量替换"，而是与通用模型并行、按难度路由——这正是"混合推理"的出发点，详见 <a href="hybrid-reasoning.html">混合推理与思考预算</a>。</p>
+
+          <h2>行为特征：推理模型"想"的时候在做什么</h2>
+          <p>分析推理模型的思维链输出，可以观察到几种反复出现的行为模式。这些模式不是被显式训练的（训练信号只有最终答案对不对），而是模型在追求正确答案的过程中自主发展出的策略。</p>
+          <p>如果把这些行为画成一张状态机，思维链并不是"一路向前"的直线，而是一个反复"尝试—验证—回溯"的循环：模型在某个路径上走几步，停下来检查中间结果，发现不对就退回重新分支，直到某条路径被验证通过才收敛到最终答案。这也是为什么推理模型的思维链里经常出现"等等，这里不太对"之类的句子——那正是状态机里的"回溯"转移被自然语言化的结果。</p>
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 理解问题
+  理解问题 --> 尝试路径: 生成解题思路
+  尝试路径 --> 自我验证: 得出中间结果
+  自我验证 --> 尝试路径: 发现错误，换方向
+  自我验证 --> 完成: 验证通过
+  完成 --> [*]
+            </div>
+            <figcaption>思维链行为的抽象状态机：尝试、验证、回溯循环，直到某条路径验证通过才收敛</figcaption>
+          </figure>
+          <p>理解这张状态机的工程价值在于：当你做推理模型的评测时，不要只盯着最终正确率，还要统计"回溯频率"和"验证质量"这类过程指标。一个会频繁回溯但总能回正道的模型，通常比一个闷头走到黑的模型在难题上更可靠；而一个从不回溯的模型，即使正确率暂时不差，也可能只是在简单题上刷分。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>行为模式</th><th>表现</th><th>为什么有效</th></tr></thead>
+              <tbody>
+                <tr><td><strong>自我验证</strong></td><td>得出中间结果后回头检查</td><td>及早发现错误，避免错误传播到后续步骤</td></tr>
+                <tr><td><strong>反思与回溯</strong></td><td>"等等，这里好像不对"然后换方向</td><td>避免在错误路径上浪费算力</td></tr>
+                <tr><td><strong>分而治之</strong></td><td>把复杂问题拆成子问题逐个解决</td><td>降低每步的推理难度</td></tr>
+                <tr><td><strong>替代路径探索</strong></td><td>一条思路走不通时尝试不同方法</td><td>增加找到正确答案的概率</td></tr>
+                <tr><td><strong>边界情况检查</strong></td><td>在给出最终答案前检查特殊值和边界</td><td>防止遗漏 corner case</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这些行为与人类解题专家的策略高度相似——这不是偶然，而是因为面对同样的"在有限步骤内找到正确答案"的压力，有效的策略空间是有限的，RL 训练和人类学习会收敛到相似的策略。这也是为什么推理模型在数学竞赛和代码竞赛上的表现，可以用人类的解题方法论来理解。</p>
+
+          <h2>思维链忠实度：模型写的就是模型想的吗</h2>
+          <p>推理模型最根本的未解问题之一：模型写出来的思维链，是否真实反映了它内部的计算过程？这叫<strong>CoT 忠实度</strong>（faithfulness）问题。</p>
+          <p>为什么这是个问题？因为思维链是自然语言输出，而模型的内部计算是高维向量运算——两者之间没有必然的对应关系。模型完全可以在思维链里写"A 因此 B"，但内部实际走的是一条完全不同的计算路径。思维链可能是一个"事后合理化"（post-hoc rationalization）——模型先有了答案（通过某种不可解释的捷径），再编一段看起来合理的推理过程。</p>
+          <p>已有的忠实度研究发现了几类不忠实现象：</p>
+          <ul>
+            <li><strong>步骤省略</strong>：模型跳过了某些实际影响答案的中间步骤，思维链不完整。</li>
+            <li><strong>因果倒置</strong>：模型先"决定"了答案，再写出导向这个答案的推理——推理是结果而非原因。</li>
+            <li><strong>偏见驱动</strong>：模型的推理过程被某些先验偏见驱动（如锚定效应），但思维链里不会写出"我因为这个偏见所以这样想"。</li>
+            <li><strong>扰动不一致</strong>：给思维链中间步骤做微小扰动，有时不影响最终答案——说明那些步骤可能不是答案的真正原因。</li>
+          </ul>
+          <div class="callout warn">
+            <span class="callout-t">关键认知</span>
+            CoT 忠实度不是一个可以"修复"的 bug，而是一个认识论层面的限制。我们永远无法从外部完全确认模型内部在"真正想什么"。实践中，思维链的价值在于<strong>它通常比直接答案更可靠</strong>（因为有中间步骤可以检查），但不能假设它是模型内部计算的忠实日志。安全敏感场景下，不能因为思维链"看起来合理"就信任最终答案。CoT 忠实度的深入分析见 <a href="../13-evaluation/interpretability.html">机制可解释性基础</a>。
+          </div>
+
+          <h2>推理模型的成本：思维链是算力税</h2>
+          <p>推理模型的一切优势都建立在一个前提上：<strong>愿意为推理付出更多算力</strong>。一条上万 token 的思维链意味着上万次前向传播（每个 token 一次），这比直接给答案贵几十倍。推理模型不是在所有场景都更优——它在"难问题"上的优势远大于"简单问题"，但算力成本对所有问题都是一样的。</p>
+          <p>这带来了一个实际问题：</p>
+          <ul>
+            <li>简单问题（"法国首都是哪"）：推理模型也会生成几百 token 的思维链来"确认"答案，完全浪费算力。</li>
+            <li>中等问题（"写一个排序函数"）：推理模型可能多想几步但整体效率不比普通模型高多少。</li>
+            <li>困难问题（"证明这个数学定理"）：推理模型的优势巨大，普通模型几乎做不对。</li>
+          </ul>
+          <p>这就是为什么需要<strong>混合推理</strong>——让模型根据问题难度动态调整思考量，简单问题快回答，困难问题多想。这是推理模型从"实验室"走向"生产"的关键工程问题，详见 <a href="hybrid-reasoning.html">混合推理与思考预算</a>。</p>
+
+          <h2>蒸馏：把推理能力传给小模型</h2>
+          <p>推理模型的能力可以通过蒸馏传给更小的模型。做法是：用大推理模型生成大量高质量的推理轨迹（问题→思维链→答案），然后用这些轨迹做 SFT 训练小模型。小模型学到的不是推理模型本身，而是它的推理模式——在哪些场景该检查、该回溯、该分而治之。</p>
+          <p>DeepSeek-R1 的蒸馏实验显示，蒸馏后的 7B 模型在很多推理基准上可以超过同参数量的非推理模型，甚至接近更大的非推理模型。这说明推理策略是可迁移的——至少部分地——不需要完整的 RLVR 训练。但蒸馏也有上限：小模型的容量有限，学不了太复杂的推理策略；且蒸馏学的是"模仿"而非"自主发现"，遇到训练轨迹没覆盖的问题类型，泛化能力不如直接做 RLVR 的模型。</p>
+
+          <h2>推理时采样：思维链的长度控制与调参</h2>
+          <p>推理模型真正落地时，你手里最直接的旋钮不是训练参数，而是推理时的采样参数。思维链本身就是一次采样过程，它的质量、长度和最终答案的正确率，直接受温度（temperature）、top-p 和采样策略的影响。</p>
+
+          <h3>温度与 top-p：在探索与稳定之间找平衡</h3>
+          <p>温度控制 softmax 分布的锐利程度。温度越低，模型越倾向于反复生成概率最高的 token，思维链变得保守、短而稳定，但也更容易陷在同一个错误思路上绕圈；温度越高，模型越"发散"，思维链更长、更愿意尝试不同的解题路径，代价是输出质量波动大，可能离题。对推理模型，实践上常用的温度范围是 0.6 到 1.0——比通用对话（常用 0.7 到 0.9）略宽一点，因为推理任务需要一定的探索性，但又不希望发散到不可用。</p>
+          <p>top-p（核采样）控制候选 token 的累计概率。它和温度是正交的两个旋钮：温度改的是分布的"形状"，top-p 改的是分布的"支撑集"。推理场景中把 top-p 设得偏低（如 0.8 到 0.9）可以抑制长尾 token 的干扰，让思维链更专注。一个典型的失败模式是：温度开太高、top-p 也高，模型在思维链里反复尝试完全无关的方向，token 烧了一大堆，最终答案却没有变好。</p>
+          <p>还有一个更实用的经验：<strong>先固定思维链的"探索强度"，再调答案生成的"确定性"</strong>。不少实现把推理过程分两段采样——思维链阶段用较高温度（保持探索），最终答案阶段用较低温度（收敛）。这样既保留了思考的多样性，又保证了最终输出的稳定。下图就是这种两段采样的时序：</p>
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant U as 用户
+  participant S as 推理服务
+  participant M as 模型
+  U->>S: 提交问题
+  S->>M: 高温度采样思维链
+  M-->>S: 思维链（探索路径）
+  S->>M: 低温度基于思维链生成答案
+  M-->>S: 最终答案
+  S->>S: 预算未耗尽则继续采样
+  S->>S: 多数投票 / 验证器打分
+  S-->>U: 返回最终答案
+            </div>
+            <figcaption>两段采样时序：思维链阶段探索、答案阶段收敛，最后用多数投票或验证器收口</figcaption>
+          </figure>
+
+          <h3>CoT 长度与正确率：边际收益递减的量化</h3>
+          <p>思维链越长，正确率越高吗？粗看是的，但收益是递减的，而且存在"平台期"——超过某个长度后，继续加长思维链对正确率的提升微乎其微，只是纯烧 token。下表是一个示意性的量化（数值反映公开基准报告中的典型趋势，用于说明规律而非精确测量）：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>思维链长度（token）</th><th>数学推理正确率（示意）</th><th>单题成本（示意）</th><th>收益判断</th></tr></thead>
+              <tbody>
+                <tr><td>0（直接回答）</td><td>约 35%</td><td>1×</td><td>基线</td></tr>
+                <tr><td>100–500</td><td>约 55%</td><td>约 3×</td><td>提升最大的一段</td></tr>
+                <tr><td>500–2000</td><td>约 70%</td><td>约 10×</td><td>仍有明显提升</td></tr>
+                <tr><td>2000–5000</td><td>约 76%</td><td>约 25×</td><td>收益递减开始</td></tr>
+                <tr><td>5000+</td><td>约 78%</td><td>约 50×</td><td>平台期，纯烧成本</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这张表告诉你两件事。第一，"零思考"和"有一点思考"之间的差距是最大的，所以推理模型的价值门槛在于"至少要想一会儿"；第二，思维链长度与成本近似线性关系，而与正确率是对数关系——在成本敏感的线上场景，把思维链从 2000 压到 1000，可能只损失一两个百分点的正确率，却省下一半推理成本。具体的拐点要用自己的数据测，但"长度上限"这个参数一定要设，否则最难的题目会一直烧 token 直到超时，拖垮整个服务的尾部延迟。</p>
+
+          <h3>思维链采样循环：一段最小实现</h3>
+          <p>把上面的直觉落到代码里。下面这段代码实现了一个最简单的"思考预算控制"循环：给定一个问题，循环采样多个带思维链的回答，按预算上限剪断过长的思维链，最后用多数投票选出最终答案。它是 Self-Consistency 的朴素实现，也是推理模型服务端最常见的脚手架。</p>
+          <pre><code class="language-python">def sample_with_cot(model, tokenizer, prompt, n_samples=8,
+                    max_cot_tokens=2048, temp=0.7, top_p=0.9):
+    """多次采样带思维链的答案，按预算上限控制长度，多数投票产出最终答案。"""
+    cot_tokens = 0            # 累计思维链预算
+    answers = []
+    for _ in range(n_samples):
+        # 段 1：较高温度生成思维链，遇到思考结束标记就停
+        cot = model.generate(
+            prompt,
+            max_new_tokens=min(256, max_cot_tokens - cot_tokens),
+            temperature=temp, top_p=top_p,   # 探索
+            eos_token_id=THINK_END,
+        )
+        cot_tokens += len(cot)
+        # 段 2：较低温度基于思维链生成最终答案
+        ans = model.generate(
+            prompt + cot,
+            max_new_tokens=128,
+            temperature=0.2, top_p=0.9,      # 收敛
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        answers.append(extract_final(ans))
+        if cot_tokens >= max_cot_tokens:
+            break                            # 预算耗尽，提前停止
+    return majority_vote(answers)            # 多数投票（或换成验证器打分）</code></pre>
+          <p>逐行看这段代码的几个关键决策。第一，思维链预算 max_cot_tokens 是硬上限：它既防止最难题烧穿服务成本，也保证尾部延迟可控，是线上必须有的"保险丝"。第二，两段采样用不同温度——思考阶段 0.7 保持探索，答案阶段 0.2 收敛——正是前面说的"探索与收敛分离"策略。第三，多数投票作为兜底：对可验证的任务（数学、代码）多数投票非常有效，因为它天然过滤了少数跑偏的样本；对开放性任务，可以把 majority_vote 换成验证器打分，见 <a href="verifier-prm.html">验证器与过程奖励模型</a>。最后注意，这里的 temperature 与 top_p 参数不是玄学——它们直接决定思维链的"探索预算"在 token 维度上怎么花，是和模型训练同等重要的推理侧调参对象。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            推理模型身上有三条最容易被误解的直觉，逐个纠正：<strong>其一，「推理模型会自我纠错，所以思维链可信」</strong>——不对，思维链可能只是事后合理化，甚至正确答案来自一条不可解释的捷径，本页后面「思维链忠实度」一节会专门讲，不能拿思维链当审计凭证；<strong>其二，「温度对推理模型没用，所以不用调」</strong>——推理模型对采样参数更敏感而不是更不敏感，思考阶段的温度直接决定探索强度，且不同厂商对温度的处理不一致，务必以官方文档为准；<strong>其三，「把思维链展示给用户 = 透明」</strong>——思维链没有经过与最终答案同等的安全对齐，里面可能直接写出不该说的中间假设，默认策略是只进日志、不进 UI。这三条每一条都踩过真实的生产事故，别等到线上出问题再想起来。</p>
+          </div>
+
+          <details class="deep">
+            <summary>展开：怎么「验证」推理模型真的在推理——三个工程上能做的实验</summary>
+            <div class="deep-body">
+              <p>忠实度问题听起来很哲学，但工程上有几条能直接上手的探测手段，帮你判断这个推理模型的思维链「有多少可信度」。</p>
+              <p><strong>实验一：思维链扰动测试。</strong>取一批题目，把模型生成的思维链中间步骤做小幅修改（比如把某个中间计算替换成数值略有偏差但方向一致的版本），看最终答案是否随之改变。如果改了中间步骤答案几乎不变，说明那些步骤可能不是答案的真正原因——思维链更像是「事后叙述」。这个测试成本低，能立刻给你一个粗略的忠实度下限。</p>
+              <p><strong>实验二：双采样交叉验证。</strong>同一个问题用两次独立采样（不同温度/不同 seed），对比两条思维链的关键中间结论是否一致。推理模型如果真在「推理」，那么关键步骤应该收敛；如果两条链「各想各的」，最终答案却碰巧一样，就要警惕答案来自模型的某种捷径而非推理。</p>
+              <p><strong>实验三：截断测试。</strong>把思维链在 1/3、2/3 处截断，只保留前半段推理再生成答案，看正确率掉多少。忠实推理的模型，截掉后半段应该损失大量正确率；如果截到 1/3 正确率仍然很高，说明后半段的「推理」很可能是装饰性的。</p>
+              <p style="margin-bottom:0">这三个实验都不能给出确定的答案，但它们组合起来能给你一个「这个模型思维链大概几成可信」的工程判断。凡是涉及高价值决策（代码合入、资金操作）的场景，建议至少跑一次实验一。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：推理模型的训练阶段细节</summary>
+            <div class="deep-body">
+              <p>一个完整的推理模型训练流程（以 DeepSeek-R1 为参考）通常包含多个阶段：</p>
+              <ol>
+                <li><strong>基座预训练</strong>：标准的 next-token prediction，在大量文本和代码上训练。这一步不涉及推理。</li>
+                <li><strong>推理冷启动 SFT</strong>（可选）：用少量高质量推理轨迹做 SFT，建立"先想再答"的基本格式。R1-Zero 跳过了这一步。</li>
+                <li><strong>推理 RLVR</strong>：在数学、代码、逻辑等可验证任务上做 GRPO 强化学习。思维链行为在此阶段涌现和强化。</li>
+                <li><strong>拒绝采样 + 通用能力 SFT</strong>：用 RL 后的模型生成大量高质量推理轨迹，混入通用能力数据（写作、翻译、问答），做一轮全量 SFT。这一步确保模型不只有推理能力，也保留通用能力。</li>
+                <li><strong>通用 RLVR</strong>：在更广泛的任务上做第二阶段 RL，不仅包括可验证的数学/代码，也包括偏好对齐（安全、有用性等）。</li>
+              </ol>
+              <p style="margin-bottom:0">多阶段设计反映了一个现实：纯推理 RLVR 训出的模型在推理上很强但通用能力会退化（类似对齐税），需要后续阶段来恢复平衡。这也是为什么没有一个公开模型是"纯 RLVR"的——生产模型都是多阶段训练的产物。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>范式转换</strong>：从"系统 1"快思考到"系统 2"慢思考——思维链从 prompt 技巧变成训练内化的权重能力。</li>
+            <li><strong>两条训练路线</strong>：o1 路线先推理 SFT 再 RLVR（冷启动稳）；R1 路线纯 RLVR 涌现再 SFT 修复（证明推理能力可自发涌现）。</li>
+            <li><strong>涌现行为</strong>：自我验证、反思回溯、分而治之、替代路径探索——训练信号只有答案对错，这些策略是自主发展的。</li>
+            <li><strong>CoT 忠实度</strong>：思维链不一定是内部计算的真实记录，可能是事后合理化。不能因为"看起来合理"就信任答案。</li>
+            <li><strong>算力成本</strong>：思维链是"算力税"，简单问题也付出高成本——这是混合推理的动机。</li>
+            <li><strong>蒸馏</strong>：推理模式可传给小模型，但学的是模仿不是自主发现，泛化有上限。</li>
+            <li><strong>多阶段训练</strong>：生产推理模型不是纯 RLVR，需要推理 RL + 通用 SFT + 通用 RL 多阶段平衡推理能力和通用能力。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>OpenAI o1 博客 — 推理模型类别的开创性发布，展示了长思维链在数学/代码/科学推理上的突破 · <a href="https://openai.com/index/learning-to-reason-with-llms/" target="_blank" rel="noopener">链接</a></li>
+            <li>DeepSeek-R1 技术报告 — 开源推理模型的标志性工作，记录了纯 RLVR 下思维链自发涌现的完整过程 · <a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener">arXiv:2501.12948</a></li>
+            <li>DeepSeekMath / GRPO — 推理模型训练的核心算法 · <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">arXiv:2402.03300</a></li>
+            <li>Chain-of-Thought Reasoning Without Prompting — 研究模型在未被提示时是否会自发推理（通过改变解码过程），与 R1-Zero 的涌现行为呼应 · <a href="https://arxiv.org/abs/2402.10200" target="_blank" rel="noopener">arXiv:2402.10200</a></li>
+            <li>Faithful Chain-of-Thought Reasoning — CoT 忠实度问题的代表性研究，提出用「翻译成符号推理链 + 确定性求解器」来保证思维链与答案一致 · <a href="https://arxiv.org/abs/2301.13379" target="_blank" rel="noopener">arXiv:2301.13379</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            推理模型对每个问题都"想很久"，但简单问题不需要——怎么动态控制思考量，见 <a href="hybrid-reasoning.html">混合推理与思考预算</a>。推理时扩展的完整路线图（CoT、Self-Consistency、Best-of-N、树搜索、TTT），见 <a href="inference-scaling.html">推理时扩展</a>。推理能力的训练侧机制（GRPO、RLVR、reward hacking），见 <a href="../07-posttraining/grpo-rlvr.html">推理强化学习</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

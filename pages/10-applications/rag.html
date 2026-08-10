@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAG 检索增强生成 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="10-applications" data-topic="rag">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>RAG 检索增强生成</h1>
+            <p class="lead">模型不知道你公司的内部文档，也记不住昨天发生的事。RAG 的思路很朴素：回答之前先去知识库里查资料，把查到的内容塞进上下文再作答。它是大模型落地企业场景最主流的方案。这一节从「为什么需要」讲到五步链路的每一个细节，再到嵌入模型选型、向量索引结构、评测集搭建和一次完整的故障排查演练。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>RAG 把「闭卷考试」变成「开卷考试」。离线阶段把文档切块、向量化、存进向量库；在线阶段用用户问题去检索最相关的片段，连同问题一起交给模型生成答案。<strong>模型的能力没变，变的是它手上有什么材料。</strong></p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  subgraph OFF["离线:构建索引"]
+    direction LR
+    D["原始文档"] --> C["切分 Chunking"] --> EM["向量化 Embedding"] --> DB[("向量数据库")]
+  end
+  subgraph ON["在线:检索问答"]
+    direction LR
+    Q["用户提问"] --> QE["问题向量化"] --> SR["相似度检索"]
+    SR --> RR["重排 Rerank"] --> P["拼装 Prompt"] --> L["LLM 生成"] --> A["带出处的答案"]
+  end
+  DB -.提供候选.-> SR
+  style OFF fill:#eaf3de,stroke:#639922
+  style ON fill:#e6f1fb,stroke:#185fa5
+              </div>
+              <figcaption>RAG 双阶段：离线建索引，在线检索 + 生成。注意这两个阶段的时间尺度完全不同——离线是小时级的批处理，在线是百毫秒级的请求响应，两边的工程约束因此差异极大。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 1 ============ -->
+          <h2>为什么需要 RAG</h2>
+          <p>先看一个具体场景。你给公司做一个 IT 支持机器人，员工问：「我的 VPN 报错 ERR_4013 怎么办？」通用大模型的回答一定是编的——因为 ERR_4013 是你们内部自定义的错误码，训练语料里根本没有。但如果你把公司的《VPN 故障处理手册》灌进知识库，模型检索到「ERR_4013：证书过期，请到 it.internal/renew 重新签发」这一段，答案立刻从瞎编变成可用。</p>
+          <p>这个例子里体现的，正是大模型几个绕不开的局限，而 RAG 恰好对症下药：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模型的问题</th><th>具体表现</th><th>RAG 的解法</th></tr></thead>
+              <tbody>
+                <tr><td><strong>知识截止</strong></td><td>训练后的新信息一概不知，问「上周发布的新版本有什么变化」只能编</td><td>检索实时数据源，随时更新知识库即可</td></tr>
+                <tr><td><strong>私域缺失</strong></td><td>不了解企业内部资料，内部错误码、流程规范、组织架构全是盲区</td><td>把内部文档灌入向量库，无需训练模型</td></tr>
+                <tr><td><strong>幻觉</strong></td><td>不知道就瞎编，且编得非常自信，格式和真答案一模一样</td><td>基于检索到的真实片段作答，并可给出出处供人核验</td></tr>
+                <tr><td><strong>更新成本高</strong></td><td>微调一次要准备数据、跑训练、做评测，周级起步</td><td>改知识库即可，重新入库后<strong>分钟级生效</strong></td></tr>
+                <tr><td><strong>无法溯源</strong></td><td>模型说什么就是什么，用户无从验证</td><td>每条结论挂上文档链接，把「相信我」变成「你自己看」</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">选型直觉</span>
+            需要模型<strong>掌握新知识</strong> → 用 RAG；需要模型<strong>改变行为风格或输出格式</strong> → 用 <a href="../07-posttraining/sft.html">微调</a>。一句更好记的话：<strong>RAG 教的是「知道什么」，微调教的是「怎么说话」。</strong>两者常常配合使用，不是二选一。
+          </div>
+
+          <h3>RAG、微调、长上下文：三条路的分工</h3>
+          <p>随着模型上下文窗口越做越长，经常有人问：「既然能塞 100 万 token，我直接把所有文档都塞进去不就行了，还要什么 RAG？」这个问题值得认真回答，因为它涉及三条技术路线的真实边界：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>RAG</th><th>微调</th><th>全量塞长上下文</th></tr></thead>
+              <tbody>
+                <tr><td><strong>知识更新</strong></td><td>改库即生效，分钟级</td><td>要重训，周级</td><td>换输入即生效，秒级</td></tr>
+                <tr><td><strong>知识规模上限</strong></td><td>无上限，取决于向量库容量</td><td>受模型容量限制</td><td>受上下文窗口硬限制</td></tr>
+                <tr><td><strong>单次推理成本</strong></td><td>低，只塞 Top-K 片段</td><td>低，不塞额外内容</td><td><strong>高</strong>，每次都为全量文档付费</td></tr>
+                <tr><td><strong>能否溯源</strong></td><td>天然可以，检索结果就是出处</td><td>不能</td><td>理论可以，但模型容易引错</td></tr>
+                <tr><td><strong>改变输出风格</strong></td><td>只能靠 Prompt，效果有限</td><td><strong>最擅长</strong></td><td>只能靠 Prompt</td></tr>
+                <tr><td><strong>典型适用</strong></td><td>知识库问答、客服、文档助手</td><td>特定格式输出、领域语气、工具调用习惯</td><td>单份长文档分析、一次性任务</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>结论很清楚：长上下文和 RAG 不是替代关系。<strong>长上下文解决的是「一份材料太长」，RAG 解决的是「材料太多不知道该看哪份」。</strong>当你的知识库有十万份文档时，无论窗口多大都塞不下；而且即便塞得下，注意力在超长上下文里也会被稀释，中间部分的信息经常被忽略——这个现象通常被称为「中间迷失」（lost in the middle）。所以现实中的做法往往是两者结合：用 RAG 把候选缩小到几十份，再用长上下文把它们完整塞进去，而不是切成碎片。</p>
+
+          <!-- ============ Section 2 ============ -->
+          <h2>核心流程五步走</h2>
+          <p>先看一次在线请求的完整时序，理解每个组件在什么时刻被调用、耗时大致落在哪里：</p>
+
+          <div class="callout tip">
+            <span class="callout-t">想直接跑起来</span>
+            五个环节都有成熟的开源实现。LangChain 官方提供了一篇可以照着跑通的 RAG 教程，见 <a href="https://python.langchain.com/docs/tutorials/rag/" target="_blank" rel="noopener">python.langchain.com/docs/tutorials/rag</a>；如果想从更底层了解检索质量如何量化，原版 RAG 论文的问题定义与评估框架见 <a href="https://arxiv.org/abs/2005.11401" target="_blank" rel="noopener">arXiv:2005.11401</a>。
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as 用户
+  participant API as RAG 服务
+  participant E as 嵌入模型
+  participant VDB as 向量库
+  participant BM as BM25 索引
+  participant RK as 重排器
+  participant LLM as 大模型
+
+  U->>API: 提问
+  API->>E: 编码查询
+  E-->>API: 查询向量
+  par 两路并行召回
+    API->>VDB: 向量检索 top50
+    VDB-->>API: 稠密候选
+  and
+    API->>BM: 关键词检索 top50
+    BM-->>API: 稀疏候选
+  end
+  API->>API: RRF 融合去重
+  API->>RK: 候选 + 查询 精排
+  RK-->>API: top5 片段
+  API->>API: 拼装 Prompt
+  API->>LLM: 流式生成
+  LLM-->>U: 带引用的答案
+            </div>
+            <figcaption>一次 RAG 问答的完整时序。注意两路召回是<strong>并行</strong>的——串行会白白多花一倍延迟。真实系统里，检索加重排通常占几十到几百毫秒，而 LLM 生成往往是延迟的大头，所以生成一般走流式输出以改善体感。</figcaption>
+          </figure>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/10-applications/rag/fig1.png" alt="论文原图：检索增强生成的整体架构——先检索相关文档，再让生成器基于检索结果生成答案" loading="lazy" style="max-width:480px">
+            <figcaption>
+              <span class="pf-title">图：RAG 整体架构——检索器召回相关文档，生成器基于检索结果生成带引用的答案</span>
+              <span class="pf-src">论文原图 · Lewis et al., <em>Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks</em>, 2020, Figure 1 · <a href="https://arxiv.org/abs/2005.11401" target="_blank" rel="noopener">arXiv:2005.11401</a></span>
+            </figcaption>
+          </figure>
+
+          <h3>① 切分 Chunking</h3>
+          <p>文档太长塞不进上下文，必须切块。切分质量直接决定检索上限——<strong>切碎了丢失语义，切大了引入噪声</strong>。这一步看起来最不起眼，却是最常被低估的环节：很多团队花几周调重排器，回头发现真正的瓶颈在于切分把表格拦腰截断了。</p>
+          <p>为什么切分决定上限？因为检索的粒度就是 chunk 的粒度。如果一个问题的答案分散在两个 chunk 里，而你每次只取 Top-5，那么这两个 chunk 必须都进 Top-5 才可能答对——概率骤降。反过来，如果一个 chunk 里塞了五个不相关的话题，它的向量就是这五个话题的「平均语义」，对任何一个具体问题都不够像，反而检索不到。这就是所谓的<strong>语义稀释</strong>。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("切分策略"))
+    固定长度
+      按字符数硬切
+      按token数硬切
+      实现最简单
+      易切断语义单元
+    递归字符
+      段落优先
+      句子次之
+      词兜底
+      通用首选方案
+    结构化
+      Markdown标题层级
+      HTML标签
+      代码按函数切
+      表格整块保留
+    语义切分
+      句间相似度找断点
+      质量高
+      需要额外编码成本
+    父子切分
+      小块用于检索
+      大块用于喂给模型
+      兼顾精准与完整
+            </div>
+            <figcaption>切分策略的方法族。实践中很少只用一种：常见组合是「结构化优先 + 递归兜底 + 父子映射」，即先按标题切成大节，节内超长再递归切小，检索命中小块后回溯取父块喂给模型。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>策略</th><th>做法</th><th>优点</th><th>坑</th><th>适合的文档</th></tr></thead>
+              <tbody>
+                <tr><td><strong>固定长度</strong></td><td>按字符或 token 数硬切</td><td>实现最简单，长度可控</td><td>会把句子、表格、代码块拦腰截断</td><td>纯散文、日志</td></tr>
+                <tr><td><strong>递归字符</strong></td><td>优先按段落，超长再按句子，再按词逐级回退</td><td>通用性最好，绝大多数场景的默认选择</td><td>对结构化内容仍然不友好</td><td>通用文本</td></tr>
+                <tr><td><strong>结构化</strong></td><td>按 Markdown 标题、HTML 标签、代码函数切</td><td>切出的块天然是完整语义单元</td><td>依赖文档本身规范；标题层级混乱时会失效</td><td>技术文档、API 手册、代码库</td></tr>
+                <tr><td><strong>语义切分</strong></td><td>逐句编码，在相似度骤降处断开</td><td>断点最贴合语义转折</td><td>需要把全文过一遍嵌入模型，建索引成本高</td><td>话题跳跃频繁的长文</td></tr>
+                <tr><td><strong>父子切分</strong></td><td>小块建索引，命中后返回其所属大块</td><td>检索精准 + 上下文完整，兼得</td><td>要额外维护父子映射关系</td><td>需要完整上下文的问答</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>实践上通常设置 <strong>chunk 之间保留 10–20% 的重叠（overlap）</strong>，避免关键信息正好被切在边界上。举个具体例子：chunk 大小 512 token、重叠 64 token，意味着每个新块会带上前一块结尾的 64 个 token。代价是索引体积增大约 12%，换来的是边界信息不丢。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">切分最容易踩的三个坑</span>
+            <strong>一是表格被拆散</strong>：表头在上一块、数据在下一块，两边都没法单独回答问题。<strong>二是列表编号断裂</strong>：「第 3 步」单独成块时失去了「安装流程」这个上下文。<strong>三是把 PDF 页眉页脚也切进去</strong>：每个 chunk 都带着「XX 公司机密 第 N 页」，这些高频重复文本会污染向量、拉高所有 chunk 之间的相似度。建议在切分前先做一遍清洗，剔除重复的页眉页脚和导航文本。
+          </div>
+
+          <details class="deep">
+            <summary>展开：一个带结构感知的切分实现</summary>
+            <div class="deep-body">
+              <p>下面这段代码演示「结构化优先、递归兜底、父子映射」的组合策略。它先按 Markdown 标题切成语义节，节内超长再递归切小，同时记录每个小块归属的父块 id。</p>
+              <pre><code class="language-python">import re
+from dataclasses import dataclass, field
+
+@dataclass
+class Chunk:
+    text: str
+    parent_id: str = ""          # 所属大块 id, 用于命中后回溯
+    heading_path: str = ""       # 如 "安装指南 &gt; 常见问题 &gt; VPN"
+    meta: dict = field(default_factory=dict)
+
+def split_by_heading(md_text):
+    """按 Markdown 标题切成语义节, 同时维护标题路径"""
+    lines = md_text.split("\n")
+    sections, cur, path = [], [], []
+    for ln in lines:
+        m = re.match(r"^(#{1,4})\s+(.*)$", ln)
+        if m:
+            if cur:
+                sections.append((" &gt; ".join(path), "\n".join(cur)))
+                cur = []
+            level = len(m.group(1))
+            path = path[:level - 1] + [m.group(2).strip()]
+        else:
+            cur.append(ln)
+    if cur:
+        sections.append((" &gt; ".join(path), "\n".join(cur)))
+    return sections
+
+def recursive_split(text, max_chars=512, overlap=64):
+    """递归回退: 段落 -&gt; 句子 -&gt; 硬切"""
+    if len(text) &lt;= max_chars:
+        return [text] if text.strip() else []
+    for sep in ["\n\n", "\n", "。", ". ", " "]:
+        parts = text.split(sep)
+        if len(parts) == 1:
+            continue
+        out, buf = [], ""
+        for p in parts:
+            cand = (buf + sep + p) if buf else p
+            if len(cand) &lt;= max_chars:
+                buf = cand
+            else:
+                if buf:
+                    out.append(buf)
+                buf = p if len(p) &lt;= max_chars else ""
+                if len(p) &gt; max_chars:
+                    out.extend(recursive_split(p, max_chars, overlap))
+        if buf:
+            out.append(buf)
+        return _apply_overlap(out, overlap)
+    # 所有分隔符都失效, 硬切兜底
+    step = max_chars - overlap
+    return [text[i:i + max_chars] for i in range(0, len(text), step)]
+
+def _apply_overlap(parts, overlap):
+    if overlap &lt;= 0 or len(parts) &lt;= 1:
+        return parts
+    out = [parts[0]]
+    for prev, cur in zip(parts, parts[1:]):
+        out.append(prev[-overlap:] + cur)
+    return out
+
+def build_chunks(md_text, doc_id):
+    chunks = []
+    for i, (path, body) in enumerate(split_by_heading(md_text)):
+        parent_id = f"{doc_id}#sec{i}"
+        for piece in recursive_split(body):
+            chunks.append(Chunk(
+                # 把标题路径拼进正文, 让 chunk 自带上下文
+                text=f"[{path}]\n{piece}",
+                parent_id=parent_id,
+                heading_path=path,
+                meta={"doc_id": doc_id},
+            ))
+    return chunks</code></pre>
+              <p style="margin-bottom:0">关键细节是倒数第三行：<strong>把标题路径拼进 chunk 正文再去做向量化</strong>。这样即使切出来的小块只写了「重新签发证书即可」，它的向量里也带着「VPN 故障处理」的语义，检索命中率会明显提升。这个技巧成本几乎为零，收益却很稳定。</p>
+            </div>
+          </details>
+
+          <h3>② 向量化 Embedding</h3>
+          <p>把文本片段映射成高维向量，语义相近的文本在向量空间中距离也相近。这一步的数学基础在 <a href="../02-representation/embeddings.html">词嵌入与向量空间</a> 一节已经讲过，这里只关心工程侧的用法。检索时用余弦相似度衡量：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{sim}(q, d) = \cos(\theta) = \frac{\mathbf{q} \cdot \mathbf{d}}{\|\mathbf{q}\| \, \|\mathbf{d}\|}$$
+          </div>
+          <p>为什么用余弦而不是欧氏距离？因为文本向量的<strong>模长</strong>往往和文本长度相关，而我们关心的是「方向是否一致」即语义是否接近，不希望长文档因为模长大就天然占优。实践中很多向量库会在入库时先做 L2 归一化，此时余弦相似度就退化为简单的点积，计算更快。</p>
+          <p>一个容易被忽略的成本项：向量化不是免费的。假设你有 100 万个 chunk，每个平均 400 token，那么建一次索引就要编码 4 亿 token。用本地开源嵌入模型跑，这是几小时的 GPU 时间；用 API，就是一笔实打实的账单。<strong>所以「换个嵌入模型试试」这句话在百万级数据量上不是一句轻松的话</strong>，它意味着一次完整的重建。</p>
+
+          <h3>③ 检索 Retrieval</h3>
+          <p>只用向量检索往往不够。<strong>混合检索（Hybrid Search）</strong>是当前的最佳实践：</p>
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">稠密检索 Dense</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">基于 Embedding 的语义匹配。擅长理解同义改写，「怎么退货」能匹配到「退换货流程」；但对专有名词、编号、罕见词不敏感，「ERR_4013」在向量空间里和「ERR_4031」几乎一样近。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">稀疏检索 Sparse</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">BM25 等关键词匹配。精确命中术语和标识符，「ERR_4013」一击即中；但不懂语义改写，用户问「怎么退货」而文档写「退换货流程」时可能完全召不回。</p>
+            </div>
+          </div>
+          <p>两者的失效场景恰好互补，所以标准做法是两路都跑，再把结果合并。合并最常用的是 <strong>RRF（Reciprocal Rank Fusion，倒数排名融合）</strong>，它不看两边的原始分数（因为余弦相似度和 BM25 分数根本不在一个量纲上，没法直接相加），只看排名：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{RRF}(d) = \sum_{r \in R} \frac{1}{k + \text{rank}_r(d)}$$
+          </div>
+          <p>其中 $R$ 是各路召回结果，$\text{rank}_r(d)$ 是文档 $d$ 在第 $r$ 路里的名次，$k$ 是一个平滑常数（原论文取 60，工程上常沿用这个默认值）。这个公式的妙处在于：<strong>它对分数量纲完全不敏感，只要求各路能给出排序。</strong>一个在两路里都排前十的文档，得分会显著高于只在一路里排第一、另一路里根本没出现的文档——这正是我们想要的「双重确认」效果。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">还有一路容易被忘记：元数据过滤</span>
+            很多问题其实带着硬性约束——「2026 年的报销标准」不应该召回 2024 年的文档，「华东区的政策」不应该召回华北区的。这类约束用向量相似度是表达不出来的，必须靠<strong>结构化字段过滤</strong>。所以入库时把日期、部门、文档类型、权限等级都写进 metadata，检索时先过滤再算相似度。这一步能挡掉大量「看起来很像但根本不该出现」的结果，性价比极高。<strong>顺带一提，权限过滤必须在检索层做，不能寄望于让模型「不要引用无权限文档」——那不是安全边界。</strong>
+          </div>
+
+          <h3>④ 重排 Rerank</h3>
+          <p>检索阶段为了速度用的是「双塔」模型（问题和文档分别编码），精度有限。重排阶段用 <strong>Cross-Encoder</strong> 把问题和候选文档拼在一起精细打分，从 Top-50 里精选出真正相关的 Top-5。这一步性价比极高，通常能显著提升最终效果。</p>
+          <p>为什么拼在一起就更准？因为双塔模型编码文档时<strong>还不知道用户会问什么</strong>，它只能编码出一个「通用语义」；而 Cross-Encoder 是带着问题去读文档的，能捕捉「这句话正好回答了问题里的哪个部分」这种细粒度对应关系。代价是它无法预计算——每来一个新问题，所有候选都要重算一遍，所以只能处理几十条。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  A["全库<br/>100万 chunk"] -->|"向量索引<br/>约10ms"| B["粗召回<br/>Top-50"]
+  A -->|"BM25 倒排<br/>约5ms"| B
+  B -->|"RRF 融合"| C["去重候选<br/>约60条"]
+  C -->|"Cross-Encoder<br/>约50-200ms"| D["精排<br/>Top-5"]
+  D -->|"拼装上下文"| E["送入 LLM"]
+
+  N1["数量: 万倍缩减<br/>成本: 每条极低"] -.-> B
+  N2["数量: 十倍缩减<br/>成本: 每条较高"] -.-> D
+
+  style A fill:#f2f4f7,stroke:#888
+  style B fill:#e6f1fb,stroke:#185fa5
+  style D fill:#eaf3de,stroke:#639922
+  style E fill:#faeeda,stroke:#ba7517
+            </div>
+            <figcaption>漏斗式检索架构：越往后候选越少、单条成本越高、精度越高。这是搜索引擎「召回—排序」两阶段的经典结构，RAG 直接继承了它。图中延迟为量级示意，实际取决于硬件与库规模，具体以你自己的压测为准。</figcaption>
+          </figure>
+
+          <p>一个实践问题：粗召回的 Top-K 该取多少？取太小，正确答案根本没进候选池，重排再强也救不回来；取太大，重排耗时线性上涨。常见的起点是粗召回 50、精排后取 5，然后用你自己的评测集去调——如果发现「召回率@50」已经接近饱和而「召回率@100」几乎不涨，那 50 就够了。</p>
+
+          <h3>⑤ 生成 Generation</h3>
+          <p>把检索到的片段和问题组装成 Prompt。关键要求模型<strong>只依据给定资料作答</strong>，并标注引用来源，资料不足时明确说「不知道」。</p>
+          <p>这里有个反直觉的细节：<strong>片段在 Prompt 里的排列顺序会影响效果。</strong>由于长上下文中间部分容易被忽略，把最相关的片段放在最前面和最后面、把次相关的放在中间，通常比单纯按相关度降序排列更稳。另一个细节是<strong>要给每个片段编号并附上来源标题</strong>，这样模型既能引用，也能在片段冲突时说明「资料 [1] 和 [3] 说法不一致」。</p>
+
+          <details class="deep">
+            <summary>展开：一个可用的 RAG Prompt 模板</summary>
+            <div class="deep-body">
+              <pre><code class="language-text">你是一个严谨的知识问答助手。请严格依据下面提供的【参考资料】回答用户问题。
+
+规则:
+1. 只使用参考资料中的信息作答,不要引入任何外部知识。
+2. 每个关键结论后标注来源编号,如 [1][2]。
+3. 如果参考资料不足以回答,直接说明"根据现有资料无法回答",不要猜测。
+4. 若资料之间存在冲突,请指出冲突并列出各方说法,不要自行裁决。
+5. 用户问题若与参考资料完全无关,礼貌说明本知识库不涵盖该主题。
+
+【参考资料】
+[1] (来源: {title_1}) {chunk_1}
+[2] (来源: {title_2}) {chunk_2}
+[3] (来源: {title_3}) {chunk_3}
+
+【用户问题】
+{question}
+
+【回答】</code></pre>
+              <p>要点：明确的约束规则 + 编号引用 + 允许「不知道」。这三条能显著降低幻觉率。第 4 条尤其重要——真实知识库里新旧文档冲突是常态，让模型自行裁决反而更危险，把冲突暴露给用户才是负责任的做法。</p>
+              <p style="margin-bottom:0">还有一个工程上的取舍：规则写得越严，模型越容易在资料稍有欠缺时就拒答，用户体验会变差；写得越松，幻觉率上升。这个阈值没有标准答案，要靠你自己的评测集在「拒答率」和「幻觉率」之间找平衡点。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：最小 RAG 实现骨架（Python 伪代码）</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">from typing import List
+
+def build_index(docs: List[str], embed_model, vector_db):
+    """离线:切分 -&gt; 向量化 -&gt; 入库"""
+    for doc in docs:
+        chunks = split_text(doc, chunk_size=512, overlap=64)
+        vectors = embed_model.encode(chunks)
+        vector_db.add(vectors, metadata=chunks)
+
+def reciprocal_rank_fusion(*rank_lists, k: int = 60):
+    """只看排名不看分数, 天然跨量纲"""
+    scores = {}
+    for lst in rank_lists:
+        for rank, doc_id in enumerate(lst, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return sorted(scores, key=scores.get, reverse=True)
+
+def rag_answer(question: str, embed_model, vector_db,
+               reranker, llm, filters: dict = None) -&gt; str:
+    """在线:过滤 -&gt; 检索 -&gt; 重排 -&gt; 生成"""
+    # 1. 混合检索, 两路各粗召回 50 条
+    q_vec = embed_model.encode(["query: " + question])[0]
+    dense_hits  = vector_db.search(q_vec, top_k=50, filters=filters)
+    sparse_hits = bm25_search(question, top_k=50, filters=filters)
+    candidates  = reciprocal_rank_fusion(dense_hits, sparse_hits)[:60]
+
+    # 2. 精排, 选出最相关的 5 条
+    top_chunks = reranker.rank(question, candidates, top_k=5)
+    if not top_chunks:
+        return "根据现有资料无法回答。"
+
+    # 3. 最相关的放两端, 次相关的放中间, 缓解中间迷失
+    ordered = _place_best_at_edges(top_chunks)
+
+    # 4. 拼装 Prompt 并生成
+    context = "\n".join(
+        f"[{i+1}] (来源: {c.title}) {c.text}" for i, c in enumerate(ordered)
+    )
+    prompt = RAG_TEMPLATE.format(context=context, question=question)
+    return llm.generate(prompt)
+
+def _place_best_at_edges(chunks):
+    """[1,2,3,4,5] -&gt; [1,3,5,4,2] 把高分片段推到首尾"""
+    head, tail = [], []
+    for i, c in enumerate(chunks):
+        (head if i % 2 == 0 else tail).append(c)
+    return head + tail[::-1]</code></pre>
+              <p style="margin-bottom:0">注意第 20 行的 <code>"query: " + question</code>：不少嵌入模型要求查询侧加特定前缀，漏加会明显掉点且不报错。具体前缀以你所用模型的官方文档为准。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section 3 ============ -->
+          <h2>嵌入模型与重排器选型</h2>
+          <p>五步流程里，<strong>向量化</strong>和<strong>重排</strong>这两步各自依赖一个独立的小模型。它们的选型直接决定检索质量的上限——生成模型再强，也救不回没检索到的内容。</p>
+
+          <h3>两类模型的分工</h3>
+          <p>很多人把它们混为一谈，其实结构和用法完全不同：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th></th><th>嵌入模型 Bi-Encoder</th><th>重排器 Cross-Encoder</th></tr></thead>
+              <tbody>
+                <tr><td><strong>怎么算</strong></td><td>查询和文档<strong>各自独立</strong>编码成向量，再比余弦相似度</td><td>查询和文档<strong>拼在一起</strong>送进模型，直接输出相关度分数</td></tr>
+                <tr><td><strong>能否预计算</strong></td><td>可以。文档向量离线算好存库，在线只算查询</td><td>不能。每个「查询-文档」对都要现算</td></tr>
+                <tr><td><strong>速度</strong></td><td>快，百万级文档毫秒响应</td><td>慢，只能处理几十条候选</td></tr>
+                <tr><td><strong>精度</strong></td><td>较低，查询和文档没有交互</td><td>高，能捕捉细粒度语义匹配</td></tr>
+                <tr><td><strong>在流程里的位置</strong></td><td>粗召回：从百万里捞出 Top-50</td><td>精排序：从 Top-50 里选出 Top-5</td></tr>
+                <tr><td><strong>换模型的代价</strong></td><td><strong>极大</strong>，要重建整个向量库</td><td>小，随时可换，不影响索引</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout tip">
+            <span class="callout-t">为什么要两段式</span>
+            Cross-Encoder 精度高但算不动全库，Bi-Encoder 算得动全库但精度不够。<strong>先用快的粗筛、再用准的精排</strong>，是检索系统的通用架构，和搜索引擎的召回-排序两阶段是同一个思路。表格最后一行还揭示了一个工程含义：<strong>重排器可以持续迭代，嵌入模型要一次选对</strong>。
+          </div>
+
+          <h3>选型该看什么</h3>
+          <p>公开榜单（如 MTEB）是有用的起点，但<strong>不能直接当选型依据</strong>——榜单任务和你的业务分布往往差得很远。实际要看这几个维度：</p>
+          <ul>
+            <li><strong>语言与领域匹配</strong>：中文场景优先选中文或多语训练充分的模型；法律、医疗、代码这类专业领域，通用模型的表现常常掉一大截。判断方法很简单：从你的业务里挑 20 个真实问题，人工看看 Top-5 里有几个是对的。</li>
+            <li><strong>向量维度</strong>：维度越高表达力越强，但存储和检索成本线性上升。百万级文档时，768 维和 1536 维的存储差一倍。部分模型支持维度截断（套娃式表示），可以按需取前 N 维——这个特性在成本敏感场景很有价值，但要确认你选的模型确实支持，普通模型截断维度会严重掉点。</li>
+            <li><strong>最大输入长度</strong>：决定了单个 chunk 能多大。超长的部分会被<strong>静默截断</strong>，这是很隐蔽的坑：你以为入库的是 1000 token 的完整段落，实际只有前 512 token 参与了编码，后面的内容在向量空间里根本不存在。</li>
+            <li><strong>对称还是非对称</strong>：「找相似句子」是对称任务，「用短问题找长文档」是非对称任务，两者最优模型不同。RAG 属于后者。</li>
+            <li><strong>是否需要指令前缀</strong>：不少嵌入模型要求查询侧加特定前缀（如 <code>query: </code>），漏加会明显掉点，且不报错。同样的，文档侧可能要求另一个前缀，两边搞混了效果会更差。</li>
+            <li><strong>部署形态</strong>：API 调用省心但有延迟和单价，本地部署要占一张卡但可控。百万级以上的批量建索引，本地部署通常更划算。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">换嵌入模型 = 重建整个向量库</span>
+            不同模型的向量空间彼此<strong>完全不可比</strong>。换模型后，旧向量必须全部重新计算，否则检索结果会变成随机噪声。更危险的是这个过程<strong>不会报错</strong>——系统照常运行，只是答得驴唇不对马嘴。所以嵌入模型的选型要尽早定下来，迁移成本随数据量增长。真要迁移，正确做法是<strong>双写双索引、灰度切流、对比评测通过后再下线旧索引</strong>，而不是原地覆盖。这类线上治理问题的完整讨论见 <a href="../12-llmops/rag-in-production.html">RAG 生产运维</a>。
+          </div>
+
+          <!-- ============ Section 4 ============ -->
+          <h2>向量库与索引结构：为什么它能在百万条里毫秒返回</h2>
+          <p>如果老老实实拿查询向量和库里每一条算余弦相似度，百万条就是百万次点积，延迟根本不可接受。向量库之所以快，靠的是<strong>近似最近邻搜索（ANN）</strong>——用一点点召回精度换取几个数量级的速度提升。理解这个取舍很重要，因为它解释了一类诡异现象：「这条文档明明在库里，为什么就是检索不到？」</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>索引类型</th><th>原理</th><th>查询速度</th><th>召回精度</th><th>内存占用</th><th>适用规模</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Flat（暴力）</strong></td><td>和每一条都算一遍，无索引</td><td>慢，线性增长</td><td><strong>100% 精确</strong></td><td>只存向量本身</td><td>几万条以内，或作为精度基线</td></tr>
+                <tr><td><strong>IVF（倒排文件）</strong></td><td>先聚类分桶，查询时只搜最近的几个桶</td><td>快</td><td>取决于搜几个桶，答案在没搜的桶里就漏了</td><td>中等</td><td>百万级</td></tr>
+                <tr><td><strong>HNSW（分层小世界图）</strong></td><td>建多层跳表式图，从稀疏层逐层下沉逼近</td><td><strong>很快</strong></td><td>高，可调</td><td><strong>高</strong>，图结构本身很占内存</td><td>百万到千万级，当前主流</td></tr>
+                <tr><td><strong>PQ / 量化组合</strong></td><td>把向量压缩成短码，牺牲精度换内存</td><td>快</td><td>较低，需配合重排补偿</td><td><strong>低</strong></td><td>内存吃紧的超大规模</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 待入库
+  待入库 --> 已切分: 切分策略执行
+  已切分 --> 已向量化: 嵌入模型编码
+  已向量化 --> 已索引: 写入向量库并建图
+  已索引 --> 可检索: 索引构建完成
+  可检索 --> 待更新: 源文档发生变更
+  待更新 --> 已切分: 重新切分入库
+  可检索 --> 陈旧: 源文档改了但没重新入库
+  陈旧 --> 已切分: 增量同步任务发现并修复
+  陈旧 --> [*]: 未被发现<br/>持续返回旧信息
+  可检索 --> 已删除: 源文档下线
+  已删除 --> [*]
+
+  note right of 陈旧
+    最危险的状态
+    系统不报错
+    答案自信但过时
+  end note
+            </div>
+            <figcaption>一个 chunk 的生命周期状态机。<strong>「陈旧」是唯一一个不报错却在持续产生错误答案的状态</strong>，它需要靠主动的增量同步任务和数据新鲜度监控才能发现，不会自己暴露出来。</figcaption>
+          </figure>
+
+          <div class="callout warn">
+            <span class="callout-t">ANN 的精度不是 100%</span>
+            HNSW 有一个搜索宽度参数（常见命名为 <code>ef_search</code> 一类，具体参数名以你所用向量库的官方文档为准），它控制搜索时探索的邻居数量：调大则召回率上升、延迟上升，调小则相反。默认值往往偏保守。<strong>当你怀疑「明明有这条文档却检索不到」时，先用 Flat 暴力检索跑一遍同样的查询做对照</strong>：如果 Flat 能找到而 HNSW 找不到，那就是索引参数问题，不是嵌入模型问题。这个对照实验能省下大量走错方向的时间。
+          </div>
+
+          <!-- ============ Section 5 ============ -->
+          <h2>建立你自己的评测集</h2>
+          <p>这是投入产出比最高、却最常被跳过的一步。没有评测集，所有调优都是盲调——你改了 chunk 大小，感觉「好像好一点」，但这个「好像」可能只是你恰好试的那三个问题变好了。</p>
+          <ol>
+            <li><strong>攒问题</strong>：从真实用户日志里捞 50–200 条代表性问题，覆盖高频、长尾、精确匹配、多跳几类。数量不必多，代表性比规模重要。如果还没上线没有日志，就让业务方每人写 10 个他们真会问的问题——注意是「真会问的」，不是「觉得应该测的」。</li>
+            <li><strong>标注答案出处</strong>：人工标出每个问题应该命中哪些 chunk。这是唯一需要人力的环节，也是评测集的价值所在。标注时允许一个问题对应多个正确 chunk，也允许标注「本库无法回答」这种负样本——后者用来测拒答能力，同样重要。</li>
+            <li><strong>算检索指标</strong>：见下表。注意召回率是上限——粗召回没捞到的，重排再强也救不回来。</li>
+            <li><strong>纳入回归</strong>：切分策略、嵌入模型、Top-K、重排器，任何一处改动都跑一遍。没有回归集，你永远不知道这次调优是真提升还是随机波动。</li>
+          </ol>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>衡量什么</th><th>什么时候看它</th><th>典型陷阱</th></tr></thead>
+              <tbody>
+                <tr><td><strong>召回率@K</strong>（Recall@K）</td><td>该找到的 chunk 有没有进 Top-K</td><td>调切分、调嵌入模型、调粗召回 K 值时</td><td>K 取得太大时永远好看，要固定 K 横向比</td></tr>
+                <tr><td><strong>MRR</strong>（平均倒数排名）</td><td>第一个正确结果排在第几位</td><td>只关心「有没有一条对的排前面」的场景</td><td>多个正确答案时只看第一个，信息丢失</td></tr>
+                <tr><td><strong>NDCG@K</strong></td><td>正确答案整体排得够不够靠前，考虑相关度分级</td><td>调重排器时的主力指标</td><td>需要分级标注，纯二值标注下退化</td></tr>
+                <tr><td><strong>拒答准确率</strong></td><td>库里没有答案时，模型有没有老实说不知道</td><td>上线前的安全检查</td><td>容易被忽略，但这是幻觉的主要来源</td></tr>
+                <tr><td><strong>引用正确率</strong></td><td>模型标的 [1][2] 是否真支撑它的结论</td><td>溯源功能上线后</td><td>需要人工或 LLM-as-Judge 抽检</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>把检索指标和最终答案质量分开看很重要：<strong>检索指标掉了，一定有问题；检索指标没掉但答案变差，问题在生成侧或 Prompt。</strong>这样能快速定位故障域，而不是每次都从头怀疑一遍。评测方法本身的偏差来源（比如 LLM-as-Judge 的位置偏好）见 <a href="../13-evaluation/eval-methods.html">评估方法论</a>；线上持续监控的做法见 <a href="../12-llmops/rag-in-production.html">RAG 生产运维</a>。</p>
+
+          <!-- ============ Section 6 ============ -->
+          <h2>一次完整的排查演练</h2>
+          <p>光有指标还不够，你得知道指标掉了之后往哪儿看。下面这个决策树是实战中最常用的排查顺序，核心原则是<strong>从数据源头往生成末端查，而不是反过来</strong>——因为末端的问题往往是源头问题的表现。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  Start["用户反馈:答案不对"] --> Q1{"正确文档<br/>在库里吗?"}
+  Q1 -->|"不在"| F1["数据接入问题<br/>检查同步任务/权限过滤"]
+  Q1 -->|"在"| Q2{"Flat 暴力检索<br/>能找到吗?"}
+  Q2 -->|"找不到"| F2["嵌入或切分问题<br/>检查截断/前缀/切分粒度"]
+  Q2 -->|"能找到"| Q3{"线上 ANN 检索<br/>能进 Top-50 吗?"}
+  Q3 -->|"不能"| F3["索引参数问题<br/>调大搜索宽度/检查过滤条件"]
+  Q3 -->|"能"| Q4{"重排后<br/>能进 Top-5 吗?"}
+  Q4 -->|"不能"| F4["重排器问题<br/>换模型或检查候选数上限"]
+  Q4 -->|"能"| Q5{"片段确实<br/>含有答案吗?"}
+  Q5 -->|"不含"| F5["切分问题<br/>答案被切散了,考虑父子切分"]
+  Q5 -->|"含有"| F6["生成侧问题<br/>调 Prompt/换模型/查上下文顺序"]
+
+  style F1 fill:#fcebeb,stroke:#a32d2d
+  style F2 fill:#faeeda,stroke:#ba7517
+  style F3 fill:#faeeda,stroke:#ba7517
+  style F4 fill:#fef3c7,stroke:#d97706
+  style F5 fill:#faeeda,stroke:#ba7517
+  style F6 fill:#e6f1fb,stroke:#185fa5
+            </div>
+            <figcaption>RAG 故障排查决策树。每个菱形都是一次可以独立执行的验证实验，一路走下来就能把问题锁定在唯一一个环节。<strong>最关键的是第二个菱形——用 Flat 暴力检索做对照</strong>，它一步就能把「嵌入/切分问题」和「索引参数问题」分开。</figcaption>
+          </figure>
+
+          <p>举一个真实感很强的例子走一遍这个流程。用户反馈：「问『差旅住宿标准是多少』，系统答的是 2023 年的旧标准。」</p>
+          <ol>
+            <li><strong>正确文档在库里吗？</strong>——查一下，2026 版《差旅管理办法》确实入库了。继续。</li>
+            <li><strong>Flat 暴力检索能找到吗？</strong>——能，2026 版排第 3。说明嵌入没问题。继续。</li>
+            <li><strong>线上 ANN 能进 Top-50 吗？</strong>——能，排第 8。继续。</li>
+            <li><strong>重排后能进 Top-5 吗？</strong>——<strong>不能</strong>，2023 版排第 2，2026 版被挤到第 7。找到了。</li>
+          </ol>
+          <p>原因是两版文档措辞几乎一致，重排器无法从文本内容上分辨新旧。<strong>这类问题不该靠重排器解决，而该靠元数据过滤解决</strong>：给文档打上 <code>effective_date</code> 和 <code>status</code> 字段，检索时直接过滤掉已废止版本。这也印证了前面那个提示框的观点——能用结构化字段表达的约束，就不要指望向量相似度去理解。</p>
+
+          <!-- ============ Section 7 ============ -->
+          <h2>常见坑位</h2>
+          <div class="callout warn">
+            <span class="callout-t">检索不到 ≠ 模型不行</span>
+            RAG 效果差，八成问题出在检索环节而非生成环节。排查顺序应该是：切分质量 → 检索召回率 → 重排精度 → Prompt 约束，最后才是换模型。换更贵的生成模型是最容易做、也最容易白花钱的动作。
+          </div>
+          <ul>
+            <li><strong>chunk 过大</strong>：引入大量无关内容，稀释注意力，还烧 token。一个 4000 token 的 chunk 里可能只有 50 token 与问题相关，剩下的都是干扰。</li>
+            <li><strong>只用向量检索</strong>：遇到产品型号、人名、错误码这类精确匹配需求会大量漏召回。这是上线后最常见的第一波投诉来源。</li>
+            <li><strong>跳过重排</strong>：直接把 Top-K 粗召回结果喂给模型，噪声大、准确率低。重排器通常是整条链路里性价比最高的一次投入。</li>
+            <li><strong>不做溯源</strong>：用户无法验证答案真伪，信任度低。而且一旦出错，你连「模型是被哪段资料带偏的」都查不出来。</li>
+            <li><strong>忽略多跳问题</strong>：「A 的负责人所在部门的预算是多少」这类问题单次检索答不了，需要 <a href="advanced-rag.html">Agentic RAG</a>。</li>
+            <li><strong>把权限交给模型</strong>：在 Prompt 里写「不要引用用户无权查看的文档」是无效的。权限必须在<strong>检索层</strong>用元数据过滤实现，让无权文档从一开始就不进候选池。</li>
+            <li><strong>索引和源数据脱节</strong>：源文档改了但没触发重新入库，系统会自信地返回旧信息且不报错。这是运维期的头号杀手，必须有增量同步和新鲜度监控。</li>
+            <li><strong>用 LLM 生成评测集然后自己评自己</strong>：用同一个模型造问题、造标准答案、再当裁判，分数会虚高。评测集的标注环节必须有人参与，哪怕只是抽检。</li>
+          </ul>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：检索外部知识注入上下文，把闭卷变开卷。模型能力没变，变的是它手上有什么材料。</li>
+            <li><strong>五步</strong>：切分 → 向量化 → 检索 → 重排 → 生成。前四步决定上限，第五步决定下限。</li>
+            <li><strong>三条路的分工</strong>：RAG 教「知道什么」，微调教「怎么说话」，长上下文解决「一份材料太长」。不是替代关系。</li>
+            <li><strong>切分</strong>：结构化优先 + 递归兜底 + 10–20% 重叠 + 把标题路径拼进正文。父子切分兼顾精准与完整。</li>
+            <li><strong>检索</strong>：稠密 + 稀疏两路并行召回，用 RRF 按排名融合（跨量纲不敏感），再叠加元数据过滤。</li>
+            <li><strong>重排</strong>：Cross-Encoder 精度高但只能处理几十条，用漏斗架构「快的粗筛 + 准的精排」。</li>
+            <li><strong>嵌入模型要一次选对</strong>：换模型等于重建整个向量库，且失效时不报错。重排器则可以随时迭代。</li>
+            <li><strong>ANN 不是精确检索</strong>：怀疑漏召回时，先用 Flat 暴力检索做对照实验定位问题环节。</li>
+            <li><strong>评测集是一切调优的前提</strong>：50–200 条真实问题 + 人工标注出处 + 召回率/NDCG/拒答准确率三类指标。</li>
+            <li><strong>排查顺序</strong>：文档在不在库 → Flat 能不能找到 → ANN 能不能召回 → 重排能不能选中 → 片段含不含答案 → 最后才是生成侧。</li>
+            <li><strong>权限必须在检索层做</strong>：Prompt 里的「不要引用」不是安全边界。</li>
+            <li><strong>不适用</strong>：需要改变模型行为风格或输出格式——那是微调的活。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：RAG 和微调分别解决什么问题？</h3>
+              <p><span class="answer-label">标准回答：</span>RAG 主要解决“回答时能查到什么”，适合动态、私域、需要引用来源的知识；微调主要解决“模型怎么做、怎么说”，适合稳定的格式、风格和行为。动态知识通常优先 RAG，而不是不断重新微调模型。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：为什么只看向量相似度不够，常要加 BM25 和 Reranker？</h3>
+              <p><span class="answer-label">标准回答：</span>Dense Retrieval 擅长语义相似，BM25 擅长精确词、编号和专有名词匹配；混合检索用两类召回互补覆盖，Reranker 再用更强的交互模型对候选文档重新排序。召回决定上限，重排改善候选顺序。</p>
+              <pre class="mini-code"><code>candidates = dense_topk + bm25_topk
+reranked = cross_encoder(query, candidates)</code></pre>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：RAG 效果差时，应该先查召回还是先改 Prompt？</h3>
+              <p><span class="answer-label">标准回答：</span>先拆开评估检索和生成。查看 Recall@K、MRR、NDCG，确认正确证据是否进入候选集；如果证据没召回，改 Prompt 没用，应排查切分、Embedding、查询改写和过滤条件。证据已召回但回答仍错，才进一步检查重排、上下文组织、引用约束和生成模型。</p>
+              <details class="deep">
+                <summary>追问：为什么 Recall@K 是生成质量的上限？</summary>
+                <div class="deep-body">
+                  <p>如果正确文档没有进入 Top-K，生成器没有可靠证据可用，只能依赖参数记忆或猜测。生成模型再强也不能稳定恢复缺失信息，所以 RAG 评测必须把“召回对不对”和“引用用没用”分开看。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q4：RAG 的权限控制应该放在哪里？</h3>
+              <p><span class="answer-label">标准回答：</span>必须在检索层做租户、用户和文档权限过滤，只让有权访问的候选进入上下文。不能只在 Prompt 里写“不要引用无权限内容”，因为模型看到了内容就可能泄露，Prompt 不是安全边界。</p>
+              <p><span class="pitfall-label">常见误区：</span>向量库的召回分数高，不代表用户有权读取；权限过滤应成为检索查询的硬约束，并纳入回归测试。</p>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks（Lewis et al., 2020, <a href="https://arxiv.org/abs/2005.11401" target="_blank" rel="noopener">arXiv:2005.11401</a>）— RAG 这个名字的出处。原始设定是检索器与生成器联合训练，与今天工程界主流的「冻结模型 + 外挂检索」有差别，但问题定义和评估框架至今适用。</li>
+            <li>Dense Passage Retrieval for Open-Domain Question Answering（Karpukhin et al., 2020, <a href="https://arxiv.org/abs/2004.04906" target="_blank" rel="noopener">arXiv:2004.04906</a>）— 双塔稠密检索的代表工作，解释了为什么 Bi-Encoder 能做到「文档向量离线预计算」，以及它相对 BM25 的强项与短板。</li>
+            <li>Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs（Malkov &amp; Yashunin, <a href="https://arxiv.org/abs/1603.09320" target="_blank" rel="noopener">arXiv:1603.09320</a>）— HNSW 原始论文。想搞清楚向量库为什么快、参数怎么调、召回率为什么不是 100%，读这篇。</li>
+            <li>Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods（Cormack, Clarke &amp; Buettcher, SIGIR 2009, <a href="https://dl.acm.org/doi/10.1145/1571941.1572114" target="_blank" rel="noopener">ACM DL</a>）— RRF 的出处，也是常数 $k=60$ 这个默认值的来源。</li>
+            <li>MTEB: Massive Text Embedding Benchmark（Muennighoff et al., <a href="https://arxiv.org/abs/2210.07316" target="_blank" rel="noopener">arXiv:2210.07316</a>）— 嵌入模型的综合评测基准。用它做初筛可以，但务必配合你自己的业务评测集做最终决策。</li>
+            <li>Retrieval-Augmented Generation for Large Language Models: A Survey（Gao et al., <a href="https://arxiv.org/abs/2312.10997" target="_blank" rel="noopener">arXiv:2312.10997</a>）— RAG 方法的系统综述，把 Naive / Advanced / Modular 三代范式梳理得比较清楚，适合建立全景认知后再深入某一支。</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            基础 RAG 只做一次检索。当问题需要多跳推理、自我反思或图结构关联时，就要升级到
+            <a href="advanced-rag.html">Advanced / Agentic RAG</a>；上下文预算的分配与压缩则属于
+            <a href="context-engineering.html">上下文工程</a> 的范畴；让它跑三个月不烂掉是
+            <a href="../12-llmops/rag-in-production.html">RAG 生产运维</a> 的活。想亲手搭一套完整可跑的，去
+            <a href="../15-practice/rag-practice.html">实战：搭建一个 RAG 系统</a>。RAG 存在的根本理由——幻觉——的成因分类见
+            <a href="../13-evaluation/hallucination.html">幻觉与事实性</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

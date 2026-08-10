@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>幻觉与事实性 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="13-evaluation" data-topic="hallucination">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>幻觉与事实性</h1>
+            <p class="lead">幻觉不是 bug——它是语言模型泛化能力的同一枚硬币的另一面。这一节从概率机制讲到五类成因，从事实性/忠实性区分讲到分层抑制策略，配上线上排查流程和监控闭环，把幻觉从概念到工程治理完整拆开。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>幻觉有五种成因，但最终都指向同一个结论：<strong>它无法被根除，只能被分层抑制</strong>。不同的成因需要不同的治理手段——混为一谈会找错药方。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+mindmap
+  root((幻觉治理))
+    五类成因
+      训练数据错误或过时
+      长尾知识稀疏
+      自回归错误累积
+      对齐的迎合倾向
+      上下文冲突
+    分层抑制
+      RAG 检索外部知识
+      逐句溯源挂出处
+      教模型说"不确定"
+      线上监控采样回流
+              </div>
+              <figcaption>幻觉不是单一原因，需要分层治理——没有银弹。五类成因对应四层抑制策略，从检索到监控形成闭环。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 1: 无法根除 ============ -->
+          <h2>必须诚实的第一句话：幻觉无法被根除</h2>
+          <p>在讲任何抑制策略之前，先接受一个事实：</p>
+
+          <div class="callout warn">
+            <span class="callout-t">幻觉无法被根除</span>
+            语言模型的本质是从训练数据中学到世界知识的<strong>近似分布</strong>，然后用这个分布做推理。既然是近似，就必然有误差；既然是根据概率采样，就必然有偏差。幻觉和泛化是同一枚硬币的两面——一个从不产生幻觉的模型，一定也是一个泛化能力极差的模型。能做的不是消灭它，是<strong>抑制它的发生频率和危害程度</strong>。
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Coin["同一枚硬币"]
+    direction LR
+    Front["正面: 泛化<br/>模型能把学到的模式<br/>应用到没见过的数据"]
+    Back["反面: 幻觉<br/>模型把模式应用到<br/>不该应用的地方"]
+  end
+  Front --- Back
+
+  style Front fill:#e8f5e9,stroke:#4a7
+  style Back fill:#fde8e8,stroke:#c44
+            </div>
+            <figcaption>泛化与幻觉是同一机制的两面。模型能从训练数据中抽象出「模式」并应用到新场景——这就是泛化；但当模式被错误应用时——这就是幻觉。你不可能只要正面不要反面。</figcaption>
+          </figure>
+
+          <p>这不是悲观——这是工程的前提。接受了这个前提，你才会设计分层防御，而不是指望一个「不幻觉的模型」。接受不了这个前提，你会陷入不断换模型、调 prompt 的循环，却永远达不到「零幻觉」。</p>
+
+          <!-- ============ Section 2: 事实性 vs 忠实性 ============ -->
+          <h2>根区分：事实性幻觉 vs 忠实性幻觉</h2>
+          <p>所有后续分类的根基。混淆这两种幻觉会导致用错药方——RAG 治不了忠实性幻觉，溯源治不了事实性幻觉。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+classDiagram
+    class 幻觉
+    class 事实性幻觉 {
+        +与外部世界的事实矛盾
+        +例: 麦克白写于1603年
+        +抑制: RAG/知识库核实
+    }
+    class 忠实性幻觉 {
+        +与给定上下文矛盾
+        +例: 摘要里没有的结论
+        +抑制: 逐句溯源
+    }
+    幻觉 <|-- 事实性幻觉
+    幻觉 <|-- 忠实性幻觉
+            </div>
+            <figcaption>事实性 vs 忠实性：与外部世界矛盾还是与给定上下文矛盾。这个区分决定了你应该用什么抑制手段。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>类型</th><th>定义</th><th>例子</th><th>主要抑制手段</th></tr></thead>
+              <tbody>
+                <tr><td><strong>事实性幻觉</strong></td><td>输出与外部世界的事实矛盾</td><td>「莎士比亚的<em>麦克白</em>写于 1603 年」<br>（实际是 1606 年）</td><td>RAG、知识库核实、时效性管理</td></tr>
+                <tr><td><strong>忠实性幻觉</strong></td><td>输出与<strong>给定的上下文</strong>矛盾</td><td>给了三篇论文摘要，模型却说了一篇摘要里没有的结论</td><td>溯源、逐句对齐、更严格的 prompt 约束</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">RAG 的双重角色</span>
+            <strong>RAG 主要解决事实性幻觉，但会引入忠实性幻觉的风险</strong>——检索回来的 chunk 本身可能包含错误信息，模型可能把它当真理复述，或者把多个 chunk 的信息错误拼接。这正是 <a href="../10-applications/rag.html">RAG 存在的理由就是抑制幻觉</a>，但 RAG 自己也需要被监控。
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            把"模型说得流畅自信"当成"内容可信"。流畅是语言模型的出厂设置——它能把一段完全编造的年份、书名、引文说得抑扬顿挫，判断可信度只能靠外部证据（检索核实、来源比对），不能靠听感。另一个高频误用是把"事实性"和"忠实性"混为一谈：RAG 能压住"与外部世界矛盾"的事实性幻觉，却治不了"与给定文档矛盾"的忠实性幻觉——后者必须靠逐句溯源和约束生成。药方开错，幻觉率不会降。
+          </div>
+
+          <!-- ============ 论文原图：幻觉直观例子（Huang et al., 2023, Figure 1） ============ -->
+          <figure class="paper-figure">
+            <img src="../../assets/figures/13-evaluation/hallucination/fig1.png"
+                 alt="论文原图：LLM 幻觉的直观示例（Huang et al., 2023, Figure 1）"
+                 loading="lazy" style="max-width:480px">
+            <figcaption>
+              <span class="pf-title">图：幻觉的直观示例——模型给出流畅但事实错误的回答，这是所有幻觉治理工作的出发点</span>
+              <span class="pf-src">论文原图 · Huang et al., <em>A Survey on Hallucination in Large Language Models: Principles, Taxonomy, Challenges, and Open Questions</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2311.05232" target="_blank" rel="noopener">arXiv:2311.05232</a></span>
+            </figcaption>
+          </figure>
+
+          <p>花两分钟读懂这张图，它会改变你看待模型输出的方式。这张图来自 2023 年那篇幻觉综述，展示的是一个大模型幻觉的典型实例：用户提出一个问题，模型的回答在<strong>措辞上完全正常</strong>——句子完整、语气笃定、结构像模像样，但<strong>内容里有确凿的事实错误</strong>（比如把年份、书名或出处说错）。图中通常还会并排标出真实情况，让你一眼看出模型"错得有多自然"。读它的核心是体会一个对比：<strong>表达层面的"正常"与事实层面的"错误"可以同时成立</strong>。这就是幻觉最难防的地方——它不靠"听起来怪"来暴露自己，恰恰相反，越是自信流畅的措辞越容易掩盖内容错误。</p>
+          <p>这张图给所有治理工作定了基调：既然幻觉无法靠"读起来对不对"来识别，就必须<strong>建立外部证据链</strong>——每一句关键陈述都要能对到一份来源上（文档、检索结果、知识库）。这也是本页后面"分层抑制"里把"逐句溯源"列为独立一层的根本原因。顺带说明：综述论文（Huang et al., 2023）对幻觉还做了系统的类型学划分，把幻觉按"与什么矛盾"分成若干类别，本页接下来的"事实性 vs 忠实性"就是这套类型学最核心的一条主线。</p>
+
+          <!-- ============ Section 3: 五种成因 ============ -->
+          <h2>五种成因详解</h2>
+          <p>不同类型需要不同的治理手段。理解每种成因的机制，才能对症下药。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Causes["五种成因与对应层级"]
+    direction TB
+    C1["① 训练数据错误/过时<br/>→ 事实性幻觉<br/>语料有错,模型学到了"]
+    C2["② 长尾知识稀疏<br/>→ 事实性幻觉<br/>冷门实体训练数据不足"]
+    C3["③ 自回归错误累积<br/>→ 两类都可能<br/>一步错步步错"]
+    C4["④ 对齐的迎合倾向<br/>→ 事实性幻觉<br/>模型宁愿编也不说不知道"]
+    C5["⑤ 上下文冲突<br/>→ 忠实性幻觉<br/>注意力稀释/中间段丢失"]
+  end
+
+  C1 -->|"RAG"| Fix1["注入外部权威知识"]
+  C2 -->|"RAG"| Fix2["检索补充稀疏知识"]
+  C3 -->|"自洽性检验"| Fix3["多次采样看方差"]
+  C4 -->|"拒答校准"| Fix4["训练模型说'不确定'"]
+  C5 -->|"溯源+注意力管理"| Fix5["逐句标出处+重排上下文"]
+
+  style C1 fill:#fde8e8,stroke:#c44
+  style C2 fill:#fde8e8,stroke:#c44
+  style C3 fill:#fef3c7,stroke:#d97706
+  style C4 fill:#fde8e8,stroke:#c44
+  style C5 fill:#e6f1fb,stroke:#185fa5
+            </div>
+            <figcaption>五种成因的机制与对应抑制手段。注意成因③（自回归错误累积）可以导致两类幻觉，需要自洽性检验来检测。</figcaption>
+          </figure>
+
+          <h3>① 训练数据本身的错误与过时</h3>
+          <p>语料库里的知识有错、有矛盾、有历史版本。模型学到了这些错误，还学得很自信。知识截止日期之前的错误无法靠 prompt 修正——只有 RAG 或微调能解决。</p>
+          <p>典型场景：模型说「GPT-4 是 2023 年 3 月发布的」——这个信息在训练数据里是对的，但如果实际上 GPT-4.5 已经在 2024 年底发布了，模型的知识就过时了。<strong>过时不等于错误</strong>——模型说的是训练时的正确答案，但世界变了。</p>
+
+          <h3>② 长尾知识稀疏</h3>
+          <p>常见实体（纽约、爱因斯坦）在训练数据里出现百万次，但冷门实体可能只有个位数。对于稀疏的知识，模型会从相关分布里「猜」——这不是故意编造，是它没有更好的信号。</p>
+          <p>典型场景：问模型一个三线城市的小众餐厅地址，模型可能「猜」一个看起来合理的地址——因为它在训练数据里只见过这个餐厅名字一两次，但见过大量「XX 路XX 号」的地址模式，就把模式套上去了。</p>
+
+          <h3>③ 自回归的错误累积</h3>
+          <p>一步错误可能让后续步骤的分布完全偏掉。更糟的是，模型倾向于把错误的开头圆下去而不是回头修改——因为训练时看到的好文本都是前后一致的，模型学会了「宁可错也得一致」。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  T1["Token 1: '莎士比亚'"] --> T2["Token 2: '的'"] --> T3["Token 3: '麦克白'"] --> T4["Token 4: '写于'"] --> T5["Token 5: '1603'"]
+  T5 --> T6["Token 6: '年'"]
+  T5 -->|"错误开始"| Err["后续 token 都基于<br/>'1603年' 这个错误前提<br/>继续生成"]
+  Err --> T7["'是詹姆斯一世时期的作品'"]
+  Err --> T8["'比哈姆雷特早两年'"]
+
+  style T5 fill:#fde8e8,stroke:#c44
+  style Err fill:#fef3c7,stroke:#d97706
+            </div>
+            <figcaption>自回归错误累积：一个错误的 token（1603）导致后续所有 token 都在错误的前提下生成。模型不会回头修正——它只看前面的 token 来预测下一个。</figcaption>
+          </figure>
+
+          <h3>④ 对齐带来的迎合倾向</h3>
+          <p>RLHF 让模型学会「有帮助的回答得分高」。但「我不知道」通常不被人类标注为「有帮助」——所以模型宁愿编一个也不愿承认不知道。这是对齐的副作用。</p>
+          <p>这个问题的根在 <a href="../07-posttraining/rlhf.html">RLHF</a> 的标注偏好——标注员倾向于给「给了答案」的回答打高分，给「我不知道」打低分。模型学会了这个偏好后，即使不确定也会给出看起来自信的答案。<strong>修复方向</strong>：在对齐阶段增加「正确拒答」的正样本——让模型学会「不确定时说不确定」也能得高分。</p>
+
+          <h3>⑤ 上下文冲突型</h3>
+          <p>给了准确的资料，模型却输出了不一致的结论。通常是注意力稀释导致——上下文中间段的信息容易被忽略（lost in the middle），或者模型被 prompt 的其他部分带偏。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Context["长上下文中的注意力分布"]
+    direction LR
+    Start["开头<br/>高注意力"] --> Mid["中间<br/>低注意力(丢失)"] --> End["结尾<br/>高注意力"]
+  end
+
+  Start -->|"信息被看到"| OK1["✓"]
+  Mid -->|"信息被忽略"| Lost["✗ 丢失"]
+  End -->|"信息被看到"| OK2["✓"]
+
+  style Start fill:#e8f5e9,stroke:#4a7
+  style Mid fill:#fde8e8,stroke:#c44
+  style End fill:#e8f5e9,stroke:#4a7
+            </div>
+            <figcaption>Lost in the Middle：长上下文中，开头和结尾的信息被模型充分关注，但中间段容易被忽略。把关键信息放在开头或结尾能缓解这个问题。</figcaption>
+          </figure>
+
+          <!-- ============ Section 4: 分层抑制 ============ -->
+          <h2>分层抑制策略：没有银弹，只有纵深防御</h2>
+          <p>抑制幻觉不是一步到位的——需要从检索到监控的多层防御，每层解决不同成因的问题：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Pipeline["幻觉抑制纵深防御"]
+    direction TB
+    L1["检索层<br/>RAG 注入外部权威知识<br/>→ 压住 ①②(事实性)"]
+    L2["生成层<br/>逐句溯源 + 严格prompt约束<br/>→ 压住 ⑤(忠实性)"]
+    L3["后处理层<br/>自洽性检验(多次采样)<br/>→ 压住 ③(错误累积)"]
+    L4["对齐层<br/>拒答校准(训练'说不知道')<br/>→ 压住 ④(迎合倾向)"]
+    L5["监控层<br/>线上幻觉率采样+用户反馈<br/>→ 发现问题(不预防)"]
+  end
+
+  L1 --> L2 --> L3 --> L4
+  L4 -.->|"持续反馈"| L5
+  L5 -.->|"数据回流"| L4
+
+  style L1 fill:#e6f1fb,stroke:#185fa5
+  style L2 fill:#eaf3de,stroke:#639922
+  style L3 fill:#fef3c7,stroke:#d97706
+  style L4 fill:#faeeda,stroke:#ba7517
+  style L5 fill:#f5f5f5,stroke:#999
+            </div>
+            <figcaption>五层纵深防御：检索 → 生成 → 后处理 → 对齐 → 监控。每层解决不同成因，监控层把线上发现的问题回流到对齐层，形成闭环。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层次</th><th>手段</th><th>解决什么</th><th>成本</th></tr></thead>
+              <tbody>
+                <tr><td><strong>检索</strong></td><td>RAG：在生成前注入外部权威知识</td><td>①训练数据错误 / ②长尾稀疏</td><td>检索延迟、chunk 管理</td></tr>
+                <tr><td><strong>生成</strong></td><td>逐句溯源：每句话标出处</td><td>⑤上下文冲突、②长尾拼接错误</td><td>token 消耗增加约 30-50%</td></tr>
+                <tr><td><strong>后处理</strong></td><td>自洽性检验：多次采样看答案是否收敛</td><td>③自回归错误（采样方差大≈不可信）</td><td>推理成本 × N</td></tr>
+                <tr><td><strong>对齐</strong></td><td>拒答校准：在 safety-alignment 中让模型学会在不确定时表达</td><td>④迎合倾向</td><td>对齐阶段的一次性成本</td></tr>
+                <tr><td><strong>监控</strong></td><td>线上幻觉率采样、用户反馈回流、回归评测</td><td>全部（发现而非预防）</td><td>持续运维成本</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>自洽性检验：多次采样看方差</h3>
+          <p>这是一种简单但有效的后处理方法：对同一个问题用不同的随机种子采样 N 次，看答案是否一致。如果 N 次答案高度一致——模型很确定；如果答案发散——模型自己也不确定，这个回答大概率不可信。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+    [*] --> 采样1: 1998
+    [*] --> 采样2: 1998
+    [*] --> 采样3: 1998
+    [*] --> 采样4: 2001
+    [*] --> 采样5: 1998
+    采样1 --> 方差分析
+    采样2 --> 方差分析
+    采样3 --> 方差分析
+    采样4 --> 方差分析
+    采样5 --> 方差分析
+    方差分析 --> 可信度高: 4/5 一致
+    方差分析 --> 警告: 1/5 偏离
+    可信度高: 输出 1998，标注 80% 一致
+    警告: 20% 的采样给出不同答案
+            </div>
+            <figcaption>自洽性检验：同一问题多次采样，方差小→可信，方差大→不可信。成本是推理 × N，但效果显著——尤其对事实性问题。</figcaption>
+          </figure>
+
+          <details class="deep">
+            <summary>展开：自洽性检验的代码实现</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">import collections
+
+def self_consistency_check(question, llm_call, n=5, temperature=0.7):
+    """对同一问题多次采样,检查答案一致性"""
+    answers = []
+    for i in range(n):
+        # 每次用不同的随机种子
+        resp = llm_call(question, temperature=temperature, seed=i)
+        answers.append(resp.strip())
+
+    # 统计答案分布
+    counter = collections.Counter(answers)
+    most_common, count = counter.most_common(1)[0]
+    consistency = count / n
+
+    if consistency >= 0.8:
+        return {
+            "answer": most_common,
+            "confidence": "high",
+            "consistency": f"{consistency:.0%}",
+            "all_answers": dict(counter)
+        }
+    elif consistency >= 0.6:
+        return {
+            "answer": most_common,
+            "confidence": "medium",
+            "consistency": f"{consistency:.0%}",
+            "warning": "部分采样给出了不同答案",
+            "all_answers": dict(counter)
+        }
+    else:
+        return {
+            "answer": None,
+            "confidence": "low",
+            "consistency": f"{consistency:.0%}",
+            "warning": "答案高度发散,模型不确定",
+            "all_answers": dict(counter)
+        }</code></pre>
+              <p>注意：自洽性检验的 temperature 不能太低——temperature=0 时每次采样结果相同，检验就没意义了。通常用 0.7-1.0 来获得足够的采样多样性。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section 5: 线上排查流程 ============ -->
+          <h2>线上排查流程：幻觉率上升时怎么办</h2>
+          <p>线上幻觉率上升时，不要急着换模型——先排查是哪一层的问题：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  Alert["幻觉率上升"] --> Step1{"Step 1: 检索指标<br/>召回率@K 是否正常?"}
+  Step1 -->|"召回率下降"| Fix1["→ 检索问题<br/>优化搜索/索引<br/>不需要动模型"]
+  Step1 -->|"召回率正常"| Step2{"Step 2: 检索内容<br/>是否包含正确信息?"}
+  Step2 -->|"检索内容无正确信息"| Fix2["→ 知识库问题<br/>补充知识/更新文档"]
+  Step2 -->|"检索内容有正确信息"| Step3{"Step 3: 模型是否<br/>用了检索内容?"}
+  Step3 -->|"模型忽略检索内容"| Fix3["→ 忠实性幻觉<br/>加强prompt约束/溯源/重排"]
+  Step3 -->|"模型用了但输出仍错"| Fix4["→ 生成侧幻觉<br/>自洽性检验/换模型/微调"]
+
+  style Alert fill:#fde8e8,stroke:#c44
+  style Fix1 fill:#e6f1fb,stroke:#185fa5
+  style Fix2 fill:#e6f1fb,stroke:#185fa5
+  style Fix3 fill:#eaf3de,stroke:#639922
+  style Fix4 fill:#fef3c7,stroke:#d97706
+            </div>
+            <figcaption>线上排查决策树：从检索→知识库→忠实性→生成侧，逐层排除。能避免无意义地换模型——很多时候问题不在模型，在检索。</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">区分检索掉了还是幻觉</span>
+            线上排查的第一步：先跑检索指标（召回率@K）确认是不是检索没捞到——如果是，幻觉只是检索失败的后果，优化搜索比换模型有效。检索指标正常但仍在编造内容，那才是生成侧的幻觉，需要从生成约束、溯源入手。
+          </div>
+
+          <h3>监控闭环：从发现到修复</h3>
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+    participant O as 线上服务
+    participant D as 幻觉检测
+    participant S as 幻觉案例库
+    participant C as 分类分析
+    participant F as 修复部署
+    O->>D: 采样线上回答
+    D->>S: 记录幻觉案例
+    S->>C: 分类: 事实性/忠实性, 检索/生成
+    C->>F: 补知识/调prompt/微调
+    F->>O: 部署修复版本
+            </div>
+            <figcaption>监控闭环：线上采样 → 检测 → 分类 → 修复 → 部署。持续运维成本不低，但这是控制幻觉率的唯一长期手段。详见 <a href="../12-llmops/observability.html">可观测性与全链路追踪</a>。</figcaption>
+          </figure>
+
+          <!-- ============ Section 6: 幻觉检测方法 ============ -->
+          <h2>幻觉的另一种切分：事实性 / 逻辑性 / 指令性</h2>
+          <p>按"与什么矛盾"切分是根，工程上还需要更细的判别口径，才能为每条线上反馈打标签。实践中常用三分法：事实性、逻辑性、指令性。三者表现不同、成因不同、修复路径也不同。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>子类型</th><th>判别标准</th><th>典型例子</th><th>修复路径</th></tr></thead>
+              <tbody>
+                <tr><td><strong>事实性幻觉</strong></td><td>与外部世界的事实不符，可用权威来源证伪</td><td>「法国首都是柏林」</td><td>RAG、知识库核实、时效管理</td></tr>
+                <tr><td><strong>逻辑性幻觉</strong></td><td>内部推理链条断裂，前后矛盾或违反基本逻辑</td><td>「3×5=12，因为 3+5=8」</td><td>自洽性检验、CoT 校验、推理微调</td></tr>
+                <tr><td><strong>指令性幻觉</strong></td><td>未执行用户明确指令，或执行了未被要求的内容</td><td>要求只输出 JSON，却输出了解释文字</td><td>prompt 约束、结构化输出、格式校验</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>三分法和"事实性 vs 忠实性"并不冲突，而是互补：前者回答"哪类错"，后者回答"跟谁比错"。一条回答可以同时是事实性幻觉（编了年份）也是忠实性幻觉（与文档矛盾）。打标签时建议两个维度都记录，否则后续归因会丢失信息。</p>
+          <p>判别实操上，事实性用检索工具交叉验证最可靠——拿生成文本里的实体和日期去搜索，看有没有权威来源背书；逻辑性靠人工或更强模型复核推导链条，重点是看每一步是否站得住，而不是看结论对不对；指令性直接对照用户原话，看输出是否满足每条约束。有了这个判别表，线上幻觉案例库的标签质量会明显提升。</p>
+
+          <h2>幻觉率怎么量化：从口径到指标</h2>
+          <p>治理幻觉的第一步是把"幻觉"变成可测量的数。但"幻觉率"的定义五花八门，不统一口径，两个团队的数字没法对比。常见口径有三种，按严格程度递增。</p>
+          <p><strong>句子级幻觉率</strong>（strict）：把回答拆成句子，逐句判断是否被检索文档支持，不支持的比例即幻觉率。优点是可自动化、可逐句定位；缺点是重查准轻查全，句子未被支持不代表一定是幻觉，可能是常识推断。</p>
+          <p><strong>回答级幻觉率</strong>（loose）：整条回答只要有一处关键事实错误就算幻觉，幻觉率 = 含幻觉的回答数 ÷ 总回答数。优点是贴近用户感受——用户不关心 30% 的句子错了，只关心这次回答能不能信；缺点是粒度粗，一条回答错了三处和错一处都记为 1。</p>
+          <p><strong>关键事实正确率</strong>：预先定义回答里的关键事实点（entities、数值、时间），逐点核对。这是最细的口径，也是 RAG 评测里的主流，但需要为每条回答额外标注"哪些是关键事实"，成本最高。</p>
+
+          <details class="deep">
+            <summary>展开：同一批数据，三个口径算出 8%、25%、10% 三种"幻觉率"——手算一遍</summary>
+            <div class="deep-body">
+              <p>设你抽了 100 条线上回答，共 500 句话，其中 40 句话与检索文档不符，且这 40 句分布在 25 条回答里（15 条回答各错 1 句，10 条回答各错 2~3 句）。同一批数据，换口径算：</p>
+              <p><strong>句子级幻觉率</strong>：40 句错 ÷ 500 句 = <strong>8%</strong>。数字最小，因为大量正确句子稀释了错误。</p>
+              <p><strong>回答级幻觉率</strong>：25 条含错 ÷ 100 条 = <strong>25%</strong>。数字最大，因为一条回答只要有一处关键错误就记为一次"不可信"——这正是用户视角：不关心 30% 的句子错了，只关心这次回答能不能信。</p>
+              <p><strong>关键事实正确率</strong>：设每条回答平均 3 个关键事实点（实体/数值/时间），共 300 点，逐点核对错 30 点，正确率 90%，对应的幻觉率（1−正确率）= <strong>10%</strong>。最细，也最贴近"哪些事实说错了"。</p>
+              <p style="margin-bottom:0">同一个模型、同一批数据，三个口径算出 8%、25%、10% 三个数——这就是为什么"我们幻觉率只有 2%"和"他们幻觉率 15%"的对比常常毫无意义，先把口径对齐再谈数字。报告幻觉率务必注明口径，最好三个口径一起报，同时附上拒答率，防止模型用"消极正确"刷分。</p>
+            </div>
+          </details>
+
+          <p>指标算出来后，还要配一条重要原则：<strong>幻觉率必须和召回/覆盖率一起看</strong>。一个模型为了不说错，把所有回答都回成"抱歉我不确定"，幻觉率降到接近 0，但产品完全没法用。监控幻觉率的同时要监控拒答率、无帮助率，防止模型用"消极正确"刷指标。三个数放在一起，才能判断治理方向是"少说"还是"说对"。具体到团队落地时，建议每周固定抽 100-200 条真实用户对话打一次标签，人工打不动就用 LLM-as-Judge 初筛、人工抽检复核，把幻觉率的变化当成和周报里的调用量一样的常规指标来追踪。</p>
+
+          <h2>温度与幻觉：一个被低估的旋钮</h2>
+          <p>生成参数里最容易被忽略的幻觉杠杆是温度（temperature）。直觉上，温度越高采样越随机，越容易胡说——这个直觉基本正确，但机制比"随机"更微妙：高温放大了低概率 token 的激活，而低概率 token 往往来自模型"不确定"的区域。模型越不确定，高温下越容易滑向任意一个看似合理的续写，这就是幻觉的温床。</p>
+          <p>一个值得做的小实验：同一批事实性提问，分别在 temperature=0、0.7、1.2 下各测 200 条，统计幻觉率。很多团队的实测曲线是：0 时幻觉率最低但回答单调，0.7 时略升但仍有可接受区间，超过 1.0 后幻觉率明显上翘。如果你的产品对事实性要求高（客服、医疗、法律），把 temperature 压到 0.3 以下，比换任何 prompt 都立竿见影；反之，创意写作场景可以放宽到 1.0+，因为那里"幻觉"反而是用户要的多样性。代价是低温会让回答偏保守、重复度高，需要结合具体场景平衡。</p>
+
+          <h2>幻觉检测：怎么知道模型在编</h2>
+          <p>抑制幻觉的前提是能检测到它。常见的检测方法各有优劣：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方法</th><th>原理</th><th>优点</th><th>缺点</th></tr></thead>
+              <tbody>
+                <tr><td><strong>外部知识核实</strong></td><td>把模型输出与权威知识库对比</td><td>最准确</td><td>只适用于有知识库的领域；成本高</td></tr>
+                <tr><td><strong>自洽性检验</strong></td><td>多次采样看方差</td><td>无需外部知识；简单</td><td>推理成本 × N；对「一致但错误」的幻觉无效</td></tr>
+                <tr><td><strong>LLM-as-Judge</strong></td><td>用另一个 LLM 判断输出是否有幻觉</td><td>灵活；可批量</td><td>评判模型自身也可能幻觉；有偏差</td></tr>
+                <tr><td><strong>溯源对齐</strong></td><td>每句话标出处，检查出处是否支持该陈述</td><td>精确到句子</td><td>需要检索基础设施；token 成本高</td></tr>
+                <tr><td><strong>用户反馈</strong></td><td>用户点踩/纠错</td><td>真实场景；免费</td><td>覆盖率低；反馈延迟；有偏差（只有不满的人才反馈）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">自洽性检验的盲区</span>
+            自洽性检验对「一致但错误」的幻觉无效——如果模型每次都自信地给出同一个错误答案，方差为零，但答案仍然是幻觉。这种情况下需要外部知识核实或 LLM-as-Judge 来补充。
+          </div>
+
+          <h2>一个完整例子：把治理流程串起来</h2>
+          <p>把这一页的知识放进一个具体场景里串一遍。假设你做了一个企业知识库问答产品，最近用户反馈说「回答里有编造的信息」，幻觉率从 3% 涨到 6%。按前面的框架，排查顺序应该是这样的。</p>
+          <p>第一步，先确认数据口径。6% 是哪个指标？如果是句子级幻觉率，用「关键事实正确率」复测一遍，看看是不是文档更新后检索命中率下降导致的——很多「幻觉投诉」其实是检索没召回，模型只能靠记忆硬答。第二步，抽 50 条幻觉案例进案例库，用「事实性 / 逻辑性 / 指令性」三分法打标签，看分布。如果 60% 是事实性，方向是补知识库；如果 40% 是指令性（比如用户要求「只给三个要点」，模型给了五个），方向是 prompt 约束；如果大量是逻辑性，方向是加自洽性检验。</p>
+          <p>第三步，对照五层防御看哪一层失守了。检索层召回率是否下降？生成层有没有做逐句溯源？后处理层有没有跑自洽性检验？如果这些防御本来就没搭，那 6% 的幻觉率是「裸奔」的正常结果，先补防御而不是先调模型。第四步，修复后用同一口径回归——把修复前的 50 条案例重新跑一遍，看幻觉率是否回落，同时盯住拒答率和无帮助率，防止模型用「我不确定」消极刷分。</p>
+          <p>这个过程里最容易被忽略的教训是：<strong>幻觉治理是一场持续对抗，不是一次发布</strong>。知识库会更新、用户提问分布会漂移、新文档可能自带错误，幻觉率必然反复。所以案例库、监控、回归评测这套闭环要长期运行，每次迭代模型或知识库都跑一遍回归。这也是为什么这一页反复强调「监控层」——它是唯一能持续发现问题的环节，其他四层都只能治标。</p>
+          <p>最后提醒一点组织层面的建议：幻觉治理需要一个明确的 owner。检索由搜索团队管、prompt 由应用团队管、模型由算法团队管，如果没人对「最终幻觉率」这个指标负责，每次出了事就是三个团队互相甩锅——「检索没问题」「prompt 没问题」「模型没问题」，但用户看到的就是答案错了。指定一个幻觉率指标的负责人，让他协调三层修复，是这个治理闭环能真正运转起来的前提。工具层面，幻觉检测已有开源框架和不少厂商的评测服务，团队可以先用现成工具搭一版监控，再根据自己领域的特点逐步定制——不必从零造轮子。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>诚实结论</strong>：幻觉无法被根除——它是泛化能力的副作用。能做的只是分层抑制。</li>
+            <li><strong>根区分</strong>：事实性幻觉（与外部世界矛盾）vs 忠实性幻觉（与给定上下文矛盾）。RAG 压前者，溯源压后者。</li>
+            <li><strong>五种成因</strong>：训练数据错误/过时、长尾知识稀疏、自回归错误累积、对齐的迎合倾向、上下文冲突。</li>
+            <li><strong>五层抑制</strong>：检索（RAG）→ 生成（溯源）→ 后处理（自洽性检验）→ 对齐（拒答校准）→ 监控（线上采样+回流）。</li>
+            <li><strong>RAG 本身会引入新幻觉</strong>：检索结果的错误拼接、chunk 间的信息扭曲。</li>
+            <li><strong>自洽性</strong>：多次采样看答案是否一致——方差大说明模型自己也不确定。对「一致但错误」的幻觉无效。</li>
+            <li><strong>线上排查决策树</strong>：先查检索召回率 → 再查检索内容 → 再查模型是否用了检索 → 最后才考虑生成侧问题。</li>
+            <li><strong>持续监控</strong>：采样 → 检测 → 分类 → 修复 → 部署，形成闭环。见 <a href="../12-llmops/observability.html">可观测性</a>。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Survey of Hallucination in Natural Language Generation (Ji et al., 2023) — 幻觉领域的综述论文，系统梳理了事实性/忠实性幻觉的定义、成因和评估方法，是理解幻觉分类框架的最佳起点 · <a href="https://arxiv.org/abs/2202.03629" target="_blank" rel="noopener">arXiv:2202.03629</a></li>
+            <li>Self-Consistency Improves Chain of Thought Reasoning in Language Models (Wang et al., 2022) — 自洽性检验的原始论文，证明了多次采样取多数投票能显著提升推理准确率 · <a href="https://arxiv.org/abs/2203.11171" target="_blank" rel="noopener">arXiv:2203.11171</a></li>
+            <li>RAG 原始论文 (Lewis et al., 2020) — 检索增强生成的奠基论文，虽然主要讲架构，但其中关于幻觉抑制的实验数据至今仍有参考价值 · <a href="https://arxiv.org/abs/2005.11401" target="_blank" rel="noopener">arXiv:2005.11401</a></li>
+            <li>Cognitive Mirage: A Review of Hallucinations in Large Language Models (2023) — 聚焦 LLM 幻觉成因与检测的最新综述 · <a href="https://arxiv.org/abs/2311.05232" target="_blank" rel="noopener">arXiv:2311.05232</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            知道怎么判断好坏还不够——还得知道自己和同行比是什么水平。看 <a href="eval-methods.html">评估方法论</a>，了解 LLM-as-Judge 和 Arena 对战的实际偏差。如果模型明明在评测上很好、实际使用却很糟糕，看 <a href="benchmarks.html">评估基准</a> 了解榜单过拟合和测试集污染。如果你想从训练侧减少幻觉，看 <a href="../07-posttraining/rlhf.html">RLHF</a> 中的拒答校准部分。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>什么是大模型 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="00-overview" data-topic="what-is-llm">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>什么是大模型</h1>
+            <p class="lead">剥掉所有包装，大模型只做一件事：给定前面的文字，猜下一个词。可就是这一件事做到极致之后，长出了写代码、解数学题、当助手的能力。这一页要说清四件事——它究竟是什么、「大」到底大在哪、为什么看起来会思考、以及它做不到什么。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>大模型的全部工作可以浓缩成一个循环：<strong>把文字切成 token，每个 token 变成向量，几十层网络反复加工，输出下一个 token 的概率分布，采样一个，拼回输入再来一轮</strong>。就像手机输入法的联想功能，只是把「联想下一个词」这件事做深了好几个数量级。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  T["输入文本<br/>今天天气"] --> K["分词<br/>切成 token 序列"]
+  K --> E["嵌入<br/>每个 token 变成向量"]
+  E --> N["数十层 Transformer<br/>反复融合上下文"]
+  N --> P["输出<br/>全词表概率分布"]
+  P --> S["采样<br/>挑出一个 token"]
+  S --> O["真"]
+  O -. 拼回输入 .-> T
+
+  style N fill:#e6f1fb,stroke:#185fa5
+  style P fill:#faeeda,stroke:#ba7517
+              </div>
+              <figcaption>自回归生成：每吐出一个 token 就拼回输入，循环往复，直到采到结束符。整页要讲的所有能力和所有毛病，都从这一个循环里长出来。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 1 ============ -->
+          <h2>它本质上是一个下一个词预测器</h2>
+          <p>「大语言模型」（Large Language Model，LLM）这个名字里，<strong>「语言模型」才是本体，「大」只是形容词</strong>。语言模型的定义几十年没变过：对「下一个词出现的概率」建模。给定前文 $x_1, \dots, x_{t-1}$，输出下一个位置的条件概率分布 $P(x_t \mid x_1, \dots, x_{t-1})$。</p>
+          <p>注意这里的输出<strong>不是一个词，而是整个词表上的一整条概率分布</strong>。主流模型的词表规模通常在数万到十几万量级，所以模型每走一步，实际上是在给十万左右的候选各打一个分。至于最终吐出哪个，由解码策略决定——温度调高就更爱冒险，温度调到 0 就永远选概率最高的那个。</p>
+          <p>训练目标同样只有一条：遮住下一个 token 让模型猜，猜错就按误差反向调整参数，在海量文本上重复这个过程。没有人告诉它语法规则，没有人标注词性和句法树，这些结构是它为了把下一个词猜得更准而<strong>自己长出来的副产品</strong>。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant T as 分词器
+    participant M as 模型权重
+    participant D as 解码器
+    U->>T: 输入一句话
+    T->>M: 转成 token id 序列
+    M->>M: 逐层前向传播 融合上下文
+    M->>D: 最后一个位置的全词表 logits
+    D->>D: 温度缩放 加截断采样
+    D-->>U: 吐出一个 token
+    D->>T: 把新 token 拼回序列
+    Note over T,D: 重复整个循环 直到采到结束符或达到长度上限
+            </div>
+            <figcaption>一次生成请求的内部时序。关键在最后一步：模型本身没有「一次说完一句话」的能力，每个字都是一次独立的前向传播加一次采样。</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            它不是一个查得到答案的数据库，而是一台把海量文本里的规律<strong>压缩进权重</strong>的续写引擎。你问它问题，它并不「查」，它是在续写一段「有人提问、有人回答」的对话。
+          </div>
+
+          <h3>同一份概率分布，能采出完全不同的文风</h3>
+          <p>很多人以为「模型答得好不好」全看模型，其实解码这一步的影响大到经常被低估：<strong>同一个模型、同一句提示，换一组采样参数就能得到风格截然不同的输出</strong>。下面这张表是你最常在 API 里见到的几个旋钮。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>参数</th><th>它在动哪一步</th><th>调大会怎样</th><th>典型用途</th></tr></thead>
+              <tbody>
+                <tr><td><strong>temperature 温度</strong></td><td>Softmax 之前把 logits 整体除以它，改变分布的陡峭程度</td><td>分布变平，低概率词更容易被采中，输出更发散也更容易跑偏</td><td>创意写作调高；抽取信息、生成 JSON 调到接近 0</td></tr>
+                <tr><td><strong>top-k</strong></td><td>只在概率最高的 k 个候选里采样，其余直接丢弃</td><td>候选池变大，多样性上升，出现离谱词的风险也上升</td><td>需要稳定输出时配合小 k 使用</td></tr>
+                <tr><td><strong>top-p 核采样</strong></td><td>按概率从高到低累加，凑够 p 就截断，候选个数随分布动态变化</td><td>候选池变大，效果类似 top-k 但更自适应</td><td>目前最常用的默认策略</td></tr>
+                <tr><td><strong>重复惩罚</strong></td><td>对已经出现过的 token 压低分数</td><td>更不容易复读，但压过头会让必要的术语无法重复出现</td><td>长文生成时轻微开启</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这里有一个非常实用的推论：<strong>当你发现模型「答得不稳定」时，先去看温度而不是急着换模型。</strong>把温度设为 0 之后如果输出就固定了，那问题在采样；如果依然飘，那才是提示或模型本身的问题。各种解码策略的完整机制见 <a href="../08-inference/decoding.html">解码策略</a>。</p>
+
+          <h3>动手看一眼那条概率分布</h3>
+          <p>光说「输出是一条分布」比较抽象，最快的建立直觉的办法是亲眼看一次。下面这段代码用 Hugging Face Transformers 拿到最后一个位置的 logits，转成概率后打印前五名：</p>
+
+          <pre><code class="language-python">from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+name = "Qwen/Qwen2.5-0.5B"        # 换成你本地已有的任意 causal LM 即可
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name)
+model.eval()
+
+text = "今天天气"
+ids = tok(text, return_tensors="pt").input_ids
+
+with torch.no_grad():
+    logits = model(ids).logits        # 形状 (batch, seq_len, vocab_size)
+
+next_logits = logits[0, -1]           # 只取最后一个位置
+probs = torch.softmax(next_logits, dim=-1)
+top = torch.topk(probs, k=5)
+
+for p, i in zip(top.values, top.indices):
+    print(f"{tok.decode(i)!r:>10}  {p.item():.4f}")</code></pre>
+
+          <p>你会看到类似「真 / 不错 / 怎么样 / 很」这样一组候选，各自带一个概率。<strong>模型每生成一个字，背后都是这么一次全词表打分。</strong>把 <code>vocab_size</code> 打印出来，你还能直观感受到词表有多大——这也是为什么最后一层的输出投影矩阵通常是整个模型里最大的单个矩阵之一。</p>
+
+          <h3>往模型内部看一眼：那张著名的架构图</h3>
+          <p>「几十层网络反复加工」到底长什么样？与其听文字描述，不如直接看 2017 年那篇开创性论文《Attention Is All You Need》里的架构图。它是整个深度学习圈被引用最多的图之一，值得花两分钟逐块读懂——因为当代几乎所有大模型，无论 GPT、Llama 还是 Qwen，骨架都是这张图。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/03-transformer/architecture-fig1.png" alt="论文原图：Transformer 完整架构——左侧编码器、右侧解码器，N× 重复层，含多头注意力与前馈网络" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：Transformer 架构原图——左边读入整段输入（编码器），右边逐个生成输出（解码器），中间靠注意力连接</span>
+              <span class="pf-src">论文原图 · Vaswani et al., <em>Attention Is All You Need</em>, 2017, Figure 1 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，先抓三块，其余先别管：<strong>① 中间的「Multi-Head Attention」（多头注意力）</strong>是模型的记忆与关联机制——它决定生成下一个词时该"看"输入里的哪些位置；<strong>② 右边的「Masked Multi-Head Attention」（带掩码的多头注意力）</strong>保证生成第 t 个词时只能看前 t−1 个词，不能偷看未来——这正是本页开头说的"自回归"；<strong>③ 最下面箭头指向的「Input Embedding / Output Embedding」</strong>就是把词变成向量、把向量变回词的入口和出口，对应前面说的分词与全词表打分。右侧那个 N× 意味着这一套要叠很多层——层数越多，模型越大，也就越"大模型"。</p>
+          <p>如果你现在觉得「没全看懂」，完全正常。这张图会在本书的 <a href="../03-transformer/architecture.html">Transformer 完整架构</a> 里被拆成零件逐个讲透，这里只需要一个整体印象：<strong>它是一台"边看边写"的机器——写每个字之前，先回头扫一遍已经有的内容，决定下一个字怎么写。</strong>把这张图留在脑子里，后面所有章节都是在给它加细节。</p>
+
+          <!-- ============ Section 2 ============ -->
+          <h2>「大」大在哪：三个能拧的旋钮</h2>
+          <p>那么「大」大在哪？三件事同时放大：<strong>参数量</strong>（网络里可训练的权重个数）、<strong>数据量</strong>（喂进去的 token 总数）、<strong>算力</strong>（训练消耗的浮点运算）。三者之间存在可预测的定量关系，这是 <a href="../06-pretraining/scaling-laws.html">Scaling Laws</a> 研究的内容。而放大之所以带来质变，一个直接的原因是：<em>要把下一个词猜得足够准，你不得不真正学会点什么</em>。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>旋钮</th><th>它衡量什么</th><th>常见量级</th><th>拧到头会撞上什么</th></tr></thead>
+              <tbody>
+                <tr><td><strong>参数量</strong></td><td>权重的个数，决定模型能记住多少、表达多复杂的函数</td><td>从端侧的十亿以下，到旗舰模型的数千亿；MoE 架构下还要区分总参数与激活参数</td><td>显存墙：权重放不进单卡，必须切分并行</td></tr>
+                <tr><td><strong>数据量</strong></td><td>预训练消耗的 token 总数</td><td>当代主流基座普遍在万亿 token 以上</td><td>高质量语料枯竭，只能靠清洗、去重与合成数据补</td></tr>
+                <tr><td><strong>算力</strong></td><td>训练总浮点运算量，约等于参数量与 token 数的乘积再乘一个常数</td><td>大规模训练以「多少张卡跑多少天」计</td><td>预算墙与训练稳定性：跑得越久越容易遇到 loss spike</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>参数量最容易被换算成一个你能立刻感知的数字：<strong>显存</strong>。权重按什么精度存，就按每个参数几字节来算——FP16 或 BF16 是每参数 2 字节，INT8 是 1 字节，INT4 是 0.5 字节。于是一个 7B 模型的 FP16 权重就是 $7 \times 10^9 \times 2 \approx 14$ GB。</p>
+
+          <div class="chart-box"><canvas id="chart-llm-weight-mem"></canvas></div>
+          <p style="font-size:13px;color:var(--text-3);margin-top:-4px">按「参数量 × 每参数字节数」直接换算的<strong>纯权重</strong>显存。真实部署还要再加 KV Cache、激活值、框架开销，通常要在这个数字上再留出可观余量。量化的原理与代价见 <a href="../09-efficiency/quantization.html">量化、剪枝与模型压缩</a>。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">别只看参数量</span>
+            两个同样标着「7B」的模型，能力可能差出一代。因为参数量只是三个旋钮之一——训练 token 数、数据质量、后训练配方的贡献同样大。近年小参数模型在特定任务上打平甚至超过更大模型，已经是常态。<strong>参数量决定的是能力上限，不是实际能力。</strong>
+          </div>
+
+          <!-- ============ Section 3 ============ -->
+          <h2>为什么它看起来会思考</h2>
+          <p>「预测下一个词」听起来是个很低级的任务，但它其实是一道<strong>伪装成填空题的通用任务</strong>。想象训练语料里有这样一句：</p>
+          <blockquote style="border-left:3px solid var(--border);padding-left:14px;color:var(--text-2)">
+            「这道题：一个水池进水管 3 小时注满，出水管 5 小时放空，两管齐开需要____小时。答案是 7.5。」
+          </blockquote>
+          <p>要把这个空填对，模型没有捷径可走——它必须在内部真的完成那次算术。同理，要续写一段代码的下半部分，它得理解上半部分的变量作用域；要续写一篇论证文的结论，它得跟上前面的逻辑链。<strong>损失函数只惩罚预测错误，但为了少犯错，模型被迫在内部构建出可复用的推理结构。</strong>这是「压缩即理解」这个说法的来源。</p>
+          <p>不过，你今天在对话框里用到的那个「助手」，和刚训完的模型不是一回事。中间隔着两到三个阶段：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+    state "预训练 · 海量无标注文本上猜下一个词" as A
+    state "基座模型 · 有知识但只会续写" as B
+    state "SFT 监督微调 · 用指令回答对示范怎么应答" as C
+    state "对齐 · 按人类偏好或可验证奖励打磨" as D
+    state "线上助手" as E
+    [*] --> A
+    A --> B : 上万亿 token 的自监督训练
+    B --> C : 少量高质量指令数据
+    C --> D : 偏好排序或自动验证信号
+    D --> E : 部署上线
+    B --> E : 直接拿基座当助手用 会翻车
+            </div>
+            <figcaption>从基座到助手的状态迁移。图里最下面那条虚线式的捷径是新手最常踩的坑：拿一个只做过预训练的 base 模型去当聊天助手用，它会把你的问题当成待续写的文本，接着给你编三个类似的问题。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>阶段</th><th>做什么</th><th>数据规模的量级差异</th><th>产出什么</th></tr></thead>
+              <tbody>
+                <tr><td><strong>预训练</strong></td><td>在海量无标注文本上做下一个词预测</td><td>万亿 token 级</td><td>基座模型：知识和语言能力都有了，但只会「续写」，你问它问题它可能给你再编三个类似的问题</td></tr>
+                <tr><td><strong>监督微调 SFT</strong></td><td>用「指令-回答」样本对示范怎么应答</td><td>通常在万到百万条量级，比预训练小好几个数量级</td><td>会听话了：知道被问就该答，而不是接着往下写</td></tr>
+                <tr><td><strong>偏好对齐 / 强化学习</strong></td><td>用人类偏好或可验证的奖励信号打磨</td><td>偏好对数量级与 SFT 相近，但需要在线采样</td><td>答得有用、诚实、无害；长思维链推理能力也主要在这一步被训出来</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>三个阶段分别对应本书的 <a href="../06-pretraining/objectives.html">预训练目标</a>、<a href="../07-posttraining/sft.html">SFT 监督微调</a> 和 <a href="../07-posttraining/rlhf.html">RLHF</a>。<strong>记住这条分界很有用</strong>：很多人抱怨「模型不听指令」，其实是在拿基座模型当助手用。另一个直接推论是——<strong>后两个阶段的数据量比预训练小好几个数量级，却几乎决定了你对这个模型的全部主观印象</strong>。这也是为什么同一个开源基座，被不同团队微调后气质能差得像两个产品。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">别过度拟人化</span>
+            「看起来会思考」和「在思考」是两回事。模型没有跨对话的连续自我、没有目标、没有信念状态；每次请求它都从同一份冻结的权重出发，你上一次说的话如果不放进上下文，它就完全不知道。把它当成「一个能力很强但完全失忆的临时工」，比当成「一个人」更有助于用好它。
+          </div>
+
+          <!-- ============ Section 4 ============ -->
+          <h2>涌现能力：真现象，但别当神话</h2>
+          <p><strong>涌现能力（Emergent Abilities）</strong>指的是这样一类观察：某些能力在小模型上的表现几乎等于随机猜，但当规模越过某个点后，表现突然大幅跃升。多步算术、按自然语言指令完成没见过的任务，都曾被当作典型例子。这个说法在 2022 年前后广为流传，也塑造了「继续把模型做大就会有惊喜」的行业预期。</p>
+          <p>但后续研究给出了一个相当有力的反驳：<strong>涌现在很大程度上可能是评测指标不连续造成的假象。</strong>逻辑是这样的——如果你用「五位数加法完全算对才得分」这种全或无的指标，那么即使模型的底层能力（比如对正确答案的对数概率）是随规模平滑上升的，它在跨过「每一位都对」的阈值前得分都会趋近于零，跨过之后陡然拉升，曲线看上去就像突变。换成连续指标重新画一遍，同样的数据往往会变成一条平滑曲线。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>视角</th><th>主张</th><th>对工程的含义</th></tr></thead>
+              <tbody>
+                <tr><td>涌现是真实的相变</td><td>规模越过阈值后出现质变，不可从小模型外推</td><td>只能靠实际把模型做大来试，小规模实验没有预测力</td></tr>
+                <tr><td>涌现是指标假象</td><td>底层能力平滑增长，离散指标制造了断崖</td><td>换连续指标就能在小规模上提前看到趋势，可以外推</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>两种视角目前都还没被完全证伪，但对使用者来说，更稳妥的姿势是<strong>采纳第二种视角的方法论</strong>：不要指望换个更大的模型就自动解锁你要的能力，而是先为你的任务设计一个有区分度的连续指标，在小模型上量出趋势，再决定要不要为规模买单。</p>
+          <p>落到实操上，「连续指标」可以简单到这个程度：不要只统计「答案完全正确的比例」，而是同时记录<strong>格式合法率</strong>、<strong>关键字段命中率</strong>、<strong>正确答案的排名</strong>这类会随能力平滑变化的量。这几个数字在小模型上就会动，能提前几周告诉你「这条路走得通」还是「换多大都不行」。相关的评测设计问题见 <a href="../13-evaluation/eval-methods.html">评估方法论</a>。</p>
+
+          <!-- ============ Section 5 ============ -->
+          <h2>能力边界：四类它真的做不到的事</h2>
+          <p>知道边界在哪，比知道它能做什么更重要——因为踩坑几乎全都发生在边界上。下面四类问题不是「模型还不够好」，而是<strong>由它的工作方式直接决定的结构性限制</strong>。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("四类结构性边界"))
+    算不准
+      分词把数字切成不规则片段
+      前向传播里没有进位寄存器
+      解法是让它写代码交给解释器算
+    编事实
+      训练目标奖励像真的而不是是真的
+      内部缺少天然的我不知道表示
+      解法是把事实外置到检索里
+    不知道近况
+      权重在训练结束那刻冻结
+      解法是检索与联网工具
+    转头就忘
+      模型本身无状态
+      上下文窗口是唯一的工作记忆
+      解法是上下文工程与记忆系统
+            </div>
+            <figcaption>四条边界及其对应的系统级解法。注意每一条的解法都在模型之外——这正是「大模型应用」和「大模型」不是一回事的原因。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>现象</th><th>根本原因</th><th>正确的应对</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>算错数</strong><br/>长乘法、大数比较翻车</td>
+                  <td>数字在分词阶段就被切碎成不规则的 token，模型内部没有进位这种精确机制，只能靠模式记忆逼近</td>
+                  <td>别让它算，让它<strong>写代码去算</strong>。见 <a href="../11-agents/tool-use-mcp.html">工具调用与 MCP</a></td>
+                </tr>
+                <tr>
+                  <td><strong>编造事实</strong><br/>人名、引用、URL 说得有鼻子有眼</td>
+                  <td>训练目标奖励的是「像真的」而不是「是真的」；模型内部也缺少天然的「我不知道」表示，低频事实尤其容易被邻近的高频模式覆盖</td>
+                  <td>把事实外置：<a href="../10-applications/rag.html">RAG 检索增强生成</a>；成因分类见 <a href="../13-evaluation/hallucination.html">幻觉与事实性</a></td>
+                </tr>
+                <tr>
+                  <td><strong>不知道最近的事</strong></td>
+                  <td>权重在训练结束那一刻就冻结了，之后世界发生什么它一无所知</td>
+                  <td>检索、联网工具，或在提示里直接把最新信息喂给它</td>
+                </tr>
+                <tr>
+                  <td><strong>转头就忘</strong></td>
+                  <td>模型本身无状态。上下文窗口是它唯一的工作记忆，滑出窗口的内容等于不存在</td>
+                  <td><a href="../10-applications/context-engineering.html">上下文工程</a>管单次请求放什么，<a href="../11-agents/agent-memory.html">Agent 记忆系统</a>管跨会话留什么</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>还有一条容易被忽略：<strong>它对自己的解释不可靠。</strong>你问「你刚才为什么这么答」，它给出的是一段听起来合理的事后叙述，未必对应内部真实的计算过程。模型写出来的思维链和它实际据以得出答案的路径是否一致，是一个仍在研究中的开放问题，见 <a href="../13-evaluation/interpretability.html">机制可解释性基础</a>。</p>
+
+          <details class="deep">
+            <summary>展开：为什么「数一数 strawberry 里有几个 r」这么难？</summary>
+            <div class="deep-body">
+              <p>这个经典案例正好把两条边界串在一起。首先，模型看到的不是字母序列，而是分词器切出来的 token——一个英文单词可能只是<strong>一两个 token</strong>，单词内部的字母构成对模型是不透明的，就像你隔着毛玻璃数窗外的树叶。</p>
+              <p>其次，即使它「知道」拼写，计数也是一个需要精确迭代状态的操作，而 Transformer 的一次前向传播里没有可循环的计数寄存器，只能靠注意力层数硬堆出有限步的近似。</p>
+              <p>所以这类任务的正确解法从来不是「换个更强的模型」，而是<strong>换个执行体</strong>——让它写一行 <code>s.count('r')</code> 交给解释器跑。分词的具体机制见 <a href="../02-representation/tokenization.html">词元化 Tokenization</a>。</p>
+              <p>同一个原理还解释了一批看起来毫不相关的失败：让它把一句话倒着写、统计一段文字有多少个字、判断两个长数字哪个大、给一首诗做藏头。<strong>凡是需要按字符精确操作的任务，都在分词这一层就已经输了。</strong>遇到这类需求，第一反应应该是「这该交给代码」，而不是「换个提示词再试试」。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section 6 ============ -->
+          <h2>澄清三个最常见的误解</h2>
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">误解一：它在联网查资料</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">默认情况下不会。它的回答全部来自权重里压缩的统计规律。只有当产品显式接入了检索或浏览工具时，才会真的去取外部信息——而那已经是一个系统，不只是一个模型了。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">误解二：参数越多一定越强</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">参数量只是三个变量之一。数据质量、训练 token 数、后训练配方的影响同样大。近年来小参数量模型在特定任务上打平甚至超过更大模型，已经是常态。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">误解三：它会记住我说的话</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">模型权重不会因为你和它聊天而改变。你感觉到的「记忆」，是产品层把历史对话重新塞回上下文，或者外挂了一套记忆系统。关掉那层，它就是完全的失忆状态。</p>
+            </div>
+          </div>
+
+          <details class="deep">
+            <summary>展开：那它到底「记住」了多少训练数据？</summary>
+            <div class="deep-body">
+              <p>一个常见的追问是：既然它把海量文本压进了权重，是不是等于存了一份互联网的副本？答案是<strong>不是，但也不能说完全没存</strong>。</p>
+              <p>先看数量级。把参数量和训练 token 数放在一起比就会发现，<strong>参数远远少于它见过的 token</strong>。这意味着模型物理上不可能逐字记住语料——它必须做有损压缩，保留可复用的规律、丢掉具体的措辞。这也是为什么它能流畅谈论一个话题，却给不出准确的出处。</p>
+              <p>但「有损」不等于「零记忆」。在训练语料里高频重复出现的内容——常见诗句、开源协议正文、被大量转载的代码片段——确实可能被逐字复现。这既是<a href="../14-governance/data-copyright.html">训练数据版权</a>争议的技术根源，也是<a href="../14-governance/privacy-security.html">隐私保护与模型安全</a>里「训练数据提取攻击」这一类研究的前提。</p>
+              <p>对使用者来说，实用的结论只有一条：<strong>它给出的任何具体引用、链接、条款编号，都应当默认为待核实。</strong>要它给准确出处，就得把出处放进上下文里，也就是走 RAG 那条路。</p>
+            </div>
+          </details>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            很多人第一次读架构图会问：「编码器和解码器是不是两个不同的模型？」对绝大多数生成式大模型（GPT、Llama、Qwen）来说，<strong>只用右边解码器那半套</strong>，左边编码器整个省略——因为聊天不是"整段翻译"，而是"顺着写下去"。左右都用的是机器翻译时代的 <a href="../02-representation/pre-transformer.html">Seq2Seq 模型</a>；到了 GPT 时代，大家发现"光有解码器也能学会一切"，于是左边退出了历史舞台。看到论文里的架构图别慌：你平时用的模型，只涉及它的右半部分。
+          </div>
+
+          <details class="deep">
+            <summary>展开：为什么光靠"猜下一个词"能学会语法、事实甚至推理？</summary>
+            <div class="deep-body">
+              <p>这是每个新手都会问的问题。答案是三个层次的递进：</p>
+              <p><strong>第一层：预测本身就需要理解。</strong>要让「今天天气真____」的空格填得准，模型必须知道"天气"和"好/不错/晴"这些词经常一起出现——这已经是词汇搭配层面的统计知识。要让「他昨天把书放在____上，今天却找不到了」填对"桌子"，模型必须理解"放在…上"和"找不到"之间的物理场景——这逼着它建立一点世界模型。</p>
+              <p><strong>第二层：任务多样到没有捷径。</strong>训练语料里什么都有：数学题、代码、论文、小说、对话。同一个"猜下一个词"的目标，在数学题上逼它学会算术，在代码上逼它学会语法与逻辑，在小说上逼它学会叙事结构。模型无法为每个任务准备专用模块，只能长出通用的内部表示——这是"涌现"的底层来源。</p>
+              <p><strong>第三层：规模让规律无处可藏。</strong>数万亿 token 里，"如果 A 那么 B"的因果关系、"A 是 B 的父亲，B 是 C 的母亲，那么 C 是 A 的____"这类逻辑链，出现的次数足够多。参数越多，模型越有能力把这些规律"刻"进权重而非死记硬背。注意最后一句话的关键：<em>它学的是规律，不是例句</em>——这也解释了为什么它能回答没见过的问题，却记不住精确的出处。</p>
+              <p style="margin-bottom:0">用一句话收束：<strong>「猜下一个词」是目标，「学会世界」是副产品，规模是把副产品做大的放大器。</strong>更严格的机制讨论见 <a href="../13-evaluation/interpretability.html">机制可解释性基础</a>。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：对 $P(x_t \mid x_{&lt;t})$ 建模的自回归续写引擎，每步输出全词表概率分布，采一个，拼回去，再来一轮。</li>
+            <li><strong>解码同样重要</strong>：温度、top-p、重复惩罚会显著改变输出风格。输出不稳定时先查温度，再怀疑模型。</li>
+            <li><strong>「大」的三个旋钮</strong>：参数量、数据量、算力，三者关系由 Scaling Laws 刻画；参数量可直接换算显存，FP16 每参数 2 字节。</li>
+            <li><strong>基座 ≠ 助手</strong>：预训练给知识，SFT 给听话，偏好对齐给有用与安全。后两步数据量小几个数量级，却决定了你的主观印象。</li>
+            <li><strong>涌现</strong>：确有观察，但很可能被离散评测指标放大。工程上应改用连续指标提前量趋势。</li>
+            <li><strong>四条硬边界</strong>：精确计算、事实幻觉、知识截止、无状态记忆——都要靠系统而不是靠模型本身解决。</li>
+            <li><strong>自我解释不可信</strong>：它对「我为什么这么答」的回答是事后叙述，不是内省报告。</li>
+            <li><strong>心智模型</strong>：一个能力极强、但完全失忆、且不会主动承认自己不知道的临时工。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Attention Is All You Need — Transformer 原始论文，本页那个「数十层网络」指的就是它 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></li>
+            <li>Language Models are Few-Shot Learners — GPT-3 论文，「规模放大后能力质变」这一认知的来源 · <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener">arXiv:2005.14165</a></li>
+            <li>Training language models to follow instructions with human feedback — InstructGPT，讲清了基座到助手中间那两步在做什么 · <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener">arXiv:2203.02155</a></li>
+            <li>Emergent Abilities of Large Language Models — 提出并系统整理涌现现象的那篇 · <a href="https://arxiv.org/abs/2206.07682" target="_blank" rel="noopener">arXiv:2206.07682</a></li>
+            <li>Are Emergent Abilities of Large Language Models a Mirage? — 对涌现的指标假象反驳，本页第四节的依据 · <a href="https://arxiv.org/abs/2304.15004" target="_blank" rel="noopener">arXiv:2304.15004</a></li>
+            <li>Hugging Face Transformers 文档 — 本页代码示例用到的库，可以照着跑通第一段代码 · <a href="https://huggingface.co/docs/transformers/index" target="_blank" rel="noopener">官方文档</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            知道了它是什么，下一步是看清整张地图：<a href="tech-map.html">技术全景图</a> 会告诉你从分词到 Agent 的每个模块各自解决什么问题、彼此怎么衔接；想知道这套东西是怎么一步步走到今天的，看 <a href="timeline.html">发展时间线</a>；如果你已经准备动手选一个模型来用，可以直接跳到 <a href="model-families.html">模型家族与选型</a>。想顺着技术脉络往下走的话，<a href="../02-representation/language-model.html">语言模型是什么</a> 会把这一页里「下一个词预测」的说法真正展开成公式。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+  (function(){
+    if (typeof Chart === 'undefined') return;
+    var ctx = document.getElementById('chart-llm-weight-mem');
+    if (!ctx) return;
+    var ch = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: ['7B', '13B', '32B', '70B'],
+        datasets: [
+          { label: 'FP16 / BF16 权重 GB', data: [14, 26, 64, 140],
+            backgroundColor: window.CB_COLORS.blueSoft,
+            borderColor: window.CB_COLORS.blue, borderWidth: 1.5 },
+          { label: 'INT4 量化后权重 GB', data: [3.5, 6.5, 16, 35],
+            backgroundColor: window.CB_COLORS.greenSoft,
+            borderColor: window.CB_COLORS.green, borderWidth: 1.5 }
+        ]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: true } },
+        scales: { y: { beginAtZero: true, title: { display: true, text: '显存 GB' } } }
+      }
+    });
+    if (window.CB_CHARTS) window.CB_CHARTS.push(ch);
+  })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPU 执行模型与显存层级 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="05-systems" data-topic="gpu-architecture">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>GPU 执行模型与显存层级</h1>
+            <p class="lead">为什么同样的矩阵乘法，在 CPU 上跑是「算」，到 GPU 上就变成了「搬数据」？为什么把 batch 从 1 加到 32，耗时几乎不变？为什么两个数学上等价的写法，性能能差 5 倍？这些问题的答案，全都藏在 GPU 的执行模型和显存层级里。理解它，是理解一切性能优化——从 FlashAttention 到 ZeRO——的物理基础。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>GPU 不是「很多核的 CPU」，而是一台<strong>以数据搬运为核心矛盾的流水线机器</strong>：成千上万个线程同时跑，但它们的计算速度远快于喂数据的速度。GPU 的显存像一座图书馆，分好几层——HBM 是地下大书库（80 GB 但慢），SRAM 是你桌上的书架（每个 SM 只有几百 KB 但快），寄存器是你手里正翻着的那一页。算力墙是你「算得不够快」，带宽墙是你「搬得不够快」，而大模型训练的大部分时间，卡在后者。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  subgraph GPU["GPU 芯片"]
+    subgraph SMCluster["SM 阵列 如 108-132 个"]
+      SM1["SM #0<br/>含 Tensor Core"]
+      SM2["SM #1<br/>含 Tensor Core"]
+      SMN["SM #N<br/>含 Tensor Core"]
+    end
+    subgraph MemTree["显存层级 由大到小"]
+      HBM["HBM<br/>80 GB<br/>约 3 TB/s"]
+      L2["L2 Cache<br/>约 50 MB<br/>约 12 TB/s"]
+      SRAM["SRAM / Shared Memory<br/>每 SM 约 228 KB<br/>约 19 TB/s"]
+      REG["寄存器 Register<br/>每 SM 约 256 KB<br/>即时访问"]
+    end
+  end
+  SM1 --> REG
+  SM2 --> REG
+  SMN --> REG
+  REG --> SRAM
+  SRAM --> L2
+  L2 --> HBM
+  style HBM fill:#fcebeb,stroke:#a32d2d
+  style L2 fill:#faeeda,stroke:#ba7517
+  style SRAM fill:#eaf3de,stroke:#639922
+  style REG fill:#e6f1fb,stroke:#185fa5
+              </div>
+              <figcaption>GPU 显存层级：从 HBM 到寄存器，容量递减、带宽递增、延迟递减。性能优化的核心只有一句话——让数据尽量留在靠近计算单元的那一层。</figcaption>
+            </figure>
+          </div>
+
+          <h2>从 CPU 到 GPU：执行模型的根本转变</h2>
+          <p>理解 GPU，先要忘掉 CPU 的思维方式。CPU 的设计哲学是<strong>低延迟</strong>：一个核心遇到 cache miss，会花大量晶体管做分支预测、乱序执行、数据预取，尽量让那个核心不闲着。GPU 的哲学完全相反——<strong>高吞吐</strong>：不关心单个线程快不快，靠同时跑成千上万个线程，用并行度把延迟藏起来。</p>
+
+          <p>这个差别可以用一个类比说清楚：CPU 像一辆<strong>法拉利</strong>，一趟能拉两个人，但跑得极快；GPU 像一列<strong>通勤火车</strong>，起步慢、单趟时间长，但一次能拉几千人。要送 10 个人，法拉利完胜；要送 10 万人，火车完胜。深度学习恰好是「送 10 万人」的场景——一个 4096×4096 的矩阵乘有 687 亿次乘加，天然适合火车。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>CPU（延迟导向）</th><th>GPU（吞吐导向）</th><th>后果</th></tr></thead>
+              <tbody>
+                <tr><td><strong>核心数量</strong></td><td>几个到几十个复杂核心</td><td>上万个简单计算单元</td><td>GPU 单线程慢，但总吞吐高一到两个数量级</td></tr>
+                <tr><td><strong>缓存策略</strong></td><td>大 L1/L2/L3，几十 MB，硬件自动管理</td><td>小片上 SRAM，程序员显式管理</td><td>GPU 上「什么时候搬什么数据」是你的责任</td></tr>
+                <tr><td><strong>延迟处理</strong></td><td>乱序执行 + 推测执行填流水线</td><td>切换到另一个 warp（零开销上下文切换）</td><td>GPU 需要「足够多的活」才能藏住延迟</td></tr>
+                <tr><td><strong>分支</strong></td><td>分支预测器，命中率可到 95%+</td><td>warp 内分歧要串行执行两条路径</td><td>GPU 上写 if-else 可能直接砍半性能</td></tr>
+                <tr><td><strong>典型瓶颈</strong></td><td>算得不够快（compute bound）</td><td>喂不饱（memory bound）</td><td>GPU 优化的主战场是访存而不是算术</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>表里最后一行是本页最重要的结论：<strong>GPU 的算力（FLOP/s）远大于它的显存带宽（Byte/s）能供养的数据量</strong>。这就是带宽墙的物理根源，后面会用具体数字量化它。</p>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">CPU：延迟导向</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">少量复杂核心，大 cache，乱序执行。目标：让单个线程尽可能快。遇到等待时用推测执行填满流水线。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">GPU：吞吐导向</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">大量简单核心，小 cache，锁步执行。目标：用海量线程的并行度掩盖单个线程的延迟。遇到等待时切换到别的线程。</p>
+            </div>
+          </div>
+
+          <h2>SM 与 Warp：GPU 的执行单元</h2>
+          <p><strong>SM（Streaming Multiprocessor，流多处理器）</strong>是 GPU 的基本计算单元。一张数据中心 GPU 由上百个 SM 组成（A100 有 108 个，H100 SXM 有 132 个）。你可以把 SM 理解成一个「小型独立处理器」——它有自己的寄存器堆、自己的片上 SRAM、自己的调度器，几乎不需要和别的 SM 通信。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+classDiagram
+  class SM {
+    +寄存器堆约256KB
+    +SharedMemory约228KB
+    +WarpScheduler四个
+    +指令Cache
+    调度warp()
+    发射指令()
+  }
+  class TensorCore {
+    +矩阵乘加单元
+    +支持BF16与FP16与FP8
+    执行MMA()
+  }
+  class CUDACore {
+    +FP32与INT32标量单元
+    +处理激活与逐元素运算
+    执行标量运算()
+  }
+  class LSU {
+    +LoadStoreUnit
+    +负责HBM与片上搬运
+    发起访存()
+  }
+  class SFU {
+    +SpecialFunctionUnit
+    +exp与sqrt与倒数
+    执行超越函数()
+  }
+  SM *-- TensorCore : 包含多个
+  SM *-- CUDACore : 包含多个
+  SM *-- LSU : 包含多个
+  SM *-- SFU : 包含少量
+            </div>
+            <figcaption>一个 SM 的内部构造：Tensor Core 负责矩阵乘（算力主力），CUDA Core 负责标量运算，LSU 负责搬数据，SFU 负责 exp 这类超越函数。softmax 慢，一部分原因就是它同时压在 SFU 和 LSU 上。</figcaption>
+          </figure>
+
+          <p><strong>Warp（线程束）</strong>是 SM 的执行调度单位。一个 warp 固定由 <strong>32 个线程</strong>组成，这 32 个线程<strong>锁步执行</strong>——它们在同一时刻执行同一条指令，只是作用在不同的数据上（SIMT：Single Instruction, Multiple Threads）。你在 CUDA 里写的是「一个线程做什么」，硬件实际执行的是「32 个线程一起做什么」。</p>
+
+          <p>这个设定带来两个必须记住的推论：</p>
+          <ul>
+            <li><strong>线程数最好是 32 的倍数</strong>。启动 33 个线程，硬件会分配 2 个 warp，第二个 warp 里 31 个线程全程空转，算力浪费 48%。</li>
+            <li><strong>warp 内不能有分歧</strong>。遇到 <code>if-else</code>，一部分线程走 if、一部分走 else，硬件会<strong>串行执行两条路径</strong>，走 if 时 else 那批线程被掩码屏蔽（空转），反之亦然。这叫 <strong>warp divergence（分支发散）</strong>。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">Warp Divergence 的实际代价</span>
+            假设 kernel 里有一个 <code>if (idx % 2 == 0) A() else B()</code>，warp 内 16 个线程走 A、16 个走 B。硬件先执行 A（16 个线程活跃、16 个空转），再执行 B（反过来）。总耗时 = A 的时间 + B 的时间，<strong>有效算力只有 50%</strong>。如果分支嵌套三层且每层都发散，最差情况下有效算力降到 12.5%。避免的办法是让分歧发生在 <strong>warp 之间</strong>而不是 warp 内部——例如按 <code>idx / 32</code> 而不是 <code>idx % 2</code> 分流。
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Grid["Grid 整个 kernel 的线程网格"]
+    subgraph B0["Block 0 如 256 线程"]
+      W0["Warp 0<br/>线程 0-31"]
+      W1["Warp 7<br/>线程 224-255"]
+    end
+    subgraph B1["Block 1 如 256 线程"]
+      W2["Warp 0<br/>线程 0-31"]
+      W3["Warp 7<br/>线程 224-255"]
+    end
+  end
+  B0 -->|"整块调度到"| SM0["SM #0<br/>Block 不跨 SM"]
+  B1 -->|"整块调度到"| SM1["SM #1"]
+  SM0 --> TC0["4 个 Warp Scheduler<br/>轮流发射指令"]
+  SM1 --> TC1["4 个 Warp Scheduler"]
+  TC0 --> EX0["Tensor Core / CUDA Core"]
+  TC1 --> EX1["Tensor Core / CUDA Core"]
+  style W0 fill:#e6f1fb,stroke:#185fa5
+  style W1 fill:#e6f1fb,stroke:#185fa5
+  style W2 fill:#eaf3de,stroke:#639922
+  style W3 fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>GPU 线程层级：Grid → Block → Warp（32 线程锁步）→ Thread。关键约束是「一个 Block 必须完整调度到同一个 SM 上」——所以 Block 内可以用 Shared Memory 通信和同步，Block 之间不行。</figcaption>
+          </figure>
+
+          <h3>延迟隐藏与 Occupancy</h3>
+          <p>GPU 藏延迟的机制叫 <strong>zero-overhead warp switching</strong>：当一个 warp 发起 HBM 读取（要等 400 个周期以上），warp scheduler 立刻切换到另一个已就绪的 warp 继续发指令，而且切换<strong>不需要保存/恢复寄存器</strong>——因为所有驻留 warp 的寄存器同时都在寄存器堆里。这就是 GPU 寄存器堆做到 256 KB 这么大的原因。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 就绪: warp 被分配到 SM
+  就绪 --> 执行: Scheduler 发射指令
+  执行 --> 就绪: 指令完成 算术类
+  执行 --> 停顿: 发起 HBM 访存 等 400 周期以上
+  停顿 --> 就绪: 数据到达
+  执行 --> 同步等待: 遇到 barrier
+  同步等待 --> 就绪: Block 内所有 warp 到齐
+  执行 --> [*]: warp 全部指令执行完
+  note right of 停顿
+    关键: 停顿期间 Scheduler
+    切到别的就绪 warp
+    驻留 warp 越多 越藏得住
+  end note
+            </div>
+            <figcaption>Warp 的生命周期状态机。「停顿」不等于「浪费」——只要 SM 上还有别的就绪 warp，计算单元就不会闲着。驻留 warp 数不够时，停顿就变成真正的空转。</figcaption>
+          </figure>
+
+          <p><strong>Occupancy（占用率）</strong> = SM 上实际驻留的 warp 数 ÷ 硬件支持的最大驻留 warp 数。Ampere 和 Hopper 的每 SM 最大驻留 warp 数是 <strong>64</strong>（即 2048 个线程），具体数值以 CUDA 文档的 Compute Capability 表为准。限制 occupancy 的因素有三个，取最小值：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>限制因素</th><th>计算方式</th><th>举例（假设每 SM 上限 64 warp）</th><th>调优手段</th></tr></thead>
+              <tbody>
+                <tr><td><strong>寄存器</strong></td><td>寄存器堆总量 ÷ 每线程寄存器用量</td><td>每线程用 64 个寄存器 → 65536/64 = 1024 线程 = 32 warp，occupancy 50%</td><td>减少局部变量、拆分 kernel、加 <code>__launch_bounds__</code></td></tr>
+                <tr><td><strong>Shared Memory</strong></td><td>SM 的 SRAM 总量 ÷ 每 Block 用量</td><td>每 Block 用 64 KB、SM 有 228 KB → 只能驻留 3 个 Block</td><td>减小 tile 尺寸、复用同一块 buffer</td></tr>
+                <tr><td><strong>Block 数上限</strong></td><td>硬件每 SM 的 Block 数上限</td><td>Block 只有 32 线程时，凑不满 2048 线程</td><td>把 Block 开到 128–512 线程</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">Occupancy 不是越高越好</span>
+            这是最常见的误解。高 occupancy 只在<strong>访存密集</strong>的 kernel 上有意义（需要多个 warp 轮换藏延迟）。对于<strong>算力密集</strong>的 kernel，反而应该给每个线程更多寄存器、让它一次处理更多数据——这叫 <strong>Instruction-Level Parallelism（ILP）</strong>。高性能 GEMM kernel 的 occupancy 常常只有 25%–33%，但性能远超 occupancy 100% 的朴素实现。判断标准永远是实测吞吐，不是 occupancy 数字。
+          </div>
+
+          <h2>显存层级：大而慢 vs 小而快</h2>
+          <p>GPU 的存储系统是一个金字塔，越往上越快但越小。理解这个金字塔，是理解所有 GPU 性能优化的前提。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层级</th><th>容量（H100 参考）</th><th>带宽（参考量级）</th><th>延迟（周期，量级）</th><th>谁管理</th></tr></thead>
+              <tbody>
+                <tr><td><strong>HBM</strong>（主显存）</td><td>80 GB</td><td>约 3.35 TB/s</td><td>约 400–600</td><td>GPU 全局，程序显式分配</td></tr>
+                <tr><td><strong>L2 Cache</strong></td><td>约 50 MB</td><td>约 12 TB/s</td><td>约 200</td><td>GPU 全局，硬件自动</td></tr>
+                <tr><td><strong>SRAM / Shared Memory</strong></td><td>每 SM 约 228 KB</td><td>约 19 TB/s</td><td>约 20–30</td><td><strong>程序员显式管理</strong></td></tr>
+                <tr><td><strong>寄存器</strong></td><td>每 SM 约 256 KB</td><td>即时</td><td>约 1</td><td>编译器分配</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:13px;color:var(--text-3)">上表数值为量级参考，不同架构与配置下有差异，精确规格以 NVIDIA 官方白皮书与 CUDA 文档为准。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            HBM 到 SRAM 的带宽差大约 5–6 倍，<strong>延迟差却有 20 倍</strong>，而容量差是 3000 倍以上。优化的核心思路就是：<strong>把数据分块搬进 SRAM，在 SRAM 里反复计算后再写回 HBM</strong>。FlashAttention、tiled GEMM、融合算子——所有经典优化都遵循这一个模式。
+          </div>
+
+          <h3>论文原图：SRAM 与 HBM 到底差多少</h3>
+          <p>上面那张金字塔表是「数据」，下面这两张「图」把同一件事画得更直观——它们分别来自 FlashAttention 论文和 NVIDIA 官方 CUDA 文档。先看论文原图：<strong>FlashAttention 论文的 Figure 1 画的就是 GPU 的两层显存：SRAM 与 HBM。</strong>图上左半边是标准 Attention 的流程：注意力分数矩阵 S 和归一化矩阵 P 都要被写回 HBM 再读回来（每个箭头都是一次慢速搬运）；右半边是 FlashAttention 的做法：把 Q、K、V 切成小块（tile），让 S 和 P 只活在被色块框住的小 SRAM 里，只有最终的输出 O 才写回 HBM。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/05-systems/flash-attention/fig1.png" alt="论文原图：FlashAttention 论文 Figure 1——SRAM/HBM 两层显存，标准 Attention 反复读写 HBM，FlashAttention 让中间矩阵留在 SRAM" loading="lazy" style="max-width:480px">
+            <figcaption>
+              <span class="pf-title">图：FlashAttention 论文里的显存层级——SRAM（小方块，快）与 HBM（大方块，慢），中间矩阵不落 HBM 是提速关键</span>
+              <span class="pf-src">论文原图 · Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图抓三个信息：<strong>① 上下的两个色块是两层存储</strong>，小的是 SRAM、大的是 HBM，容量和速度都差一个数量级以上；<strong>② 标准 Attention 的箭头在两层之间来回穿梭</strong>，每穿一次都要付一次「走窄带宽管道」的代价；<strong>③ FlashAttention 的箭头几乎全部收在小盒子里</strong>，只保留最开始把 Q/K/V 读进 SRAM、最后把 O 写回 HBM 两条。你可以把 SRAM 想成厨师的操作台、HBM 想成仓库——标准做法是每做一道菜都跑一趟仓库，FlashAttention 是一次性把本周食材搬上操作台。这正是 <a href="flash-attention.html">FlashAttention 与 IO 感知注意力</a> 那一页的核心图，本页借用它来说明「数据留在哪一层」这件事有多重要。</p>
+
+          <figure class="paper-figure">
+            <img src="https://docs.nvidia.com/cuda/cuda-c-programming-guide/_images/memory-hierarchy.png" alt="NVIDIA 官方文档图：CUDA 编程指南的内存层级——寄存器、局部内存、共享内存、全局内存、常量内存、纹理内存的金字塔结构" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：NVIDIA CUDA 官方文档里的完整内存层级金字塔——寄存器最快，全局内存（HBM）最慢，中间是共享内存与 L2</span>
+              <span class="pf-src">权威文档图 · NVIDIA, <em>CUDA C++ Programming Guide</em>, "Memory Hierarchy" 图 · <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">docs.nvidia.com</a></span>
+            </figcaption>
+          </figure>
+
+          <p>第二张来自 NVIDIA 官方编程指南，它把刚才那张「只有两层」的图补全成完整的金字塔：<strong>最顶上、离线程最近的寄存器（最快、由编译器分配），往下依次是共享内存（本页的 SRAM，程序员显式管理）、L2 缓存（硬件自动）、全局内存（HBM）与常量/纹理内存。</strong>注意两件事：一是<strong>「共享内存」和「L2 缓存」是两回事</strong>——L2 是硬件帮你自动缓存，共享内存得你（或编译器）显式搬数据进去，用错就浪费；二是<strong>金字塔越往下延迟越大</strong>——从寄存器到全局内存，延迟差了数百个周期，这解释了为什么「把数据留在寄存器/共享内存里反复用」是所有 kernel 优化的总纲。这张官方图与 FlashAttention 论文图互相印证：<strong>层级真实存在，而优化的艺术就是尽量把热点数据留在金字塔上层的「小房间」里。</strong></p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            新手最容易搞错两件事。第一件是<strong>把「共享内存」当成「缓存」</strong>：L2 缓存是硬件自动管，共享内存必须程序员显式搬——你没搬，它就一直空着；搬少了，kernel 频繁穿透到 HBM，性能断崖。第二件是<strong>看到「显存容量大」就以为「跑得快」</strong>：80 GB 的 HBM 决定的是「装得下多少」，带宽（TB/s）决定的才是「跑得多快」，两者无关。判断一个 kernel 快不快，永远看带宽与算术强度，不看容量。
+          </div>
+
+          <p>注意 SRAM 是<strong>每 SM 私有</strong>的。全卡 SRAM 总量 = 每 SM 容量 × SM 数量。H100 的 132 个 SM 各有约 228 KB，合计约 <strong>30 MB</strong>——这就是你整张卡能用的「快速存储」总量，和 L2 Cache 差不多大。这也解释了为什么把数据全部留在片上几乎不可能：一个 8192×8192 的 FP16 注意力矩阵就有 128 MB，是全卡 SRAM 的 4 倍多。所以只能<strong>分块</strong>——这正是 <a href="flash-attention.html">FlashAttention</a> 的出发点。</p>
+
+          <h3>把访存代价换算成「等价 FLOP」</h3>
+          <p>直觉上很难感受「HBM 慢」到底有多慢。换个算法：在 H100 上，<strong>读一个 FP16 元素（2 字节）的时间，够 Tensor Core 做多少次浮点运算？</strong></p>
+          <p>H100 BF16 峰值约 989 TFLOP/s，HBM 带宽约 3.35 TB/s。每秒能搬 $3.35\times10^{12}$ 字节，能算 $9.89\times10^{14}$ 次运算。所以：</p>
+          <div class="figure" style="text-align:center">
+            $$\frac{9.89\times10^{14}\ \text{FLOP/s}}{3.35\times10^{12}\ \text{Byte/s}} \approx 295\ \text{FLOP/Byte}$$
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>操作</th><th>搬运字节数</th><th>「够算多少次」（H100，BF16）</th><th>解读</th></tr></thead>
+              <tbody>
+                <tr><td>从 HBM 读 1 个 FP16 数</td><td>2 B</td><td>约 <strong>590</strong> 次浮点运算</td><td>读一个数的功夫，够算 590 次——所以只算一两次就是巨亏</td></tr>
+                <tr><td>从 HBM 读 1 个 FP32 数</td><td>4 B</td><td>约 <strong>1180</strong> 次</td><td>FP32 不仅算力低，访存代价还翻倍</td></tr>
+                <tr><td>读一整行 4096 维 FP16 向量</td><td>8 KB</td><td>约 <strong>240 万</strong>次</td><td>值得为它做点复杂计算，比如整个 FFN</td></tr>
+                <tr><td>逐元素加法 <code>c = a + b</code></td><td>读 4 B 写 2 B = 6 B</td><td>实际只算 <strong>1</strong> 次</td><td>算术强度 0.17，浪费了 99.9% 的算力</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>最后一行触目惊心：一个逐元素加法，算术强度只有 <strong>0.17 FLOP/Byte</strong>，而 H100 的平衡点是 295。这意味着这个 kernel 只用到了理论算力的 $0.17/295 \approx 0.06\%$。它的耗时<strong>完全</strong>由带宽决定，跟 GPU 算力多强毫无关系。<strong>这就是为什么算子融合能带来数倍加速——不是算得更快了，而是少搬了几次数据。</strong></p>
+
+          <details class="deep">
+            <summary>展开：手算一个 LayerNorm 到底要搬多少数据</summary>
+            <div class="deep-body">
+              <p>拿一个真实算子练手：LayerNorm（层归一化）。输入是一批激活张量，形状为 $(B, S, d) = (1, 2048, 4096)$，BF16（每元素 2 字节）。</p>
+              <p><strong>第一步：数它必须读写多少字节。</strong>理想情况下，读输入一次、写输出一次：$2 \times (1 \times 2048 \times 4096) \times 2\ \text{B} = 2 \times 16.8 \times 10^6 \times 2 = 67\ \text{MB}$ 左右。</p>
+              <p><strong>第二步：算它要做多少次浮点运算。</strong>每个元素要做几次平方、求均值、归一化、乘缩放——粗算每个元素约 10 次 FLOP，总共约 $16.8 \times 10^6 \times 10 \approx 1.7 \times 10^8$ FLOP。</p>
+              <p><strong>第三步：看它在 H100 上各要多久。</strong>带宽 3.35 TB/s 下，搬 67 MB 约需 $67\times10^6 / 3.35\times10^{12} \approx 20\ \mu s$；算 1.7 亿次 FLOP，用 989 TFLOP/s 的零头就够，约 $0.2\ \mu s$。<strong>结论：这个算子 99% 的时间都在等数据搬运，属于典型的带宽墙算子。</strong></p>
+              <p style="margin-bottom:0">所以工程上要做的不是「把这个算子写得更快」，而是「把它和前后算子融合，让数据少读少写几遍」——这正是 <a href="triton-kernel.html">Triton Kernel 与编译优化</a> 那一页的全部动机。</p>
+            </div>
+          </details>
+
+          <h3>访存模式：合并访问与 Bank Conflict</h3>
+          <p>「读 8 KB」这个说法还隐含了一个前提：这 8 KB 是<strong>连续</strong>的。GPU 的 HBM 以 <strong>32 字节为最小事务单位</strong>搬运，一个 warp 的 32 个线程如果访问连续地址，硬件会把它们<strong>合并（coalesce）</strong>成几个大事务；如果访问的地址东一块西一块，每个线程都会触发独立事务。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>访存模式</th><th>warp 内 32 线程访问</th><th>实际搬运量</th><th>有效带宽利用率</th></tr></thead>
+              <tbody>
+                <tr><td><strong>完美合并</strong></td><td>连续的 128 字节（每线程 4 B）</td><td>128 B</td><td><strong>100%</strong></td></tr>
+                <tr><td><strong>跨步访问</strong>（stride=8）</td><td>每隔 32 B 取 4 B</td><td>约 1024 B</td><td>约 12.5%</td></tr>
+                <tr><td><strong>完全随机</strong></td><td>32 个不相干地址</td><td>32 × 32 B = 1024 B</td><td>约 12.5%</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这就是为什么 <strong>PyTorch 里 <code>tensor.contiguous()</code> 有时能带来意外的提速</strong>：转置后的张量在内存里是跨步布局的，直接喂给 kernel 会触发非合并访问，白白浪费 80% 以上的带宽。这也是 FlashAttention 等库对「非 contiguous 张量」不友好、可能静默回退的原因之一。</p>
+
+          <details class="deep">
+            <summary>展开：Shared Memory 的 Bank Conflict</summary>
+            <div class="deep-body">
+              <p>Shared Memory 在硬件上被切成 <strong>32 个 bank</strong>（对应 warp 的 32 个线程），每个 bank 宽 4 字节。地址 <code>addr</code> 落在第 <code>(addr / 4) % 32</code> 个 bank 上。</p>
+              <ul>
+                <li><strong>无冲突</strong>：32 个线程访问 32 个不同的 bank，一个周期全部完成。</li>
+                <li><strong>N 路冲突</strong>：N 个线程访问同一个 bank 的<strong>不同</strong>地址，硬件串行处理，耗时变 N 倍。</li>
+                <li><strong>广播</strong>：多个线程访问同一个 bank 的<strong>同一</strong>地址，硬件广播，不算冲突。</li>
+              </ul>
+              <p>最经典的坑是<strong>按列访问一个二维数组</strong>。假设 <code>__shared__ float tile[32][32]</code>，warp 里第 i 个线程访问 <code>tile[i][0]</code>。这些地址相隔 32×4 = 128 字节，全部落在 bank 0 上——<strong>32 路冲突，慢 32 倍</strong>。</p>
+              <p>标准解法是 <strong>padding</strong>：把数组声明成 <code>tile[32][33]</code>（多一列）。此时相邻行的起始地址相隔 33×4 = 132 字节，$(132/4) \bmod 32 = 33 \bmod 32 = 1$，每行错开一个 bank，冲突完全消除。多浪费 3% 的 SRAM，换来 32 倍性能——这是 CUDA 优化里性价比最高的一行改动。</p>
+              <p style="margin-bottom:0">写 Triton 时你通常不用手动处理这一层（编译器会做布局优化），但当你发现一个 kernel 的 shared memory 吞吐远低于预期，bank conflict 是首要怀疑对象。用 Nsight Compute 的 <code>shared_ld_bank_conflict</code> 指标可以直接看到。</p>
+            </div>
+          </details>
+
+          <h2>算力墙与带宽墙</h2>
+          <p>先把这两种「墙」用一个生活场景装起来：一家餐厅，<strong>算力是厨师颠勺的速度，带宽是传菜电梯的速度</strong>。如果厨师一小时能炒 1000 道菜，但电梯一小时只能送 300 份出去，那么餐厅的产能上限是 300——厨师再快也没用，菜在厨房里积压。反过来，如果电梯快而厨师慢，瓶颈就在厨房。GPU 上的每个算子，都在这两种「墙」之间二选一。</p>
+          <p>大模型训练的性能瓶颈可以归结为两种「墙」：</p>
+          <ul>
+            <li><strong>算力墙（Compute Bound）</strong>：计算量大到喂不饱 GPU 的计算单元。此时提升带宽没用，得加算力或减少计算量。大 GEMM（矩阵乘）在 Tensor Core 上通常接近算力墙。</li>
+            <li><strong>带宽墙（Memory Bound）</strong>：计算单元在等数据。此时加再多的算力也没用，得减少访存或提高带宽。注意力 softmax、激活函数、LayerNorm、逐元素操作往往是带宽墙。</li>
+          </ul>
+
+          <p>判断一个操作是算力墙还是带宽墙，用<strong>算术强度（Arithmetic Intensity）</strong>来衡量：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{Arithmetic Intensity} = \frac{\text{FLOP（浮点运算次数）}}{\text{Byte（访存字节数）}} \quad (\text{单位：FLOP/Byte})$$
+          </div>
+
+          <p>GPU 的<strong>峰值算力与峰值带宽之比</strong>叫做<strong>平衡点（machine balance）</strong>。不同代次 GPU 的平衡点：</p>
+
+          <div class="chart-box"><canvas id="chart-gpu-balance"></canvas></div>
+          <p style="font-size:13px;color:var(--text-3);text-align:center;margin-top:-6px">各代 GPU 的平衡点（BF16 峰值算力 ÷ HBM 带宽）。算术强度低于这条线的算子，一定是带宽受限。</p>
+
+          <p>算一遍 H100：BF16 峰值约 989 TFLOP/s，HBM 带宽约 3.35 TB/s，平衡点 = 989 / 3.35 ≈ <strong>295 FLOP/Byte</strong>。这意味着：一个操作的算术强度如果低于 295，它就是<strong>带宽受限</strong>的——GPU 的计算单元在空转等数据；如果高于 295，则是<strong>算力受限</strong>的。</p>
+
+          <p>注意一个残酷的趋势：<strong>平衡点在逐代升高</strong>（A100 约 156，H100 约 295）。算力增长速度快于带宽增长速度，意味着<strong>越新的卡，越容易被带宽卡住</strong>。同一个 LayerNorm kernel，在 A100 上可能能用到 5% 算力，换到 H100 上只能用到 2.5%——你花钱买的算力大部分闲置了。这就是为什么算子融合和 FlashAttention 这类 IO 优化在新硬件上价值反而更大。</p>
+
+          <div class="callout">
+            <span class="callout-t">为什么 Attention 是带宽墙的典型</span>
+            标准 Attention 先算 $QK^\top$（矩阵乘，算力密集），再做 softmax（逐行归一化，访存密集），最后乘 $V$。问题出在 softmax：它需要把整个 $N \times N$ 的注意力矩阵写回 HBM 再读回来，但每个元素只做了几次运算。$N = 4096$、FP16 时，这个矩阵有 1677 万元素、占 32 MB，读写三四遍就是 100 MB 以上的 HBM 流量，而算术强度只有个位数。FlashAttention 的核心突破就是<strong>把 softmax 留在 SRAM 里做完</strong>，避免中间结果落盘。详见 <a href="flash-attention.html">FlashAttention 与 IO 感知注意力</a>。
+          </div>
+
+          <h2>Tensor Core：为什么 GPU 算矩阵乘这么快</h2>
+          <p>Tensor Core 是 NVIDIA 从 Volta 架构（V100）开始引入的专用矩阵计算单元。普通 CUDA Core 一次做一个标量乘加（FMA），Tensor Core 一次做一整个<strong>矩阵片段</strong>的乘加——例如在若干时钟周期内完成 $D = A \times B + C$，其中 $A$、$B$ 是形如 $16\times8$、$8\times16$ 的小块。硬件层面这叫 <strong>MMA（Matrix Multiply-Accumulate）指令</strong>。</p>
+
+          <p>为什么这样能快几十倍？关键在<strong>数据复用</strong>。用 CUDA Core 算 $16\times16$ 的矩阵块乘法，需要 4096 次独立的 FMA 指令，每次都要从寄存器取操作数；Tensor Core 把这个块整体喂进去，操作数在硬件内部复用，指令数从 4096 降到个位数。<strong>省的不是算术，是取数和发指令的开销</strong>——又一次印证了「GPU 的瓶颈在搬数据」。</p>
+
+          <p>但 Tensor Core 有约束，这些约束直接决定了你的模型能不能跑满算力：</p>
+          <ul>
+            <li><strong>数据类型限制</strong>：不同代次支持不同精度。Volta 支持 FP16，Ampere（A100）增加 BF16/TF32/INT8，Hopper（H100）增加 FP8，Blackwell 进一步支持 FP4。<strong>FP32 走不了 Tensor Core</strong>（只能走 TF32 这种降精度路径），这是混合精度训练的根本动机。</li>
+            <li><strong>形状对齐</strong>：矩阵维度需要对齐到 tile 大小的倍数（通常 8 或 16），否则需要 padding，边缘 tile 的算力被浪费。<strong>把 hidden_size 设成 4096 而不是 4095，把 vocab_size 从 50257 padding 到 50304，都是这个原因。</strong></li>
+            <li><strong>需要专门调用</strong>：要么用 cuBLAS/cuDNN 等库，要么写 CUDA/Triton kernel。普通的 <code>torch.matmul</code> 会自动走 cuBLAS，但你手写的循环不会。</li>
+          </ul>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>GPU 代次</th><th>代表型号</th><th>SM 数</th><th>HBM 容量</th><th>HBM 带宽</th><th>BF16 峰值算力</th><th>平衡点</th></tr></thead>
+              <tbody>
+                <tr><td>Ampere</td><td>A100 80G SXM</td><td>108</td><td>80 GB</td><td>约 2.0 TB/s</td><td>约 312 TFLOP/s</td><td>约 156 FLOP/B</td></tr>
+                <tr><td>Hopper</td><td>H100 SXM</td><td>132</td><td>80 GB</td><td>约 3.35 TB/s</td><td>约 989 TFLOP/s</td><td>约 295 FLOP/B</td></tr>
+                <tr><td>Blackwell</td><td>B200</td><td>—</td><td>约 192 GB</td><td>约 8.0 TB/s</td><td>约 2250 TFLOP/s*</td><td>约 281 FLOP/B</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:13px;color:var(--text-3)">*B200 的 FP4 峰值更高，BF16 精确值与 SM 数量以 NVIDIA 官方规格为准。上述数字为公开 datasheet 的量级参考。实际训练中可用算力通常为峰值的 30%–60%（即 MFU 30%–60%），详见 <a href="compute-budget.html">FLOP、显存核算与性能剖析</a>。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title NVIDIA 数据中心 GPU 与 Tensor Core 精度演进
+  section 前 Tensor Core 时代
+    Pascal P100 2016 : 只有 CUDA Core : FP32 / FP16 存储
+  section Tensor Core 登场
+    Volta V100 2017 : 首代 Tensor Core : 支持 FP16 矩阵乘加
+    Turing T4 2018 : 增加 INT8 / INT4 : 推理量化起步
+  section 大模型时代
+    Ampere A100 2020 : 增加 BF16 与 TF32 : 结构化稀疏 : 训练主力
+    Hopper H100 2022 : 增加 FP8 : TMA 异步搬运 : Thread Block Cluster
+  section 低精度极致化
+    Blackwell B200 2024 : 增加 FP4 : 第二代 Transformer Engine
+            </div>
+            <figcaption>Tensor Core 的演进主线只有一条：<strong>不断往下压低精度</strong>。FP32 → FP16 → BF16 → FP8 → FP4，每降一档，峰值算力翻倍、显存和带宽压力减半。代价是数值稳定性变难，需要 loss scaling、per-tensor scale 等配套技术。</figcaption>
+          </figure>
+
+          <h2>卡与卡之间：互联也是显存层级的一部分</h2>
+          <p>训一个 70B 模型必须多卡，此时「显存层级」要往外再延伸一层：<strong>另一张卡的 HBM</strong>。它的带宽比本地 HBM 低一个数量级，跨机器时低两个数量级。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层级</th><th>典型带宽（量级）</th><th>相对本地 HBM</th><th>在训练中承担什么</th></tr></thead>
+              <tbody>
+                <tr><td>SM 内 Shared Memory</td><td>约 19 TB/s</td><td>约 6×</td><td>tile 内复用、FlashAttention 的工作区</td></tr>
+                <tr><td>本卡 HBM</td><td>约 3.35 TB/s（H100）</td><td>1×</td><td>权重、激活、KV Cache 的家</td></tr>
+                <tr><td>NVLink（卡间，同机）</td><td>约 900 GB/s（H100 聚合双向）</td><td>约 1/4</td><td>张量并行的 AllReduce、专家并行的 All-to-All</td></tr>
+                <tr><td>PCIe Gen5 x16</td><td>约 64 GB/s（单向）</td><td>约 1/50</td><td>CPU 与 GPU 之间搬数据、无 NVLink 时的卡间通信</td></tr>
+                <tr><td>InfiniBand NDR（跨机）</td><td>400 Gb/s ≈ 50 GB/s</td><td>约 1/67</td><td>数据并行的梯度同步、流水线并行的激活传递</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:13px;color:var(--text-3)">上述为常见配置的量级参考，具体带宽取决于机型与拓扑，以厂商规格为准。</p>
+
+          <p>这张表解释了并行策略的设计逻辑：<strong>通信量最大的并行方式，必须放在带宽最高的层级上</strong>。张量并行（TP）每层都要 AllReduce，通信极频繁，所以只能在 NVLink 域内做（通常 TP ≤ 8）；数据并行（DP）每步只同步一次梯度，通信相对稀疏，可以跨机器走 InfiniBand。把 TP 开到跨机器，训练效率会断崖式下跌。详见 <a href="../06-pretraining/distributed-training.html">分布式训练与并行策略</a>。</p>
+
+          <h2>动手：查你自己的 GPU</h2>
+          <p>上面所有数字都可以在自己的机器上验证。下面这段脚本会打印硬件规格，并实测有效 HBM 带宽和 GEMM 算力：</p>
+
+          <pre><code class="language-python">import torch, time
+
+# ---------- 1. 读硬件规格 ----------
+p = torch.cuda.get_device_properties(0)
+print(f"设备:            {p.name}")
+print(f"SM 数量:         {p.multi_processor_count}")
+print(f"计算能力:        {p.major}.{p.minor}")
+print(f"HBM 容量:        {p.total_memory / 1024**3:.1f} GB")
+# 每 Block 可用 Shared Memory（不同架构上限不同）
+print(f"每 Block SRAM:   {p.shared_memory_per_block / 1024:.0f} KB")
+
+# ---------- 2. 实测有效 HBM 带宽 ----------
+def bench(fn, warmup=10, iters=50):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters
+
+N = 256 * 1024 * 1024                      # 256M 个元素
+a = torch.empty(N, device="cuda", dtype=torch.float16)
+b = torch.empty(N, device="cuda", dtype=torch.float16)
+
+t = bench(lambda: b.copy_(a))              # 纯拷贝: 读 2N 字节 + 写 2N 字节
+bytes_moved = 2 * N * 2
+print(f"\n实测 HBM 带宽:   {bytes_moved / t / 1e12:.2f} TB/s")
+
+# ---------- 3. 实测 BF16 GEMM 算力 ----------
+M = K = Nd = 8192
+x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+w = torch.randn(K, Nd, device="cuda", dtype=torch.bfloat16)
+
+t = bench(lambda: torch.matmul(x, w))
+flops = 2 * M * K * Nd                     # 每个输出元素 K 次乘加 = 2K FLOP
+print(f"实测 BF16 算力:  {flops / t / 1e12:.1f} TFLOP/s")
+
+# ---------- 4. 算平衡点 ----------
+# 用实测值算出你这张卡真实的平衡点
+print(f"\n实测平衡点:      {(flops / t) / (bytes_moved / t):.0f} FLOP/Byte")
+print("→ 算术强度低于这个值的算子, 一定是带宽受限")</code></pre>
+
+          <p>几个解读要点：</p>
+          <ul>
+            <li><strong>实测带宽通常是峰值的 80%–90%</strong>。达不到峰值是正常的，HBM 的刷新、ECC 校验、行切换都有开销。如果只有 50% 以下，检查张量是否 contiguous、数据量是否太小（几 MB 的拷贝被 kernel 启动开销主导）。</li>
+            <li><strong>实测 GEMM 算力通常是峰值的 70%–90%</strong>。矩阵越大越接近峰值。把 8192 改成 512 再跑一次，你会看到算力掉到峰值的百分之几——因为小矩阵的算术强度不够，而且填不满 132 个 SM。</li>
+            <li><strong>实测平衡点会略高于理论平衡点</strong>，因为实测带宽的下滑幅度通常大于实测算力的下滑幅度。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">Benchmark 的三个必踩坑</span>
+            <strong>①</strong> 不加 <code>torch.cuda.synchronize()</code>：CUDA kernel 是异步的，不同步的话你测的是「CPU 发指令的时间」，会得到荒谬的高性能。<strong>②</strong> 不做 warmup：第一次调用包含 cuBLAS 算法选择、显存分配、JIT 编译，可能比稳态慢 10 倍以上。<strong>③</strong> 数据量太小：几 MB 的操作会被 kernel 启动开销（约 5 μs）主导，测出来的是启动开销不是带宽。
+          </div>
+
+          <h2>对深度学习工程意味着什么</h2>
+          <p>理解了 GPU 的执行模型和显存层级，很多「经验法则」就有了物理依据。下面这张思维导图把常见优化手段挂回它们对应的硬件约束：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("GPU 性能优化"))
+    带宽墙
+      算子融合
+        torch.compile
+        手写 Triton kernel
+        FlashAttention
+      降低精度
+        BF16 减半流量
+        FP8 再减半
+        权重量化
+      提高数据复用
+        分块 tiling
+        数据留在 SRAM
+        KV Cache 复用
+    算力墙
+      用 Tensor Core
+        混合精度
+        维度对齐到 16 的倍数
+      减少无效计算
+        变长序列去 padding
+        MoE 稀疏激活
+    并行度不足
+      加大 batch
+      加大 tile 让 SM 满载
+      多流并发
+    启动与调度开销
+      CUDA Graph
+      减少小 kernel 数量
+      异步 H2D 拷贝
+    通信瓶颈
+      TP 限制在 NVLink 域内
+      梯度累积减少同步频率
+      计算与通信重叠
+            </div>
+            <figcaption>性能优化手段的分类地图：先用 profiler 判断瓶颈属于哪一类，再从对应分支挑手段。不要凭感觉优化——瓶颈判断错，做再多优化也是白费。</figcaption>
+          </figure>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">为什么大 batch 更快</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">大 batch 让每个 SM 都有足够的 warp 在跑，GPU 可以在等内存时切换到别的 warp，掩盖延迟；同时权重只读一次却服务更多样本，算术强度上升。batch 太小时 SM 空转，算力浪费。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">为什么混合精度重要</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">BF16/FP8 不仅减半／减四分之一显存占用和 HBM 流量，更关键的是让计算走进 Tensor Core。FP32 走不了 Tensor Core，算力通常只有 BF16 的几分之一。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">为什么算子融合有效</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">把多个小 kernel（如 bias + activation + residual）合成一个，中间结果留在寄存器，避免反复写 HBM。三个逐元素算子融成一个，HBM 流量能降到三分之一。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">为什么通信是瓶颈</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">卡间通信走 NVLink（约 900 GB/s）或 InfiniBand（约 50 GB/s），比本地 HBM 低一到两个数量级。梯度同步的通信量直接卡住扩展效率。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">为什么维度要对齐</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">Tensor Core 按 tile 计算，维度不是 8/16 的倍数时要 padding，边缘 tile 白算。把 vocab_size 从 50257 补到 50304 是常见做法。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">为什么小模型跑不满卡</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">小模型的每个 kernel 都很小，既填不满 132 个 SM，又被 5 μs 级的启动开销主导。此时 CUDA Graph 和更大 batch 比换更强的卡有用得多。</p>
+            </div>
+          </div>
+
+          <details class="deep">
+            <summary>展开：Hopper 引入的三个新机制（TMA / Cluster / Async）</summary>
+            <div class="deep-body">
+              <p>H100 之后，「怎么搬数据」这件事本身有了新的硬件支持，理解它们有助于看懂 FlashAttention-3 这类新 kernel 的设计思路。</p>
+              <ul>
+                <li><strong>TMA（Tensor Memory Accelerator）</strong>：一个专门的硬件单元，负责在 HBM 和 Shared Memory 之间做<strong>多维张量块</strong>的异步拷贝。以前搬一个 tile 需要 warp 里所有线程各自算地址、各自发 load 指令；有了 TMA，只需一个线程发一条描述符指令，硬件自己把整块搬过来。省下的线程可以同时去算别的东西，实现<strong>访存与计算真正重叠</strong>。</li>
+                <li><strong>Thread Block Cluster</strong>：在 Grid 和 Block 之间新增一个层级。同一个 Cluster 内的多个 Block 保证被调度到<strong>相邻的 SM</strong> 上，并且可以互相直接读写对方的 Shared Memory（叫 Distributed Shared Memory）。这相当于把「可协作的快速内存」从 228 KB 扩大到几个 SM 的总和，对大 tile 的 GEMM 很有价值。</li>
+                <li><strong>Warp Specialization（异步执行）</strong>：让一个 Block 内的不同 warp 组承担不同角色——一组专门做「生产者」（用 TMA 搬数据进 SRAM），另一组做「消费者」（用 Tensor Core 算）。两组通过异步屏障同步，形成软件流水线。FlashAttention-3 的主要提速来源就是这个。</li>
+              </ul>
+              <p style="margin-bottom:0">这三点的共同主题依然是：<strong>把「搬数据」和「算」解耦，让它们同时进行</strong>。硬件演进的方向一直在回应同一个矛盾——带宽墙。具体接口与约束以 CUDA 编程指南和 Hopper 架构白皮书为准。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：GPU 是吞吐导向的处理器，瓶颈通常不在算力而在带宽——数据搬不进来，计算单元就空转。</li>
+            <li><strong>显存金字塔</strong>：HBM（约 80 GB / 约 3 TB/s）→ L2（约 50 MB）→ SRAM（每 SM 约 228 KB / 约 19 TB/s）→ 寄存器。带宽差 5–6 倍，延迟差 20 倍，容量差 3000 倍。</li>
+            <li><strong>论文原图</strong>：FlashAttention 论文 Figure 1 直接画出了 SRAM/HBM 两层显存与数据流，NVIDIA CUDA 指南给出了完整的金字塔——「数据留在哪一层」是 GPU 优化的总纲。</li>
+            <li><strong>执行单元</strong>：SM 是计算单元，Block 整块绑定到一个 SM，warp（32 线程锁步）是调度单位，Tensor Core 是矩阵乘加速器。</li>
+            <li><strong>warp divergence</strong>：warp 内走不同分支会串行执行两条路径，有效算力减半。让分歧发生在 warp 之间。</li>
+            <li><strong>Occupancy</strong>：受寄存器、Shared Memory、Block 数三者中最紧的那个限制。<strong>不是越高越好</strong>——算力密集型 kernel 的高性能实现常常只有 25%–33%。</li>
+            <li><strong>算力墙 vs 带宽墙</strong>：算术强度低于平衡点（A100 约 156、H100 约 295 FLOP/Byte）就是带宽受限。逐元素加法只有 0.17，用掉不到 0.1% 的算力；LayerNorm 99% 时间在等数据。</li>
+            <li><strong>平衡点在逐代升高</strong>：算力增长快于带宽增长，越新的卡越容易被带宽卡住，IO 优化的价值反而越大。</li>
+            <li><strong>合并访问</strong>：warp 内 32 线程访问连续地址才能跑满带宽；跨步或随机访问的有效带宽可能只剩 12%。这是 <code>contiguous()</code> 有时能提速的原因。</li>
+            <li><strong>共享内存 ≠ 缓存</strong>：共享内存（SRAM）要程序员显式搬数据，L2 才由硬件自动管理——搬少了就频繁穿透到 HBM。</li>
+            <li><strong>互联是显存层级的延伸</strong>：NVLink 约为本地 HBM 的 1/4，InfiniBand 约为 1/67。TP 必须限制在 NVLink 域内。</li>
+            <li><strong>工程启示</strong>：大 batch、混合精度、算子融合、维度对齐、减少通信——所有常见优化都能追溯到显存层级和带宽墙的物理约束。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>NVIDIA H100 Tensor Core GPU Architecture Whitepaper — GPU 微架构的官方参考，含 SM 组成、Tensor Core、TMA、Thread Block Cluster 与 HBM 的详细规格 · <a href="https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-architecture-whitepaper" target="_blank" rel="noopener">NVIDIA 官方白皮书</a></li>
+            <li>CUDA C++ Programming Guide — warp 调度模型、Shared Memory 与 bank、合并访问、Compute Capability 各代次上限的权威文档，本页金字塔图即出自此 · <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">NVIDIA CUDA 文档</a></li>
+            <li>CUDA C++ Best Practices Guide — 合并访问、occupancy、bank conflict 等优化项的官方实践清单 · <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/" target="_blank" rel="noopener">NVIDIA 官方指南</a></li>
+            <li>NVIDIA A100/Ampere 架构白皮书 — Ampere 一代 SM、Tensor Core 与 40/80 GB HBM 规格的权威来源 · <a href="https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/nvidia-ampere-architecture-whitepaper.pdf" target="_blank" rel="noopener">NVIDIA 官方 PDF</a></li>
+            <li>Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (2022) — 本页论文原图（Figure 1：SRAM/HBM 层级）的出处，也是「IO 感知」优化的源头 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></li>
+            <li>Ivanov et al., "Data Movement Is All You Need: A Case Study on Optimizing Transformers" (2021) — 从数据搬运视角量化 Transformer 的性能瓶颈，与本文的带宽墙视角完全一致 · <a href="https://arxiv.org/abs/2107.02039" target="_blank" rel="noopener">arXiv:2107.02039</a></li>
+            <li>Williams et al., "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (2009) — 算术强度与平衡点这套分析框架的原始出处 · <a href="https://dl.acm.org/doi/10.1145/1498765.1498785" target="_blank" rel="noopener">ACM Digital Library</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            理解了 GPU 的硬件结构，下一步是学会<strong>手算</strong>一个模型需要多少算力和显存：<a href="compute-budget.html">FLOP、显存核算与性能剖析</a>。如果想直接看如何把「数据留在 SRAM」这条原则用到极致，跳转 <a href="flash-attention.html">FlashAttention 与 IO 感知注意力</a>；想亲手写一个融合算子，看 <a href="triton-kernel.html">Triton Kernel 与编译优化</a>；想把这些数字换算成并行策略，见 <a href="../06-pretraining/distributed-training.html">分布式训练与并行策略</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+  (function(){
+    if (typeof Chart === 'undefined') return;
+    var ctx = document.getElementById('chart-gpu-balance');
+    if (!ctx) return;
+    var ch = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: ['A100 80G', 'H100 SXM', 'B200'],
+        datasets: [{
+          label: '平衡点 FLOP/Byte（BF16 峰值 ÷ HBM 带宽）',
+          data: [156, 295, 281],
+          backgroundColor: window.CB_COLORS.blueSoft,
+          borderColor: window.CB_COLORS.blue,
+          borderWidth: 1.5
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: true } },
+        scales: { y: { beginAtZero: true, title: { display: true, text: 'FLOP / Byte' } } }
+      }
+    });
+    if (window.CB_CHARTS) window.CB_CHARTS.push(ch);
+  })();
+  </script>
+</body>
+</html>

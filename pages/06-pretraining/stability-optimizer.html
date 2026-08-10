@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>训练稳定性与优化器 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="06-pretraining" data-topic="stability-optimizer">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>训练稳定性与优化器</h1>
+            <p class="lead">大模型训练 90% 的深夜值班，都耗在同一个问题：loss 突然炸了。这一页给出一套「loss spike 排查 → 梯度裁剪兜底 → 学习率调度设计 → 新一代优化器选型」的完整打法。重点拆解三件事：<strong>训练为什么会数值失稳</strong>（从初始化、残差流到混合精度的全链路视角）、<strong>梯度裁剪与 warmup 为何是默认安全网</strong>、以及 <strong>Muon</strong>——从研究走向生产的代表性优化器，它的牛顿-舒尔茨正交化到底在优化什么。读完你应该能在 spike 发生的第一时间判断根因，而不是盲目重启。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>训练崩溃很少是「模型坏了」，而是「数值 / 数据 / 调度」三个环节的某个参数越界。标准响应流程：先看 loss 曲线形态判断崩溃类型，再查数据批次、精度、梯度范数，最后用梯度裁剪兜底并把学习率调度改稳。<strong>一个常被忽视的事实：80% 的崩溃是数值问题、15% 是数据问题、只有 5% 才是模型结构问题</strong>——所以先查数值与数据，别急着改模型。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  SP["loss spike 出现"] --> C{"形态判断"}
+  C -->|"单点尖刺后恢复"| D1["数据坏批次<br/>或精度溢出"]
+  C -->|"持续发散"| D2["学习率过大<br/>或梯度爆炸"]
+  C -->|"缓慢爬升"| D3["数据分布漂移<br/>或 loss 计算 bug"]
+  D1 --> R["回滚坏步 + 过滤数据"]
+  D2 --> R2["降学习率 + 梯度裁剪"]
+  D3 --> R3["修数据管线"]
+  R --> OK["恢复稳定训练"]
+  R2 --> OK
+  R3 --> OK
+  style C fill:#e6f1fb,stroke:#185fa5
+  style D1 fill:#fcebeb,stroke:#a32d2d
+  style D2 fill:#fcebeb,stroke:#a32d2d
+  style D3 fill:#faeeda,stroke:#ba7517
+              </div>
+              <figcaption>loss spike 排查决策树：按形态分类，对症下药。单点尖刺多半是一两个坏批次，持续发散多半是学习率或梯度失控，缓慢爬升则往往是数据管线慢性病。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ 一、loss spike 形态 ============ -->
+          <h2>一、loss spike 的三类形态与根因</h2>
+          <p>训练不稳定几乎都先表现为 loss 曲线的异常形态。学会「读曲线」是第一步——三种形态对应三类完全不同的根因，处置方式也完全不同。下面用一张思维导图把三类的「根因—处置」配对记牢：读曲线时可以先问自己三个问题——「是一点还是一片？」「下一步还回得来吗？」「是突然还是慢慢？」，答案基本就能锁定形态。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root["Loss Spike 三类形态"]
+    单点尖刺["① 单点尖刺后恢复"]
+      根因["坏数据批次<br/>或 FP16 溢出"]
+      处置["回滚坏步 过滤数据"]
+    持续发散["② 持续发散 ↗"]
+      根因["学习率过大<br/>或梯度爆炸"]
+      处置["降 lr 梯度裁剪"]
+    缓慢爬升["③ 缓慢爬升 ↑"]
+      根因["数据漂移<br/>或 loss 计算 bug"]
+      处置["修数据管线"]
+            </div>
+            <figcaption>三类 loss 异常形态的「根因—处置」配对。注意区分：尖刺是「点状事件」（回滚即可），发散是「趋势问题」（要改超参），缓升是「慢性病」（要修管线）。</figcaption>
+          </figure>
+
+          <p><strong>形态一：单点尖刺，随后自动恢复</strong>。最常见于混合精度训练：某个超大激活值超出了 FP16 表示范围，产生 Inf/NaN，污染一步更新。排查顺序：看是不是「坏数据批次」（含 Inf/NaN 标签或异常大文本）→ 看 loss 缩放器（scaler）有没有正确跳过 Inf 步 → 检查 embedding 层是否有未掩码的填充位置。实践中，一个长度异常的超长样本混进 batch，会让这一步的激活值瞬间涨好几个数量级，进而产生 Inf，典型表现就是「某一步 loss 从 2.0 跳到 8.7，下一步又回到 2.1」。</p>
+          <p><strong>形态二：持续发散，loss 单调上升</strong>。典型根因是学习率过大或梯度范数失控。标准处置：先确认是否「某层梯度爆炸」（打印每层梯度范数），再降学习率或换 warmup 更长的调度。这类问题不会自愈——如果不干预，loss 会一路冲到 1e4 甚至 NaN，模型基本废掉，只能从最近的 checkpoint 回滚。</p>
+          <p><strong>形态三：缓慢爬升，温水煮青蛙</strong>。最容易被忽略：数据管线里混入了错误样本（标签错位）、或 loss 计算出现累计误差（如 BF16 下长序列求和的尾数截断）。这种往往要靠「对比上一个大 checkpoint 的 loss 曲线」才能发现，单看实时曲线只是小幅波动。DeepSeek-LLM 的技术报告里专门记录过预训练中周期性的 loss spike 现象，并给出了一套工程化的检测与跳过策略。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>形态</th><th>曲线特征</th><th>最可能的根因</th><th>首选处置</th><th>是否自愈</th></tr></thead>
+              <tbody>
+                <tr><td>单点尖刺</td><td>一步暴涨、下一步回落</td><td>坏数据批次 / FP16 溢出</td><td>回滚坏步、过滤样本</td><td><strong>通常自愈</strong></td></tr>
+                <tr><td>持续发散</td><td>单调上升不回头</td><td>学习率过大 / 梯度爆炸</td><td>降 lr、加强裁剪、回滚</td><td><strong>不自愈</strong></td></tr>
+                <tr><td>缓慢爬升</td><td>长期小幅上移</td><td>数据漂移 / loss 计算 bug</td><td>修数据管线、核对 loss</td><td><strong>不自愈</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            训练崩溃 80% 是「数值问题」，15% 是「数据问题」，5% 是「模型结构问题」。先查数据与数值，别急着改模型——改模型是成本最高、成功率最低的动作。
+          </div>
+
+          <!-- ============ 二、为什么会数值失稳 ============ -->
+          <h2>二、为什么会数值失稳：从初始化到残差流</h2>
+          <p>要真正「治本」而不是每次 spike 都重启，得理解数值失稳是怎么一步步累积的。大模型能稳定训练，靠的是一整套「不让激活值和梯度在深网络中爆炸」的设计，任何一环松动都可能出事。</p>
+          <ul>
+            <li><strong>初始化要保住方差</strong>。残差网络的核心假设是：每一层输入的方差近似等于输出的方差，信号才能一路传到底。Xavier / Kaiming 初始化的目标就是让「前向方差」和「反向梯度方差」都约等于 1。如果学习率过大，参数更新一步就把这个平衡打断，方差开始指数级漂移。</li>
+            <li><strong>深度会放大任何微小偏差</strong>。假设某层把激活值放大了 1.01 倍，经过 100 层就是 $1.01^{100} \approx 2.7$ 倍——看似无害的偏差在深网络里被指数放大。这就是为什么深层模型对初始化和归一化特别敏感。</li>
+            <li><strong>归一化层是「方差保险丝」</strong>。LayerNorm / RMSNorm 把每层的激活值重新归一到单位方差附近，相当于每过一层就把漂移拉回原点。这也是为什么去掉归一化层，深层 Transformer 几乎必然在几百步内发散。</li>
+            <li><strong>注意力是离群值的温床</strong>。softmax 对最大值敏感，一旦某个 token 的 logit 异常大，它的注意力权重会接近 1，把整条序列的表征「带偏」。大语言模型中常见的「激活值离群点（outlier）」就来源于此，也是 FP16 训练容易溢出的直接原因。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">为什么「降学习率」几乎总是第一步有效</span>
+            在 warmup 没做好的情况下，训练最初几步优化器的二阶矩 $v$ 还是接近 0，$1/\sqrt{v}$ 这个因子会非常大，相当于瞬时学习率被放大几十倍。模型还没来得及把方差稳住，就被这一脚「踹飞」了。所以 warmup 的本质不是「慢慢来」，而是<strong>给 Adam 的二阶矩统计量留出几个 step 的预热时间</strong>，等它估计准了再放开学习率。
+          </div>
+
+          <details class="deep">
+            <summary>展开：用一个小实验亲眼看到梯度爆炸</summary>
+            <div class="deep-body">
+              <p>下面这段脚本模拟「没有归一化、学习率过大」时梯度范数的指数增长，帮助建立直觉：</p>
+              <pre><code class="language-python">import torch
+
+torch.manual_seed(0)
+# 一个 8 层、每层放大 1.02 倍、无归一化的玩具网络
+layers = torch.nn.Sequential(*[
+    torch.nn.Linear(64, 64) for _ in range(8)
+])
+opt = torch.optim.SGD(layers.parameters(), lr=0.1)  # 故意给大 lr
+
+x = torch.randn(32, 64)
+for step in range(20):
+    opt.zero_grad()
+    y = layers(x)
+    loss = y.pow(2).mean()
+    loss.backward()
+    # 统计全局梯度范数
+    gnorm = torch.sqrt(sum(p.grad.pow(2).sum() for p in layers.parameters()))
+    print(f"step {step:2d}  grad_norm = {gnorm.item():.2e}  loss = {loss.item():.2e}")
+    opt.step()</code></pre>
+              <p style="margin-bottom:0">跑起来会看到 <code>grad_norm</code> 每几步就翻几倍，loss 很快变成 <code>nan</code>。把 <code>lr</code> 调到 0.001、或在每个 <code>Linear</code> 后加一个 <code>LayerNorm</code>，曲线立刻收敛到平稳区间。这就是「方差保险丝」的实证。</p>
+            </div>
+          </details>
+
+          <!-- ============ 三、梯度裁剪 ============ -->
+          <h2>三、梯度裁剪：最后一道安全网</h2>
+          <p>全局范数裁剪（global norm clipping）是当前主流：计算所有参数梯度的总范数 $\|g\|_2$，若超过阈值则整体缩放，保持更新方向不变、只限制更新幅度：</p>
+          <p style="text-align:center;font-size:1.05em">$$\tilde{g} = \frac{g}{\max(1,\ \|g\|_2 / \text{clip\_norm})}$$</p>
+          <p>它不区分「哪个参数炸了」，而是把整包梯度当成一个向量，超阈值就整体按比例缩小。这一步发生在反向传播之后、优化器更新之前，是防止单点离群值把整步更新带飞的最后防线。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant F as 前向
+    participant B as 反向
+    participant C as 梯度裁剪
+    participant O as 优化器
+    F->>B: 算 loss 与激活值
+    B->>C: 得到梯度 g
+    C->>C: 计算全局范数 ‖g‖₂
+    alt ‖g‖₂ 大于 clip_norm
+        C->>C: 整体缩放 g × clip_norm / ‖g‖₂
+    else 未超阈值
+        C->>C: 原样保留
+    end
+    C->>O: 送裁剪后梯度
+    O->>O: AdamW / Muon 更新参数
+            </div>
+            <figcaption>一个训练步中梯度裁剪的时序位置：它夹在「反向」与「优化器更新」之间。裁剪只改幅度不改方向，所以模型不会「走错路」，只是「走慢一点」。</figcaption>
+          </figure>
+
+          <pre><code class="language-python">def clip_grad_norm(parameters, max_norm=1.0, norm_type=2.0):
+    """全局梯度范数裁剪（PyTorch 简化实现）
+
+    Args:
+        parameters: 模型参数迭代器
+        max_norm: 裁剪阈值
+        norm_type: 范数类型（2 = L2 范数）
+    """
+    # 1. 计算全局范数（各参数张量分别求范数再聚合）
+    total_norm = 0.0
+    for p in parameters:
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(norm_type)
+            total_norm += param_norm.item() ** norm_type
+    total_norm = total_norm ** (1.0 / norm_type)
+
+    # 2. 超阈值则整体缩放，保持方向不变
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        for p in parameters:
+            if p.grad is not None:
+                p.grad.data.mul_(clip_coef)
+
+    return total_norm
+
+# 使用：每一步更新前
+norm = clip_grad_norm(model.parameters(), max_norm=1.0)
+if norm > 5.0:
+    log_warning(f"梯度范数异常: {norm:.2f}")  # 记录告警，但不要因此停止训练</code></pre>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>优化器家族</th><th>常见 clip_norm</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>Adam / AdamW</td><td><strong>1.0</strong></td><td>最常用，基本是默认经验值</td></tr>
+                <tr><td>SGD + Momentum</td><td>1.0–5.0</td><td>SGD 梯度天然更「硬」，阈值可放宽</td></tr>
+                <tr><td>Muon（矩阵参数）</td><td>0.1–1.0 或按谱范数</td><td>对 2D 矩阵用谱范数裁剪更贴合</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>裁剪阈值的选择：常见经验值在 0.5–1.0（Adam 系）或 1.0–5.0（SGD 系）。<strong>关键不是阈值本身，而是监控裁剪触发频率</strong>——如果频繁触发（&gt;10% 的步数），说明学习率或数据有问题，裁剪只是「止痛药」不是「治病」。一个健康的训练，裁剪应该<strong>几乎从不触发</strong>，它存在的意义是「兜底」而非「常用」。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            梯度裁剪不是「把梯度变小的压缩器」，而是「<strong>超阈值才触发的一次性缩放器</strong>」——阈值之内它什么都不做。很多人误以为开了裁剪就能高枕无忧、学习率随便调，结果发现训练照样发散。原因在于：裁剪只限制<strong>更新幅度</strong>，不修正<strong>更新方向</strong>；如果梯度整体在朝错误方向偏移（比如数据污染导致），裁剪只是让模型「慢速走错路」。而且裁剪的缩放因子是全梯度共享的——它不区分「那个离群参数的梯度」和「其他正常参数的梯度」，是整体一起缩。真正该做的事是：<strong>把裁剪当安全网，把监控（触发率、梯度范数）当仪表盘</strong>，频繁触发就必须回头查学习率和数据。
+          </div>
+
+          <!-- ============ 四、学习率调度 ============ -->
+          <h2>四、学习率调度：warmup 与退火</h2>
+          <p>大模型训练几乎都遵循「warmup + 峰值 + 退火」的三段式调度。设计不当是训练不稳定的第二大来源——甚至比优化器选型更常见。下面的状态机标出了三段各自的职责：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+    [*] --> Warmup
+    Warmup --> Peak: 前 1-2% 步线性升到峰值
+    Peak --> Decay: 主训练段 保持峰值
+    Decay --> [*]: 末 10-20% 退火到接近 0
+    note right of Warmup
+      给 Adam 二阶矩统计量预热
+      避免开局被踹飞
+    end note
+    note right of Decay
+      收敛到更平坦的谷底
+      提升最终精度
+    end note
+            </div>
+            <figcaption>学习率三段式状态机。warmup 解决「开局不稳」，peak 是主训练段，decay 让模型在训练末期收敛到更平坦、更泛化的极小值。三段缺一段都容易出问题。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>调度策略</th><th>形状</th><th>特点</th><th>适用</th></tr></thead>
+              <tbody>
+                <tr><td>Cosine 退火</td><td>余弦曲线降到 0</td><td>主流默认，平滑收敛</td><td>预训练、微调通用</td></tr>
+                <tr><td>WSD（预热-稳定-衰减）</td><td>峰值保持 → 快速衰减</td><td>后期可缩短、损失小、易续训</td><td>大规模预训练</td></tr>
+                <tr><td>线性退火</td><td>直线降到 0</td><td>简单</td><td>快速实验</td></tr>
+                <tr><td>常数保持</td><td>峰值不变</td><td>简单但不收敛</td><td>不推荐</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>WSD（Warmup-Stable-Decay，预热-稳定-衰减）是 2024 年后大规模预训练特别流行的调度，它的「后期快速衰减」到底长什么样、能带来什么，MiniCPM 论文里有一张很直观的实验图，值得直接看原图。</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/2404.06395/assets/x2.png" alt="论文原图：MiniCPM 在 WSD 学习率调度的衰减阶段，模型训练 loss 出现一次突降——稳定段 loss 平滑，进入快速衰减段后 loss 明显下降并继续走低" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：WSD 调度下模型训练 loss 在衰减阶段出现突降——说明「末期把学习率快速压低」本身就能额外压下一截损失</span>
+              <span class="pf-src">论文原图 · Hu et al., <em>MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies</em>, 2024, Figure 5 · <a href="https://arxiv.org/abs/2404.06395" target="_blank" rel="noopener">arXiv:2404.06395</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，注意两点：<strong>① 横轴是训练步数，纵轴是 loss（越低越好），曲线中间竖线附近标注了「decay stage starts」</strong>——也就是衰减阶段从那里开始。竖线左边，模型一直在峰值学习率下训练，loss 平缓下降；竖线右边进入快速衰减，学习率几万步内从峰值跌到接近 0，可以明显看到<strong>loss 曲线在衰减段经历一次更陡的下降</strong>。<strong>② 这张图想说的核心结论</strong>：训练末期把学习率快速压低，不是一个「收尾动作」，而是<strong>能实打实再压低一截 loss</strong>——因为低学习率让优化器在当前极小值附近做更精细的搜索，收敛到更平坦的谷底。</p>
+          <p>把这张图和前面那张状态机放在一起读：状态机讲的是「三段怎么切」，这张图讲的是「第三段（衰减）为什么值得专门设计」。这也解释了 WSD 的两大工程优势——<strong>衰减段很短，可以单独调</strong>（把 90% 的算力花在峰值段，最后 10% 用来提点），而且<strong>衰减段跑完就收工，中途想续训只需重开一段新的稳定段</strong>，不必像 cosine 那样从头规划总步数。</p>
+
+          <pre><code class="language-python">import math
+
+def cosine_schedule(step, total, lr_max, lr_min=0.0):
+    """余弦退火：从 lr_max 平滑降到 lr_min"""
+    t = min(step, total) / total
+    return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * t))
+
+def wsd_schedule(step, total, lr_max, decay_ratio=0.1):
+    """WSD：前 (1-decay_ratio) 段保持峰值，最后一段线性衰减到 0"""
+    decay_start = int(total * (1 - decay_ratio))
+    if step &lt; decay_start:
+        return lr_max
+    t = (step - decay_start) / max(1, total - decay_start)
+    return lr_max * (1 - t)
+
+# warmup 通常再加在最前面：前 warmup_steps 步从 0 线性升到 lr_max
+def warmup_lr(step, warmup, lr_max):
+    return lr_max * min(1.0, step / max(1, warmup))</code></pre>
+
+          <details class="deep">
+            <summary>展开：warmup 长度与 WSD 的数学直觉</summary>
+            <div class="deep-body">
+              <p><strong>warmup 该多长？</strong>经验上取总步数的 0.5%–3%。太小（如 0.1%）容易开局炸，太大（如 10%）则浪费了本可用于主训练的学习率。一个常被引用的工程经验：参数量越大、batch 越大，warmup 越要长一些，因为大 batch 下每步的梯度噪声更小、二阶矩估计收敛更快，但参数空间更大也更怕开局偏离。</p>
+              <p><strong>为什么 WSD 适合大规模预训练？</strong>WSD（Warmup-Stable-Decay）在绝大部分训练步里保持峰值学习率不变，只在最后 10% 快速衰减。它的好处是：如果训练中途发现数据不够或要换语料，可以「截断」当前段、接一个新的稳定段继续训，损失很小；而 cosine 一旦定下总步数就很难中途改。这也是为什么许多 2024 年后的大厂预训练报告转向 WSD。</p>
+              <p style="margin-bottom:0"><strong>退火为什么能提精度？</strong>训练末期把学习率压低，等价于让优化器在当前的极小值附近做更精细的「局部搜索」，有研究表明最后阶段的退火能额外带来可观的困惑度下降，且这种收益主要来自末期，而不是峰值段。</p>
+            </div>
+          </details>
+
+          <!-- ============ 五、优化器选型 ============ -->
+          <h2>五、优化器选型：从 AdamW 到 Muon</h2>
+          <p>优化器直接决定训练的稳定性与收敛速度。AdamW 是多年来的默认选择，但 2024–2026 年 Muon 等新一代优化器正在挑战它的地位。下面用思维导图把当前主流优化器家族理清：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root["优化器家族"]
+    一阶自适应["一阶自适应"]
+      AdamW["AdamW 默认安全"]
+      Adam["Adam 基础版本"]
+    矩阵正交化["矩阵正交化"]
+      Muon["Muon 牛顿-舒尔茨"]
+      Shampoo["Shampoo 二阶预处理"]
+    带动量SGD["带动量 SGD"]
+      SGD["SGD + Momentum"]
+            </div>
+            <figcaption>当前大模型训练的两大主流方向：以 AdamW 为代表的「逐参数一阶自适应」，和以 Muon 为代表的「把权重矩阵整体当作对象做正交化更新」。后者在同 token 数下通常收敛更快，但对超参更敏感。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>AdamW</th><th>Muon</th></tr></thead>
+              <tbody>
+                <tr><td>更新方式</td><td>逐参数自适应（一阶/二阶矩）</td><td>矩阵正交化（牛顿-舒尔茨迭代）</td></tr>
+                <tr><td>学习率</td><td>需 warmup + 退火</td><td>可恒定、对调度更鲁棒</td></tr>
+                <tr><td>收敛速度</td><td>基准</td><td>更快（同 token 数效果通常更好）</td></tr>
+                <tr><td>稳定性</td><td>成熟可靠、工业验证充分</td><td>对超参敏感，需经验调优</td></tr>
+                <tr><td>适用参数</td><td>所有参数</td><td>2D 矩阵（如注意力/MLP 的权重）效果最明显</td></tr>
+                <tr><td>生态支持</td><td>全框架原生</td><td>2025–2026 逐步接入主流框架</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>实践上的稳妥策略：<strong>默认 AdamW + BF16 + 全局裁剪 1.0 + Cosine/WSD 调度</strong>。想进一步提效，再在小模型上先验证 Muon 的超参（它不像 AdamW 那样「开箱即用」），确认无损后再放大模型。Muon 一般只作用于 2D 权重矩阵，embedding、LayerNorm 的缩放参数等仍交给 AdamW，即「Muon + AdamW 混合」是当前最常见的组合。</p>
+
+          <p>需要警惕的是，Muon 并非「免费午餐」。它对新手最不友好的地方在于：<strong>学习率、正交化迭代次数、是否做谱范数归一化，三者会互相影响</strong>。牛顿-舒尔茨迭代如果输入没归一化，几步之内就可能数值发散；而迭代次数太少，正交化又不充分，等于白做。社区经验值大概是 5 次迭代 + 按谱范数归一化，但这在不同模型规模下并非一成不变。所以工程上的建议永远是：<strong>先拿 1/100 规模的模型把 Muon 跑通、画出 loss 曲线对齐 AdamW，再考虑放大</strong>——直接在大模型上首试 Muon，很可能连 warmup 都过不了。</p>
+
+          <details class="deep">
+            <summary>展开：Muon 在优化什么——牛顿-舒尔茨正交化的直觉与代码</summary>
+            <div class="deep-body">
+              <p>Adam 对每个参数独立地做自适应缩放，完全忽略了「权重是一个矩阵」这一结构。Muon 的核心想法是：把权重矩阵 $W$ 的更新方向取为梯度 $G$ 的<strong>极分解（polar decomposition）中的正交部分</strong>——也就是先把 $G$ 做 SVD，再把奇异值全部置 1，只保留「方向」去掉「大小」。这样做出的更新是一个近似正交矩阵，能让隐藏层表征在训练中保持良好条件数，从而收敛更快。</p>
+              <p>极分解可以通过牛顿-舒尔茨（Newton-Schulz）迭代高效地近似，不需要真正的 SVD：</p>
+              <pre><code class="language-python">import torch
+
+def newton_schulz_orthogonal(X, steps=5, eps=1e-7):
+    """把矩阵 X 投影到最近的正交矩阵（近似极分解）
+
+    Args:
+        X: 形状 [out, in] 的梯度矩阵
+        steps: 迭代次数，5 次通常足够
+    """
+    a, b, c = (3.4445, -4.7750, 2.0315)  # 经典 NS 系数
+    # 先按谱范数归一化，避免迭代发散
+    X = X / (X.norm() + eps)
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X
+
+def muon_step(W, G, lr=0.02, momentum=0.9):
+    """Muon 一步更新（示意，作用于 2D 权重矩阵）"""
+    # 1. 对梯度做正交化投影
+    G_ortho = newton_schulz_orthogonal(G)
+    # 2. 带动量的更新（与 AdamW 的 momentum 类似）
+    state = momentum * state + (1 - momentum) * G_ortho
+    W = W - lr * state
+    return W</code></pre>
+              <p style="margin-bottom:0">直觉上，正交矩阵「既不放大也不缩小」输入向量的长度，只是旋转它。用正交更新去更新权重，相当于每次只「调整方向」而不「剧烈改变尺度」，这被认为有利于深层网络的信号传播与最终收敛质量。注意以上为教学示意，生产实现还要处理分布式分片、与 AdamW 的混合、以及谱范数裁剪等细节。</p>
+            </div>
+          </details>
+
+          <!-- ============ 六、混合精度与数值稳定 ============ -->
+          <h2>六、混合精度与数值稳定</h2>
+          <p>大模型训练几乎必用混合精度（FP16/BF16 + FP32 主权重），而精度选择直接关系数值稳定性。BF16 的动态范围与 FP32 相同，是预训练默认；FP16 动态范围窄，需要 loss scaling，尖刺风险更高。两条路线对比如下：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph FP16["FP16 路线"]
+    F1["动态范围窄<br/>小数值下溢 / 大数值溢出"]
+    F2["需要 loss scaler<br/>动态调整缩放"]
+    F3["尖刺风险高<br/>需跳过 Inf 步"]
+  end
+  subgraph BF16["BF16 路线"]
+    B1["动态范围同 FP32<br/>无溢出问题"]
+    B2["无需 loss scaling"]
+    B3["但尾数仅 7 位<br/>长序列累加有误差"]
+  end
+  subgraph Mixed["混合策略"]
+    M1["BF16 前向 + 反向<br/>FP32 主权重 + 优化器状态"]
+    M2["梯度在 FP32 累加<br/>减小误差"]
+  end
+  FP16 --> Recommend["推荐：BF16 混合精度"]
+  BF16 --> Recommend
+  Mixed --> Recommend
+  style Recommend fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>FP16 vs BF16：动态范围差异决定数值稳定性。BF16 因指数位与 FP32 相同，几乎不会溢出，成为预训练默认；FP16 则需要 loss scaling 兜底，尖刺风险显著更高。</figcaption>
+          </figure>
+
+          <p>BF16 的唯一软肋是尾数只有 7 位，意味着长序列求和、梯度跨卡归约这类「把很多小数加到大数上」的操作会有系统性截断误差。对策是：<strong>梯度的跨卡归约用 FP32、梯度累积累加器用 FP32、LayerNorm / Softmax / 损失计算内部用 FP32 累加</strong>。主流框架的算子实现基本已经这么做了，但自己写 kernel 时要特别小心。更多显存与精度的细节见 <a href="mixed-precision.html">混合精度与显存优化</a>。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">BF16 也会翻车的三个隐蔽点</span>
+            虽然 BF16 不会像 FP16 那样因范围溢出而炸，但有三处隐蔽点仍会让你在深夜被叫醒：其一，<strong>超大词表 embedding</strong> 在 BF16 下个别行可能累积出离群值，长训练里表现为偶发 spike；其二，<strong>自定义 kernel 忘了用 FP32 累加器</strong>，在长序列或大规模 reduction 时尾数截断会被放大成明显偏差；其三，<strong>FP32 主权重与 BF16 副本不一致</strong>（保存或恢复 checkpoint 时类型写错），导致「训得好好的、一续训就炸」。这些都不是 warmup 或裁剪能兜住的，只能靠监控里的 Inf/NaN 比例与每层梯度范数抓出来。
+          </div>
+
+          <p>一个低成本的「精度自检」动作：在训练开头几百步，取一份固定样本分别走 BF16 路径与强制 FP32 路径，对比两者前向输出的差异。如果差异随步数单调增大，说明有算子在用低精度累加器偷偷丢精度；如果稳定在一个小范围内，则混合精度配置基本可信。这一步能帮你在大模型立项早期排除一整类「说不清的 spike」。</p>
+
+          <!-- ============ 七、监控仪表盘 ============ -->
+          <h2>七、监控指标：训练稳定的「仪表盘」</h2>
+          <p>只盯着 loss 远远不够。一套完整的稳定性监控应该包括以下信号，任何一个越界都要拉响警报。监控不是「出事后看」，而是「运行中实时回路」：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>正常范围</th><th>异常含义</th><th>应对</th></tr></thead>
+              <tbody>
+                <tr><td>梯度全局范数</td><td>0.5–5.0</td><td>持续 &gt;10：梯度爆炸</td><td>降 lr / 加强裁剪</td></tr>
+                <tr><td>裁剪触发率</td><td>＜5%</td><td>&gt;10%：lr 或数据有问题</td><td>调调度 / 查数据</td></tr>
+                <tr><td>Inf/NaN 比例</td><td>0</td><td>&gt;0：精度或数据异常</td><td>查批次 / 加 scaler</td></tr>
+                <tr><td>每层梯度范数</td><td>近似均匀</td><td>某层异常大：该层不稳定</td><td>该层加初始化 / 归一化</td></tr>
+                <tr><td>激活统计量</td><td>无 NaN / 无穷</td><td>出现：数值溢出</td><td>查残差 / 加 LayerNorm</td></tr>
+                <tr><td>loss 与上一步差</td><td>平滑波动</td><td>突变：坏数据 / 管线 bug</td><td>回滚 + 过滤</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+    autonumber
+    loop 每个训练步
+        participant T as 训练循环
+        participant M as 监控器
+        participant A as 自动响应
+        T->>M: 上报 loss / 梯度范数 / NaN
+        M->>M: 判断是否越界
+        alt 越界
+            M->>A: 触发告警
+            A->>T: 回滚坏步 / 降 lr
+        else 正常
+            M-->>T: 继续
+        end
+    end
+            </div>
+            <figcaption>稳定性监控闭环：训练中实时监控关键指标，越界即自动响应（回滚 / 降 lr / 告警），形成反馈回路。这个回路越自动化，深夜值班的人工成本越低。</figcaption>
+          </figure>
+
+          <p>把监控接进训练脚本并不复杂，关键是把「梯度范数」和「裁剪触发」变成每步可读、越界可告警的信号。下面是一段可直接挂到训练循环里的轻量辅助：</p>
+          <pre><code class="language-python">def log_grad_stats(model, step, clip_trigger=False):
+    """每 N 步打印一次梯度健康度信号"""
+    if step % 50 != 0:
+        return
+    gnorm = torch.sqrt(sum(
+        p.grad.pow(2).sum() for p in model.parameters() if p.grad is not None
+    ))
+    # 越界即告警：范数异常大 或 刚刚触发了裁剪
+    flag = "⚠️" if (gnorm > 10 or clip_trigger) else "✅"
+    print(f"[step {step}] grad_norm={gnorm.item():.2f} {flag}")
+    if gnorm > 10:
+        # 这里可以做自动响应：回滚到上一步 / 降 lr / 发告警
+        trigger_auto_response(step)</code></pre>
+
+          <!-- ============ 八、技术演进时间线 ============ -->
+          <h2>八、训练稳定性与优化器的演进</h2>
+          <p>把这一页的方法放到时间轴上，能看到一条清晰的主线：从「手动调学习率」到「warmup+退火成为常识」，再到「自动化监控 + 矩阵正交化优化器」。理解这条线，能帮你判断哪些是当前的最佳实践、哪些还是实验性技术。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+    title 训练稳定性与优化器演进
+    2014 : Adam 提出 : 一阶自适应成为主流
+    2017 : AdamW 解耦权重衰减 : 预训练事实标准
+    2018 : 混合精度训练 : FP32 主权重加 loss scaling
+    2021 : BF16 普及 : 免 loss scaling 更稳
+    2024 : Muon 出现 : 矩阵正交化提速
+    2024 : DeepSeek 记录 loss spike : 工程化处置
+    2025 : WSD 加自动化监控 : 大规模预训练标配
+            </div>
+            <figcaption>训练稳定性技术的演进：每过几年就有一项「把训练变稳、变省」的关键技术从论文走进框架。今天的最佳实践（BF16 + warmup + 全局裁剪 + 自动化监控）是这十年工程经验的结晶。</figcaption>
+          </figure>
+
+          <!-- ============ 九、趋势与建议 ============ -->
+          <h2>九、2024–2026 趋势与实用建议</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>趋势</th><th>内容</th><th>对实践者的意义</th></tr></thead>
+              <tbody>
+                <tr><td>WSD 调度普及</td><td>大厂预训练转向 WSD</td><td>后期衰减可缩短、省算力、易续训</td></tr>
+                <tr><td>Muon 进入框架</td><td>主流框架开始支持</td><td>大模型训练可尝试提效</td></tr>
+                <tr><td>BF16 成为默认</td><td>FP16 逐渐退居微调场景</td><td>预训练默认 BF16</td></tr>
+                <tr><td>自动化监控</td><td>训练平台内置稳定性看板</td><td>深夜值班人工成本下降</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>实用建议总结：<strong>默认 AdamW + BF16 + 全局裁剪 1.0 + Cosine/WSD 调度；监控六个核心指标；loss 炸了先查数据与数值，再考虑改模型结构</strong>。想提效再尝试 Muon，但要在小模型上先验证超参。把「稳定性」当作一套<strong>可观测、可自动响应</strong>的系统来设计，而不是每次 spike 都靠人肉重启。</p>
+
+          <!-- ============ 十、现场处置 SOP ============ -->
+          <h2>十、一次 loss spike 的现场处置 SOP</h2>
+          <p>方法讲再多，真在凌晨被告警叫醒时，你需要的是一条可机械执行的清单，而不是临场翻文档。下面把前面九节压缩成「先止血、再查因、后根治」的 SOP，照着走就能覆盖绝大多数情况。</p>
+          <ul>
+            <li><strong>第一步 止血</strong>：先确认训练是否已自动回滚坏步；若未配置自动响应，手动停到最近的健康 checkpoint，避免无效 step 空烧算力。不要急于改代码重启。</li>
+            <li><strong>第二步 看形态</strong>：把 loss 曲线拉出来，套用「三类形态」判断——单点尖刺多半自愈，持续发散必须回滚降 lr，缓慢爬升要去查数据管线。形态决定下一步动作。</li>
+            <li><strong>第三步 查数值</strong>：看 Inf/NaN 比例与每层梯度范数。若某层梯度异常大，优先给该层补初始化或归一化；若整体范数飙升，先降学习率再加强全局裁剪到 1.0 兜底。</li>
+            <li><strong>第四步 查数据</strong>：翻这一步对应的数据批次，找超长样本、坏标签、编码异常。过滤掉后再跑，很多「单点尖刺」到此消失。</li>
+            <li><strong>第五步 根治</strong>：如果 spike 周期性出现，回到学习率调度（拉长 warmup / 换 WSD）和精度配置（确认 BF16 + FP32 累加器），从根上减少复发，而不是每次都人工回滚。</li>
+          </ul>
+          <div class="callout tip">
+            <span class="callout-t">SOP 的核心原则</span>
+            永远「先查数值与数据，后改模型结构」。改结构是成本最高、成功率最低的动作，而数值与数据问题占了 95% 的崩溃来源。把这条原则贴在值班屏幕上，能省下大量无谓的重训。
+          </div>
+
+          <!-- ============ 要点速查 ============ -->
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：训练不稳定 = 数值 / 数据 / 调度三环节的越界；80% 是数值问题、15% 数据、5% 结构。</li>
+            <li><strong>三类形态</strong>：单点尖刺（坏数据/溢出，通常自愈）、持续发散（lr 过大/梯度爆炸，不自愈）、缓慢爬升（数据漂移/loss bug，慢性病）。</li>
+            <li><strong>为什么会炸</strong>：深层会指数放大微小偏差；归一化层是方差保险丝；注意力是离群值温床；warmup 给 Adam 二阶矩预热。</li>
+            <li><strong>梯度裁剪</strong>：全局范数裁剪保方向限幅度；默认阈值 1.0；频繁触发（&gt;10%）说明根因未除，裁剪只是止痛药。</li>
+            <li><strong>调度</strong>：warmup + 峰值 + 退火三段式；warmup 取 0.5%–3% 步数；Cosine 默认、WSD 适合大规模且易续训。</li>
+            <li><strong>优化器</strong>：AdamW 默认安全；Muon 收敛更快但对超参敏感，作用于 2D 矩阵、常混合 AdamW 使用。</li>
+            <li><strong>混合精度</strong>：BF16 是预训练默认（范围同 FP32）；FP16 需 loss scaling，尖刺风险高；长序列累加仍要用 FP32。</li>
+            <li><strong>监控</strong>：梯度范数、裁剪触发率、Inf/NaN 比例、每层梯度范数、激活统计量、loss 突变六个仪表盘，构成自动响应闭环。</li>
+            <li><strong>常见坑</strong>：只盯 loss 不看梯度；裁剪当治疗；FP16 无 scaler 硬训；warmup 过短开局炸；深夜改模型结构而非查数据。</li>
+          </ul>
+
+          <!-- ============ 十一、稳定性深挖：从一次 spike 到可恢复训练系统 ============ -->
+          <h2>十一、稳定性深挖：从一次 spike 到可恢复训练系统</h2>
+          <p>前面的章节给出了常用组件，但生产训练不能只靠“经验参数”。更可靠的做法是把稳定性当成一个闭环：先定义什么叫坏步，再把证据写入日志和 checkpoint，最后让训练循环具备跳过、回滚、降级和恢复能力。这里的“稳定”不是 loss 每一步都严格下降，而是损失、梯度和参数更新都处于可解释的统计范围内；短时波动可以接受，连续越界必须阻断。下面的规则适用于预训练和大规模继续训练，阈值应以小规模基线和历史分布校准，不要把任何单一经验值当成定理。</p>
+
+          <h3>11.1 Loss spike 根因树：先把“坏步”分层</h3>
+          <p>排障时不要从优化器开始猜。先记录发生 spike 的 <code>global_step</code>、数据 shard、样本 id、micro-batch 序号、学习率、梯度累积进度、loss scale 和通信状态，再沿根因树逐层排除。一个单点尖刺往往是局部输入或精度事件；连续发散更像更新规则或状态已经偏离；跨 rank 只有部分机器异常，则优先怀疑通信、随机数或状态同步。</p>
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  S["Loss spike / NaN"] --> Q1{"是否所有 rank 同时出现?"}
+  Q1 -->|"否"| C1["通信归约、rank 状态、数据分片不一致"]
+  Q1 -->|"是"| Q2{"是否单步后恢复?"}
+  Q2 -->|"是"| Q3{"批次或精度证据"}
+  Q2 -->|"否"| Q4{"grad norm / update norm"}
+  Q3 --> D1["坏批次：标签错位、超长样本、非法 token、异常权重"]
+  Q3 --> D2["FP16/BF16：Inf、NaN、scale 抖动、低精度归约"]
+  Q4 --> O1["学习率过大、warmup 太短、有效 batch 改变"]
+  Q4 --> O2["梯度爆炸、局部层异常、裁剪频繁"]
+  Q4 --> O3["优化器/主权重/动量状态恢复错误"]
+  C1 --> R["隔离坏步并回滚最近健康 checkpoint"]
+  D1 --> R
+  D2 --> R
+  O1 --> R
+  O2 --> R
+  O3 --> R
+  R --> V["重放固定批次 + 对比 FP32 参考路径"]
+  V --> F["修复根因后再放大训练"]
+  style S fill:#fcebeb,stroke:#a32d2d
+  style R fill:#e6f1fb,stroke:#185fa5
+  style F fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>根因树强调“先问是否跨 rank 同步，再问是否单步恢复”。数据、精度、优化器和通信问题的证据不同，不能只凭 loss 曲线猜测。</figcaption>
+          </figure>
+          <ul>
+            <li><strong>数据坏批次</strong>：检查 token 是否越界、label 是否错位、padding 和 attention mask 是否一致、序列长度是否超出预期，以及样本是否重复或含异常 Unicode。把坏 batch 原样保存到隔离区，用固定随机种子重放，确认它能在独立前向中复现。</li>
+            <li><strong>学习率与有效 batch</strong>：核对 scheduler 使用的是 optimizer step 还是 micro-batch step，恢复 checkpoint 后是否重复 warmup，global batch 改变时是否仍沿用旧峰值学习率。突然增大有效 batch 或错误地重复调用 scheduler，都会造成隐含的瞬时学习率变化。</li>
+            <li><strong>梯度爆炸</strong>：比较总梯度范数、最大单层范数和裁剪前后范数。若只有某个 block 异常，重点检查该层输入、归一化和残差缩放；若全模型同步放大，优先看学习率、损失缩放和数据分布。</li>
+            <li><strong>FP16/BF16 溢出与舍入</strong>：FP16 需要动态 loss scaling，并且在发现 Inf/NaN 时跳过 optimizer step；BF16 的指数范围接近 FP32，但 reduction、softmax、LayerNorm 和长序列累加仍应使用 FP32 累加器。BF16 并不等于“任何 kernel 都安全”。</li>
+            <li><strong>通信与状态错误</strong>：检查 all-reduce 是否有 rank 提前退出、梯度是否被重复归约、梯度累积边界是否一致、参数/优化器状态是否完整保存。若一个 rank 先遇到 NaN 而其他 rank 继续更新，下一次同步可能把坏状态扩散到全局。</li>
+          </ul>
+
+          <p>根因树的价值在于把排障从“看起来像”变成可验证的实验。数据问题可以通过固定样本、单卡前向和 FP32 参考结果复现；学习率问题可以在相同 batch 上回放不同峰值；梯度问题可以对比裁剪前后的范数与逐层分布；精度问题可以切换累加器或关闭 autocast；通信问题则要比较各 rank 的 checksum、step 和归约结果。每次只改变一个变量，并保留实验配置和结果，才能避免多个修复同时上线后无法判断真正原因。对生产集群而言，诊断包还应包含最近若干步的轻量快照，而不是只保存发生异常的那一行日志；这样即使节点随后被回收，也能重建完整的时间序列。</p>
+
+          <h3>11.2 AdamW、Muon、Adafactor 的选型边界</h3>
+          <p><strong>AdamW 是基线，不是永远最优</strong>。它的逐参数一阶、二阶矩估计和解耦权重衰减已经被大量训练任务验证，调试工具、分布式实现和 checkpoint 兼容性也最成熟。7B 或 70B 的首个生产基线，通常先用 AdamW 建立 loss、吞吐和稳定性参考，再比较其他优化器；否则即使新优化器表现变化，也很难判断是算法收益还是训练配置差异。</p>
+          <p><strong>Muon 的边界在于参数结构与工程验证</strong>。Muon 主要对二维隐藏层权重进行矩阵级更新，embedding、输出头、LayerNorm/RMSNorm 的缩放参数和偏置通常仍需用 AdamW 或其他安全优化器。它利用牛顿-舒尔茨近似极分解，理论直觉与经验结果都不能直接推出“所有模型都更好”。实现还涉及张量并行切分、正交化的通信成本、混合参数组的学习率和状态保存。适合在小规模模型上做等 token、等算力、等数据顺序的 A/B；不适合在没有基线、没有回滚、没有精确状态恢复时直接替换 AdamW。</p>
+          <p><strong>Adafactor 的边界在内存，而不是稳定性魔法</strong>。它通过分解二阶统计量降低状态内存，适合显存受限、参数规模大或需要保留更大 batch 的场景；但学习率、相对步长、参数尺度和是否使用 momentum 的约定与 AdamW 不同，不能把 AdamW 的超参原封不动搬过去。对长时间预训练，先验证 loss 曲线、梯度统计和恢复一致性，再判断节省的状态内存是否值得新增调参成本。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>场景</th><th>优先选择</th><th>可尝试替代</th><th>必须验证的边界</th></tr></thead>
+              <tbody>
+                <tr><td>首次建立 7B/70B 基线</td><td>AdamW</td><td>无</td><td>稳定性、吞吐、断点续训和评测曲线</td></tr>
+                <tr><td>显存主要被 optimizer state 占用</td><td>AdamW + 分片/卸载</td><td>Adafactor</td><td>状态精度、收敛速度、权重尺度和恢复一致性</td></tr>
+                <tr><td>二维隐藏层权重、已有可靠基线</td><td>AdamW</td><td>Muon + AdamW 混合</td><td>正交化数值稳定、通信开销、不同参数组学习率</td></tr>
+                <tr><td>小数据或短微调任务</td><td>AdamW</td><td>按任务验证</td><td>不要把预训练中的“更快收敛”结论外推到微调</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>公平比较至少要固定模型、数据顺序、token 数、有效 batch、精度、评估频率和 checkpoint 策略；同时报告最终 loss 之外的吞吐、峰值显存、通信时间、裁剪率、NaN 次数和恢复次数。若只展示某个阶段的最低 loss，容易把偶然波动包装成优化器优势。</p>
+
+          <h3>11.3 Global batch、梯度累积、warmup、cosine 与 clipping 的关系</h3>
+          <p>先统一三个量：<code>micro_batch</code> 是单卡一次前向的样本数，<code>data_parallel_size</code> 是参与数据并行的卡数，<code>accumulation_steps</code> 是多少个 micro-batch 才执行一次 optimizer update。忽略序列长度差异时，<code>global_batch = micro_batch × data_parallel_size × accumulation_steps</code>。学习率 scheduler、梯度裁剪和 checkpoint 的“step”最好都以 optimizer update 为单位；若日志同时记录 micro-step，必须明确两者的换算。</p>
+          <p>global batch 变大通常降低每次更新的梯度噪声，但不意味着学习率可以无条件线性放大。线性缩放只是某些区间的经验近似，还会受模型规模、数据重复、优化器、warmup 和正则化影响。更稳妥的做法是先固定目标 global batch，按显存选择 micro-batch 与 accumulation 的组合，再用小规模网格试验峰值学习率。改变 accumulation 后，若误把每个 micro-batch 都更新一次 scheduler，实际 warmup 和 cosine 进度会被加速，造成“调度提前结束”。</p>
+          <p>warmup 保护的是开局的状态估计和参数尺度，cosine decay 负责训练后段的细化；二者共同定义“这一步允许多大更新”。梯度裁剪则是更新前的硬上限，公式中的梯度是完成 unscale、跨卡归约和梯度累积后的全局梯度。FP16 场景若在 unscale 之前裁剪，阈值会被 loss scale 放大，结果失真；分布式场景若每卡单独裁剪，得到的并不是全局范数，跨卡合成后仍可能超阈值。</p>
+          <ul>
+            <li><strong>先累积后裁剪</strong>：每个 micro-batch 只累积梯度，达到 accumulation 边界后执行 unscale、global all-reduce、计算全局 norm、裁剪和 optimizer step。</li>
+            <li><strong>scheduler 只随 optimizer step 前进</strong>：warmup 的总步数、cosine 的总步数和 checkpoint 中的 scheduler 状态必须一起保存。</li>
+            <li><strong>裁剪率是诊断信号</strong>：偶发触发可接受，持续高触发率说明峰值学习率、数据异常或 loss scaling 存在问题；不能靠把 clip_norm 调得极小来掩盖根因。</li>
+            <li><strong>token batch 要考虑长度</strong>：长短样本混合时，按样本计的 global batch 不等于按 token 计的有效 batch，应同时记录有效 token 数和 padding 比例。</li>
+          </ul>
+          <pre><code class="language-python"># 以 optimizer step 为唯一调度时钟的伪代码
+for micro_step, batch in enumerate(loader):
+    with autocast(dtype=amp_dtype):
+        loss = model(batch) / accumulation_steps
+    scaler.scale(loss).backward()
+
+    if (micro_step + 1) % accumulation_steps != 0:
+        continue
+
+    scaler.unscale_(optimizer)              # 先 unscale，再看 norm
+    global_norm = distributed_global_norm(model)
+    clipped = global_norm &gt; clip_norm
+    clip_grad_norm_(model.parameters(), clip_norm)
+
+    if not finite_gradients(model):
+        scaler.update(found_inf=True)
+        optimizer.zero_grad(set_to_none=True)
+        record_bad_step(micro_step, global_norm)
+        continue
+
+    old_params = snapshot_update_reference(model)
+    scaler.step(optimizer)
+    scaler.update()
+    scheduler.step()                        # 只在真正更新后推进
+    update_norm = parameter_delta_norm(model, old_params)
+    log_stability(global_norm, update_norm, scaler, clipped)</code></pre>
+
+          <h3>11.4 监控指标与恢复策略：让系统知道何时刹车</h3>
+          <p>建议把指标分成四层。第一层是结果信号：训练 loss、验证 loss、perplexity 和有效 token 数；第二层是梯度信号：global grad norm、最大层 grad norm、裁剪前后比例；第三层是更新信号：update norm、参数 norm、<code>update_norm / param_norm</code>，用来区分“梯度大”与“实际更新过猛”；第四层是数值与系统信号：loss scale、Inf/NaN 计数、激活范围、通信耗时、各 rank 的 step 和 checksum。loss 没有立刻爆炸时，update-to-weight ratio 往往能提前暴露学习率或状态错误。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>信号</th><th>建议记录</th><th>触发条件示例</th><th>自动动作</th></tr></thead>
+              <tbody>
+                <tr><td>loss / perplexity</td><td>均值、分位数、与固定 batch 的对照</td><td>连续窗口偏离基线或单步突增</td><td>暂停写入新 checkpoint，保存坏批次</td></tr>
+                <tr><td>global grad norm</td><td>裁剪前值、裁剪系数、每层 top-k</td><td>连续超历史 P99 或裁剪率过高</td><td>降低 lr，必要时回滚</td></tr>
+                <tr><td>update norm</td><td>参数增量范数及其与参数范数比</td><td>比值突变、跨 rank 不一致</td><td>阻断 optimizer step，核对状态</td></tr>
+                <tr><td>scale / Inf / NaN</td><td>当前 scale、下降次数、坏张量位置</td><td>出现非有限值或 scale 连续下降</td><td>跳过坏步，FP16 降 scale 并重放</td></tr>
+                <tr><td>checkpoint 健康度</td><td>权重、optimizer、scheduler、RNG、数据游标</td><td>保存后校验失败或 rank checksum 不同</td><td>标记不可恢复，选择上一健康点</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>恢复必须分级。<strong>一级是跳过坏步</strong>：当检测到 Inf/NaN 时不执行 optimizer step，清空当前梯度，记录 batch 和 scaler 状态；这只适用于参数尚未被坏梯度更新的情况。<strong>二级是回滚 checkpoint</strong>：若已经执行了坏更新，回到最近健康点，同时恢复 optimizer state、scheduler state、RNG、数据游标和混合精度 scaler，不能只加载模型权重。<strong>三级是降级重放</strong>：固定坏批次，临时切到 BF16/FP32、关闭 Muon 或降低学习率，确认根因后再返回主配置。任何自动回滚都要防止无限循环，例如同一 batch 连续失败时将其隔离并告警，而不是无休止重试。</p>
+          <p>checkpoint 至少应包含模型分片、优化器分片、scheduler、AMP scaler、随机数状态、数据集 shard 与 offset、训练配置版本、git commit 和最近一段指标摘要。保存后做一次可读性校验和小批次前向校验，并给 checkpoint 打上 <code>healthy</code>、<code>suspect</code> 或 <code>invalid</code> 标签。这样“回滚到最近点”才有确定含义，而不是在一串文件名中凭时间猜测。</p>
+
+          <h3>11.5 面试系统设计题：7B / 70B 如何保障训练稳定</h3>
+          <p><strong>7B 题目的回答重点是闭环可落地。</strong>先用 AdamW、BF16、固定 global batch、短 warmup 和全局裁剪建立基线；训练平台每个 optimizer step 记录 loss、有效 token、grad norm、update norm、裁剪率、NaN、吞吐和 checkpoint 健康度。数据侧做 token 合法性、长度、标签和去重检查，并保留可重放的 shard 游标。遇到 spike，系统先阻断坏更新、保存诊断包，再从最近健康 checkpoint 恢复；若连续两次失败，自动隔离批次并切换到保守学习率。最终通过固定评估集和等 token A/B，验证恢复前后曲线和模型质量没有回归。</p>
+          <p><strong>70B 题目的回答重点是分布式一致性和故障域。</strong>除了数据并行，还要考虑张量并行、流水线并行、参数/优化器分片与异步故障。global norm 必须定义清楚并在正确的通信边界计算；流水线各 stage 的 micro-batch 顺序、梯度累积边界和 scheduler step 必须一致；rank 级 NaN 需要快速广播为全局事件，不能让单个 stage 静默继续。checkpoint 采用分片并行保存，记录每个 rank 的元数据、通信拓扑、重算配置和数据游标，保存后通过 checksum 与恢复演练验证。对 70B，监控还要覆盖链路带宽、all-reduce 延迟、NCCL 错误、显存水位、热降频和节点重启，因为系统性抖动会伪装成优化器问题。</p>
+          <p>面试中应明确“稳定性预算”：定义允许的坏步率、最大自动回滚次数、单次回滚可接受的 token 损失和人工介入条件；再解释如何用小规模 canary、固定 batch 重放和故障注入验证设计。不要回答“加大 clip_norm 就行”或“换 Muon 就会更稳”，而要说明证据、边界和回滚路径。</p>
+
+          <h3>11.6 面试问答与排障 checklist</h3>
+          <dl>
+            <dt>问：为什么 loss spike 后不能只把学习率调小继续跑？</dt>
+            <dd>答：如果坏步已经写入参数或 optimizer state，继续跑会把污染状态带入后续更新；应先判断坏步是否提交，必要时回滚模型、优化器、scheduler、RNG 和数据游标，再用固定批次重放验证。</dd>
+            <dt>问：梯度裁剪放在 gradient accumulation 的哪个位置？</dt>
+            <dd>答：通常在累积完成、unscale 和全局归约之后、optimizer.step 之前裁剪。每个 micro-batch 单独裁剪会改变梯度平均的方向和尺度；FP16 在 unscale 前裁剪也会使阈值失去意义。</dd>
+            <dt>问：BF16 既然范围大，为什么仍要监控 NaN？</dt>
+            <dd>答：NaN 不只来自指数范围溢出，也可能来自非法数据、除零、错误 kernel、softmax 实现或状态恢复。BF16 降低一类风险，但不替代非有限值检测和 FP32 reduction。</dd>
+            <dt>问：如何证明 Muon 优于 AdamW？</dt>
+            <dd>答：在相同模型、数据顺序、token 数、有效 batch、精度和算力预算下做多次 A/B，报告 loss、验证指标、吞吐、显存、通信、裁剪率、坏步率和恢复成本；若只在单次曲线上更低，不能下普遍结论。</dd>
+          </dl>
+          <div class="callout tip">
+            <span class="callout-t">现场排障 checklist</span>
+            <ol>
+              <li>记录 step、rank、batch/shard、micro-step、lr、scale 和最近健康 checkpoint。</li>
+              <li>确认是单 rank 还是全局同时异常，核对 all-reduce、梯度累积和 scheduler 边界。</li>
+              <li>检查 loss、grad norm、update norm、参数 norm、裁剪率和每层 top-k 梯度。</li>
+              <li>扫描输入 token、label、mask、长度、Inf/NaN 和异常样本，保存可重放 batch。</li>
+              <li>检查 FP16 scaler 或 BF16/FP32 reduction，核对主权重、副本和 optimizer state 类型。</li>
+              <li>阻断坏更新；已提交则回滚完整状态，连续失败的 batch 进入隔离队列。</li>
+              <li>用固定 batch 在保守配置下重放，确认根因后再恢复峰值 lr 或实验性优化器。</li>
+              <li>补充回归测试和故障注入，确保下一次能自动检测、告警、回滚并留下证据。</li>
+            </ol>
+          </div>
+
+          <!-- ============ 参考文献 ============ -->
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Muon: An optimizer for hidden layers in neural networks（Keller Jordan 等）— Muon 优化器原始介绍与牛顿-舒尔茨实现 · <a href="https://kellerjordan.github.io/posts/muon/" target="_blank" rel="noopener">kellerjordan.github.io</a></li>
+            <li>Decoupled Weight Decay Regularization（Loshchilov &amp; Hutter, 2019）— AdamW 解耦权重衰减，预训练事实标准优化器 · <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener">arXiv:1711.05101</a></li>
+            <li>Adam: A Method for Stochastic Optimization（Kingma &amp; Ba, 2015）— Adam 原始论文 · <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener">arXiv:1412.6980</a></li>
+            <li>On the Convergence of Adam and Beyond（Reddi et al., 2019）— 讨论 Adam 收敛性问题与 AMSGrad · <a href="https://arxiv.org/abs/1904.09237" target="_blank" rel="noopener">arXiv:1904.09237</a></li>
+            <li>Mixed Precision Training（Micikevicius et al., 2018）— 混合精度训练奠基论文，FP32 主权重与 loss scaling 的出处 · <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">arXiv:1710.03740</a></li>
+            <li>DeepSeek-LLM: Scaling Open-Source Language Models with Longtermism（DeepSeek-AI, 2024）— 记录了预训练中的周期性 loss spike 及工程化处置 · <a href="https://arxiv.org/abs/2401.02954" target="_blank" rel="noopener">arXiv:2401.02954</a></li>
+            <li>MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies（Hu et al., 2024）— 大规模采用 WSD 调度并讨论其对续训的友好性 · <a href="https://arxiv.org/abs/2404.06395" target="_blank" rel="noopener">arXiv:2404.06395</a></li>
+            <li>Cramming: Training a Language Model on a Single GPU（Geiping &amp; Goldstein, 2023）— 在受限算力下复现预训练稳定性技巧的实证 · <a href="https://arxiv.org/abs/2212.14034" target="_blank" rel="noopener">arXiv:2212.14034</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            训练稳定是预训练的基础工程，预训练的整体流程见 <a href="objectives.html">预训练目标</a> 与 <a href="distributed-training.html">分布式训练</a>；混合精度的深入内容见 <a href="mixed-precision.html">混合精度与显存优化</a>；把模型状态真正切开需要分布式框架，见 <a href="training-frameworks.html">训练框架与工程实现</a>；算力规划见 <a href="../05-systems/compute-budget.html">算力预算</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

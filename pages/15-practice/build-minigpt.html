@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实战：从零实现 miniGPT · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="15-practice" data-topic="build-minigpt">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>实战：从零实现 miniGPT</h1>
+            <p class="lead">两百行 PyTorch 代码，搭出一个可训练的 decoder-only Transformer，并在真实文本上跑通完整的「数据加载 → 前向 → 反向 → 采样生成」闭环。读完这一页，你就拆掉了大模型的第一层神秘感——它不再是黑盒，而是你能逐行追踪的计算图。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>miniGPT 的全部就是三件事：把文本切成 token 序列，用因果自注意力逐个预测下一个 token，用交叉熵梯度更新权重。没有魔法，只有矩阵乘法。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  T["原始文本<br/>'Hello World'"] --> TK["Tokenize<br/>→ token ids"]
+  TK --> EM["Token Embedding<br/>+ Position Embedding"]
+  EM --> BLK["Transformer Block × N<br/>因果自注意力 + FFN"]
+  BLK --> LM["LM Head<br/>线性层 → vocab"]
+  LM --> SM["Softmax<br/>→ 下一个 token 概率"]
+  SM --> GEN["采样生成"]
+  SM --> LOSS["交叉熵损失<br/>↓ 反向传播"]
+  LOSS --> BLK
+              </div>
+              <figcaption>miniGPT 全流程：文本到 token，token 到 logits，logits 到损失，损失回传更新权重</figcaption>
+            </figure>
+          </div>
+
+          <h2>为什么从零实现</h2>
+          <p>你可以直接用 Hugging Face 的 <code>AutoModelForCausalLM</code>，一行代码加载预训练模型。但那样你永远不会理解：<strong>为什么位置编码很重要？为什么需要因果掩码？残差连接到底在残差什么？</strong></p>
+          <p>从零实现的价值不在于造一个能用的模型——nanoGPT 训练出来的小模型能力远不如任何开源模型。价值在于：当你遇到训练发散、梯度爆炸、loss 不下降的时候，<strong>你知道该去哪里找问题</strong>。这份经验是从 API 调用者到算法工程师的分水岭。</p>
+          <p>一个具体的例子：当你的训练 loss 在 200 步时突然变成 <code>nan</code>，有实现经验的人会立刻去查梯度裁剪和初始化方差，而不是盲目调小学习率。这种「知道去哪找问题」的直觉，只能从亲手写过前向和反向的人身上长出来。再比如推理时显存爆了，你会自然想到是激活值还是权重占大头，从而决定用梯度检查点还是量化——这些判断都建立在对计算图的真实理解上，而不是对 API 的模糊印象。</p>
+          <p>还有一个隐性的收获：从零实现会让你对「抽象泄漏」习以为常。用 transformers 时，<code>model(config)</code> 一行就建好了网络，出问题时你面对的是「框架行为」，解释空间很大；自己写时，出问题的每一层都是你能直接打印、直接断言的张量。这种「能直接摸到底层」的掌控感，会让你在调大模型时更敢于做假设、验证假设，而不是靠玄学试参数。</p>
+          <p>本页的实现灵感来自 Karpathy 的 <a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener">nanoGPT</a>，但进一步精简到约 200 行，确保每一行都能在单卡 GPU（甚至 CPU）上跑通。</p>
+
+          <h2>前置准备</h2>
+          <p>只需要 PyTorch 和一个文本文件。我们用莎士比亚的《李尔王》片段作为训练语料——数据量小（约 1MB 文本），但足以让模型学会拼写和简单语法。</p>
+          <pre><code class="language-bash">pip install torch</code></pre>
+          <pre><code class="language-bash"># 下载训练数据（莎士比亚全集，约 1MB）
+# nanoGPT 仓库提供了这个经典数据集
+curl -O https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt</code></pre>
+
+          <h2>第一步：模型定义（约 100 行）</h2>
+          <p>整个 miniGPT 模型由四个组件组成：<strong>多头因果注意力</strong>、<strong>前馈网络</strong>、<strong>Transformer Block</strong>（组合前两者 + 残差 + LayerNorm）、<strong>完整 GPT</strong>（embedding + N 个 block + 输出头）。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TD
+  subgraph GPT["GPT Model"]
+    TE["Token Embedding<br/>vocab_size → d_model"]
+    PE["Position Embedding<br/>seq_len → d_model"]
+    BLK1["Block 1"]
+    BLK2["Block 2"]
+    BLKN["Block N<br/>..."]
+    LM["LM Head<br/>d_model → vocab_size"]
+    TE --> ADD["+ 相加"]
+    PE --> ADD
+    ADD --> BLK1
+    BLK1 --> BLK2
+    BLK2 --> BLKN
+    BLKN --> LM
+  end
+  subgraph BLOCK["Block 内部"]
+    LN1["LayerNorm"] --> ATTN["因果自注意力"]
+    ATTN --> R1["+ 残差"]
+    R1 --> LN2["LayerNorm"]
+    LN2 --> FFN["FFN<br/>d_model → 4×d_model → d_model"]
+    FFN --> R2["+ 残差"]
+  end
+            </div>
+            <figcaption>GPT 模型结构：N 个 Block 堆叠，每个 Block 内部是注意力 + FFN + 残差</figcaption>
+          </figure>
+
+          <pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass
+
+@dataclass
+class GPTConfig:
+    vocab_size: int = 256       # 字符级词表，ASCII 0-255
+    block_size: int = 128       # 上下文窗口长度
+    n_layer: int = 4            # Transformer 层数
+    n_head: int = 4             # 注意力头数
+    d_model: int = 128          # 模型维度
+    dropout: float = 0.1
+
+class CausalSelfAttention(nn.Module):
+    """多头因果自注意力：每个位置只能看到自己和之前的 token"""
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        assert config.d_model % config.n_head == 0
+        # QKV 合并到一个线性层，减少 kernel launch 开销
+        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.n_head = config.n_head
+        self.d_head = config.d_model // config.n_head
+        self.dropout = config.dropout
+        # 因果掩码：上三角为 -inf，softmax 后变成 0
+        mask = torch.tril(torch.ones(config.block_size, config.block_size))
+        self.register_buffer("mask", mask.view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.shape                     # batch, seq_len, d_model
+        qkv = self.qkv(x)                      # (B, T, 3C)
+        q, k, v = qkv.split(C, dim=-1)         # 各 (B, T, C)
+        # 重排为 (B, n_head, T, d_head)
+        q = q.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        # 注意力分数：(B, n_head, T, T)
+        att = (q @ k.transpose(-2, -1)) / (self.d_head ** 0.5)
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = F.dropout(att, p=self.dropout, training=self.training)
+        # 加权求和：(B, n_head, T, d_head) → (B, T, C)
+        out = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(out)
+
+class FeedForward(nn.Module):
+    """前馈网络：两层线性 + GELU 激活，中间层扩展 4 倍"""
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.fc1 = nn.Linear(config.d_model, 4 * config.d_model, bias=False)
+        self.fc2 = nn.Linear(4 * config.d_model, config.d_model, bias=False)
+        self.dropout = config.dropout
+
+    def forward(self, x):
+        return self.fc2(F.dropout(F.gelu(self.fc1(x), approximate='tanh'),
+                                   p=self.dropout, training=self.training))
+
+class Block(nn.Module):
+    """一个 Transformer Block：Pre-Norm + 注意力 + 残差 + Pre-Norm + FFN + 残差"""
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(config.d_model)
+        self.attn = CausalSelfAttention(config)
+        self.ln2 = nn.LayerNorm(config.d_model)
+        self.ffn = FeedForward(config)
+
+    def forward(self, x):
+        # Pre-Norm：先归一化再进子层，残差连接跨子层
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+class GPT(nn.Module):
+    """完整的 decoder-only GPT"""
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+        self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
+        self.pos_emb = nn.Embedding(config.block_size, config.d_model)
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.d_model)
+        # 权重共享：输出层和 token embedding 用同一个矩阵
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head.weight = self.tok_emb.weight  # weight tying
+        # 初始化
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device).unsqueeze(0)  # (1, T)
+        x = self.tok_emb(idx) + self.pos_emb(pos)               # (B, T, d_model)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)                                 # (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1
+            )
+        return logits, loss</code></pre>
+
+          <div class="callout tip">
+            <span class="callout-t">Weight Tying</span>
+            <code>lm_head</code> 和 <code>tok_emb</code> 共享同一个权重矩阵——这不是为了省参数，而是因为「从 token id 到向量」和「从向量到 token 概率」本就是同一个语义空间的正反映射。共享权重让训练更稳定，是 GPT-2 以来的标准做法。
+          </div>
+
+          <h2>第二步：数据准备（约 30 行）</h2>
+          <p>用字符级分词——每个 ASCII 字符就是一个 token。词表大小只有 256，让小模型也能学到有意义的模式。</p>
+          <pre><code class="language-python">class CharDataset:
+    """字符级数据集：把文本转成 token id 序列"""
+
+    def __init__(self, text: str, block_size: int):
+        chars = sorted(set(text))
+        self.stoi = {ch: i for i, ch in enumerate(chars)}
+        self.itos = {i: ch for i, ch in enumerate(chars)}
+        self.vocab_size = len(chars)
+        self.data = torch.tensor([self.stoi[ch] for ch in text], dtype=torch.long)
+        self.block_size = block_size
+
+    def __len__(self):
+        return len(self.data) - self.block_size
+
+    def __getitem__(self, idx):
+        # x 是 block_size 个 token，y 是 x 右移一位
+        x = self.data[idx : idx + self.block_size]
+        y = self.data[idx + 1 : idx + self.block_size + 1]
+        return x, y
+
+# 加载数据
+with open("input.txt", "r", encoding="utf-8") as f:
+    text = f.read()
+
+config = GPTConfig(vocab_size=len(set(text)), block_size=128)
+dataset = CharDataset(text, config.block_size)
+print(f"词表大小: {dataset.vocab_size}, 语料长度: {len(dataset.data)} tokens")</code></pre>
+
+          <p>这里有一个关键设计：<strong>目标 <code>y</code> 是输入 <code>x</code> 右移一位</strong>。位置 $t$ 的输入预测位置 $t+1$ 的 token，这就是「下一个 token 预测」任务。因果掩码保证了位置 $t$ 只能看到 $0$ 到 $t$，不会偷看未来。</p>
+          <p>为什么用字符级而不是词级？因为词表是「学」出来的，需要从语料统计；字符级分词词表固定为 256 个 ASCII 码，零训练成本、零未知词。代价前面说过：序列变长。一个额外的好处是：字符级模型的输出层直接对应可见字符，你可以肉眼检验它学到的拼写模式，调试非常直观。如果你之后想换成 BPE，只要替换 <code>CharDataset</code> 里的分词逻辑，训练循环和模型代码一行都不用改——这就是「数据加载与模型解耦」的体现。另外注意 <code>__getitem__</code> 返回的 x 和 y 都带 <code>block_size</code> 长度，DataLoader 会把它们自动堆成 batch，所以 <code>__len__</code> 返回的是「可切的窗口数」，而不是样本数——这个细节写错会导致取不到数据而报空 batch。</p>
+
+          <h2>第三步：训练循环（约 40 行）</h2>
+          <pre><code class="language-python">from torch.utils.data import DataLoader
+
+def train(model, dataset, config, epochs=10, lr=3e-4, batch_size=64, device="cuda"):
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
+    # 余弦退火学习率
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs * len(dataset) // batch_size)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+    model.train()
+    step = 0
+    for epoch in range(epochs):
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            logits, loss = model(x, targets=y)
+            optimizer.zero_grad()
+            loss.backward()
+            # 梯度裁剪：防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            step += 1
+            if step % 200 == 0:
+                print(f"epoch {epoch} step {step} loss {loss.item():.4f} lr {scheduler.get_last_lr()[0]:.2e}")
+    return model
+
+# 开始训练
+model = GPT(config)
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
+    print("警告：未检测到 GPU，训练会很慢。建议减少 epochs 或使用 Colab。")
+
+model = train(model, dataset, config, epochs=10, device=device)</code></pre>
+
+          <p>训练循环里值得注意的参数是 <code>weight_decay=0.1</code>：AdamW 的权重衰减与动量更新是解耦的，它不直接惩罚梯度的方向，而是把权重本身往零收缩一点。对没有 bias 和 norm 参数的矩阵权重，0.1 是常见的起点；对小玩具模型，它主要起「防过拟合」的作用——语料只有约 1MB，训练到后期 loss 很容易贴着训练集走，weight decay 能稍微缓解。另一个容易被忽视的是 <code>scheduler.step()</code> 的位置：它必须和 <code>optimizer.step()</code> 一一对应，每个 batch 更新一次，而不是每个 epoch 更新一次，否则余弦退火的相位会和实际步数错位，退火效果全废。最后，<code>num_workers=4</code> 让数据加载在四个子进程并行，避免 GPU 等数据——对玩具模型影响不大，但这是写真实训练脚本时的默认姿势。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">训练发散怎么办</span>
+            如果你看到 loss 变成 <code>nan</code>，按顺序排查：① 学习率太大（降到 1e-4 试试）；② 没做梯度裁剪（上面的 <code>clip_grad_norm_</code> 不能省）；③ 初始化方差太大（检查 <code>_init_weights</code> 的 std 是否为 0.02）；④ 数据里有空 batch（检查 <code>__len__</code> 是否返回 0）。
+          </div>
+
+          <p>正常训练时你会看到 loss 从初始的约 2.5 一路下降。这里的直觉是：256 词表下随机猜测的负对数似然约为 ln(256)≈5.5，模型只要学会「下一个字符大概率还是字母、空格和标点」就能迅速压到 2.5 以下；再往后它才开始学单词边界、拼写和语法。在莎士比亚这类小语料上，最终训练 loss 通常稳定到约 1.0–1.5。</p>
+          <p>判断「收敛」不要只看最后一个数字，要看<strong>验证集 loss 的曲线</strong>：如果训练 loss 还在降、验证 loss 却开始回升，说明过拟合了，该停。玩具模型数据量小，往往几十分钟就能看到明显的语言模式涌现——这也是从零实现的乐趣之一：你能亲眼看着「智能」一点点长出来，而不是下载一个黑盒权重。等 loss 不再明显下降（连续几百步平台期），就可以停了，继续训也只是过拟合。</p>
+
+          <h2>第四步：采样生成（约 20 行）</h2>
+          <pre><code class="language-python">@torch.no_grad()
+def generate(model, dataset, prompt: str, max_new_tokens: int = 200, temperature: float = 0.8, top_k: int = 40):
+    model.eval()
+    ids = [dataset.stoi[ch] for ch in prompt]
+    idx = torch.tensor([ids], dtype=torch.long, device=next(model.parameters()).device)
+
+    for _ in range(max_new_tokens):
+        # 裁剪到 block_size 以内
+        idx_cond = idx[:, -config.block_size:]
+        logits, _ = model(idx_cond)
+        logits = logits[:, -1, :] / temperature  # 只取最后一个位置
+        # Top-K 采样：只从概率最高的 K 个 token 中采样
+        if top_k is not None:
+            v, _ = torch.topk(logits, top_k)
+            logits[logits &lt; v[:, [-1]]] = float('-inf')
+        probs = F.softmax(logits, dim=-1)
+        next_id = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat([idx, next_id], dim=1)
+
+    return "".join([dataset.itos[i.item()] for i in idx[0]])
+
+# 生成莎士比亚风格的文本
+print(generate(model, dataset, prompt="ROMEO:\n", max_new_tokens=300))</code></pre>
+
+          <p>训练 10 个 epoch 后（单卡 GPU 约 15 分钟），你会看到模型输出类似这样的文本——不完美，但有明显的单词边界、换行和标点模式，甚至偶尔出现看起来像莎士比亚对白的结构：</p>
+          <pre><code class="language-text">ROMEO:
+Whave my the he mistaked the pacing
+And thou the sould the ghat thes the masterd,
+The ford the cound the the wour the be the sould the pacing</code></pre>
+
+          <p>这已经是从零开始学到的东西——它学会了英文单词的拼写模式、冒号和换行的格式、甚至对白的大致结构。继续训练（更多 epoch、更大模型、更多数据），输出质量会持续提升。</p>
+          <p>如果生成结果完全不成样子（连单词边界都没有），先别急着怪模型——检查 prompt 是否在词表内：字符级模型只认识它见过的字符，prompt 里出现语料外的字符会映射到错误的 id。用 <code>dataset.itos</code> 打印一遍词表，确认所有字符都在里面，这是调试生成结果的第一步。</p>
+
+          <h2>采样策略：Temperature 和 Top-K 到底在调什么</h2>
+          <p>训练完只是上半场，生成时的采样策略决定了输出是「死板复述」还是「灵动创作」。核心是两个旋钮：Temperature 和 Top-K（以及常见的 Top-P）。</p>
+          <p>Temperature 作用在 softmax 之前：把 logits 除以一个温度 T。T 越大，概率分布越平滑，低概率 token 也有机会被选中，输出更<strong>多样</strong>；T 越小，分布越尖锐，模型越「自信」、越确定，但也更容易<strong>重复</strong>。T=1 是原分布，T→0 退化为贪心解码（永远选概率最高的 token）。</p>
+          <p>Top-K 作用在 softmax 之后：只保留概率最高的 K 个 token，其余置为 0 再重新归一化。K 越小输出越保守，K 越大越发散。Top-P（核采样）则是按累计概率截断，保留累计概率达到 P 的最小 token 集合，能自适应地控制候选数量。实践中常用 Top-P=0.9 或 Top-K=40 二者取一，再配合 Temperature=0.7~0.9。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>策略</th><th>调什么</th><th>偏小效果</th><th>偏大效果</th><th>典型取值</th></tr></thead>
+              <tbody>
+                <tr><td>Temperature</td><td>分布平滑度</td><td>确定、易重复</td><td>多样、易跑题</td><td>0.7–0.9</td></tr>
+                <tr><td>Top-K</td><td>候选数量</td><td>保守、安全</td><td>发散、随机</td><td>40</td></tr>
+                <tr><td>Top-P</td><td>候选累计概率</td><td>保守</td><td>发散</td><td>0.9</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>一个常见坑：当 loss 已经很低、模型能力也够，但生成结果「车轱辘话」反复循环，通常是 Temperature 太低或没做重复惩罚（repetition penalty）。把 Temperature 提到 0.9、加上重复惩罚往往就解决。采样本身不更新权重，所以调采样参数<strong>零成本</strong>——生成质量不理想时，先调它，再回头怀疑模型。</p>
+          <p>如果想更精确地理解两个旋钮，注意它们的生效位置：温度作用在 logits 上，即「决策前的最后一层」，对任何采样策略都生效；top-k、top-p 作用在 softmax 之后，属于「候选集合的过滤」。两者配合的典型思路是：先用 top-p 或 top-k 把明显不合理的候选滤掉，再用温度调节剩余候选之间的相对概率。调参顺序也有讲究——先固定 top-k=40 或 top-p=0.9，只动温度，找到「不重复也不太随机」的温度区间，再回头微调候选集合大小。一次只动一个旋钮，否则两个因素耦合在一起，出了问题你分不清是谁的锅。</p>
+
+          <h2>学习率调度：warmup 与余弦退火为什么重要</h2>
+          <p>训练里最容易踩的坑不是模型结构，而是学习率。miniGPT 默认用 AdamW + 余弦退火，并在前 10% 的步数做 warmup。为什么要这么麻烦？</p>
+          <p>warmup 的意思是：训练一开始不急着用大学习率，而是从接近 0 慢慢升到目标值。原因是初始化后权重仍处于「乱糟糟」的状态，一上来就用大步长容易把刚学到的微小结构冲掉，导致 loss 震荡甚至发散。warmup 让模型先「站稳」再加速，相当于发车前先松离合。</p>
+          <p>余弦退火则是让学习率随训练推进平滑下降，到末期接近 0。它的直觉是：前期用大步长快速靠近最优解区域，后期用小步长精细收敛、避免在最优点附近来回横跳。比起固定学习率，余弦退火通常能多挤出一点最终精度。上面代码里的 <code>CosineAnnealingLR</code> 配合每步调用 <code>scheduler.step()</code>，就是这套机制。如果嫌麻烦，也可以直接用 transformers 的 <code>get_cosine_schedule_with_warmup</code>，它会一次性把 warmup 和退火都安排好。</p>
+
+          <h2>拆解一次前向传播：以 5 个 token 为例</h2>
+          <p>代码能跑通，不代表你真的懂了。下面用一组具体数字把前向传播走一遍，把抽象的矩阵乘法落到可验证的数值上。假设 batch size=1、序列长度 T=5、模型维度 d_model=4、注意力头数 n_head=2（每头 d_head=2）、块数 n_layer=1，输入 token 序列是 <code>[4, 1, 7, 2, 5]</code>。</p>
+          <p>第一步，token embedding 把每个 id 查表成一个 4 维向量，再加上可学习的位置编码，得到输入矩阵 X（5×4）。第二步，QKV 线性层（维度 4→12）把 X 投影成 Q、K、V，各为 5×4，再拆成 2 个头、每头 5×2。第三步，算注意力分数 <code>Q·Kᵀ / √d_head</code>，得到一个 5×5 的分数矩阵；因果掩码把右上三角（未来的位置）填成 −∞，softmax 之后变成 0，于是位置 t 只能看到 0…t。第四步，用 softmax 之后的权重对 V 加权求和，得到每个位置的上下文向量。第五步，FFN 把这个向量从 4 维扩到 16 维再压回 4 维，并加回残差。最后 LM Head 把 4 维向量映射到词表（256 维）logits，取最后一个位置做 softmax，得到下一个 token 的概率分布。</p>
+          <p>关键观察：<strong>因果掩码是这份代码能学会「续写」的根本</strong>。如果没有掩码，每个位置都能看到整句话，模型会直接「抄」答案而不是「预测」下一个字——训练 loss 会虚假地很低，但生成时一无是处。这也是为什么前面 <code>CausalSelfAttention</code> 里那一长串 <code>masked_fill</code> 不能省。</p>
+          <p>把这个例子再往前推一步：如果你把 T=5 改成 T=128（代码里的默认 block_size），前向传播的机制完全不变，只是每个位置的「可见范围」从最多 5 个 token 变成最多 128 个。这就是「上下文窗口」的全部含义——它不是模型内部有什么特殊结构，而是因果掩码的尺寸决定了每个位置最多能回看多远。超过窗口的历史 token 根本进不了注意力计算，所以处理超长文本时要么截断、要么靠位置编码做长度外推（见 <a href="../03-transformer/positional-encoding.html">位置编码</a>）。顺着这条线索还能想明白：为什么推理时要先把输入裁剪到 <code>block_size</code> 以内（第四步代码里的 <code>idx[:, -config.block_size:]</code>）——超了窗口的位置只能白算。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant D as DataLoader
+  participant M as GPT Model
+  participant L as 交叉熵损失
+  participant O as Optimizer
+  D->>M: 一个 batch (x, y)
+  M->>M: Embedding + 位置编码
+  M->>M: Block × N 因果注意力 + FFN
+  M->>M: LM Head 得到 logits
+  M->>L: logits 与 y
+  L->>L: 计算交叉熵
+  L-->>M: loss 反向传播
+  M->>O: 梯度
+  O->>O: AdamW + 梯度裁剪 + 学习率调度
+  O->>M: 更新权重
+            </div>
+            <figcaption>一个训练 step 的时序：数据进模型，前向出 logits，算损失，反向更新权重</figcaption>
+          </figure>
+
+          <h2>显存与参数账：为什么玩具模型能单卡跑</h2>
+          <p>理解显存账，你就明白「为什么这个玩具模型能在笔记本上跑，而 7B 模型需要数据中心」。训练时的显存主要有四块：模型权重、梯度、优化器状态、激活值。下面这张表把两者摆在一起对比。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>项目</th><th>miniGPT（约 400 万参数）</th><th>7B 模型（全精度）</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>权重（FP16）</td><td>约 8 MB</td><td>约 14 GB</td><td>参数量 × 2 字节</td></tr>
+                <tr><td>梯度（FP16）</td><td>约 8 MB</td><td>约 14 GB</td><td>与权重同形状</td></tr>
+                <tr><td>优化器状态（AdamW）</td><td>约 16 MB</td><td>约 28 GB</td><td>动量 + 方差，FP32 存两份</td></tr>
+                <tr><td>激活值</td><td>可忽略</td><td>数 GB（取决于 batch 与长度）</td><td>反向传播需要的中间结果</td></tr>
+                <tr><td>训练总显存</td><td>不到 0.1 GB</td><td>60 GB 以上</td><td>单卡 A100（80GB）才够</td></tr>
+                <tr><td>推理显存</td><td>不到 0.1 GB</td><td>约 14 GB</td><td>推理只需权重</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这就是为什么 nanoGPT 级别的玩具模型「有 GPU 就用，没 GPU CPU 也能跑」——它的训练总显存不到 100 MB。而全参数微调 7B 需要 60 GB 以上，单张消费级显卡根本放不下，这才逼出了 LoRA/QLoRA 这类只训练低秩补丁的方法（详见 <a href="finetune-practice.html">LoRA 微调全流程</a>）。</p>
+
+          <h2>分词方式：字符级只是起点</h2>
+          <p>本页用字符级分词是为了「词表小、代码短」。但它有明显的天花板：一个中文字、一个英文单词、一个 emoji 都只占一个 token，序列被拉得很长，模型要学更长的依赖，训练也更慢。生产模型普遍用 BPE 或 SentencePiece，把高频子串合并成更短的 token，同等文本下序列长度能缩短好几倍。下面这张表对比三种选择。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>字符级（本页）</th><th>BPE</th><th>SentencePiece / Unigram</th></tr></thead>
+              <tbody>
+                <tr><td>词表大小</td><td>约 65（可见字符）</td><td>3 万–10 万</td><td>3 万–15 万</td></tr>
+                <tr><td>序列长度</td><td>长（每字符一个 token）</td><td>短</td><td>短</td></tr>
+                <tr><td>是否需预分词</td><td>否</td><td>通常需正则</td><td>否（直接过字节/字符）</td></tr>
+                <tr><td>实现复杂度</td><td>极简</td><td>中等</td><td>中等（自带训练）</td></tr>
+                <tr><td>适用场景</td><td>教学玩具</td><td>英文为主模型</td><td>多语言 / 字节级</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>想亲手实现一个分词器，看 <a href="build-tokenizer.html">从零实现分词器</a>；想理解位置编码、归一化这些零件的底层数学，分别看 <a href="../03-transformer/positional-encoding.html">位置编码</a> 与 <a href="../03-transformer/normalization.html">归一化技术</a>。</p>
+
+          <details class="deep">
+            <summary>深入：为什么 Pre-Norm 比 Post-Norm 更不容易发散</summary>
+            <p>残差连接 <code>x = x + Sublayer(Norm(x))</code>（Pre-Norm）把每一层的输出变成「上一层的输出 + 一个小的残差增量」。这意味着梯度在反向传播时有一条「高速公路」可以直接从深层流回浅层，不会被每层的小导数连乘压成 0（梯度消失）或爆成 ∞（梯度爆炸）。</p>
+            <p>Post-Norm（先子层后归一化，<code>x = Norm(x + Sublayer(x))</code>）的问题在于：归一化作用在残差「相加之后」，深层梯度要经过归一化的缩放才能传回去，训练不稳定，通常需要精细的 warmup 学习率。Pre-Norm 把归一化放在残差「相加之前」，残差路径上没有归一化，梯度回流更顺畅，所以 modern GPT 一律采用 Pre-Norm。</p>
+            <p>一个直观判断：把网络看成一条河，残差连接是并行的一条直河道。Pre-Norm 让直河道全程畅通；Post-Norm 在直河道上架了水闸（归一化），水（梯度）流得磕磕绊绊。这就是为什么上面的代码里写的是 <code>x = x + self.attn(self.ln1(x))</code>，而不是反过来。</p>
+          </details>
+
+          <h2>miniGPT 知识地图</h2>
+          <p>把前面所有零件收进一张图，方便你回头查阅哪块没吃透。</p>
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((miniGPT))
+    架构零件
+      Token Embedding
+      Position Embedding
+      因果自注意力
+      FFN
+      LM Head
+    训练要素
+      数据加载
+      因果掩码
+      余弦退火
+      梯度裁剪
+    关键技巧
+      Weight Tying
+      Pre-Norm
+      Top-K 采样
+    扩展方向
+      BPE 分词
+      RoPE 位置编码
+      Flash Attention
+      RMSNorm
+            </div>
+            <figcaption>miniGPT 知识地图：从架构零件到训练要素，再到扩展方向</figcaption>
+          </figure>
+
+          <h2>关键设计决策解析</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>决策</th><th>选择</th><th>为什么</th></tr></thead>
+              <tbody>
+                <tr><td>分词方式</td><td>字符级</td><td>词表小（~65），小模型也能学。生产用 BPE。</td></tr>
+                <tr><td>Norm 位置</td><td>Pre-Norm</td><td>训练更稳定，深层不发散。GPT-2 起的标准。</td></tr>
+                <tr><td>激活函数</td><td>GELU (tanh 近似)</td><td>比 ReLU 平滑，梯度更友好。GPT 系列标配。</td></tr>
+                <tr><td>权重共享</td><td>lm_head = tok_emb</td><td>参数减半，训练更稳，语义空间一致。</td></tr>
+                <tr><td>初始化</td><td>正态分布 std=0.02</td><td>标准做法，太大发散太小学不动。</td></tr>
+                <tr><td>优化器</td><td>AdamW + 余弦退火</td><td>权重衰减与梯度更新解耦，学习率平滑下降。</td></tr>
+                <tr><td>梯度裁剪</td><td>max_norm=1.0</td><td>防止早期训练的梯度尖峰导致发散。</td></tr>
+                <tr><td>采样策略</td><td>Top-K + Temperature</td><td>Top-K 截断长尾，Temperature 控制随机性。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>从 miniGPT 到真实模型，差了什么</h2>
+          <p>这个 200 行的 miniGPT 和真实的 GPT/Qwen/DeepSeek 之间，差的是工程量而非架构原理：</p>
+          <ul>
+            <li><strong>规模</strong>：真实模型层数 32-80，维度 4096-8192，参数量 7B-671B。架构完全一样，只是大了几个数量级。</li>
+            <li><strong>分词</strong>：BPE/SentencePiece 替代字符级，词表 3-15 万，压缩序列长度。</li>
+            <li><strong>位置编码</strong>：RoPE 替代可学习位置编码，支持长度外推。详见 <a href="../03-transformer/positional-encoding.html">位置编码</a>。</li>
+            <li><strong>注意力优化</strong>：Flash Attention 替代朴素实现，显存从 $O(n^2)$ 降到 $O(n)$。详见 <a href="../05-systems/flash-attention.html">Flash Attention</a>。</li>
+            <li><strong>归一化</strong>：RMSNorm 替代 LayerNorm，去掉中心化只保留缩放，更快。详见 <a href="../03-transformer/normalization.html">归一化技术</a>。</li>
+            <li><strong>激活函数</strong>：SwiGLU 替代 GELU，引入门控机制。详见 <a href="../03-transformer/ffn-activation.html">前馈网络与激活函数</a>。</li>
+            <li><strong>训练策略</strong>：分布式训练（数据/张量/流水线/序列/专家并行）、混合精度、课程学习。</li>
+            <li><strong>后训练</strong>：SFT + RLHF/DPO 对齐，让模型从「续写机器」变成「对话助手」。</li>
+          </ul>
+          <p>其中「后训练」这一条常常被初学者忽略：真实的大模型在预训练之后还要经过 SFT 和偏好对齐，才能回答「怎么退款」这类问题——预训练模型只会续写，它可能在你问题的后面接一段「退款流程」的百科式文字，而不是像客服那样直接回答。miniGPT 停在「预训练」这一站，是因为这一页的主题是理解架构与训练机制；想体验「续写模型 → 对话助手」的完整转变，可以直接接着做 <a href="finetune-practice.html">LoRA 微调全流程</a> 里的实战。类似的，缩放定律（scaling law）告诉我们：模型的最终能力主要由「数据量 × 参数量 × 算力」决定，架构细节的影响往往小于数量级的差异——这也是为什么 minGPT 的 200 行代码能成为理解数千亿参数模型的钥匙。</p>
+
+          <div class="callout">
+            <span class="callout-t">核心收获</span>
+            跑通 miniGPT 之后，你应该能回答这些问题：因果掩码为什么是上三角？Pre-Norm 为什么比 Post-Norm 稳定？权重共享为什么合理？梯度裁剪为什么必要？——这些问题的答案就是你后续读论文、调参数、排 bug 的<strong>直觉地基</strong>。
+          </div>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/03-transformer/architecture-fig1.png" alt="论文原图：Transformer 编码器和解码器由多头注意力、前馈网络、残差连接和归一化组成" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：Transformer 架构原图——编码器读入输入序列，解码器以因果掩码逐步生成输出</span>
+              <span class="pf-src">论文原图 · Vaswani et al., <em>Attention Is All You Need</em>, 2017, Figure 1 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></span>
+            </figcaption>
+          </figure>
+          <p>读图时先抓住数据流的上下方向：底部的输入先经过 embedding，随后进入重复的 N× 模块；每个模块都把注意力与前馈网络包在残差和归一化里。对本页的 decoder-only miniGPT，只需保留右侧解码器路径，并把 cross-attention 去掉，因为它不接收另一条编码器序列。</p>
+          <p>图中右侧的 Masked Multi-Head Attention 是生成模型的关键：当前位置只能访问已经出现的 token，不能偷看未来答案。你在代码中看到的下三角 mask、QKV 重排、残差相加和最终线性投影，都能在这张原图上找到对应位置；把图块和张量形状一一对齐，是验证实现没有“看起来像但其实错了”的最快方法。</p>
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            训练 loss 下降不等于模型会生成：如果因果 mask 方向写反，训练时每个位置可能偷看目标 token，loss 会异常漂亮，推理时却完全失效。务必用一个极短序列打印 mask，确认上三角在 softmax 前是负无穷、下三角保持可见。
+          </div>
+          <details class="deep">
+            <summary>展开：最小可运行版本、验证步骤与排查清单</summary>
+            <div class="deep-body">
+              <p>先把配置缩到 <code>n_layer=1、n_head=2、d_model=32、block_size=32</code>，用几百行文本跑一个 batch。验证输入输出形状：<code>x</code> 和 <code>y</code> 都应为 <code>[B,T]</code>，logits 应为 <code>[B,T,vocab_size]</code>，loss 应为有限标量。再做一次过拟合单 batch 实验：如果几十到几百步后 loss 不能明显下降，先不要扩大数据或模型。</p>
+              <p>排查顺序是：词表映射是否双射、<code>y</code> 是否右移一位、mask 是否因果、<code>d_model % n_head == 0</code> 是否成立、学习率和梯度是否有限。CPU 太慢时可减少 block_size 和 batch_size；显存不足时先缩短序列，因为注意力中间矩阵按 T² 增长；若只想理解架构而不训练，可用固定随机权重完成一次前向和形状断言。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>架构</strong>：decoder-only Transformer = token embedding + position embedding + N × (因果自注意力 + FFN) + LM head。200 行足够。</li>
+            <li><strong>因果掩码</strong>：上三角填 -inf，softmax 后变 0，保证位置 t 只看到 0 到 t。</li>
+            <li><strong>Pre-Norm</strong>：先 LayerNorm 再进子层，残差跨子层。比 Post-Norm 更稳，是现代 GPT 的标配。</li>
+            <li><strong>Weight Tying</strong>：lm_head 和 tok_emb 共享权重，省参数、稳训练、语义一致。</li>
+            <li><strong>训练发散排查</strong>：学习率 → 梯度裁剪 → 初始化 → 数据，按这个顺序查。</li>
+            <li><strong>采样</strong>：Temperature 控制随机性，Top-K 截断长尾。生成质量 = 采样策略 × 模型能力。</li>
+            <li><strong>从 mini 到 real</strong>：架构原理一样，差的是规模、分词、位置编码、注意力优化、归一化、训练策略、后训练对齐。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>nanoGPT — Karpathy 的最小 GPT 实现，本页的直接灵感来源 · <a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener">GitHub</a></li>
+            <li>Attention Is All You Need — Transformer 原始论文 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></li>
+            <li>Language Models are Unsupervised Multitask Learners — GPT-2 论文，确立了 decoder-only + Pre-Norm 的现代范式 · <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener">PDF</a></li>
+            <li>Let's build GPT: from scratch, in code, spelled out — Karpathy 的视频教程，逐行讲解 · <a href="https://www.youtube.com/watch?v=kCc8FmEb1nY" target="_blank" rel="noopener">YouTube</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            你已经从零搭了一个 GPT。想理解 Transformer 每个零件的设计原理，看 <a href="../03-transformer/architecture.html">Transformer 完整架构</a>。想把这个模型微调成对话助手，看 <a href="finetune-practice.html">LoRA 微调全流程</a>。想让它基于文档回答问题，看 <a href="rag-practice.html">搭建 RAG 系统</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

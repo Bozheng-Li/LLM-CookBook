@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>并行策略：5D 并行的原理与组合 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="06-pretraining" data-topic="distributed-training">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>并行策略：5D 并行的原理与组合</h1>
+            <p class="lead">一个万亿参数模型单机放不下，一次前向的激活值也单机放不下。把训练拆到成百上千张卡上，不是一个选项，而是唯一出路。但「拆」的方式有五种，每种有不同的通信代价和显存收益。这一页讲清五种并行各自的原理、通信模式、显存账本，以及它们如何叠加成一个等效并行度——框架的具体实现和配置项见 <a href="training-frameworks.html">训练框架与工程实现</a>。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>五种并行的本质都是<strong>把一个大的计算任务切成多份，分给不同 GPU</strong>，区别只在于「切哪个维度」。数据并行切 batch，流水线并行切层，张量并行切层内矩阵，序列并行切序列长度，专家并行切 FFN 的专家。它们可以叠加，最终等效并行度等于各维度并行度的乘积。</p>
+            <p>换个生活化的类比：一本厚书要抄完。数据并行是「找 8 个人各抄一本不同的书，抄完对一下笔记」；流水线并行是「8 个人排队，第一个人抄第 1 章，抄完传给第二个人抄第 2 章」；张量并行是「8 个人同时抄同一页，每人抄一竖列，抄完拼起来」；序列并行是「一段超长的句子拆成 8 截，每人抄一截」；专家并行是「8 个人各自擅长不同学科，来什么内容就转给对应的专家抄」。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  M["模型训练任务"] --> DP["数据并行 DP<br/>切 batch 维度"]
+  M --> PP["流水线并行 PP<br/>切层维度"]
+  M --> TP["张量并行 TP<br/>切层内矩阵"]
+  M --> SP["序列并行 SP<br/>切序列长度"]
+  M --> EP["专家并行 EP<br/>切 FFN 专家"]
+  DP --> DP1["每卡完整模型<br/>不同数据<br/>AllReduce 通信"]
+  PP --> PP1["层分配到不同卡<br/>流水线传递激活<br/>气泡开销"]
+  TP --> TP1["矩阵分块到不同卡<br/>AllReduce / AllGather"]
+  SP --> SP1["序列分段到不同卡<br/>AllGather + ReduceScatter"]
+  EP --> EP1["专家分配到不同卡<br/>All-to-All 通信"]
+  style DP fill:#e6f1fb,stroke:#185fa5
+  style EP fill:#f0f7e8,stroke:#4a8a2a
+              </div>
+              <figcaption>五种并行各自切一个不同的维度，通信模式和显存收益各不相同。切法不同，代价也不同——这是全篇的主线。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 0: 先算一笔显存账 ============ -->
+          <h2>先算一笔账：为什么单卡一定不够</h2>
+          <p>在讨论「怎么拆」之前，先要理解「为什么非拆不可」。很多人以为显存主要被模型参数占了，其实<strong>参数只是账单里最小的一项</strong>。用最常见的「BF16 混合精度 + Adam 优化器」配置，每一个参数在显存里要留下四份账：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>项目</th><th>精度</th><th>每参数字节</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>模型权重（计算副本）</td><td>BF16</td><td><strong>2</strong></td><td>前向反向实际参与矩阵乘的那一份</td></tr>
+                <tr><td>梯度</td><td>BF16</td><td><strong>2</strong></td><td>反向传播产出，AllReduce 的通信对象</td></tr>
+                <tr><td>FP32 主权重</td><td>FP32</td><td><strong>4</strong></td><td>优化器真正更新的那一份，避免 BF16 累加误差</td></tr>
+                <tr><td>Adam 一阶矩 m</td><td>FP32</td><td><strong>4</strong></td><td>梯度的滑动平均</td></tr>
+                <tr><td>Adam 二阶矩 v</td><td>FP32</td><td><strong>4</strong></td><td>梯度平方的滑动平均</td></tr>
+                <tr><td colspan="2"><strong>合计（不含激活值）</strong></td><td><strong>16</strong></td><td>这就是常说的「每参数 16 字节」经验值</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>按 16 字节/参数换算：7B 模型约需 <strong>112 GB</strong>，70B 约需 <strong>1.1 TB</strong>，405B 约需 <strong>6.5 TB</strong>。而一张 80GB 的 H100 只能装下 5B 参数左右的完整训练状态——<strong>连 7B 都放不下</strong>。这还没算激活值。</p>
+          <p>激活值是第二座大山。前向传播中每一层的中间结果都要暂存下来供反向使用，它的规模大致正比于 <strong>批大小 × 序列长度 × 隐层维度 × 层数</strong>。序列一长，注意力内部还有正比于序列长度平方的中间量（<a href="../05-systems/flash-attention.html">FlashAttention</a> 正是为消除这一项而生）。在长上下文训练里，激活值经常反超参数显存成为第一大头。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            显存里装的不只是模型，还有<strong>「模型的三个影子」</strong>——梯度、优化器状态、激活值。参数只占总账的八分之一。所以「70B 模型需要多少显存」这个问题，正确答案不是 140GB（BF16 权重），而是 1.1TB 起步。这也是为什么并行不是可选项。
+          </div>
+
+          <p>五种并行分别针对账单里的不同项目下刀。下面这张思维导图先把全局关系摆出来，后面逐个展开：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("5D 并行"))
+    数据并行 DP
+      切 batch
+      AllReduce 每步一次
+      单独用不省显存
+      配 ZeRO 后切三件套
+    张量并行 TP
+      切层内矩阵
+      每层多次 AllReduce
+      省参数与激活
+      只适合节点内
+    流水线并行 PP
+      切层
+      点对点 send recv
+      通信量最小
+      气泡是主要损耗
+    序列并行 SP
+      切序列长度
+      AllGather 与 ReduceScatter
+      专治长上下文激活值
+    专家并行 EP
+      切 MoE 专家
+      All-to-All
+      负载均衡是命门
+            </div>
+            <figcaption>五种并行的能力地图：各自切什么、用什么通信原语、省的是哪一部分显存、最大的坑在哪。建议读完全文后回头再看一遍这张图。</figcaption>
+          </figure>
+
+          <!-- ============ Section 1: DP ============ -->
+          <h2>数据并行（DP）：最简单的起点</h2>
+          <p>数据并行是所有并行策略的基础。核心思路：<strong>每张卡上放一份完整的模型副本，各自处理不同的 batch 数据</strong>。前向各算各的，反向传播时梯度通过 AllReduce 聚合，保证所有卡的模型参数同步更新。</p>
+          <p>它的通信模式很简单：每个反向传播步骤结束时，做一次梯度的 AllReduce。现代实现普遍采用 <strong>Ring AllReduce</strong>——把梯度切成 $N$ 段（$N$ 为卡数），先做一轮 ReduceScatter（每张卡负责求和其中一段），再做一轮 AllGather（把求和结果广播回所有卡）。这样每张卡收发的数据量约为 $2\frac{N-1}{N}\Psi$，其中 $\Psi$ 是梯度总字节数。关键性质是：<strong>通信量与卡数几乎无关</strong>（$N$ 大时趋近于 $2\Psi$），所以数据并行的横向扩展性非常好。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>阶段</th><th>做什么</th><th>每卡收发量</th><th>备注</th></tr></thead>
+              <tbody>
+                <tr><td>ReduceScatter</td><td>梯度切 $N$ 段，每卡求和自己负责的那段</td><td>$\frac{N-1}{N}\Psi$</td><td>环形传递，每步只与相邻卡通信</td></tr>
+                <tr><td>AllGather</td><td>把各卡求好的段广播回全体</td><td>$\frac{N-1}{N}\Psi$</td><td>同样环形，可与前一步流水重叠</td></tr>
+                <tr><td colspan="2"><strong>合计</strong></td><td><strong>$\approx 2\Psi$</strong></td><td>与卡数几乎无关，扩展性好</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>朴素数据并行的致命问题在于<strong>每张卡都存了完整的模型参数、梯度和优化器状态</strong>——上一节算过，一个 70B 模型单卡就要 1.1 TB，显然不可能放在一张 80GB 的 H100 上。数据并行<strong>本身完全不省显存</strong>，它只是把 batch 摊开、把吞吐做大。</p>
+          <p>这就是 ZeRO 和 FSDP 出现的原因：它们在数据并行的框架内，把「参数 + 梯度 + 优化器状态」这三件套沿 DP 维度切分到不同卡上，用时再临时 AllGather 回来。代价是通信量从 $2\Psi$ 上升到约 $3\Psi$（多了一次参数 AllGather），换来显存的线性下降。具体分级和配置见 <a href="training-frameworks.html">训练框架与工程实现</a>。</p>
+
+          <h3>梯度累积：用时间换 batch</h3>
+          <p>还有一个常被忽略但极其常用的技巧：<strong>梯度累积（gradient accumulation）</strong>。当你想要一个 4M token 的全局 batch，但显存只够一次跑 8K token 时，可以连续跑若干个 micro-batch、把梯度累加起来，最后才做一次 AllReduce 和参数更新。</p>
+          <p>它的两个副作用值得记住：一是<strong>通信频率下降</strong>（累积 $k$ 步才通信一次，AllReduce 的开销被摊薄 $k$ 倍），这在跨节点带宽紧张时是纯收益；二是它<strong>与流水线并行的 micro-batch 是同一件事</strong>——PP 里的 micro-batch 数 $M$，本质上就是梯度累积步数。理解这一点，后面 PP 的气泡公式就会变得非常自然。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            数据并行就像一个团队里每个人都会做全套菜，但每人负责不同的桌——做完了大家把食谱改动汇总一下（AllReduce），保证下顿饭所有人用的是同一本食谱。问题是<strong>每个人都得背一整本厚食谱</strong>，这就是 ZeRO 要解决的事：让每人只背几页，需要别的章节时临时问一声。
+          </div>
+
+          <!-- ============ Section 2: TP ============ -->
+          <h2>张量并行（TP）：切层内矩阵</h2>
+          <p>在讲切法之前，先看一张来自 Megatron-LM 论文的原图——它把「朴素模型并行」和「模型并行 + 数据并行」的差别一次讲清楚。这是理解 TP 为什么出现的起点。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/06-pretraining/distributed-training/fig1.png" alt="论文原图：Megatron-LM 提出的模型并行 vs 模型+数据并行对比——左图只把模型切到两卡（每卡只算一半层但整批数据），右图在切模型的同时每个副本处理不同的 batch，两卡各持一层并各算不同数据" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：朴素模型并行（左）与「模型并行 + 数据并行」组合（右）——把层切到不同卡的同时，让每组卡处理不同的数据，显存与吞吐同时受益</span>
+              <span class="pf-src">论文原图 · Shoeybi et al., <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>, 2019, Figure 1 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">arXiv:1909.08053</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图抓三个点：<strong>① 左边是「只有模型并行」</strong>——整个模型的层被分到两张卡上（卡 1 算前半层、卡 2 算后半层），数据只有一份，两卡各算各的层，前向的中间结果在卡间传递。它的毛病是：卡 1 算完第 1-2 层传给卡 2 之前，卡 2 一直在空等；而且每次只处理一个 batch，整张卡只干自己那一段活。<strong>② 右边是「模型并行 + 数据并行」</strong>——把「层切分」复制成两套（一套处理 batch 1，一套处理 batch 2），每张卡虽然只持有模型的一部分，但都在持续干活，没有空转。<strong>③ 关键结论</strong>：图下方那句话——「模型并行 + 数据并行」让每张卡的<strong>计算量不变、通信量最小</strong>。这正是「先 TP 再 DP」组合的原始动机。</p>
+          <p>注意图里的切法是<strong>按层切</strong>，也就是「把层分成两组」——这是论文为了讲清楚「并行」概念画的示意图。真正工业界用到的 Megatron 式张量并行，比这个更细：它切的是<strong>单个层内部</strong>的矩阵乘（而不是整层），这也是本小节下面要展开的内容。图上「每张卡只持有一部分权重」这个直觉，两种切法是一致的。</p>
+
+          <p>张量并行把<strong>单个层内的矩阵乘法</strong>拆到多张卡上。以一个线性层 $Y = XW$ 为例，可以把权重矩阵 $W$ 按列切分（Column Parallel），每张卡持有 $W$ 的一部分列，各自算出 $Y$ 的一部分，然后通过 AllGather 拼成完整的 $Y$。也可以按行切分（Row Parallel），每张卡算出部分结果后通过 AllReduce 求和。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  X["输入 X"] --> G1["GPU 1<br/>W 的前半列"]
+  X --> G2["GPU 2<br/>W 的后半列"]
+  G1 --> Y1["Y 的前半"]
+  G2 --> Y2["Y 的后半"]
+  Y1 --> AG["AllGather"]
+  Y2 --> AG
+  AG --> Y["完整输出 Y"]
+  style AG fill:#fff3e0,stroke:#e65100
+            </div>
+            <figcaption>张量并行 Column Parallel：权重按列切分，每卡算出输出的一部分列，最后通过 AllGather 拼接成完整输出。</figcaption>
+          </figure>
+
+          <h3>Megatron 的巧妙之处：让两次通信变成一次</h3>
+          <p>先看论文里的第二张原图。它把「一个 Transformer 层在 Megatron 式张量并行下怎么切分、哪里需要通信」画得明明白白——这张图是理解 TP 在 Transformer 上具体落法的关键。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/06-pretraining/distributed-training/fig2.png" alt="论文原图：Megatron-LM 的 Transformer 层切分方案——f 与 g 标记通信点，注意力块的 QKV 与输出投影、MLP 块的两个线性层分别按列/按行切分，每块只在边界做一次通信" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：Megatron-LM 的 Transformer 层张量并行方案——f 和 g 是两个「配对通信点」，注意力与 MLP 两块内部零通信，整层前向只需两次 AllReduce</span>
+              <span class="pf-src">论文原图 · Shoeybi et al., <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>, 2019, Figure 2 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">arXiv:1909.08053</a></span>
+            </figcaption>
+          </figure>
+
+          <p>这张图信息密度高，新手按顺序读四块：<strong>① 最下面一行是输入 X</strong>，在每个 TP 卡上都有一份完整副本（论文里叫「f 的输入」，即 f 做一次 Identity + 复制，让每张卡都拿到同样的 X）。<strong>② 注意力块</strong>：QKV 投影合在一个矩阵里按<strong>列</strong>切——每个注意力头天然是独立的，把不同的头分到不同卡上，每卡算自己的头；Softmax 和加权求和都在卡内完成，不需要通信；最后输出投影按<strong>行</strong>切，在「g」这个点做一次 AllReduce 把部分和加起来，得到完整输出。<strong>③ MLP 块</strong>：第一个线性层按列切（每卡算不同的隐藏单元，GeLU 逐元素、无需通信），第二个线性层按行切，再在「g」做一次 AllReduce。<strong>④ 图上标着 f / g 的方块</strong>就是论文定义的「一对互为逆的通信操作」——f 把张量切成 N 份或复制，g 做对应的 AllReduce，两者配对使用让通信次数最小化。数一下：整层前向只有 <strong>2 次 AllReduce</strong>（注意力块 1 次、MLP 块 1 次）。</p>
+          <p>把这张图和上面 Figure 1 连起来看，Megatron 的设计哲学就很完整了：<strong>Figure 1 回答「为什么要并行」（显存与吞吐），Figure 2 回答「Transformer 该怎么切」（每层仅两次通信）</strong>。前者是动机，后者是方案。读懂了这两张图，「TP 为什么只适合节点内」「为什么 TP 度要能整除注意力头数」这些问题就都有了答案。</p>
+
+          <p>朴素地切每一个矩阵，会导致每个矩阵乘后面都跟一次通信。Megatron-LM 的关键洞察是：<strong>把 Column Parallel 和 Row Parallel 配对使用，中间那次通信可以完全省掉</strong>。</p>
+          <p>以 FFN 为例，它是两个连续的 GEMM：$Y = \text{GELU}(XW_1)W_2$。如果 $W_1$ 按列切、$W_2$ 按行切，那么第一个 GEMM 的输出（$Y$ 的部分列）正好就是第二个 GEMM 所需要的输入（$X$ 的部分行）——<strong>数据已经在正确的卡上了，中间不需要任何通信</strong>。只在第二个 GEMM 之后做一次 AllReduce 求和即可。而且 GELU 是逐元素运算，按列切完全不影响结果，这一点也很关键。</p>
+          <p>注意力层同理：QKV 投影按列切（多头天然可以分到不同卡，每卡负责若干个完整的头），输出投影按行切，中间的 softmax 和加权求和都在各卡本地完成。于是<strong>一个 Transformer 层前向只需 2 次 AllReduce</strong>（注意力块 1 次、FFN 块 1 次），反向对称地再来 2 次，合计 4 次。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模块</th><th>第一个矩阵</th><th>第二个矩阵</th><th>中间是否通信</th><th>块末通信</th></tr></thead>
+              <tbody>
+                <tr><td><strong>FFN</strong></td><td>$W_1$ 按<strong>列</strong>切</td><td>$W_2$ 按<strong>行</strong>切</td><td>不需要（GELU 逐元素）</td><td>1 次 AllReduce</td></tr>
+                <tr><td><strong>注意力</strong></td><td>QKV 按<strong>列</strong>切（按头分）</td><td>输出投影按<strong>行</strong>切</td><td>不需要（头内自洽）</td><td>1 次 AllReduce</td></tr>
+                <tr><td><strong>Embedding</strong></td><td colspan="2">词表维度切分</td><td>—</td><td>1 次 AllReduce</td></tr>
+                <tr><td><strong>LayerNorm</strong></td><td colspan="2">不切，各卡冗余计算</td><td>—</td><td>0（除非配合 SP）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>张量并行的通信发生在<strong>每一层的前向和反向</strong>，频率远高于数据并行。每次 AllReduce 的数据量约为 $b \times s \times h$ 个激活元素（批大小 × 序列长度 × 隐层维度），一个 80 层的模型一步就要做 320 次集合通信。因此它对<strong>通信带宽和延迟都极度敏感</strong>，通常只在 NVLink 互联的同一节点内（如一台 8 卡 H100 机器）使用。跨节点用 TP 会因网络带宽不足严重拖慢训练——这几乎是并行配置里最硬的一条规则。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">常见坑</span>
+            <strong>TP 度不要超过单节点的 GPU 数。</strong> 一个典型错误是在 8 卡机上配 TP=16，跨了两台机器。此时每层的 AllReduce 都要走 InfiniBand，节点内 NVLink 的带宽优势完全用不上，MFU 常常从 45% 掉到 15% 以下。另外 TP 度必须能整除注意力头数——TP=6 配 32 个头会直接报错或触发隐式 padding。
+          </div>
+
+          <!-- ============ Section 3: PP ============ -->
+          <h2>流水线并行（PP）：切层</h2>
+          <p>流水线并行把<strong>不同的层分配到不同的卡上</strong>。GPU 1 处理第 1-10 层，GPU 2 处理第 11-20 层，以此类推。数据像流水线上的产品一样从第一组层流到最后一组层。</p>
+          <p>朴素流水线的问题是<strong>气泡</strong>（bubble）：当 GPU 1 在处理第一个 micro-batch 时，GPU 2 到 GPU N 都在空等。为了压缩气泡，实际做法是把一个 mini-batch 切成多个 micro-batch，让不同 GPU 同时处理不同的 micro-batch，这就是 GPipe 和 1F1B（one-forward-one-backward）调度策略。</p>
+          <div class="mermaid">
+flowchart LR
+  subgraph "朴素流水线（气泡大）"
+    G1A["GPU1: F1"] --> G2A["GPU2: F1"]
+    G2A --> G3A["GPU3: F1"]
+    G3A --> G4A["GPU4: F1"]
+    G1A -.-> G1B["GPU1: 空闲..."]
+  end
+  subgraph "1F1B 调度（气泡小）"
+    G1C["GPU1: F1 F2 F3 F4"] --> G2C["GPU2: F1 F2 F3 F4"]
+    G2C --> G3C["GPU3: F1 F2 F3 F4"]
+    G3C --> G4C["GPU4: F1 F2 F3 F4"]
+  end
+          </div>
+
+          <p>把时间轴摊开看会更清楚。下面这张时序图展示 4 个流水线阶段在 1F1B 调度下的行为：先是一段「填充期」让流水线灌满，然后进入稳态——<strong>每个阶段交替做一次前向和一次反向</strong>，最后是一段「排空期」。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant S1 as 阶段1 第1到10层
+  participant S2 as 阶段2 第11到20层
+  participant S3 as 阶段3 第21到30层
+  participant S4 as 阶段4 第31到40层
+  Note over S1,S4: 填充期 后面的阶段还在空等 这就是气泡
+  S1->>S2: F1 激活
+  S1->>S2: F2 激活
+  S2->>S3: F1 激活
+  S2->>S3: F2 激活
+  S3->>S4: F1 激活
+  Note over S1,S4: 稳态 每卡交替执行一次前向与一次反向 显存占用被限制住
+  S4-->>S3: B1 梯度
+  S3-->>S2: B1 梯度
+  S2-->>S1: B1 梯度
+  S1->>S2: F3 激活
+  Note over S1,S4: 排空期 前面的阶段先做完 又出现一段气泡
+            </div>
+            <figcaption>1F1B 流水线的三个时期：填充、稳态、排空。1F1B 相对 GPipe 的关键改进不是气泡更小（气泡率相同），而是<strong>稳态下每卡同时在途的 micro-batch 数被限制住了</strong>，激活值显存从 $O(M)$ 降到 $O(P)$。</figcaption>
+          </figure>
+
+          <p>即便如此，流水线开头和结尾仍有一段气泡无法消除。气泡占比近似为 $(P-1)/M$，其中 $P$ 是流水线阶段数、$M$ 是 micro-batch 数。举例：$P=8$、$M=8$ 时气泡率高达 $7/8 = 87.5\%$，几乎全在空转；把 $M$ 提到 64，气泡率降到 $7/64 \approx 11\%$；提到 256 则约 2.7%。<strong>经验法则是 $M \geq 4P$，最好 $M \geq 8P$。</strong></p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>调度策略</th><th>气泡率</th><th>激活值显存</th><th>代价</th></tr></thead>
+              <tbody>
+                <tr><td><strong>GPipe</strong>（全前向后全反向）</td><td>$(P-1)/M$</td><td>$O(M)$ 个 micro-batch 的激活</td><td>显存压力大，$M$ 提不上去</td></tr>
+                <tr><td><strong>1F1B</strong>（交替前反向）</td><td>$(P-1)/M$</td><td>$O(P)$，显著更省</td><td>调度实现复杂一些</td></tr>
+                <tr><td><strong>Interleaved 1F1B</strong>（每卡持 $v$ 段不连续的层）</td><td>$(P-1)/(M \cdot v)$</td><td>与 1F1B 同量级</td><td>通信次数增加 $v$ 倍</td></tr>
+                <tr><td><strong>Zero-Bubble 类方案</strong>（拆分反向）</td><td>理论可趋近 0</td><td>需额外缓存权重梯度</td><td>实现复杂，框架支持有限</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>Interleaved 1F1B 值得单独说一句：它让每张卡持有<strong>多段不连续的层</strong>（比如 GPU 1 同时负责第 1-5 层和第 21-25 层），相当于把流水线「折叠」了 $v$ 次，气泡率再降 $v$ 倍。代价是点对点通信次数也变成 $v$ 倍——所以它在节点内高带宽环境下收益明显，跨节点时要谨慎评估。</p>
+          <p>流水线并行的通信量很小——只在相邻阶段之间传递激活值和梯度，单次传输大小约为 $b_{\text{micro}} \times s \times h$，而且是点对点的 send/recv，不是集合通信。它<strong>最适合跨节点</strong>使用，因为节点间带宽远低于节点内，正好匹配 PP「低通信量、高延迟容忍」的特点。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">常见坑</span>
+            <strong>流水线阶段的负载必须均衡，否则最慢的那一段决定整条流水线的节奏。</strong> 常见的不均衡来源有三个：第一层带着 embedding、最后一层带着 lm_head 和 loss 计算（词表大时这一块极重）；层数不能被阶段数整除时最后一段多背一层；不同层的重计算策略不一致。实践中经常需要手工调整每个阶段的层数（比如首尾阶段少放 1-2 层）来把时间对齐。
+          </div>
+
+          <!-- ============ Section 4: SP ============ -->
+          <h2>序列并行（SP）：切序列长度</h2>
+          <p>当上下文窗口从 4K 扩展到 128K 甚至 1M，<strong>序列维度本身就成了显存瓶颈</strong>——激活值正比于序列长度，注意力内部的中间量还正比于序列长度的平方。序列并行把一条长序列切成多段，分到不同卡上各自处理。</p>
+          <p>这里要区分两种常被混为一谈的东西，它们解决的问题不同：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>名称</th><th>切的是什么</th><th>解决什么</th><th>通信</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Megatron 式序列并行</strong></td><td>TP 没能切走的那部分——LayerNorm、Dropout、残差处的激活</td><td>补上 TP 的显存短板，与 TP 共用同一组卡</td><td>把 TP 的 AllReduce 拆成 AllGather + ReduceScatter，总量不变</td></tr>
+                <tr><td><strong>上下文并行 / Ring Attention</strong></td><td>整条序列，包括注意力的 Q/K/V</td><td>让单卡放不下的超长序列成为可能</td><td>环形传递 K/V 分块，量正比于序列长度</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>第一种的思路很精巧：TP 切走了矩阵乘的显存，但 LayerNorm、Dropout 这些逐元素操作在每张卡上是<strong>冗余重复</strong>的，它们的激活值仍然是完整尺寸。既然这些操作在序列维度上互相独立，就干脆沿序列切开。更妙的是，原本 TP 块末的那次 AllReduce，可以等价地拆成「ReduceScatter（进入序列并行区）+ AllGather（回到张量并行区）」，<strong>总通信量与原来完全相同</strong>——白赚一份显存。</p>
+          <p>第二种才是真正让百万上下文成为可能的技术。注意力是全局操作——序列上的每个位置都需要看到所有其他位置，直接切段会破坏这个全局性。Ring Attention 的做法是让持有不同序列分块的卡<strong>围成一个环，把各自的 K/V 分块依次传给下一张卡</strong>；每张卡在收到一个新分块时就用它更新自己的注意力累加结果，转满一圈后每个位置就都「见过」了全序列。这与 <a href="../05-systems/flash-attention.html">FlashAttention</a> 的在线 softmax 分块累加是同一套数学，只是把分块从 SRAM 层面搬到了 GPU 之间。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话记住</span>
+            Megatron 式 SP 是<strong>「把 TP 漏掉的显存补上」</strong>，几乎零成本，能开就开；上下文并行是<strong>「把序列真的切开」</strong>，是长上下文训练的必需品但有实打实的通信开销。两者名字接近、层次完全不同，配置文档里看到 <code>sequence_parallel</code> 和 <code>context_parallel</code> 两个开关时别搞混。
+          </div>
+
+          <!-- ============ Section 5: EP ============ -->
+          <h2>专家并行（EP）：切 FFN 专家</h2>
+          <p>专家并行专门为 <a href="../04-modern-arch/moe.html">MoE 混合专家</a> 架构设计。它把不同的专家分配到不同 GPU 上——每张卡只存放和计算一部分专家。路由器决定每个 token 去哪张卡，于是需要一个 All-to-All 通信：先把 token 发到目标专家所在的卡，算完后再把结果发回来。</p>
+          <div class="mermaid">
+flowchart LR
+  T1["GPU 1 的 token"] -->|路由分发| R1["All-to-All"]
+  T2["GPU 2 的 token"] -->|路由分发| R2["All-to-All"]
+  R1 --> E1["GPU1: 专家 A B"]
+  R1 --> E2["GPU2: 专家 C D"]
+  R2 --> E1
+  R2 --> E2
+  E1 -->|结果回收| R3["All-to-All"]
+  E2 -->|结果回收| R4["All-to-All"]
+  R3 --> O1["GPU 1 的输出"]
+  R4 --> O2["GPU 2 的输出"]
+  style R1 fill:#fff3e0,stroke:#e65100
+  style R2 fill:#fff3e0,stroke:#e65100
+          </div>
+          <p>All-to-All 是五种并行里<strong>最难受的通信原语</strong>：它不像 AllReduce 那样可以用环形算法把带宽需求摊平，而是每张卡都要给其他所有卡发一份不同的数据。通信量正比于「本卡 token 数 × top-k × 隐层维度」，且对<strong>全互联拓扑</strong>要求很高。在一个 MoE 层里要做两次（分发一次、回收一次），一个 60 层的 MoE 模型一步前向就是 120 次 All-to-All。</p>
+          <p>专家并行的关键挑战是<strong>负载均衡</strong>：如果路由器倾向于把大部分 token 都发给少数几个「明星专家」，这些专家所在的卡会成为瓶颈，其他卡空转。而且 All-to-All 是<strong>同步</strong>的——所有卡必须等最慢的那张卡算完才能进入下一步，所以负载不均的惩罚是全局性的，不是局部的。解决方案包括辅助负载均衡损失、容量因子限制以及无辅助损失均衡方案（详见 <a href="../04-modern-arch/moe.html">MoE 混合专家</a>）。</p>
+          <p>专家并行与数据并行可以叠加：同一组专家复制到多个副本（数据并行维度），每个副本内部用 EP 分布专家。注意此时<strong>注意力层走 DP/TP、FFN 层走 EP</strong>，同一个模型的不同部分用了不同的并行拓扑，这是 MoE 训练配置里最容易搞错的地方。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">常见坑</span>
+            <strong>容量因子（capacity factor）设置不当会静默丢 token。</strong> 为了让 All-to-All 的缓冲区大小固定，实现上通常给每个专家设一个容量上限；超出上限的 token 会被直接丢弃（走残差跳过 FFN）。容量因子设成 1.0 看似省显存，实际可能丢掉 10% 以上的 token，训练照跑不误但效果莫名其妙地差。务必<strong>把「丢弃率」加入监控看板</strong>，这是 MoE 训练最隐蔽的一类 bug。
+          </div>
+
+          <!-- ============ Section 6: 5D 叠加 ============ -->
+          <h2>5D 叠加：设备网格与拓扑映射</h2>
+          <p>真实的大模型训练不是选一种并行，而是<strong>把五种叠加起来</strong>。一个典型的千卡训练配置可能是：8 卡节点内用 TP=4 + SP=2，节点间用 PP=4 + DP=32，再叠加 EP=8（如果用 MoE）。等效并行度为各维度之积。</p>
+          <p>理解叠加的正确心智模型是<strong>「设备网格」（device mesh）</strong>：把 $W$ 张卡看成一个多维数组，每个维度对应一种并行。一张卡的全局 rank 可以唯一分解成一组坐标 $(d_{\text{dp}}, d_{\text{pp}}, d_{\text{tp}})$，而每种并行的「通信组」就是固定其他坐标、只让某一维变化所形成的那一列卡。</p>
+
+          <pre><code class="language-python"># 设备网格：把全局 rank 分解成各并行维度的坐标
+# 维度顺序决定了哪种并行落在相邻的卡上（相邻 = 通常在同一节点内 = 带宽高）
+# 这里用 (dp, pp, tp) 的顺序，tp 变化最快 -> TP 组内的卡 rank 连续 -> 落在同一节点
+
+def build_mesh(world_size, tp, pp):
+    assert world_size % (tp * pp) == 0, "world_size 必须能被 tp*pp 整除"
+    dp = world_size // (tp * pp)
+    return {"dp": dp, "pp": pp, "tp": tp}
+
+def rank_to_coord(rank, mesh):
+    tp = mesh["tp"]; pp = mesh["pp"]
+    tp_i = rank % tp                       # 最内层：张量并行
+    pp_i = (rank // tp) % pp               # 中间层：流水线阶段
+    dp_i = rank // (tp * pp)               # 最外层：数据并行副本
+    return dp_i, pp_i, tp_i
+
+def group_members(rank, mesh, axis):
+    """返回与 rank 同处一个通信组的所有 rank（沿 axis 轴变化）"""
+    dp_i, pp_i, tp_i = rank_to_coord(rank, mesh)
+    tp = mesh["tp"]; pp = mesh["pp"]; dp = mesh["dp"]
+    def to_rank(d, p, t):
+        return d * tp * pp + p * tp + t
+    if axis == "tp":
+        return [to_rank(dp_i, pp_i, t) for t in range(tp)]
+    if axis == "pp":
+        return [to_rank(dp_i, p, tp_i) for p in range(pp)]
+    if axis == "dp":
+        return [to_rank(d, pp_i, tp_i) for d in range(dp)]
+    raise ValueError(axis)
+
+mesh = build_mesh(world_size=64, tp=8, pp=4)   # dp 自动算出 = 2
+print(mesh)                                     # {'dp': 2, 'pp': 4, 'tp': 8}
+print(rank_to_coord(11, mesh))                  # (0, 1, 3)
+print(group_members(11, mesh, "tp"))            # [8..15] 同一节点内的 8 张卡
+print(group_members(11, mesh, "pp"))            # [3, 11, 19, 27] 跨节点
+</code></pre>
+
+          <p>这段代码里最重要的一行是坐标分解的<strong>顺序</strong>。让 <code>tp</code> 变化最快，意味着同一个 TP 组的 8 张卡 rank 连续（如 8~15），而集群里连续的 rank 通常就在同一台机器上、由 NVLink 互联。反过来，如果把 <code>dp</code> 放在最内层，TP 组就会跨节点——配置一字之差，训练速度可能差三倍。真实框架的 device mesh 抽象做的就是这件事，具体 API 以官方文档为准。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Node1["节点 1 · NVLink 约 900 GB/s"]
+    direction LR
+    N1G1["rank 0<br/>tp=0"] --- N1G2["rank 1<br/>tp=1"] --- N1G3["rank 2<br/>tp=2"] --- N1G4["rank 3<br/>tp=3"]
+  end
+  subgraph Node2["节点 2 · NVLink 约 900 GB/s"]
+    direction LR
+    N2G1["rank 4<br/>tp=0"] --- N2G2["rank 5<br/>tp=1"] --- N2G3["rank 6<br/>tp=2"] --- N2G4["rank 7<br/>tp=3"]
+  end
+  Node1 <-->|"InfiniBand 约 50-100 GB/s<br/>走 PP 的点对点 与 DP 的 AllReduce"| Node2
+  TPnote["TP 与 SP 放这里<br/>每层多次通信 延迟敏感"] -.-> Node1
+  PPnote["PP 与 DP 放这里<br/>通信量小 或频率低"] -.-> Node2
+  style Node1 fill:#e6f1fb,stroke:#185fa5
+  style Node2 fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>拓扑映射的黄金法则：<strong>通信频率高的并行放高带宽链路，通信频率低的放低带宽链路</strong>。TP/SP 每层都要通信，必须待在节点内；PP 每个阶段边界才通信一次，DP 每步才通信一次，都能容忍跨节点。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>并行策略</th><th>切的维度</th><th>通信模式</th><th>通信频率</th><th>省的显存</th><th>适合的互联层级</th></tr></thead>
+              <tbody>
+                <tr><td>数据并行 DP</td><td>batch</td><td>AllReduce</td><td>每步反向一次</td><td>0（配 ZeRO 后切三件套）</td><td>节点间（高容忍）</td></tr>
+                <tr><td>张量并行 TP</td><td>层内矩阵</td><td>AllReduce / AllGather</td><td>每层前向+反向</td><td>参数 + 部分激活</td><td>节点内 NVLink（带宽敏感）</td></tr>
+                <tr><td>流水线并行 PP</td><td>层</td><td>点对点 send/recv</td><td>每阶段边界</td><td>参数 + 激活（按层分摊）</td><td>节点间（低通信量）</td></tr>
+                <tr><td>序列并行 SP</td><td>序列长度</td><td>AllGather + ReduceScatter</td><td>每层前向+反向</td><td>长序列激活值</td><td>节点内或高速互联</td></tr>
+                <tr><td>专家并行 EP</td><td>FFN 专家</td><td>All-to-All</td><td>每个 MoE 层</td><td>专家权重</td><td>节点间（需全互联）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">常见坑</span>
+            <strong>并行度不是越大越好。</strong> TP=8 看起来切得更细，但每层都要做 AllReduce，通信开销可能吃掉计算收益。通常 TP 不超过节点内 GPU 数（如 8），PP 的阶段数也不宜过多（气泡随阶段数增长），DP 太大会让全局 batch 超过临界值、导致同样 token 数下收敛变差。最优配置取决于模型大小、序列长度、硬件拓扑和数据量的联合搜索——没有万能配方，只有可复用的搜索流程。
+          </div>
+
+          <!-- ============ Section 7: 决策流程 ============ -->
+          <h2>怎么选：一套可执行的配置流程</h2>
+          <p>面对五个旋钮，实践中的调法是有顺序的。下面这条决策路径来自「先保证放得下，再追求跑得快」的基本原则：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  Start(["开始配置"]) --> Q1{"单卡能放下<br/>完整训练状态吗"}
+  Q1 -->|"能"| DPonly["纯 DP<br/>再加梯度累积凑 batch"]
+  Q1 -->|"不能"| Q2{"是 MoE 模型吗"}
+  Q2 -->|"是"| SetEP["先定 EP<br/>按专家数与卡数整除关系"]
+  Q2 -->|"否"| Q3
+  SetEP --> Q3{"节点内还放不下吗"}
+  Q3 -->|"是"| SetTP["开 TP<br/>取值 2 4 8 不超过单节点卡数"]
+  Q3 -->|"否"| Q4
+  SetTP --> SetSP["顺手开 Megatron 式 SP<br/>几乎零成本省激活"]
+  SetSP --> Q4{"序列超过 32K 吗"}
+  Q4 -->|"是"| SetCP["再开上下文并行<br/>Ring Attention"]
+  Q4 -->|"否"| Q5
+  SetCP --> Q5{"还是放不下吗"}
+  Q5 -->|"是"| SetPP["开 PP<br/>阶段数尽量小 micro-batch 尽量多"]
+  Q5 -->|"否"| Rest
+  SetPP --> Rest["剩余卡数全给 DP<br/>配 ZeRO 或 FSDP 分片"]
+  DPonly --> Tune["实测 MFU 并回头调参"]
+  Rest --> Tune
+  style Q1 fill:#faeeda,stroke:#ba7517
+  style Tune fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>并行配置的决策路径：显存约束优先，通信开销次之。每一步都是「不得不加」才加，因为每加一维都会带来额外的通信和实现复杂度。</figcaption>
+          </figure>
+
+          <p>把这个流程量化成一个能跑的估算脚本，能省掉大量试错。核心是把单卡显存拆成四项，看总和是否低于硬件上限：</p>
+
+          <pre><code class="language-python">GB = 1024 ** 3
+
+def per_gpu_memory(params_b, layers, hidden, seq, micro_bs,
+                   tp=1, pp=1, dp=1, zero_stage=0, recompute="none"):
+    """粗略估算单卡显存占用（GB）。数量级参考用，真实值以 profiler 为准。"""
+    P = params_b * 1e9
+
+    # 1) 模型状态：BF16 权重2 + BF16 梯度2 + FP32 主权重4 + Adam m/v 各4 = 16 字节/参数
+    #    TP 与 PP 直接把参数切开；ZeRO 沿 DP 维再切
+    p_shard = P / (tp * pp)
+    weight_bytes = 2 * p_shard
+    grad_bytes   = 2 * p_shard
+    optim_bytes  = 12 * p_shard
+    if zero_stage &gt;= 1: optim_bytes /= dp
+    if zero_stage &gt;= 2: grad_bytes  /= dp
+    if zero_stage &gt;= 3: weight_bytes /= dp
+    state = weight_bytes + grad_bytes + optim_bytes
+
+    # 2) 激活值：每层每 token 的中间量粗估为 c 倍 hidden，BF16 存储
+    #    这里 c 取一个经验常数，不同实现差异很大
+    c = 20
+    layers_here = layers / pp
+    act = c * micro_bs * seq * hidden * layers_here * 2 / tp
+    if recompute == "full":       act *= 0.05   # 只存每层入口，反向时重算
+    elif recompute == "selective": act *= 0.35  # 只重算注意力等访存密集部分
+
+    # 3) 通信缓冲与碎片，按经验留出余量
+    overhead = 4 * GB
+    return (state + act) / GB + overhead / GB
+
+cfg = dict(params_b=70, layers=80, hidden=8192, seq=8192, micro_bs=1)
+for tp, pp, z in [(1, 1, 0), (8, 1, 0), (8, 4, 1), (8, 4, 3)]:
+    m = per_gpu_memory(dp=8, tp=tp, pp=pp, zero_stage=z, recompute="selective", **cfg)
+    print(f"tp={tp} pp={pp} zero={z}  ->  {m:7.1f} GB  "
+          f"{'放得下' if m &lt; 80 else '超了'}")
+</code></pre>
+
+          <p>这个脚本不追求精确——激活值那个常数 $c$ 在不同实现里能差两倍——但它足以在提交千卡作业之前<strong>筛掉明显不可行的配置</strong>，把候选从几十个压到三五个，再用小规模实测挑最优。真正的精确核算方法见 <a href="../05-systems/compute-budget.html">FLOP、显存核算与性能剖析</a>。</p>
+
+          <details class="deep">
+            <summary>展开：等效并行度的计算实例</summary>
+            <div class="deep-body">
+              <p>假设要训练一个 405B 参数的模型，序列长度 8K，使用 2048 张 H100。一个可能的配置：</p>
+              <ul>
+                <li>TP = 8（一个 8 卡节点内，走 NVLink）</li>
+                <li>PP = 8（8 个流水线阶段，跨 8 个节点）</li>
+                <li>DP = 32（32 个数据并行副本）</li>
+              </ul>
+              <p>等效并行度 = $8 \times 8 \times 32 = 2048$，刚好用满 2048 张卡。每张卡上的有效参数量约为 $405\text{B} / (8 \times 8) \approx 6.3\text{B}$，按 16 字节/参数算是 101 GB——仍然超过 80GB，所以还必须叠加 ZeRO-1 把优化器状态沿 DP 维切开：$12 \times 6.3\text{B} / 32 \approx 2.4$ GB，加上权重和梯度的 $4 \times 6.3\text{B} = 25$ GB，模型状态降到约 27 GB，剩下的留给激活值。</p>
+              <p>micro-batch 数怎么定？$P=8$ 要求 $M \geq 32$ 才能把气泡压到 20% 以内，$M=64$ 时气泡约 11%。假设每个 micro-batch 是 1 条 8K 序列，那么一个 DP 副本一步处理 $64 \times 8\text{K} = 512\text{K}$ token，32 个副本合计约 <strong>1600 万 token 的全局 batch</strong>——这个量级已经偏大，可能需要减小 $M$ 或 DP 度来控制，这就是「显存、气泡、batch 大小」三者互相牵制的典型场景。</p>
+              <p>如果是 MoE 模型，还需要叠加 EP。例如 256 个路由专家分布在 32 张卡上，每卡 8 个专家，则 EP = 32。注意 EP 通常<strong>复用 DP 或 TP 的卡</strong>而不是额外占用——即 FFN 层按 EP 拓扑通信、注意力层按 TP/DP 拓扑通信，总卡数不变。把 EP 简单乘进等效并行度是常见的误解。</p>
+              <p style="margin-bottom:0">这些数字仅说明计算方法，实际配置需要根据显存上限、通信带宽和 MFU（模型算力利用率）反复调优。框架层面如何落地这些配置，见 <a href="training-frameworks.html">训练框架与工程实现</a>。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：为什么 TP 的通信量与卡数无关，而气泡与卡数强相关</summary>
+            <div class="deep-body">
+              <p>这两个性质常被混淆，但它们决定了 TP 和 PP 完全不同的扩展行为，值得单独辨析。</p>
+              <p><strong>TP 的通信量：与 TP 度无关。</strong> 一次 AllReduce 的对象是<strong>激活张量</strong>，形状为 $b \times s \times h$，与你把权重切成几份没有关系。用 Ring AllReduce 时每卡收发约 $2\frac{N-1}{N} \cdot bsh$ 字节，$N$ 增大时趋近常数 $2bsh$。所以从 TP=2 加到 TP=8，通信总量几乎不变，但计算被摊薄到 4 倍的卡上——<strong>计算通信比在恶化</strong>。这才是 TP 扩不上去的真正原因：不是通信变多了，而是计算变少了，通信占比自然上升。</p>
+              <p><strong>PP 的气泡：与 PP 度线性相关。</strong> 气泡率 $(P-1)/M$ 里 $P$ 在分子上，阶段数翻倍气泡就翻倍。要抵消它只能同步把 $M$ 翻倍，而 $M$ 又受全局 batch 大小的约束（$M \times \text{micro-bs} \times \text{DP} = \text{全局 batch}$）。当模型规模上去、DP 度也大时，$M$ 很容易顶到天花板，此时再加 PP 就是纯亏。</p>
+              <p><strong>推论。</strong> 两者的扩展瓶颈来源不同，所以正确的做法是<strong>都用一点，谁都别用满</strong>：TP 取 4 或 8 吃掉节点内带宽红利，PP 取 4 到 16 摊开层数，剩下的规模全部交给扩展性最好的 DP。这就是为什么几乎所有公开的千卡配置都长得很像。</p>
+              <p style="margin-bottom:0">顺带一提，这也解释了 Interleaved 1F1B 为什么值得：它在不增加 $P$ 的前提下把气泡除以 $v$，相当于绕开了「$M$ 有上限」这个约束。代价是通信次数变成 $v$ 倍，所以只在节点内高带宽时划算。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section 7A: ZeRO/FSDP、批次与 MoE 深化 ============ -->
+          <h2>ZeRO-1/2/3 与 FSDP：到底切了什么、何时通信</h2>
+          <p>把 DP 理解成「每卡一份完整状态」后，ZeRO 与 FSDP 的差别就可以落到同一张账本上：令 $W$、$G$、$O$ 分别表示参数、梯度和优化器状态，$D$ 为数据并行组大小。朴素 DP 每卡保存 $W+G+O$；分片策略则把其中一部分按 DP 维度切成 $1/D$，计算某一层时再临时聚合。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方案</th><th>每卡常驻状态（理想化）</th><th>关键通信时机</th><th>优点</th><th>主要代价/限制</th></tr></thead>
+              <tbody>
+                <tr><td>朴素 DP</td><td>$W+G+O$</td><td>反向结束 AllReduce 梯度</td><td>实现最简单、通信路径成熟</td><td>完全不省模型状态显存</td></tr>
+                <tr><td><strong>ZeRO-1</strong></td><td>$W+G+O/D$</td><td>优化器更新前后同步分片状态</td><td>通常是最小改动的显存收益</td><td>参数和梯度仍有完整副本</td></tr>
+                <tr><td><strong>ZeRO-2</strong></td><td>$W+G/D+O/D$</td><td>反向过程中 ReduceScatter 梯度，更新后同步</td><td>进一步降低梯度显存</td><td>梯度归约与累积语义更需小心</td></tr>
+                <tr><td><strong>ZeRO-3</strong></td><td>$W/D+G/D+O/D$</td><td>按参数分片在模块前 AllGather、用完后释放/重分片</td><td>模型状态近似按 $D$ 线性切分，可训练更大模型</td><td>参数通信频繁，需预取、重叠和良好拓扑</td></tr>
+                <tr><td><strong>FSDP FULL_SHARD</strong></td><td>与 ZeRO-3 同量级：参数、梯度、优化器状态都分片</td><td>按 FSDP wrapping 单元 AllGather 参数，反向后 ReduceScatter 梯度</td><td>PyTorch 原生模块封装，支持 mixed precision、CPU offload 等</td><td>wrap 粒度决定峰值显存与通信次数；模块状态必须保持一致</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>面试时不要只背「ZeRO-3 = FSDP」。两者的<strong>状态切分目标相近</strong>，但抽象层不同：DeepSpeed ZeRO 常以优化器/训练引擎为中心，FSDP 以模块 wrapping 为边界，在进入模块前聚合参数、离开后释放。FSDP 的 SHARD_GRAD_OP、HYBRID_SHARD 等模式还允许只在节点内分片、节点间做复制或较少通信；选择时应同时看模型状态、wrap 粒度和网络拓扑。参见 <a href="https://www.deepspeed.ai/tutorials/zero/" target="_blank" rel="noopener">DeepSpeed ZeRO 官方教程</a> 与 <a href="https://pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener">PyTorch FSDP 文档</a>。</p>
+          <div class="callout tip">
+            <span class="callout-t">面试回答模板</span>
+            「先按 $W/G/O$ 三类状态说清楚：ZeRO-1 切 $O$，ZeRO-2 再切 $G$，ZeRO-3 连 $W$ 也切；切得越彻底，常驻显存越低，但参数 AllGather/梯度 ReduceScatter 越频繁。FSDP FULL_SHARD 是模块级的全分片实现，工程上重点调 wrapping、prefetch、通信重叠和 CPU/NVMe offload，而不是只看一个 stage 名字。」
+          </div>
+
+          <h2>DP/TP/PP/EP 怎么组合：先问带宽，再问显存</h2>
+          <p>一个可迁移的选型顺序是：<strong>先用 TP/PP/EP 解决「单副本放不下」的问题，再用 DP 扩吞吐，最后用 ZeRO/FSDP 压状态显存</strong>。并行维度不是简单相乘：MoE 的 EP 通常复用 TP 或 DP 的设备组，不能把 EP 盲目再乘一次。</p>
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  A([输入模型与集群]) --> B{单卡能放下训练状态?}
+  B -->|能| C[DP + 梯度累积]
+  B -->|不能| D{MoE 专家数/路由容量需要分布?}
+  D -->|是| E[先定 EP<br/>专家数可被 EP 整除]
+  D -->|否| F[跳过 EP]
+  E --> G{TP 组能完全放入节点内?}
+  F --> G
+  G -->|否| H[减小 TP 或改用 PP/ZeRO]
+  G -->|是| I[TP=2/4/8 + SP<br/>高频集合通信留在 NVLink]
+  I --> J{序列/激活仍放不下?}
+  H --> J
+  J -->|是| K[加 CP/Ring Attention 或 PP]
+  J -->|否| L[保留当前 TP/PP]
+  K --> M[剩余设备给 DP + ZeRO/FSDP]
+  L --> M
+  C --> N[测 MFU、通信占比、阶段空泡]
+  M --> N
+  N --> O([用 2/8/32 卡逐级放大验证])
+  style I fill:#e6f1fb,stroke:#185fa5
+  style M fill:#eaf3de,stroke:#4a8a2a
+            </div>
+            <figcaption>决策树的硬约束：TP/SP 的每层集合通信优先落在节点内；PP 的点对点和 DP 的低频同步可以跨节点；EP 的 All-to-All 只有在拓扑和负载均衡都可控时才扩大。</figcaption>
+          </figure>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>并行维度</th><th>典型通信</th><th>首选链路</th><th>跨节点判断</th><th>常见决策</th></tr></thead>
+              <tbody>
+                <tr><td>TP/SP</td><td>每层 AllReduce、AllGather、ReduceScatter</td><td>NVLink/NVSwitch</td><td>跨节点会把延迟乘到每层，通常避免</td><td>TP 不超过单节点卡数；长序列顺手开 SP</td></tr>
+                <tr><td>PP</td><td>相邻 stage 的激活/梯度 send/recv</td><td>高速 IB/RoCE 即可</td><td>通信频率低、可跨节点，但需均衡 stage</td><td>显存仍不够时加 PP，并提高 micro-batch</td></tr>
+                <tr><td>DP + ZeRO/FSDP</td><td>梯度 ReduceScatter、参数/状态同步</td><td>节点间网络可承受</td><td>DP 组越大，带宽与同步尾延迟越关键</td><td>剩余卡优先给 DP，控制 global batch</td></tr>
+                <tr><td>EP</td><td>每个 MoE 层 dispatch/combine All-to-All</td><td>全互联 NVSwitch 或高质量 IB</td><td>跨节点前先测 all-to-all，有热点就不要盲目扩大</td><td>EP 与 TP/DP 复用 mesh；监控 token drop 和专家方差</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>粗略判断通信是否会成为瓶颈，可用「通信时间 ÷ 计算时间」做第一版筛选：$t_{comm}\approx V/B_{eff}+n_{collective}L$。其中 $V$ 是本步通信字节数，$B_{eff}$ 是实测有效带宽，$L$ 是单次集合通信延迟。TP 的 $n_{collective}$ 随层数增长，PP 的 $V$ 较小且可流水，DP 则通常只在同步点出现。正式结论应来自 NCCL profiler 与实测，而不是只看标称带宽；集合通信语义和调优入口见 <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html" target="_blank" rel="noopener">NCCL Collectives 文档</a>。</p>
+
+          <h2>Pipeline bubble 与 batch：四个名词必须分清</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>名词</th><th>定义</th><th>与其他量的关系</th></tr></thead>
+              <tbody>
+                <tr><td><strong>micro-batch</strong></td><td>一次送入流水线、单次前向/反向处理的最小 batch</td><td>PP 调度的基本颗粒；每个 micro-batch 通常产生一份梯度贡献</td></tr>
+                <tr><td><strong>gradient accumulation steps</strong>（$A$）</td><td>多少个 micro-batch 梯度累加后才更新一次参数</td><td>无 PP 时可直接理解为连续 $A$ 个 micro-batch；有 PP 时常与 $M$ 相关但不一定相等</td></tr>
+                <tr><td><strong>global batch</strong></td><td>一次 optimizer update 覆盖的全局样本/ token 数</td><td>$B_{global}=B_{micro}\times A\times DP$（按 token 计时还要乘每条序列长度）</td></tr>
+                <tr><td><strong>pipeline micro-batches</strong>（$M$）</td><td>一次流水线 flush 中灌入的 micro-batch 数</td><td>1F1B 的近似 bubble 比例为 $(P-1)/M$；$M$ 太小会让卡空等</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>算例：$DP=8$，每卡每次处理 $B_{micro}=2$ 条、每条 $8192$ token，梯度累积 $A=16$，则一次更新的全局 token 数为 $2\times8192\times16\times8=2{,}097{,}152$（约 2.1M tokens）。若再使用 $PP=P=8$，选择一次 flush 的 $M=64$ 个 micro-batch，则 bubble 近似为 $(8-1)/64=10.94\%$；此时每个 DP 副本在一个 update 内需安排的 micro-batch 数、梯度累积语义和框架的 virtual pipeline 配置必须对齐，不能只把 $M$ 当成「随便加大的 batch」。当目标 global batch 固定时，增大 DP 或 $B_{micro}$ 会反向压缩可用的 $A/M$，因此<strong>气泡、激活显存和收敛 batch 是同一个约束系统</strong>。GPipe 对 micro-batch/流水线的原始定义见 <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener">GPipe 论文</a>。</p>
+          <div class="callout warn">
+            <span class="callout-t">对拍检查</span>
+            多卡 loss 不一致时，先检查梯度是按 token 数做平均还是按 micro-batch 数做平均；再核对最后一个 accumulation window 是否被错误地当成完整窗口。将 $B_{global}$、有效 token 数、学习率 schedule 和 warmup step 全部打印出来，避免「卡数变了但训练语义也悄悄变了」。
+          </div>
+
+          <h2>MoE 的 All-to-All：capacity factor 不只是一个旋钮</h2>
+          <p>设本地输入 token 数为 $T$、专家数为 $E$、路由 top-$k$、容量因子为 $c$。常见实现按每个专家预留容量槽，单专家容量可粗略写为 $C=\lceil c\cdot T\cdot k/E\rceil$；$c$ 越小显存和通信 buffer 越省，但越容易出现 token 超出容量。超出的 token 可能被丢弃、走 residual，或在实现允许时 reroute；三者对训练行为不同，必须查框架语义，不能把「capacity factor=1」理解成没有损失。Switch Transformer 对 capacity factor、token dropping 与 top-1 路由有清晰讨论，见 <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">Switch Transformers 论文</a>。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>现象</th><th>根因</th><th>观测指标</th><th>处理顺序</th></tr></thead>
+              <tbody>
+                <tr><td>少数专家满载、其他专家空闲</td><td>路由偏置或负载均衡损失不足</td><td>每专家 token histogram、max/mean load</td><td>先检查 router logits/辅助损失，再调 capacity factor</td></tr>
+                <tr><td>token drop 上升、loss 变差</td><td>容量槽不足或跨节点拥塞导致有效容量下降</td><td>dispatch 前后 token 数、drop rate、每层每 rank 统计</td><td>提高 $c$、降低 top-$k$ 或改善均衡；同时核对 residual 语义</td></tr>
+                <tr><td>All-to-All 尾延迟很长</td><td>消息碎片多、拓扑不匹配、某 rank 专家热点</td><td>all-to-all effective bandwidth、p95/p99、rank 时间线</td><td>合并小消息、重排 EP 组、把热点专家复制/迁移</td></tr>
+                <tr><td>吞吐忽高忽低</td><td>不同 batch 的路由分布波动</td><td>step-level expert load variance</td><td>固定随机种子做对拍，再评估 router noise 与 capacity</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>All-to-All 需要同时看<strong>平均负载和最慢专家</strong>：同步 MoE 层的 step 时间近似由最慢 rank 决定。一个简单的健康指标是 $\text{imbalance}=\max_e(load_e)/(\operatorname{mean}_e load_e+\epsilon)$；它不是统一标准，但能快速定位「平均吞吐正常、尾部 rank 已拖垮全局」的问题。GShard 对自动分片和专家路由的系统设计可参见 <a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener">GShard 论文</a>。</p>
+
+          <h2>故障排查 Checklist：吞吐、通信占比与 OOM</h2>
+          <ol>
+            <li><strong>先做可复现基线：</strong>固定数据、随机种子、精度和 sequence packing，在单卡/2 卡/单节点逐级比较 loss、tokens/s、峰值显存。</li>
+            <li><strong>吞吐低：</strong>记录 MFU、tokens/s、每层 kernel 时间和 data-loader 等待；若 GPU 利用率低但通信高，查 TP/EP 组是否跨节点，及 NCCL effective bandwidth。</li>
+            <li><strong>通信占比高：</strong>将通信时间拆成 TP collectives、DP ReduceScatter/AllReduce、PP send/recv、EP All-to-All；确认是否与 GEMM 重叠，避免只看总 NCCL 时间。</li>
+            <li><strong>PP 空泡大：</strong>计算 $(P-1)/M$，检查 stage 时间方差、virtual pipeline 设定和首尾 embedding/lm-head 是否失衡。</li>
+            <li><strong>显存 OOM：</strong>分别打印参数、梯度、优化器、激活、通信 buffer 与 allocator reserved；先减 micro-batch/开 selective recompute，再考虑 TP/PP/ZeRO/FSDP，避免只增卡却不改变单卡峰值。</li>
+            <li><strong>MoE 异常：</strong>每层记录 capacity、token drop、专家 load 方差、dispatch/combine 时间；drop rate 为零也不代表均衡，可能只是容量因子过大把浪费隐藏了。</li>
+            <li><strong>结果不一致或卡死：</strong>核对 loss scaling、梯度平均语义、collective 调用顺序和所有 rank 的条件分支；用最小模型做单卡/多卡数值对拍。</li>
+          </ol>
+          <p>推荐把这些指标写进每一步或每 N 步的结构化日志，而不是只依赖 nvidia-smi。PyTorch profiler 的通信与算子分析入口见 <a href="https://pytorch.org/docs/stable/profiler.html" target="_blank" rel="noopener">PyTorch Profiler 文档</a>；NCCL 调试变量与诊断方式见 <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener">NCCL Environment Variables</a>。</p>
+          <pre><code class="language-python"># 伪代码：先定位单卡峰值，再判断是哪一类并行拖慢了训练
+for step in train_steps:
+    stats = profiler.snapshot()  # peak_allocated、reserved、通信与 kernel 时间
+    if stats.peak_allocated &gt; 0.9 * gpu_memory:
+        if stats.activation_bytes &gt; stats.model_state_bytes:
+            enable("selective_recompute")
+            reduce("micro_batch")
+        elif stats.model_state_bytes &gt; 0.7 * gpu_memory:
+            enable("ZeRO-3_or_FSDP_FULL_SHARD")
+            increase("TP_or_PP_only_if_topology_allows")
+    if stats.comm_ratio &gt; 0.3:
+        assert tp_group_is_single_node()
+        overlap("collective", "backward_compute")
+    if stats.pipeline_bubble &gt; 0.15:
+        increase("pipeline_micro_batches")
+        check("stage_time_variance")
+    if stats.moe_drop_rate &gt; 0 or stats.expert_imbalance &gt; 1.5:
+        increase("capacity_factor")
+        tune("load_balance_loss_or_router")
+</code></pre>
+
+          <h2>系统设计题：70B、128K 训练如何拆</h2>
+          <p><strong>题目：</strong>用 80GB H100 训练 70B dense Transformer，序列长度 128K，要求可扩展到多节点，如何设计并行与验证方案？下面是面试中可落地的回答框架，数字是估算起点，不是固定答案。</p>
+          <ol>
+            <li><strong>先算账：</strong>BF16 + Adam 的 $W+G+O$ 约 $16\times70\text{B}=1.12$ TB；先用 ZeRO-3/FSDP FULL_SHARD 沿 DP 切状态，仍需为 128K 激活预留空间。</li>
+            <li><strong>节点内：</strong>每 8 卡节点取 TP=8，开启 Megatron SP；TP 组不跨节点。若注意力仍因 128K 激活放不下，在同一 TP 组上增加 context parallel/Ring Attention，或开启 selective activation recompute。</li>
+            <li><strong>节点间：</strong>把 PP 放在节点边界，例如 PP=4/8，stage 按 profile 均衡；PP 的激活 send/recv 走 IB/RoCE。剩余卡给 DP，并用 ZeRO-3/FSDP 管理状态。</li>
+            <li><strong>batch 约束：</strong>假设每卡 micro-batch=1、DP=8、gradient accumulation=8，则 global tokens/update $=1\times128K\times8\times8=8.39$M；再根据优化稳定性与数据规模调整，不要为了降低 bubble 无限增大 $M$。</li>
+            <li><strong>验证顺序：</strong>先单节点 TP/SP 跑通，再 2 节点验证 PP，随后加 DP 分片；每一步对拍 loss/梯度、峰值显存、tokens/s。最后用 profiler 检查 TP 通信是否留在节点内、PP bubble、ZeRO 参数 AllGather 是否与计算重叠。</li>
+          </ol>
+          <div class="callout tip">
+            <span class="callout-t">高频问答</span>
+            <p><strong>问：为什么不直接 TP=64？</strong> 答：TP 每层都要集合通信，跨节点会把高频激活通信放到低带宽网络；通常用节点内 TP，跨节点改用 PP/DP。</p>
+            <p><strong>问：ZeRO-3 和 PP 能否同时用？</strong> 答：可以，PP 先按层切副本，ZeRO/FSDP 再沿 DP 组切每个 stage 的训练状态；要重新核对参数 AllGather 峰值与通信组。</p>
+            <p><strong>问：增大 micro-batch 一定更快吗？</strong> 答：不一定。它能降低 $(P-1)/M$ bubble，但会增加激活显存和 global batch；超过硬件或收敛甜点区后反而变差。</p>
+            <p style="margin-bottom:0"><strong>问：MoE 的 EP 越大越好吗？</strong> 答：不是。EP 减少单卡专家状态，却增加 All-to-All 路径和负载尾延迟；先用实测 all-to-all 带宽、token drop 和专家负载方差决定。</p>
+          </div>
+
+          <!-- ============ Section 8: 演进 ============ -->
+          <h2>技术演进：为什么会长成今天这个样子</h2>
+          <p>五种并行不是一次设计出来的，而是被一个个具体瓶颈逼出来的。理解这条时间线，有助于判断下一个瓶颈会在哪里：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 并行技术的演进脉络
+  2018 : GPipe 提出 micro-batch 流水线 把巨型模型切到多卡
+  2019 : Megatron-LM 给出 Transformer 专属的张量并行切法 : ZeRO 提出把优化器状态沿数据并行维分片
+  2020 : GShard 用 All-to-All 实现专家并行 让参数量与算力解耦
+  2021 : 三维并行加 1F1B 交错调度成为千卡训练的事实标准
+  2022 : 序列并行与选择性重计算把激活值这座大山压下来
+  2023 : Ring Attention 把上下文推向百万级 : FSDP 让分片数据并行进入主流框架
+  2024 : 5D 并行成为万卡 MoE 训练的默认组合 通信与计算重叠成为调优主战场
+            </div>
+            <figcaption>并行技术的演进：每一代都在解决上一代暴露出的新瓶颈——先是参数放不下，再是优化器状态放不下，然后是激活值放不下，现在是通信打不满。</figcaption>
+          </figure>
+
+          <p>看清这条线索会发现一个规律：<strong>显存瓶颈被逐个消灭之后，剩下的全是通信问题</strong>。2024 年之后的优化重心，已经从「怎么切」转向「怎么把通信藏起来」——梯度 AllReduce 与反向计算重叠、All-to-All 与专家计算重叠、参数 AllGather 提前预取。这些都不改变并行策略本身，只是让 GPU 在等数据的时间里有活可干。</p>
+
+          <!-- ============ Section 9: 坑 ============ -->
+          <h2>真实会踩的坑</h2>
+          <p>原理讲完了，最后列一份来自真实训练现场的问题清单。这些坑的共同特征是：<strong>训练不报错，照跑不误，但结果或速度莫名其妙地差</strong>。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>症状</th><th>可能原因</th><th>怎么确认</th><th>处理</th></tr></thead>
+              <tbody>
+                <tr><td>MFU 只有 15% 左右</td><td>TP 组跨了节点</td><td>打印每个 TP 组的 rank 列表，看是否连续</td><td>调整 device mesh 的维度顺序</td></tr>
+                <tr><td>加卡不提速甚至变慢</td><td>PP 气泡率过高，$M$ 太小</td><td>算 $(P-1)/M$；用 profiler 看各阶段空闲时段</td><td>增大 micro-batch 数或减少 PP 阶段</td></tr>
+                <tr><td>某几张卡显存爆、其他很闲</td><td>PP 阶段负载不均（首尾带 embedding / lm_head）</td><td>打印每阶段的参数量与峰值显存</td><td>手工调整各阶段层数</td></tr>
+                <tr><td>MoE 训练效果远低于预期</td><td>容量因子过小，token 被静默丢弃</td><td>统计每层的 token 丢弃率</td><td>提高容量因子或加强均衡损失</td></tr>
+                <tr><td>loss 曲线与单卡基线对不上</td><td>梯度累积时 loss 未按累积步数归一</td><td>用极小规模跑单卡 vs 多卡对拍</td><td>检查 loss 缩放与 AllReduce 的 average/sum 语义</td></tr>
+                <tr><td>训练偶发卡死</td><td>不同 rank 执行到了不同的集合通信调用</td><td>看卡死时各 rank 的调用栈是否一致</td><td>确保所有分支在所有 rank 上对称执行</td></tr>
+                <tr><td>换了并行配置后效果变差</td><td>全局 batch 变了但学习率没跟着调</td><td>核对 $M \times \text{micro-bs} \times \text{DP}$</td><td>并行配置与全局 batch 解耦，学习率随 batch 调整</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">一条通用调试原则</span>
+            分布式训练的第一原则是<strong>「先在 2 卡上把逻辑跑对，再上 2000 卡」</strong>。绝大多数分布式 bug（通信组划分错、loss 归一错、分支不对称）在 2 卡 + 极小模型上就能暴露，且几秒钟一个迭代，调试成本是千卡集群的万分之一。上大集群之前，务必有一条「单卡结果 vs 多卡结果」的数值对拍流程。
+          </div>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>为什么必须并行</strong>：混合精度 Adam 训练约需 <strong>16 字节/参数</strong>，70B 模型光模型状态就 1.1 TB，加上激活值远超单卡容量。</li>
+            <li><strong>本质</strong>：五种并行各自切一个维度——DP 切 batch、TP 切层内矩阵、PP 切层、SP 切序列、EP 切专家——叠加后等效并行度等于各维度之积。</li>
+            <li><strong>DP</strong>：Ring AllReduce 通信量约 $2\Psi$ 且与卡数无关，扩展性最好，但<strong>本身不省显存</strong>，需配 ZeRO / FSDP。</li>
+            <li><strong>TP</strong>：Megatron 把 Column/Row Parallel 配对，让 FFN 与注意力块内部零通信，每块只需块末一次 AllReduce。通信量与 TP 度无关，所以 TP 越大计算通信比越差——<strong>不要超过单节点卡数</strong>。</li>
+            <li><strong>PP</strong>：气泡率 $\approx (P-1)/M$，Interleaved 1F1B 可再除以 $v$。1F1B 相对 GPipe 的核心收益是激活值显存从 $O(M)$ 降到 $O(P)$。通信量最小，最适合跨节点。</li>
+            <li><strong>SP</strong>：区分两件事——Megatron 式 SP 补 TP 的显存短板、总通信量不变（能开就开）；上下文并行 / Ring Attention 真正切开序列，是长上下文的必需品。</li>
+            <li><strong>EP</strong>：All-to-All 是最难的通信原语，同步特性让负载不均的惩罚全局化；容量因子过小会<strong>静默丢 token</strong>，必须监控丢弃率。</li>
+            <li><strong>拓扑映射</strong>：通信频率高的（TP/SP）放节点内 NVLink，频率低或量小的（DP/PP）放节点间网络。device mesh 的维度顺序决定了这件事，配错速度差数倍。</li>
+            <li><strong>配置顺序</strong>：先看单卡放不放得下 → MoE 先定 EP → 不够就加 TP（顺手开 SP）→ 长序列加 CP → 还不够加 PP → 剩下全给 DP + ZeRO。</li>
+            <li><strong>框架实现</strong>：以上原理如何变成配置项——ZeRO 的三个阶段、FSDP 的 sharding、Megatron 的 TP+PP——见 <a href="training-frameworks.html">训练框架与工程实现</a>。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism (Shoeybi et al., 2019) — 张量并行在 Transformer 层上的高效切分方案，Column/Row Parallel 配对的出处 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">arXiv:1909.08053</a></li>
+            <li>Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (Narayanan et al., 2021) — 引入 1F1B 与 Interleaved 调度，系统分析 DP+TP+PP 三维并行的组合与 MFU · <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">arXiv:2104.04473</a></li>
+            <li>GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism (Huang et al., 2019) — 流水线并行与 micro-batch 调度的奠基工作 · <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener">arXiv:1811.06965</a></li>
+            <li>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (Rajbhandari et al., 2019) — 把优化器状态、梯度、参数沿数据并行维分片的三个阶段 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">arXiv:1910.02054</a></li>
+            <li>Reducing Activation Recomputation in Large Transformer Models (Korthikanti et al., 2022) — Megatron 式序列并行与选择性重计算，激活值显存优化的关键文献 · <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">arXiv:2205.05198</a></li>
+            <li>Ring Attention with Blockwise Transformers for Near-Infinite Context (Liu et al., 2023) — 环形传递 K/V 分块实现上下文并行 · <a href="https://arxiv.org/abs/2310.01889" target="_blank" rel="noopener">arXiv:2310.01889</a></li>
+            <li>GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding (Lepikhin et al., 2020) — 专家并行与 All-to-All 分发的早期系统化方案 · <a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener">arXiv:2006.16668</a></li>
+            <li>DeepSpeed 官方教程 — Microsoft DeepSpeed 关于 ZeRO、3D 并行与 MoE 专家并行的工程文档，配置项含义以官方文档为准 · <a href="https://www.deepspeed.ai/tutorials/" target="_blank" rel="noopener">deepspeed.ai/tutorials</a></li>
+            <li>Zero Bubble Pipeline Parallelism — 通过把反向拆成「算输入梯度」与「算权重梯度」两步来填补流水线气泡的方案，论文名可搜索获取。</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            并行原理清楚了，下一个问题是<strong>用哪个框架把这些策略跑起来</strong>——ZeRO、FSDP、Megatron-LM、torchtitan 各自封装了哪些并行、怎么配置、怎么避坑，见 <a href="training-frameworks.html">训练框架与工程实现</a>。训练起来后怎么压显存、用 BF16/FP8 提速，见 <a href="mixed-precision.html">混合精度与显存优化</a>；训练炸了怎么排查，见 <a href="stability-optimizer.html">训练稳定性与优化器</a>。想先补硬件侧的基本功（SM、HBM、带宽墙从何而来），见 <a href="../05-systems/gpu-architecture.html">GPU 执行模型与显存层级</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

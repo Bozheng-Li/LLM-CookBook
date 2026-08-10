@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAG 生产运维 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="12-llmops" data-topic="rag-in-production">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>RAG 生产运维</h1>
+            <p class="lead">RAG demo 跑通后，真正的考验是三个月后它还好不好用。源文档改了但向量库没刷新、检索策略调整后静默掉点、上下文悄悄超出窗口——这些不是算法问题，是运维问题。让它更准归 advanced-rag，让它跑三个月不烂掉归本条。本节讲 RAG 上线后三类最常见的静默失效，以及各自的监控信号和治理手段。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>RAG 在生产中的失效不是报错——它照常返回答案，只是答案基于过时的信息、被噪声淹没的上下文、或被截断的检索结果。三类失效各有不同的根因，需要不同的监控信号来发现。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  USER["用户提问"] --> RET["检索"]
+  RET --> F1["失效一: 陈旧 Embedding<br/>源文档更新但向量库没刷"]
+  RET --> F2["失效二: 检索噪声<br/>相关 chunk 被无关 chunk 稀释"]
+  RET --> F3["失效三: 上下文溢出<br/>检索结果超出模型窗口"]
+
+  F1 --> R1["信号: 文档版本号 vs<br/>向量版本号不一致"]
+  F2 --> R2["信号: 检索 Top-K<br/>相似度分数偏低"]
+  F3 --> R3["信号: 输入 token 数<br/>接近上下文窗口"]
+
+  style F1 fill:#fce4e4,stroke:#c0392b
+  style F2 fill:#fff8e6,stroke:#d4a017
+  style F3 fill:#e6f1fb,stroke:#185fa5
+              </div>
+              <figcaption>三类 RAG 静默失效及各自的监控信号。每类失效的根因不同，监控指标也不同，不能用一个指标覆盖</figcaption>
+            </figure>
+          </div>
+
+          <h2>为什么 RAG 的运维和其他系统不一样</h2>
+          <p>想象你把一个大型图书馆改造成了"AI 图书管理员"。图书管理员本身很聪明（模型），但它的工作质量取决于三件事：书架上是不是最新版的书（索引）、找书的时候有没有被无关书页干扰（检索质量）、以及它手头那本"参考手册"有没有超出它能一次性看完的页数（上下文窗口）。传统系统运维只关心"图书馆门有没有开"（可用性），而 RAG 运维还要关心<strong>"书架上的书是不是最新的、找的书对不对、参考手册塞没塞爆"</strong>——这三件事每一件都在静默变化，而且几乎都不产生报错。</p>
+          <p>传统检索系统（如 Elasticsearch）的运维关注的是索引健康、查询延迟、可用性。RAG 多了一层：检索结果要喂给 LLM 生成答案，所以<strong>检索质量</strong>本身就成了运维指标。更麻烦的是，RAG 的质量问题几乎都是静默的——系统不报错，只是答案开始变差。</p>
+          <div class="callout warn">
+            <span class="callout-t">RAG 运维的核心难点</span>
+            传统系统的故障是"不工作"——503、超时、崩溃。RAG 的故障是"工作得不好"——返回了答案，但基于过时信息、被噪声干扰、或丢了关键上下文。<strong>用户不会报错，只会觉得"这个 AI 越来越笨了"</strong>，然后默默流失。你需要主动监控，不能等反馈。
+          </div>
+          <p>本节不讨论怎么让 RAG 更准——那是 <a href="../10-applications/advanced-rag.html">Advanced RAG</a> 的范畴。本节讨论的是：一个已经调好的 RAG 系统，怎么保证它在生产环境中持续保持质量，不随时间衰减。</p>
+
+          <h3>权威图：RAG 的骨架长什么样</h3>
+          <p>聊运维之前，先确认我们运维的对象。RAG 的骨架来自 2020 年那篇奠基论文《Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks》，图里画的就是"检索器 + 生成器"这个组合：左边检索器从文档库里取出与输入最相关的片段，右边生成器拿到这些片段后生成答案。今天所有 RAG 系统——不管前端接了多少层查询改写、重排、混合检索——底层都还是这张图的形状。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/10-applications/rag/fig1.png" alt="论文原图：RAG 总览——检索器从非参数记忆（文档索引）中取出相关片段，生成器基于片段与输入生成输出，分为 RAG-Sequence 与 RAG-Token 两种形式" loading="lazy" style="max-width:680px">
+            <figcaption>
+              <span class="pf-title">图：RAG 总览原图——检索器（左）从文档库取出片段，生成器（右）用片段生成答案。生产运维的所有对象（文档库、索引、检索、生成）都能在这张图上对号入座</span>
+              <span class="pf-src">论文原图 · Lewis et al., <em>Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks</em>, 2020, Figure 1 · <a href="https://arxiv.org/abs/2005.11401" target="_blank" rel="noopener">arXiv:2005.11401</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，把它拆成三个"可以被运维"的部分看。第一，<strong>"Non-Parametric Memory"（非参数记忆）</strong>就是你的文档库 + 索引——这是运维最需要盯的部分：文档在更新，索引却没有跟着更新，就是本页后面要讲的"陈旧 Embedding"。第二，<strong>检索器（Retriever）</strong>负责从记忆里取片段——它取回来的片段质量如何，对应"检索噪声"。第三，<strong>生成器（Generator）</strong>把片段和输入一起生成答案——它一次能吞下的上下文是有限的，对应"上下文溢出"。整张图其实就告诉我们一句话：<strong>RAG 系统是"数据 + 检索 + 生成"三段式的组合体，而生产里出问题的地方，几乎都在前两段（数据和检索），而不是模型本身。</strong>把这句话记牢，后面的三类失效就都有了解释框架。</p>
+
+          <h2>失效一：陈旧 Embedding——最隐蔽的杀手</h2>
+
+          <h3>怎么发生</h3>
+          <p>你的知识库不是静态的——产品文档在更新、政策在调整、价格在变化。当源文档更新后，你需要重新生成对应的 embedding 并更新向量库。如果这个同步出了问题（定时任务挂了、增量更新漏了某批文档、文档被修改但 hash 没变导致跳过），向量库里存的还是旧版本的 embedding。</p>
+          <p>结果就是：用户问"最新的退款政策是什么"，RAG 检索到了旧的退款政策文档，模型基于旧政策生成答案——<strong>自信地答了过时的信息</strong>。没有报错，没有告警，只有用户被误导。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">为什么这个问题特别难发现</span>
+            陈旧 embedding 不会影响任何技术指标——检索延迟正常、检索结果数量正常、模型生成正常。唯一的问题是"内容过时了"，而这只有人看了答案才能发现。等你从用户投诉中发现时，可能已经错误回答了几千个请求。关于幻觉的成因和检测方法，详见 <a href="../13-evaluation/hallucination.html">幻觉</a>。
+          </div>
+
+          <h3>监控信号：文档版本 vs 向量版本</h3>
+          <p>发现陈旧 embedding 的关键是对账（reconciliation）。为每个文档维护两个版本号：</p>
+          <ul>
+            <li><strong>源文档版本</strong>：文档最后修改时间或内容 hash。文档管理系统里就有。</li>
+            <li><strong>向量版本</strong>：该文档对应的 embedding 生成时间或 embedding 模型版本。向量库的元数据里应该记录。</li>
+          </ul>
+          <p>定期跑一个对账任务：扫描所有文档，比对源文档版本和向量版本。<strong>源文档版本比向量版本新 = 该文档的 embedding 是陈旧的</strong>。把"陈旧文档数"作为一个监控指标，超过阈值就告警。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  DOC["源文档库"] --> HASH["计算内容 hash"]
+  HASH --> CMP{"hash == 向量库<br/>存的 hash?"}
+  CMP -->|"不一致"| STALE["标记为陈旧"]
+  CMP -->|"一致"| OK["正常"]
+  STALE --> REEMB["重新生成 embedding"]
+  REEMB --> UPDATE["更新向量库"]
+  UPDATE --> OK
+  style STALE fill:#fce4e4,stroke:#c0392b
+  style OK fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>Embedding 对账流程：比对源文档和向量库中的版本，不一致的重新生成。这是发现陈旧 embedding 的核心机制</figcaption>
+          </figure>
+
+          <details class="deep">
+            <summary>展开：一个可以直接抄的对账任务（Python 骨架）</summary>
+            <div class="deep-body">
+              <p>对账任务的主干逻辑很朴素，难点全在边界情况上：文档删除、chunk 级别的残留、以及"内容没变但切分策略变了"。下面这段骨架把三种情况都覆盖了。</p>
+              <pre><code class="language-python">import hashlib
+
+CHUNKER_VERSION = "v3"        # 切分策略版本，变了要全量重建
+EMBEDDER_VERSION = "bge-m3"   # embedding 模型版本
+
+def content_hash(text: str) -&gt; str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def reconcile(doc_store, vector_store, report):
+    doc_ids = set(doc_store.list_ids())
+    indexed_ids = set(vector_store.list_doc_ids())
+
+    # 情况一：源文档已删除，向量还在 —— 孤儿向量
+    for doc_id in indexed_ids - doc_ids:
+        vector_store.delete_by_doc(doc_id)
+        report.count("orphan_deleted")
+
+    # 情况二：新文档从未被索引
+    for doc_id in doc_ids - indexed_ids:
+        reindex(doc_id, doc_store, vector_store)
+        report.count("new_indexed")
+
+    # 情况三：已索引，但内容或版本号对不上
+    for doc_id in doc_ids &amp; indexed_ids:
+        doc = doc_store.get(doc_id)
+        meta = vector_store.get_doc_meta(doc_id)
+        stale = (
+            meta["content_hash"] != content_hash(doc.text)
+            or meta["chunker_version"] != CHUNKER_VERSION
+            or meta["embedder_version"] != EMBEDDER_VERSION
+        )
+        if stale:
+            # 关键：先按 doc_id 删干净所有旧 chunk，再整体重建
+            vector_store.delete_by_doc(doc_id)
+            reindex(doc_id, doc_store, vector_store)
+            report.count("stale_rebuilt")
+
+    report.gauge("stale_ratio",
+                 report.get("stale_rebuilt") / max(len(doc_ids), 1))
+</code></pre>
+              <p>三个必须强调的细节：</p>
+              <ul>
+                <li><strong>重建必须"先按 doc_id 全删、再整体插入"，不能逐 chunk 更新。</strong>文档改动会让 chunk 边界整体位移——原来的第 3 个 chunk 在新文档里可能对应第 4 个，逐 chunk 覆盖会留下一批错位的残留，而且这些残留在检索时看起来完全正常。</li>
+                <li><strong>陈旧判定要同时看三个版本号</strong>：内容 hash、切分策略版本、embedding 模型版本。只比内容 hash 的话，你换了切分策略或换了 embedding 模型时，对账任务会一致认为"一切正常"。</li>
+                <li><strong>把 <code>stale_ratio</code> 做成告警指标</strong>，而不只是打一行日志。正常情况下每次对账后它应该回到接近 0；如果它长期停在某个水位，说明有一批文档的同步链路一直是坏的，只是没人发现。</li>
+              </ul>
+            </div>
+          </details>
+
+          <h3>增量更新策略</h3>
+          <p>全量重建向量库太慢，通常用增量更新。但增量更新有几个坑：</p>
+          <ul>
+            <li><strong>删除问题</strong>：文档被删了，但向量库里的对应向量没删（因为删除操作和更新操作走不同路径）。定期清理"孤儿向量"——源文档已不存在但向量还在的条目。</li>
+            <li><strong>chunk 粒度问题</strong>：一个文档切成 10 个 chunk，文档改了其中一段。如果增量更新是文档级的（整个文档重新切分重新入库），旧的 10 个 chunk 需要先删除再插入新的。如果只做"新增"不做"删除"，会残留旧 chunk。</li>
+            <li><strong>更新延迟</strong>：文档更新到向量库更新之间的时间窗口，用户可能拿到旧信息。对时效性要求高的场景（如价格、库存），需要做准实时更新或加一层缓存校验。</li>
+          </ul>
+
+          <p>把一个文档在向量库里可能经历的状态画在一起，就能看清增量更新到底要处理哪些迁移路径。<strong>漏掉其中任何一条，都会在向量库里留下一批查不出来的脏数据：</strong></p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 待索引: 文档新增
+  待索引 --> 已索引: 切分并写入向量
+  已索引 --> 陈旧: 源文档内容变更
+  已索引 --> 陈旧: 切分策略或 embedding 版本升级
+  陈旧 --> 重建中: 对账任务发现
+  重建中 --> 已索引: 先删旧 chunk 再整体写入
+  已索引 --> 待清理: 源文档被删除
+  待清理 --> [*]: 清理任务删除向量
+  已索引 --> 孤儿: 源文档已删但清理未执行
+  孤儿 --> 待清理: 对账任务发现
+            </div>
+            <figcaption>文档在向量库中的状态流转。"孤儿"这个状态是最容易被忽略的——它不影响任何指标，但会持续污染检索结果，而且会一直存在下去</figcaption>
+          </figure>
+          <div class="callout tip">
+            <span class="callout-t">同步链路要能"补跑"</span>
+            实践中最常见的失效不是逻辑写错了，而是<strong>某次定时任务挂了，然后没有人补</strong>。因此同步链路要设计成<strong>幂等且可回放</strong>：任务失败时下一次运行能自动把上次漏掉的补上（这正是全量对账存在的意义——它天然就是一次补偿）。只做基于事件的增量更新而没有定期全量对账，等于把系统的正确性押在"每一个事件都不丢"上。
+          </div>
+
+          <h2>失效二：检索噪声——相关性在悄悄下降</h2>
+
+          <h3>怎么发生</h3>
+          <p>随着知识库增长，向量库里的内容越来越多，检索的噪声也会增加。一个用户问题检索回来的 Top-5 chunk 里，可能只有 1 个真正相关，另外 4 个是语义相近但内容无关的"噪声 chunk"。这些噪声被塞进 prompt 后，<strong>稀释了模型的注意力</strong>，让模型更容易跑偏或幻觉。</p>
+          <p>检索噪声的恶化通常是渐进的——知识库从 1 万条增长到 10 万条，噪声比例慢慢升高。你不会在某一天突然发现问题，但三个月后回头看，答案质量已经明显下降了。</p>
+
+          <h3>监控信号：检索质量指标</h3>
+          <p>检索质量需要持续监控，不能只在线下评测时看。几个关键指标：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>怎么算</th><th>异常意味着</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Top-K 平均相似度</strong></td><td>每条请求的 Top-5 chunk 与查询的余弦相似度均值</td><td>持续下降 = 知识库增长后检索精度在恶化</td></tr>
+                <tr><td><strong>Top-1 与 Top-5 相似度差</strong></td><td>Top-1 相似度减去 Top-5 相似度</td><td>差值缩小 = 检索结果区分度在降低，噪声增多</td></tr>
+                <tr><td><strong>无命中请求率</strong></td><td>Top-1 相似度低于阈值（如 0.7）的请求占比</td><td>上升 = 越来越多的问题在知识库里找不到答案</td></tr>
+                <tr><td><strong>用户反馈率</strong></td><td>点踩 / 重新生成的请求占比</td><td>直接信号——但覆盖率低，需要和其他指标交叉看</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这些指标在<a href="observability.html">可观测性</a>体系里应该作为 RAG 子链路 Span 的聚合指标，持续跟踪趋势。不是看绝对值，而是看<strong>趋势变化</strong>——如果 Top-K 平均相似度在过去一个月持续下降，就该调查原因了。</p>
+
+          <h3>手算一组检索指标：0.66 的相似度说明什么</h3>
+          <p>指标不是看过就算，要能读出结论。假设今天三条请求的 Top-5 平均相似度分别是 0.72、0.68、0.66，而一个月前的基线是 0.75。怎么解读？先看绝对值：0.66 是否低于"无命中阈值"（比如 0.7）——如果低于，说明这请求在向量库里几乎找不到相关段落。再看趋势：三天从 0.72 掉到 0.66，幅度虽然不大，但如果伴随"Top-1 与 Top-5 相似度差"从 0.10 缩到 0.05，那说明不光是整体分数在降，而是<strong>第一名和后面的差距在缩小——检索结果的"分辨力"变弱了</strong>，典型原因是知识库涨了但检索参数没跟着调，或新入库的文档语义互相接近。这组数字组合起来指向的运维动作是：看最近入库了什么、重排阈值要不要重调，而不是去改 prompt。<strong>检索指标的读法永远是多指标交叉，单一相似度数字几乎不说明问题。</strong></p>
+
+          <h3>缓解策略</h3>
+          <ul>
+            <li><strong>定期重排阈值调优</strong>：知识库增长后，原来设定的 Top-K 数量和重排阈值可能不再最优。定期用评测集重新调参。</li>
+            <li><strong>引入元数据过滤</strong>：在检索前先按元数据（时间、类别、权限）过滤，减少候选集。这不只是精度问题，也是安全问题——不同用户能看到的文档不同。</li>
+            <li><strong>监控无命中请求</strong>：如果大量请求的 Top-1 相似度都很低，说明知识库覆盖不足。分析这些"无命中"的问题，把它们作为补充知识库的输入——用户的提问就是知识库的缺口。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            很多团队用"检索到了多少条"（命中数量）当检索质量的监控指标，这是错的。<strong>命中数量回答的是"索引有没有正常工作"，回答不了"召回的质量好不好"。</strong>一条请求召回了 top-5，可能 5 条全是噪声——数量正常，质量很差。反过来，一条请求只召回了 2 条，可能 2 条都是高相关。正确的做法是监控"相似度分布"（Top-1 的分数、Top-1 与 Top-5 的差值、无命中占比）而不是"条数"。同理，"有检索结果"不等于"检索结果有用"，这两者的监控信号完全不同。
+          </div>
+
+          <h2>失效三：上下文溢出——静默截断</h2>
+
+          <h3>怎么发生</h3>
+          <p>RAG 系统的 prompt 由系统提示 + 检索到的 chunk + 用户问题 + 对话历史组成。随着对话轮次增加、检索的 chunk 越来越长、系统提示不断加规则，总长度可能悄悄超出模型的上下文窗口。</p>
+          <p>超出窗口的后果取决于模型 API 的行为：<strong>有的直接报错</strong>（好，至少你知道了），<strong>有的静默截断</strong>（坏，你不知道丢了什么）。如果是静默截断，可能把系统提示的尾部截掉了（约束规则丢失），也可能把对话历史的开头截掉了（上下文丢失），还可能把 RAG 检索结果截掉了（知识丢失）。每种截断的症状不同，但都表现为"答案质量下降"。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">最容易忽略的场景</span>
+            你的系统提示从 500 token 涨到了 1500 token（产品加了一堆规则），RAG 上下文从 2000 token 涨到了 4000 token（检索策略改了 top-K），对话历史 10 轮 3000 token——加起来 8500 token，模型窗口是 8192。差一点点，不报错但截断了。<strong>上下文溢出经常不是因为某一个部分暴涨，而是所有部分都在慢慢涨</strong>。
+          </div>
+
+          <h3>监控信号：Token 预算追踪</h3>
+          <p>在 trace 里记录每个请求的 prompt 组成和 token 数，然后监控：</p>
+          <ul>
+            <li><strong>输入 token 分解</strong>：系统提示 token / RAG 上下文 token / 对话历史 token / 用户问题 token 各占多少。看趋势，不看绝对值。</li>
+            <li><strong>窗口利用率</strong>：输入 token / 模型上下文窗口大小。超过 80% 就该告警——你离溢出只差一次系统提示加几行规则。</li>
+            <li><strong>截断事件计数</strong>：如果模型 API 返回了截断标志（如 finish_reason = "length"），记录并告警。</li>
+          </ul>
+
+          <p>Token 预算管理是一个工程问题，不只是"少塞点上下文"这么简单。详细的上下文分配与压缩策略见 <a href="../10-applications/context-engineering.html">上下文工程</a>。</p>
+
+          <h2>Chunk 策略版本化</h2>
+          <p>切分策略（chunk size、overlap、切分方法）不是一次定终身的事。随着文档类型变化、业务需求调整，你可能需要修改切分策略。但修改切分策略等于<strong>整个向量库需要重建</strong>——所有 chunk 的边界都变了，旧的 embedding 全部失效。</p>
+          <p>这带来两个运维需求：</p>
+          <ol>
+            <li><strong>记录切分策略版本</strong>：向量库里每个 chunk 要记录它是用哪个切分策略生成的（版本号 + 参数）。这样你可以知道当前线上用的是哪个版本，以及是否所有 chunk 都已迁移到新策略。</li>
+            <li><strong>双索引并行过渡</strong>：切换切分策略时，不要直接替换。建一个新的向量索引（新策略），让新旧索引并行运行一段时间。在<a href="prompt-eval-ci.html">canary</a>验证新索引的检索质量后再切流量。如果新策略有问题，切回旧索引即可——零风险。</li>
+          </ol>
+          <div class="callout tip">
+            <span class="callout-t">切分策略变更 = 一次"模型迁移"</span>
+            把切分策略变更当成和换 embedding 模型一样的大事来对待：跑评测集、canary 流量、对比检索指标。很多团队在这上面栽过跟头——"只是把 chunk_size 从 512 改成 256"，结果召回率掉了 15%，因为小 chunk 丢失了更多上下文语义。
+          </div>
+
+          <h2>Embedding 模型迁移：静默掉点的重灾区</h2>
+          <p>embedding 模型的迁移是 RAG 运维中最危险的操作之一。危险不在于操作复杂，而在于<strong>迁移不完整时系统不报错，只是静默掉点</strong>。</p>
+
+          <h3>为什么会静默掉点</h3>
+          <p>不同 embedding 模型的向量空间<strong>完全不可比</strong>。模型 A 的向量 [0.1, 0.3, ...] 和模型 B 的向量 [0.8, 0.2, ...] 在同一个向量库里混在一起，相似度计算的结果是毫无意义的。如果迁移时只更新了一部分文档的 embedding，剩下的还是旧模型的，检索结果会变成新旧向量混合的"随机噪声"。</p>
+          <p>更隐蔽的情况：你用新模型重新生成了所有 embedding，但<strong>查询侧还用旧模型编码用户问题</strong>。查询向量和文档向量来自不同模型，检索结果完全不可靠——但系统照常运行，只是准确率暴跌。</p>
+
+          <h3>安全迁移流程</h3>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  EVAL["新模型离线评测<br/>用 golden set 跑检索指标"] --> CMP{"新模型 ≥ 旧模型?"}
+  CMP -->|"否"| STOP["不迁移，继续用旧模型"]
+  CMP -->|"是"| BUILD["全量重建新索引"]
+  BUILD --> DUAL["双索引并行<br/>影子模式对比"]
+  DUAL --> SIG{"线上检索质量<br/>不下降?"}
+  SIG -->|"是"| SWITCH["切流量到新索引<br/>同时切查询侧模型"]
+  SIG -->|"否"| ROLL["保留旧索引"]
+  SWITCH --> CLEAN["清理旧索引"]
+  style STOP fill:#fce4e4,stroke:#c0392b
+  style SWITCH fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>Embedding 模型迁移的安全流程：离线评测 → 全量重建 → 双索引并行 → 切流量。关键约束：查询侧和文档侧必须同时切换</figcaption>
+          </figure>
+
+          <p>迁移方案有三种，成本和风险差别很大。除非是内部低风险系统，否则不建议选第一种：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方案</th><th>服务影响</th><th>成本</th><th>回滚难度</th><th>适用场景</th></tr></thead>
+              <tbody>
+                <tr><td><strong>原地全量覆盖</strong></td><td>重建期间检索质量不可用或新旧混合</td><td>最低，只存一份</td><td>极难——旧向量已被覆盖，回滚等于再重建一次</td><td>只适合内部低风险、可停机的系统</td></tr>
+                <tr><td><strong>双索引并行</strong></td><td>零影响，旧索引照常服务</td><td>较高，两份存储 + 一次全量编码</td><td>容易，路由切回旧索引即可</td><td><strong>生产系统的默认选择</strong></td></tr>
+                <tr><td><strong>影子对比后切换</strong></td><td>零影响</td><td>最高，还要额外跑一遍查询编码</td><td>容易</td><td>高风险或大体量场景，需要真实流量证据再决策</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>选双索引方案时，要提前算好<strong>全量编码的时间和成本</strong>。一个百万级 chunk 的知识库重新编码一遍，可能需要几个小时到一整天，而且这段时间里源文档还在继续更新——所以重建过程本身也要能处理增量：<strong>先做一次全量快照重建，再把重建期间的变更补跑一遍</strong>，然后才进入对比阶段。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">铁律：查询侧和文档侧必须同时切换</span>
+            迁移时最常见的错误是分步切换——先切文档索引，再切查询编码器。在切换的中间窗口里，查询用旧模型编码、文档用新模型编码，检索结果完全不可靠。正确做法是：新索引建好后，查询侧和文档侧同时切到新模型，中间不做灰度——因为混合向量没有灰度可言。双索引并行期的"灰度"是在两个完整索引之间切换，不是在一个索引里混用两个模型。
+          </div>
+
+          <h2>向量库治理</h2>
+          <p>向量库不是"建好了就不用管"的基础设施。随着数据增长，几个治理问题会浮现：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>治理问题</th><th>表现</th><th>对策</th></tr></thead>
+              <tbody>
+                <tr><td>孤儿向量</td><td>源文档已删除，但向量库中对应的向量还在</td><td>定期对账，清理无对应文档的向量</td></tr>
+                <tr><td>重复向量</td><td>同一文档被多次入库，检索时返回重复 chunk</td><td>入库前按文档 ID + chunk 位置去重</td></tr>
+                <tr><td>索引膨胀</td><td>历史版本切分策略的残留向量未清理</td><td>迁移完成后清理旧索引</td></tr>
+                <tr><td>权限泄漏</td><td>用户 A 检索到了只有用户 B 才能看的文档</td><td>检索时带权限过滤，不要依赖事后过滤</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>权限泄漏是安全问题中最严重的。正确做法是<strong>在检索阶段就做权限过滤</strong>（作为元数据过滤条件），而不是检索完再过滤——后者可能在截断或排序时已经把不该看的内容混进来了。安全和隐私的系统性讨论见 <a href="../14-governance/privacy-security.html">隐私与安全</a>。</p>
+
+          <details class="deep">
+            <summary>展开：为什么权限过滤必须做在检索里，而不是检索之后</summary>
+            <div class="deep-body">
+              <p>"检索完再把没权限的结果过滤掉"听起来完全等价，而且实现简单得多。但它在四个地方会出问题，而且每一个都是真实事故的来源。</p>
+              <p><strong>第一，结果数量会静默塌陷。</strong>你请求 top-5，检索器返回 5 条，后置过滤掉了其中 4 条没权限的，最后只剩 1 条进 prompt。系统不报错，用户拿到一个"信息不全"的答案。更糟的是这种情况对不同用户表现不同——权限少的用户体验持续更差，而你在聚合指标上看不出来，因为平均值被权限充足的用户拉平了。</p>
+              <p><strong>第二，相似度分数的语义被破坏。</strong>你用来做监控的"Top-1 相似度""Top-1 与 Top-5 差值"这些指标，如果是在过滤前算的，反映的就不是用户真正看到的检索质量。过滤后再算，又会因为样本数不固定而失去可比性。前置过滤则不存在这个问题——检索出来的 5 条就是用户能看的 5 条。</p>
+              <p><strong>第三，重排和截断会提前泄漏。</strong>如果链路是"检索 → 重排 → 截断 top-3 → 权限过滤"，那么无权限的文档已经参与了重排的打分，甚至可能把有权限的文档挤出了 top-3。用户虽然最终没看到那条内容，但他看到的结果集已经被不该影响他的数据影响了。在某些合规场景下，这本身就构成问题。</p>
+              <p><strong>第四，最直接的——总有一条路径会忘记过滤。</strong>后置过滤意味着每一个调用检索的地方都要记得加过滤，包括你三个月后新加的那个"相关问题推荐"功能、那个导出摘要的定时任务、那个给运营看的调试接口。<strong>安全控制放在共享路径上才可靠，放在调用方手里迟早会漏。</strong></p>
+              <p>正确的做法是把权限当成<strong>检索的元数据过滤条件</strong>：入库时给每个 chunk 打上可见性标签（部门、角色、密级、租户），检索时把当前用户的权限集合作为硬过滤条件传给向量库，让向量库在候选集层面就排除掉无权限的内容。主流向量库都支持带元数据过滤的向量检索。代价是过滤条件会影响索引的检索效率，需要为高频过滤字段建立合适的索引结构——但这是一个性能问题，比安全问题好解决得多。</p>
+              <p>最后补一句：<strong>权限变更也要能实时生效。</strong>如果 chunk 的可见性标签是入库时写死的，那么某人调岗、某文档升密之后，向量库里的标签还是旧的。要么把权限做成"查询时从权限系统实时解析成过滤条件"，要么给权限变更也建一条同步链路——和文档内容的同步链路是同一个问题。</p>
+            </div>
+          </details>
+
+          <h2>运维日历：把这些检查变成例行工作</h2>
+          <p>本节讲的所有机制，只要依赖"想起来的时候看一眼"，最后都会退化成不存在。把它们排进一张固定的日历，才是真正落地的样子。下面用一张甘特图把各周期的例行工作画在同一时间轴上，再配一张明细表说明每项动作的判据——<strong>「每天该做什么、每周该做什么」这种问题，应该能在一张图上回答，而不是翻文档</strong>。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+gantt
+  title RAG 运维例行日历
+  dateFormat  YYYY-MM-DD
+  axisFormat  %d日
+  section 持续（分钟级）
+    检索指标聚合与告警      :active, c1, 2026-01-01, 30d
+  section 每日
+    增量对账 + 孤儿清理     :d1, 2026-01-01, 1d
+    增量对账 + 孤儿清理     :d2, 2026-01-02, 1d
+    增量对账 + 孤儿清理     :d3, 2026-01-03, 1d
+  section 每周
+    检索评测集回归          :w1, 2026-01-05, 1d
+    无命中请求复核          :w2, 2026-01-12, 1d
+  section 每月
+    全量对账                :m1, 2026-02-01, 1d
+    重排阈值与 top-k 复调    :m2, 2026-02-02, 1d
+  section 每季度
+    评估 embedding 与切分策略 :q1, 2026-04-01, 3d
+            </div>
+            <figcaption>RAG 运维例行日历：持续任务盯指标，每日对账，每周回归，每月复调，每季度评估模型。周期越长的任务越要提前排期，避免"临时起意"</figcaption>
+          </figure>
+          <p>下面这张表可以直接作为你团队的起点，按业务的变更频率调整周期：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>周期</th><th>动作</th><th>产出与判据</th></tr></thead>
+              <tbody>
+                <tr><td><strong>持续（分钟级）</strong></td><td>检索质量指标聚合、窗口利用率、截断事件计数</td><td>接入 <a href="observability.html">可观测性</a>看板；利用率超 80% 或出现截断即告警</td></tr>
+                <tr><td><strong>每日</strong></td><td>增量对账 + 孤儿向量清理</td><td><code>stale_ratio</code> 回到接近 0；清理数量异常时人工确认</td></tr>
+                <tr><td><strong>每周</strong></td><td>跑一遍检索评测集；复核"无命中"请求 top 列表</td><td>召回指标不低于上周；无命中问题整理成知识库补充清单</td></tr>
+                <tr><td><strong>每月</strong></td><td>全量对账；重排阈值与 top-k 复调；权限标签抽查</td><td>全量与增量的差异应为零，有差异说明增量链路有漏洞</td></tr>
+                <tr><td><strong>每季度</strong></td><td>评估是否需要更换 embedding 模型或切分策略</td><td>先离线评测，通过后再按双索引方案排期，不临时起意</td></tr>
+                <tr><td><strong>变更触发</strong></td><td>切分策略、embedding 模型、检索参数任一变更</td><td>一律走双索引 + canary，不允许原地改</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout">
+            <span class="callout-t">和其他章节的分工</span>
+            这张日历里"怎么让它更准"的部分（重排策略、查询改写、混合检索）属于 <a href="../10-applications/advanced-rag.html">Advanced RAG</a>；"怎么衡量准不准"的方法论属于 <a href="../13-evaluation/eval-methods.html">评估方法</a>；本节负责的是<strong>把这些检查变成有周期、有判据、有告警的例行工作</strong>，让系统三个月后还是三个月前那个样子。
+          </div>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：RAG 上线后的失效几乎都是静默的——不报错，只是答案变差。让它更准归 advanced-rag，让它跑三个月不烂掉归本条。</li>
+            <li><strong>骨架</strong>：RAG = 检索器 + 生成器（见 RAG 论文原图）。生产问题几乎都出在数据和检索段，而不是模型。</li>
+            <li><strong>三类失效</strong>：陈旧 embedding（源文档更新但向量库没刷）、检索噪声（知识库增长后相关性下降）、上下文溢出（prompt 悄悄超出窗口）。各有不同监控信号。</li>
+            <li><strong>陈旧 embedding</strong>：监控文档版本 vs 向量版本的对账。定期跑对账任务，发现不一致就重新生成。</li>
+            <li><strong>检索噪声</strong>：监控 Top-K 相似度趋势、Top-1 与 Top-5 差值、无命中请求率。关注趋势变化而非绝对值，且要看"质量分布"而非"命中条数"。</li>
+            <li><strong>上下文溢出</strong>：监控输入 token 分解和窗口利用率。超 80% 就告警。</li>
+            <li><strong>Chunk 策略版本化</strong>：切分策略变更要像换模型一样对待——双索引并行 + canary 验证。</li>
+            <li><strong>Embedding 迁移</strong>：查询侧和文档侧必须同时切换，不能混用不同模型的向量。双索引并行期是在两个完整索引间切换，不是混合使用。</li>
+            <li><strong>对账三要素</strong>：同时比对内容 hash、切分策略版本、embedding 模型版本；重建时先按 doc_id 全删再整体写入；把 <code>stale_ratio</code> 做成告警指标。</li>
+            <li><strong>同步链路要幂等可回放</strong>：只做事件驱动的增量更新而没有定期全量对账，等于把正确性押在"每个事件都不丢"上。</li>
+            <li><strong>权限必须前置过滤</strong>：后置过滤会导致结果数塌陷、监控指标失真、重排被无权限文档影响，而且总有调用路径会忘记加过滤。</li>
+            <li><strong>把检查排进日历</strong>：日对账、周评测、月全量、季度评估模型、变更走双索引。依赖"想起来看一眼"的机制等于不存在。</li>
+            <li><strong>常见坑</strong>：增量更新只新增不删除导致旧 chunk 残留；权限过滤做在检索后而非检索中导致泄漏；系统提示缓慢膨胀导致上下文溢出；换了 embedding 模型但对账只比内容 hash，于是全库陈旧却毫无察觉；用"命中条数"当检索质量指标。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks — RAG 奠基论文，本页骨架图的出处 · <a href="https://arxiv.org/abs/2005.11401" target="_blank" rel="noopener">arXiv:2005.11401</a></li>
+            <li>LangChain Q&A with RAG 生产指南 — RAG 系统的生产化最佳实践，包括索引更新与监控 · <a href="https://python.langchain.com/docs/use_cases/question_answering/" target="_blank" rel="noopener">python.langchain.com/docs/use_cases/question_answering</a></li>
+            <li>LlamaIndex Production Patterns — RAG 生产部署模式，包括数据刷新与向量库治理 · <a href="https://docs.llamaindex.ai/en/stable/optimizing/production_patterns/" target="_blank" rel="noopener">docs.llamaindex.ai/en/stable/optimizing/production_patterns</a></li>
+            <li>Pinecone Vector Database Best Practices — 向量库运维的工程实践，包括索引管理与权限控制 · <a href="https://docs.pinecone.io/guides/best-practices" target="_blank" rel="noopener">docs.pinecone.io/guides/best-practices</a></li>
+            <li>RAGAS: Automated Evaluation of RAG — RAG 系统自动化评估框架，可用于线上质量监控 · <a href="https://github.com/explodinggradients/ragas" target="_blank" rel="noopener">github.com/explodinggradients/ragas</a></li>
+            <li>Anthropic Contextual Retrieval — 检索增强里的上下文增强方法，属于检索质量优化方向 · <a href="https://www.anthropic.com/news/contextual-retrieval" target="_blank" rel="noopener">anthropic.com/news/contextual-retrieval</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            RAG 跑稳之后，最后一道防线是安全。<a href="guardrails.html">护栏与输出校验</a>讲怎么在运行时拦住提示注入和不安全输出。如果需要回溯 RAG 质量问题的根因，<a href="observability.html">可观测性</a>提供全链路 trace，<a href="../13-evaluation/hallucination.html">幻觉</a>提供幻觉成因的分析框架。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Advanced / Agentic RAG · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="10-applications" data-topic="advanced-rag">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+              <span class="tag-frontier">2026 前沿</span>
+            </div>
+            <h1>Advanced / Agentic RAG</h1>
+            <p class="lead">基础 RAG 的流程是「查一次 → 答一次」，但真实问题远比这复杂：用户问「对比 A 公司和 B 公司 2024 年的营收增长率」，需要两次检索、一次计算；问「导致 X 事件的因果链是什么」，需要多跳推理把分散在多份文档中的片段串起来。Advanced RAG 解决的就是「查不准、查不全、查不对」的问题——让检索从一次性动作变成可改写、可迭代、可反思的智能过程。这一节把五条主要路线逐一拆开，并给出何时该用、何时是过度工程的判据。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>基础 RAG 是「直线管道」：问题 → 检索 → 生成。Advanced RAG 把这条直线弯成一个<strong>循环</strong>：问题先被改写和拆解，检索结果会被评估是否够用，不够就重新检索，够了才生成——生成后还能自检是否需要补查。这就像写论文：不是搜一次文献就动笔，而是搜了看、看了再搜、写了再查证。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  Q["用户问题"] --> RW["查询改写<br/>拆解 / 扩展 / 改写"]
+  RW --> RT["检索"]
+  RT --> EV{"结果够用?"}
+  EV -->|不够| RW
+  EV -->|够| GEN["生成答案"]
+  GEN --> CHK{"答案可信?"}
+  CHK -->|存疑| RT
+  CHK -->|可信| OUT["输出带出处的答案"]
+  style RW fill:#e6f1fb,stroke:#185fa5
+  style EV fill:#faeeda,stroke:#ba7517
+  style CHK fill:#fcebeb,stroke:#a32d2d
+  style OUT fill:#eaf3de,stroke:#639922
+              </div>
+              <figcaption>Advanced RAG 的核心：把直线管道变成带反思的循环——检索结果和生成答案都会被评估，不够就重来。注意这个循环必须有<strong>出口条件</strong>，否则会无限打转，这是工程上第一个要处理的问题。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 0: 三代范式 ============ -->
+          <h2>先定位：RAG 的三代范式</h2>
+          <p>在钻进具体技法之前，先建立一张地图。业界常把 RAG 的演进分成三代，这个分法不是严格的时间线，而是<strong>复杂度阶梯</strong>——你完全可以在一个系统里同时用到三代的组件。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title RAG 复杂度阶梯的演进
+  section 第一代 Naive RAG
+    固定管道 : 切分 : 向量检索 : 一次生成
+    痛点暴露 : 查不准 : 查不全 : 无法多跳
+  section 第二代 Advanced RAG
+    检索前优化 : 查询改写 : 子问题拆解 : HyDE
+    检索中优化 : 混合检索 : 元数据过滤 : 图结构
+    检索后优化 : 重排 : 压缩 : 去冗余
+  section 第三代 Modular / Agentic RAG
+    控制权转移 : LLM自主决定检索时机 : 检索成为工具
+    循环与反思 : 检索评估 : 生成验证 : 按需补查
+    多源编排 : 向量库 : 图谱 : 结构化DB : 联网搜索
+            </div>
+            <figcaption>RAG 的三代范式。<strong>关键变化不是「加了更多模块」，而是控制权的归属</strong>：第一代由代码写死流程，第二代由代码编排更复杂的流程，第三代把「下一步做什么」交给模型自己决定。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>Naive RAG</th><th>Advanced RAG</th><th>Agentic RAG</th></tr></thead>
+              <tbody>
+                <tr><td><strong>控制流</strong></td><td>写死的直线管道</td><td>写死的分支与有限循环</td><td><strong>LLM 自主决策</strong></td></tr>
+                <tr><td><strong>检索次数</strong></td><td>恰好 1 次</td><td>固定上限，如 1–3 次</td><td>动态，理论无上限，需人为设闸</td></tr>
+                <tr><td><strong>延迟可预测性</strong></td><td>高，几乎恒定</td><td>中，有上界</td><td><strong>低</strong>，同一类问题可能差 5 倍</td></tr>
+                <tr><td><strong>单次成本</strong></td><td>1 次生成调用</td><td>2–5 次模型调用</td><td>5–20 次不等，需预算上限</td></tr>
+                <tr><td><strong>能答的问题</strong></td><td>单点事实查询</td><td>对比、汇总、有限多跳</td><td>开放式研究、需要试错的探索</td></tr>
+                <tr><td><strong>调试难度</strong></td><td>低，链路固定</td><td>中，分支有限可穷举</td><td><strong>高</strong>，每次轨迹都不同，必须有完整 trace</td></tr>
+                <tr><td><strong>适合场景</strong></td><td>FAQ、文档助手</td><td>企业知识库问答</td><td>深度研究、竞品分析、尽调</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">选型第一原则</span>
+            <strong>永远从 Naive RAG 开始，用评测集证明它不够用，再往上升级。</strong>Advanced RAG 的每个组件都在增加延迟、成本和故障面。如果你的评测集显示 Naive RAG 的召回率已经 90%，那么加查询改写最多再涨几个点，却可能让 p95 延迟翻倍——这笔账多数时候不划算。真正需要升级的信号很明确：评测集里有一整类问题（多跳、对比、聚合）系统性地答不对，而不是零星几个 case 不理想。
+          </div>
+
+          <!-- ============ Section 1: 查询改写 ============ -->
+          <h2>查询改写：问题不对，检索白费</h2>
+          <p>基础 RAG 直接用用户原始问题去检索，但用户的问题往往不是最好的检索 query。用户问「他后来怎么样了」——这个「他」指谁？用户问「帮我对比下这两家」——「这两家」是哪两家？查询改写（Query Rewriting）就是在检索前先把用户问题变成更适合检索的 query。</p>
+          <p>为什么这一步收益这么大？因为<strong>检索是整条链路里唯一「一步错步步错」的环节</strong>。生成阶段模型答得不好，你还能换个 Prompt 补救；但检索没捞到正确文档，后面所有环节都在处理垃圾。而用户的自然语言表达和文档的书面表达之间，天然存在一道鸿沟：用户说「网络连不上」，文档标题是「网络连通性故障排除指南」；用户说「多少钱」，文档写「定价策略与费率表」。查询改写就是在这道鸿沟上架桥。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("查询改写<br/>手法族"))
+    上下文补全
+      指代消解
+        他 它 这两家 换成实体
+      省略补全
+        那第二种呢 补成完整问题
+      依赖对话历史
+    结构变换
+      子问题拆解
+        对比类拆成两问
+        聚合类拆成多问
+      多步规划
+        先查A再查B
+    表达扩展
+      同义改写
+        生成N个变体并行检索
+      术语归一
+        口语换成文档术语
+      HyDE
+        先编一个假答案再检索
+    抽象升降
+      Step-back
+        退一步问更一般的问题
+      具体化
+        补上时间地点等限定
+            </div>
+            <figcaption>查询改写的四类手法。<strong>它们不是互斥的</strong>：一个复杂问题常常先做指代消解补全上下文，再拆解成子问题，每个子问题再各自做同义扩展。真实系统里通常按顺序串起来用。</figcaption>
+          </figure>
+
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">指代消解</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">用对话历史把「他」「它」「这两家」等代词替换为具体实体。多轮对话场景必备。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">子问题拆解</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">把复杂问题拆成多个独立子问题分别检索。「对比 A 和 B 的营收增长率」→「A 的营收」「B 的营收」「各自的增长率」。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">查询扩展</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">用同义词、上位词或 LLM 生成多个变体 query，并行检索后合并去重，提高召回率。</p>
+            </div>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            查询改写就像去图书馆前先想清楚要搜什么关键词——用户说「那个拿诺奖的日本作家」，你得先改成「日本 诺贝尔文学奖 作家」才能搜到东西。
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>手法</th><th>解决什么问题</th><th>额外成本</th><th>什么时候一定要上</th><th>反面风险</th></tr></thead>
+              <tbody>
+                <tr><td><strong>指代消解</strong></td><td>多轮对话里的代词、省略</td><td>1 次小模型调用</td><td>只要支持多轮对话，就必须有</td><td>消解错实体，把问题引向完全错误的方向</td></tr>
+                <tr><td><strong>子问题拆解</strong></td><td>对比、聚合、多条件复合问题</td><td>1 次调用 + N 路检索</td><td>评测集里对比类问题成批失败时</td><td>过度拆解，把简单问题拆成 5 个子问题，延迟暴涨</td></tr>
+                <tr><td><strong>同义扩展</strong></td><td>用户口语与文档术语不匹配</td><td>1 次调用 + N 路检索</td><td>用户群体和文档作者不是同一批人时</td><td>变体太发散，召回一堆无关内容反被噪声淹没</td></tr>
+                <tr><td><strong>HyDE</strong></td><td>问题与答案的向量形态差异大</td><td>1 次生成调用（较贵）</td><td>零样本冷启动、无标注数据可调时</td><td>假答案本身是幻觉，会把检索带偏到虚构方向</td></tr>
+                <tr><td><strong>Step-back 抽象</strong></td><td>问题过于具体，库里只有一般性论述</td><td>1 次小模型调用</td><td>问题里有大量具体细节但文档偏原理性</td><td>抽象过头，召回的全是泛泛而谈的内容</td></tr>
+                <tr><td><strong>术语归一</strong></td><td>同一概念的多种叫法</td><td>近乎为零（查词表）</td><td>有稳定行业术语表时，性价比最高</td><td>词表过期，把新术语映射到废弃术语</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>HyDE（Hypothetical Document Embedding）是一种特殊的查询改写：先让 LLM 假设性地生成一个答案文档，再用这个假文档的向量去检索。原理是「答案比问题更像答案」——问题「2024 年中国 GDP 增速」和文档「2024 年中国 GDP 同比增长 5%」的向量相似度，可能不如假答案「2024 年中国 GDP 增速约为 5%」和真实文档的相似度高。</p>
+
+          <details class="deep">
+            <summary>展开：HyDE 为什么有效，以及它什么时候会反噬</summary>
+            <div class="deep-body">
+              <p>回忆一下嵌入模型的训练方式。多数通用嵌入模型是在「相似句子对」上训练的，它学到的是<strong>文本形态的相似性</strong>而不是「问题—答案」的对应关系。一个疑问句和一个陈述句，即便语义上一问一答严丝合缝，在向量空间里也未必接近——因为它们的句式、语气、长度都不一样。这就是所谓的<strong>非对称检索</strong>难题。</p>
+              <p>HyDE 的巧思在于：既然「答案像答案」，那就先造一个假答案，用假答案去找真答案。这一步把非对称检索<strong>转化成了对称检索</strong>，绕开了嵌入模型的训练目标与使用场景之间的错配。</p>
+              <p>但它有两个明确的失效场景，都很致命：</p>
+              <ul>
+                <li><strong>私域知识上会编得离谱。</strong>问「ERR_4013 怎么处理」，模型完全不知道这个内部错误码，生成的假答案可能是「ERR_4013 通常表示网络超时，请检查防火墙设置」——一段自信的胡话。用这段胡话去检索，会精准命中「网络超时」相关文档，而真正的「证书过期」文档反而被挤出去。<strong>假答案的幻觉方向，直接变成检索的偏移方向。</strong></li>
+                <li><strong>成本不低。</strong>HyDE 要求在检索之前先跑一次生成，这是整条链路里最贵的一类调用。如果用小模型生成假答案来省钱，假答案质量下降，前一条风险又会放大。</li>
+              </ul>
+              <p style="margin-bottom:0">所以 HyDE 的最佳场景是<strong>通用知识 + 零样本冷启动</strong>：模型对领域有基本常识，但你还没有任何标注数据可以微调嵌入模型。一旦你有了几百条标注数据，微调一个领域嵌入模型的收益通常超过 HyDE，而且没有推理期的额外开销。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：查询改写的一个可用实现（拆解 + 扩展 + 并路融合）</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">import json
+from typing import List, Dict
+
+REWRITE_PROMPT = """你是检索查询优化助手。给定对话历史和用户当前问题,输出 JSON:
+{
+  "resolved": "把代词和省略补全后的完整问题",
+  "sub_queries": ["拆出的独立子问题, 若无需拆解则只放 resolved 本身"],
+  "expansions": ["同义或术语归一后的检索变体, 最多 2 条"],
+  "needs_multi_hop": true/false
+}
+规则:
+- 简单事实问题不要拆解, sub_queries 只放一条。
+- 变体要贴近文档的书面表达, 不要天马行空。
+- 只输出 JSON, 不要解释。
+
+历史: {history}
+问题: {question}"""
+
+
+def rewrite_query(question: str, history: List[str], llm) -&gt; Dict:
+    raw = llm.generate(
+        REWRITE_PROMPT.replace("{history}", "\n".join(history[-6:]))
+                      .replace("{question}", question),
+        max_tokens=300, temperature=0.0,
+    )
+    try:
+        plan = json.loads(_extract_json(raw))
+    except Exception:
+        # 改写失败必须优雅降级, 绝不能因此让整个请求挂掉
+        return {"resolved": question, "sub_queries": [question],
+                "expansions": [], "needs_multi_hop": False}
+    # 兜底: 保证 sub_queries 非空且不过度膨胀
+    subs = plan.get("sub_queries") or [plan.get("resolved", question)]
+    plan["sub_queries"] = subs[:4]
+    plan["expansions"] = (plan.get("expansions") or [])[:2]
+    return plan
+
+
+def multi_query_retrieve(plan: Dict, retriever, per_query_k: int = 30,
+                         final_k: int = 60) -&gt; List:
+    """所有改写变体并行检索, 再用 RRF 融合"""
+    queries = plan["sub_queries"] + plan["expansions"]
+    rank_lists = [retriever.search(q, top_k=per_query_k) for q in queries]
+
+    scores = {}
+    for lst in rank_lists:
+        for rank, doc_id in enumerate(lst, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (60 + rank)
+    return sorted(scores, key=scores.get, reverse=True)[:final_k]</code></pre>
+              <p style="margin-bottom:0">三个工程细节值得注意。<strong>第一，改写必须能优雅降级</strong>——JSON 解析失败就退回原始问题，绝不让一个可选的增强环节把主链路搞挂。<strong>第二，要给拆解数量设硬上限</strong>（代码里是 4），否则模型偶尔会把一个问题拆成十几个子问题，延迟直接失控。<strong>第三，多路结果用 RRF 融合而不是简单拼接</strong>，因为不同子问题的相似度分数不可比，只有排名可比。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section 2: 多跳检索 ============ -->
+          <h2>多跳检索：把分散的拼图拼起来</h2>
+          <p>很多真实问题需要<strong>多跳推理</strong>（Multi-hop Reasoning）：答案不在一个文档里，而分散在多个文档中，且后一步的检索依赖前一步的结果。</p>
+          <p>典型例子：「2024 年诺贝尔文学奖得主写的上一部小说叫什么？」这个问题的检索链是：</p>
+          <ol>
+            <li>先检索「2024 年诺贝尔文学奖得主」→ 得到韩江</li>
+            <li>再检索「韩江的上一部小说」→ 得到《不做告别》</li>
+          </ol>
+          <p>基础 RAG 一步检索做不到——它不知道第一个 query 的答案是「韩江」，也就无法构造第二个 query。多跳检索的关键是<strong>迭代检索</strong>：每一步检索的结果用来构造下一步的 query。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as 用户
+  participant P as 多跳控制器
+  participant R as 检索器
+  participant M as LLM
+
+  U->>P: 2024诺奖得主的上一部小说?
+  P->>M: 这个问题需要几跳? 第一跳查什么?
+  M-->>P: 需要2跳, 先查"2024诺贝尔文学奖得主"
+  P->>R: 检索 第1跳
+  R-->>P: 候选片段
+  P->>M: 从片段中抽取中间答案
+  M-->>P: 中间答案 = 韩江
+  Note over P: 检查: 是否已能回答原问题?<br/>否 -> 继续下一跳
+  P->>M: 用中间答案构造第2跳query
+  M-->>P: "韩江 上一部小说"
+  P->>R: 检索 第2跳
+  R-->>P: 候选片段
+  P->>M: 综合两跳证据生成最终答案
+  M-->>U: 答案 + 两跳的出处链
+            </div>
+            <figcaption>多跳检索的时序。<strong>每一跳之间都有一次「是否已经够了」的判断</strong>，这是防止无限循环的关键闸门。注意最终答案要带上完整的出处链，用户才能验证每一跳是否正确——只给最终答案的出处是不够的。</figcaption>
+          </figure>
+
+          <p>多跳检索的挑战在于<strong>错误传播</strong>：如果第一跳检索找错了（比如把 2023 年的得主当成 2024 年的），后续全错。而且这种错误特别隐蔽——最终答案格式完全正确、逻辑完全自洽、出处也真实存在，只是从第一跳就走错了岔路。人工审核时很容易被最后那个「看起来很像那么回事」的答案骗过去。</p>
+
+          <p>缓解手段有三层，按代价从低到高：</p>
+          <ul>
+            <li><strong>每跳保留多个候选（beam）</strong>：不只取最优中间答案，而是保留 Top-3，各自展开下一跳，最后比较哪条路径的证据链最完整。这类似解码里的 Beam Search，只不过 beam 展开的是<strong>推理路径</strong>而非 token 序列。代价是检索次数乘以 beam 宽度。</li>
+            <li><strong>中间答案带置信度</strong>：让模型在抽取中间答案时同时给出「这个答案在片段中的支撑强度」，低于阈值就不往下走，而是回头改写第一跳的 query。</li>
+            <li><strong>反向验证</strong>：拿到最终答案后，反过来验证「如果答案是 X，那么第一跳的中间答案应该是 Y 吗」。这一步能抓住一部分逻辑断裂，但要额外一次模型调用。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">多跳的隐性成本被严重低估</span>
+            一个 2 跳 + beam 宽度 3 的检索，意味着 1（规划）+ 1（第 1 跳检索）+ 3（抽取中间答案）+ 3（构造第 2 跳 query）+ 3（第 2 跳检索）+ 1（综合生成）≈ 12 次调用，其中大半是模型调用。相比 Naive RAG 的 1 次生成，成本可能是<strong>十倍量级</strong>，延迟从 2 秒变成 15 秒。上线前务必用真实分布的问题跑一遍成本压测，而不是只测几个精心挑选的多跳样例——真实流量里多跳问题的占比往往远低于你的直觉，可能只有 5–15%，这正是路由存在的意义。
+          </div>
+
+          <!-- ============ Section 3: GraphRAG ============ -->
+          <h2>GraphRAG：用知识图谱补向量检索的盲区</h2>
+          <p>向量检索的软肋是<strong>关系推理</strong>。向量擅长找「语义相似」的文档，但不擅长回答「A 和 B 之间有什么关系」这类需要跨文档连接的问题。GraphRAG 在向量索引之外引入<strong>知识图谱</strong>，把文档中的实体和关系抽取成图结构，检索时同时走向量路径（找相关段落）和图路径（找关联实体）。</p>
+
+          <p>更根本的原因在于：向量检索是<strong>局部的</strong>。它只能回答「哪些片段和这个问题最像」，无法回答「整个语料库在讲什么」。像「这批财报里反复出现的风险主题有哪些」这类<strong>全局性问题</strong>（global query），向量检索天然无能为力——因为答案不存在于任何单个片段中，而存在于所有片段的聚合之上。GraphRAG 通过预先构建社区摘要来处理这一类问题，这是它区别于「向量检索 + 多跳」的核心价值。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>向量检索</th><th>GraphRAG</th></tr></thead>
+              <tbody>
+                <tr><td>擅长</td><td>语义相似、主题匹配</td><td>实体关系、多跳连接、全局聚合</td></tr>
+                <tr><td>索引构建</td><td>切块 + embedding</td><td>实体抽取 + 关系图谱 + 社区摘要 + embedding</td></tr>
+                <tr><td>查询类型</td><td>「关于 X 的信息」</td><td>「X 和 Y 的关系」「X 影响了谁」「整体上有哪些主题」</td></tr>
+                <tr><td>构建成本</td><td>低，自动化</td><td><strong>高</strong>，每份文档都要过 LLM 做实体抽取</td></tr>
+                <tr><td>维护成本</td><td>低，增量更新容易</td><td><strong>高</strong>，图谱更新需保持一致性，删一个实体要处理所有相关边</td></tr>
+                <tr><td>幻觉风险</td><td>较高，检索到的片段可能不相关</td><td>较低，关系链可追溯</td></tr>
+                <tr><td>失效模式</td><td>漏召回、召回噪声</td><td><strong>实体抽取错误会污染整张图</strong>，且难以察觉</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph BUILD["离线:图谱构建 (贵)"]
+    direction TB
+    D["原始文档"] --> S["切分"]
+    S --> EX["LLM 实体与关系抽取<br/>每个chunk一次调用"]
+    EX --> MG["实体消歧与合并<br/>同一实体的不同写法归一"]
+    MG --> G[("知识图谱")]
+    G --> CD["社区检测<br/>把稠密连接的实体聚成簇"]
+    CD --> CS["LLM 生成社区摘要<br/>自底向上逐层汇总"]
+    CS --> SUM[("多层社区摘要")]
+  end
+
+  subgraph QUERY["在线:双路检索"]
+    direction TB
+    Q["用户问题"] --> CLS{"局部问题<br/>还是全局问题?"}
+    CLS -->|"局部:关于某实体"| LOC["定位实体<br/>沿边遍历邻居<br/>取相关原文片段"]
+    CLS -->|"全局:整体有什么主题"| GLB["取相关层级的<br/>社区摘要<br/>map-reduce 汇总"]
+    LOC --> GEN["生成答案"]
+    GLB --> GEN
+  end
+
+  G -.-> LOC
+  SUM -.-> GLB
+
+  style BUILD fill:#faeeda,stroke:#ba7517
+  style QUERY fill:#e6f1fb,stroke:#185fa5
+  style EX fill:#fcebeb,stroke:#a32d2d
+  style CS fill:#fcebeb,stroke:#a32d2d
+            </div>
+            <figcaption>GraphRAG 的完整结构。<strong>标红的两步是成本大头</strong>：实体抽取要对每个 chunk 调一次 LLM，社区摘要要对每个社区调一次。图上「局部 / 全局」的分流是理解 GraphRAG 的关键——它其实是两套检索机制共用一份索引。</figcaption>
+          </figure>
+
+          <p>GraphRAG 的典型流程：离线阶段用 LLM 从文档中抽取实体和关系构建知识图谱，并为图的社区（community）生成摘要；在线检索时先定位问题相关的实体，沿图谱遍历关联实体和关系，再结合向量检索的段落一起送入 LLM 生成。微软的 GraphRAG 是这条路线的代表实现。</p>
+
+          <details class="deep">
+            <summary>展开：社区摘要为什么能回答「全局问题」</summary>
+            <div class="deep-body">
+              <p>假设你有 5000 份客户反馈，问题是「客户最常抱怨的三类问题是什么」。这个问题的答案不在任何一份反馈里——每份反馈只讲一件事，「最常」这个判断需要把 5000 份聚合起来看。</p>
+              <p>向量检索会怎么做？它会召回 Top-5 条和「抱怨」语义最近的反馈，然后模型基于这 5 条回答「客户最常抱怨的是……」。<strong>这个答案在统计意义上毫无根据</strong>，它只是 5 个样本的描述，却被表述成了全局结论。这是 RAG 在全局问题上最典型、也最危险的失效：答案听起来完全合理，但抽样方式根本不支撑这个结论。</p>
+              <p>GraphRAG 的处理方式是把聚合工作<strong>提前到离线阶段</strong>：</p>
+              <ol>
+                <li>把所有反馈里的实体（产品模块、故障现象、情绪词）和关系抽出来建图。</li>
+                <li>做社区检测，把连接紧密的实体聚成簇——比如「登录模块 / 验证码 / 收不到短信 / 着急」自然聚成一簇。</li>
+                <li>对每个底层社区生成一段摘要；再把相邻社区的摘要合并、生成上一层摘要；如此自底向上形成<strong>多层摘要树</strong>。</li>
+              </ol>
+              <p>在线回答全局问题时，取合适层级的所有社区摘要，做一次 map-reduce：每个摘要各自产出一个局部结论，再汇总排序。这样得出的「最常抱怨的三类」才是建立在全量数据之上的。</p>
+              <p style="margin-bottom:0">代价也很直白：这套预处理的 LLM 调用量与语料规模成正比，且每次语料大幅更新都要重跑。所以 GraphRAG 更适合<strong>语料相对稳定、查询价值高</strong>的场景（如尽调、行业研究报告），不适合每天新增几万条的高频更新场景。</p>
+            </div>
+          </details>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            GraphRAG 不是万能的。它的图谱构建需要大量 LLM 调用（每份文档都要做实体抽取），成本可能是纯向量索引的数倍到十倍量级，具体倍数取决于文档长度和抽取 Prompt 的复杂度。而且图谱质量高度依赖实体抽取的准确率——<strong>抽取错了，后面的检索全错，而且错得非常安静</strong>：图上多了一条不存在的关系边，系统照常返回一条「有理有据」的关系链。如果你的场景以「找相关文档」为主而非「推理实体关系」或「全局聚合」，GraphRAG 大概率是过度工程。
+          </div>
+
+          <!-- ============ Section 4: 自反思 ============ -->
+          <h2>自反思检索：答案不满意就重来</h2>
+          <p>Agentic RAG 的核心特征是<strong>自我评估和迭代</strong>。基础 RAG 不管检索结果好坏，一律塞给模型生成。Advanced RAG 会在两个关键节点做评估：</p>
+
+          <!-- ============ 论文原图：Self-RAG 概览（Asai et al., 2023, Figure 1） ============ -->
+          <figure class="paper-figure">
+            <img src="../../assets/figures/10-applications/advanced-rag/fig1.png"
+                 alt="论文原图：Self-RAG 的检索-批判-生成框架（Asai et al., 2023, Figure 1）"
+                 loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：Self-RAG 框架——模型学习"何时检索、检索是否相关、回答是否被证据支持"等反射 token，把检索决策内化到生成过程</span>
+              <span class="pf-src">论文原图 · Asai et al., <em>Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2310.11511" target="_blank" rel="noopener">arXiv:2310.11511</a></span>
+            </figcaption>
+          </figure>
+
+          <h3>检索后评估：结果够不够用</h3>
+          <p>检索回来的文档可能不相关、不充分或矛盾。评估方式可以是：</p>
+          <ul>
+            <li><strong>LLM-as-Judge</strong>：让 LLM 判断检索结果是否足以回答问题，不够则改写 query 重新检索。优点是灵活，缺点是又多一次模型调用，而且判官本身也会出错。</li>
+            <li><strong>重排器打分</strong>：用 cross-encoder 重排器对检索结果打分，如果 Top-1 的分数低于阈值，说明检索质量差。这个方案<strong>几乎零额外成本</strong>——重排本来就要跑，只是顺手把分数拿来当信号用。性价比最高，应该作为默认方案。</li>
+            <li><strong>覆盖率检查</strong>：对于拆解的子问题，检查每个子问题是否都有对应的检索结果。这是纯代码逻辑，成本为零，适合和子问题拆解配套使用。</li>
+          </ul>
+
+          <h3>生成后验证：答案对不对</h3>
+          <p>生成答案后，再做一轮验证：</p>
+          <ul>
+            <li><strong>引用一致性</strong>：答案中的每个事实声明是否都能在检索到的文档中找到出处。这是最实用的一项，因为它直接对应用户最在意的「你说的这句话有依据吗」。</li>
+            <li><strong>自洽性检查</strong>：让 LLM 用不同的 prompt 重新回答，比较两次答案是否一致。不一致往往意味着证据不足、模型在猜。</li>
+            <li><strong>置信度评估</strong>：如果检索结果与答案存在矛盾或答案缺乏支撑，标记低置信度或触发补充检索。</li>
+          </ul>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 改写查询
+  改写查询 --> 检索中
+  检索中 --> 评估检索: 拿到候选
+
+  评估检索 --> 改写查询: 相关度过低<br/>且未超迭代上限
+  评估检索 --> 联网兜底: 本地库确实没有
+  评估检索 --> 生成中: 证据充分
+  联网兜底 --> 生成中: 补到外部证据
+  联网兜底 --> 拒答: 外部也查不到
+
+  生成中 --> 验证答案
+  验证答案 --> 检索中: 有断言缺出处<br/>且未超迭代上限
+  验证答案 --> 输出: 全部断言可溯源
+  验证答案 --> 降级输出: 超出迭代上限<br/>标注低置信度
+
+  评估检索 --> 拒答: 超出迭代上限<br/>仍无有效证据
+
+  输出 --> [*]
+  降级输出 --> [*]
+  拒答 --> [*]
+
+  note right of 拒答
+    拒答是合法终态
+    不是系统故障
+    强行编答案才是故障
+  end note
+            </div>
+            <figcaption>自反思 RAG 的状态机。<strong>三个终态缺一不可</strong>：正常输出、降级输出（带低置信度标记）、明确拒答。很多实现只考虑了正常输出，结果一旦证据不足就在循环里空转，最后超时或者硬编一个答案——这两种都比老实拒答更糟。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>路线</th><th>判断在哪一步做</th><th>不满意时怎么办</th><th>额外成本</th><th>适合场景</th></tr></thead>
+              <tbody>
+                <tr><td><strong>阈值触发（重排分数）</strong></td><td>重排之后，纯数值比较</td><td>改写 query 重检一次</td><td><strong>近乎为零</strong></td><td>所有场景的默认起点</td></tr>
+                <tr><td><strong>Self-RAG 式自评</strong></td><td>模型自己产出反思标记，判断是否需检索、检索到的是否相关、答案是否被支撑</td><td>按标记决定重检或继续生成</td><td>需要专门训练过的模型</td><td>有条件做定制训练时</td></tr>
+                <tr><td><strong>Corrective RAG 式纠错</strong></td><td>用一个轻量评估器给检索结果打「正确 / 模糊 / 错误」三档</td><td>正确则精炼，错误则改走网络搜索兜底</td><td>一个小评估模型 + 可能的外部搜索</td><td>本地库覆盖不全、允许联网的场景</td></tr>
+                <tr><td><strong>引用校验后置</strong></td><td>生成之后，逐条断言比对出处</td><td>标记无出处的断言，或删除后重生成</td><td>1 次校验调用</td><td>对溯源要求高的合规场景</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">先上最便宜的那一档</span>
+            上面四条路线里，<strong>「阈值触发」几乎是免费的</strong>——你已经在跑重排器了，只需要把 Top-1 分数拿出来和一个阈值比一下。它能拦住相当一部分「检索完全没命中」的情况，而这类情况恰恰是幻觉的主要来源。先把这一档做扎实，再考虑要不要上更贵的自评和纠错。工程上一个常见错误是直接冲着最复杂的方案去，结果调不动、也说不清收益来自哪一环。
+          </div>
+
+          <!-- ============ Section 5: Agentic RAG ============ -->
+          <h2>Agentic RAG：把检索变成工具调用</h2>
+          <p>当 RAG 的控制流从固定管道变成 LLM 自主决策——什么时候检索、检索什么、检索几次、什么时候停——它就变成了 <strong>Agentic RAG</strong>。本质上是把检索作为工具交给 Agent 自主调用，Agent 根据当前状态决定下一步动作。</p>
+
+          <p>Agentic RAG 与管道式 Advanced RAG 的区别在于<strong>控制权的归属</strong>：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>管道式 Advanced RAG</th><th>Agentic RAG</th></tr></thead>
+              <tbody>
+                <tr><td>控制流</td><td>预定义的改写→检索→评估→生成</td><td>LLM 自主决定每一步动作</td></tr>
+                <tr><td>检索次数</td><td>固定或有限迭代</td><td>动态，按需调用</td></tr>
+                <tr><td>灵活性</td><td>中，管道结构可调</td><td>高，可处理未预见的检索需求</td></tr>
+                <tr><td>延迟</td><td>可控，管道长度有上限</td><td>不可控，可能多轮检索</td></tr>
+                <tr><td>成本</td><td>可预估</td><td>波动大，需设上限</td></tr>
+                <tr><td>可观测性</td><td>链路固定，日志结构统一</td><td><strong>必须有完整 trace</strong>，否则无法复盘</td></tr>
+                <tr><td>适用场景</td><td>结构化问答</td><td>复杂研究、开放探索</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>Agentic RAG 真正解锁的能力是<strong>多数据源编排</strong>。当检索变成工具后，它就不再局限于一个向量库：可以有「查内部知识库」「查结构化数据库」「查知识图谱」「联网搜索」四个工具，由模型根据问题性质自己选。问「上季度华东区销售额」应该走结构化 SQL 查询而不是向量检索，问「竞品最近有什么动作」应该走联网搜索——这类分派逻辑用 if-else 写死会越写越乱，交给模型反而清爽。这一部分的通用机制见 <a href="../11-agents/tool-use-mcp.html">工具调用与 MCP</a>。</p>
+
+          <details class="deep">
+            <summary>展开：一个带硬预算闸门的 Agentic RAG 主循环</summary>
+            <div class="deep-body">
+              <p>Agentic RAG 最大的工程风险不是效果，而是<strong>失控</strong>：模型陷入「检索—觉得不够—再检索」的循环，把预算烧光、把用户晾住。下面这个骨架演示三道闸门：迭代次数上限、token 预算上限、重复查询检测。</p>
+              <pre><code class="language-python">from dataclasses import dataclass, field
+
+@dataclass
+class Budget:
+    max_iters: int = 6
+    max_tokens: int = 30000
+    used_iters: int = 0
+    used_tokens: int = 0
+    seen_queries: set = field(default_factory=set)
+
+    def exhausted(self) -&gt; bool:
+        return (self.used_iters &gt;= self.max_iters
+                or self.used_tokens &gt;= self.max_tokens)
+
+    def is_repeat(self, q: str) -&gt; bool:
+        key = q.strip().lower()
+        if key in self.seen_queries:
+            return True
+        self.seen_queries.add(key)
+        return False
+
+
+TOOLS = {
+    "search_kb":   "在内部知识库做语义检索, 参数: query",
+    "query_sql":   "对结构化业务库做统计查询, 参数: question",
+    "search_web":  "联网检索公开信息, 参数: query",
+    "finish":      "证据已足够, 输出最终答案, 参数: answer, citations",
+}
+
+def agentic_rag(question: str, llm, tools, budget: Budget) -&gt; dict:
+    evidence = []          # 累积的证据片段, 每条带来源
+    trace    = []          # 完整轨迹, 用于线上复盘
+
+    while not budget.exhausted():
+        budget.used_iters += 1
+        step = llm.plan(question=question, evidence=evidence,
+                        tool_specs=TOOLS)      # 返回 {tool, args}
+        trace.append(step)
+
+        if step["tool"] == "finish":
+            return {"answer": step["args"]["answer"],
+                    "citations": step["args"].get("citations", []),
+                    "confidence": "high", "trace": trace}
+
+        # 闸门1: 重复查询直接拦掉, 并把这个事实告诉模型
+        q = str(step["args"].get("query") or step["args"].get("question", ""))
+        if budget.is_repeat(q):
+            evidence.append({"source": "system",
+                             "text": f"查询 '{q}' 已执行过, 结果无新增, 请换思路或结束。"})
+            continue
+
+        # 闸门2: 未知工具不执行
+        if step["tool"] not in tools:
+            evidence.append({"source": "system",
+                             "text": f"无此工具: {step['tool']}"})
+            continue
+
+        result = tools[step["tool"]](**step["args"])
+        budget.used_tokens += result.get("tokens", 0)
+        evidence.extend(result["chunks"])
+
+    # 闸门3: 预算耗尽 -&gt; 降级输出而非硬编答案
+    if not evidence:
+        return {"answer": "根据现有资料无法回答。", "citations": [],
+                "confidence": "none", "trace": trace}
+    draft = llm.summarize(question, evidence, note="预算已耗尽, 基于现有证据作答")
+    return {"answer": draft, "citations": [e["source"] for e in evidence],
+            "confidence": "low", "trace": trace}</code></pre>
+              <p>四个设计要点：</p>
+              <ul>
+                <li><strong>重复查询不是静默跳过，而是把「你已经查过了」写回证据里。</strong>如果只是跳过，模型下一轮很可能再发一次同样的查询，白白消耗迭代次数。把这个事实显式告诉它，才能促使它换个思路。</li>
+                <li><strong>预算耗尽时降级而不是失败。</strong>已经攒到的证据是有价值的，基于它们给一个标注了 <code>confidence: low</code> 的答案，比直接报错对用户更友好。</li>
+                <li><strong>trace 必须完整记录每一步的工具与参数。</strong>Agentic 系统同一个问题两次运行的轨迹可能完全不同，没有 trace 就没法复盘线上问题。可观测性的完整讨论见 <a href="../12-llmops/observability.html">可观测性与全链路追踪</a>。</li>
+                <li><strong>confidence 字段要一路传到前端。</strong>低置信度的答案应该在 UI 上有明显区分，而不是和高置信度答案长得一模一样。</li>
+              </ul>
+              <p style="margin-bottom:0">另外注意：这里的 <code>max_iters=6</code> 和 <code>max_tokens=30000</code> 是示意值，实际取值要根据你的 SLO 和单位经济来定，参见 <a href="../12-llmops/cost-engineering.html">推理成本工程</a>。</p>
+            </div>
+          </details>
+
+          <div class="callout">
+            <span class="callout-t">设计取舍</span>
+            Agentic RAG 更灵活但延迟和成本更不可控——一个复杂问题可能触发 5–10 次检索调用。生产环境通常设一个最大迭代次数和 token 预算上限，避免 Agent 陷入「检索-评估-再检索」的死循环。管道式 Advanced RAG 更适合需要稳定 SLO 的在线服务，Agentic RAG 更适合离线研究或对延迟不敏感的场景。一个常见的折中：<strong>在线走管道式并给出快速答案，同时把复杂问题异步转入 Agentic 深度处理，完成后推送给用户。</strong>
+          </div>
+
+          <!-- ============ Section 6: 路由 ============ -->
+          <h2>路由：让简单问题走简单的路</h2>
+          <p>Advanced RAG 的每一步增强都增加了延迟和成本。一个简单问题的检索-生成可能 2 秒，加上查询改写、多跳检索和自反思可能变成 10–20 秒。不是所有问题都需要 Advanced RAG——大部分简单事实问答用基础 RAG 就够了。关键是<strong>路由</strong>：先判断问题复杂度，简单问题走快速管道，复杂问题走 Advanced 管道。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  Q["用户问题"] --> C1{"是闲聊或<br/>与知识库无关?"}
+  C1 -->|是| P0["直答/礼貌说明<br/>不检索"]
+  C1 -->|否| C2{"能被单条<br/>事实回答?"}
+  C2 -->|是| P1["快速管道<br/>混合检索+重排+生成<br/>约1-3秒"]
+  C2 -->|否| C3{"需要跨实体<br/>关系推理?"}
+  C3 -->|是| P3["图路径<br/>GraphRAG"]
+  C3 -->|否| C4{"需要统计聚合<br/>或精确数值?"}
+  C4 -->|是| P4["结构化查询<br/>Text-to-SQL"]
+  C4 -->|否| C5{"依赖前一步<br/>结果继续查?"}
+  C5 -->|是| P5["多跳管道<br/>约8-20秒"]
+  C5 -->|否| P2["改写+扩展管道<br/>约3-6秒"]
+
+  P1 --> V{"重排Top1分数<br/>低于阈值?"}
+  V -->|是| P2
+  V -->|否| OUT["输出"]
+  P2 --> OUT
+  P3 --> OUT
+  P4 --> OUT
+  P5 --> OUT
+  P0 --> OUT
+
+  style P1 fill:#eaf3de,stroke:#639922
+  style P2 fill:#e6f1fb,stroke:#185fa5
+  style P5 fill:#faeeda,stroke:#ba7517
+  style P3 fill:#faeeda,stroke:#ba7517
+            </div>
+            <figcaption>RAG 路由决策树。<strong>最关键的是 P1 下面那个回退分支</strong>：先乐观地走最便宜的快速管道，只有当重排分数说明「没检索到好东西」时才升级到更贵的管道。这种「乐观执行 + 失败升级」的结构，比一上来就用分类器精确判断复杂度更鲁棒——因为分类器本身也会判错，而重排分数是基于实际检索结果的事后信号，更可靠。</figcaption>
+          </figure>
+
+          <p>路由器怎么实现？三种做法，成本递增：</p>
+          <ol>
+            <li><strong>规则 + 关键词</strong>：包含「对比」「哪个更」「一共有多少」等词就走复杂管道。零成本，但覆盖率有限，且容易被绕过。</li>
+            <li><strong>小模型分类</strong>：用一个轻量模型做几路分类。延迟几十毫秒，准确率尚可，是多数场景的合理选择。</li>
+            <li><strong>乐观执行 + 事后回退</strong>：不预判，直接走快速管道，用重排分数或答案验证结果决定要不要升级。<strong>准确性最高，因为判据来自实际检索结果而非猜测</strong>；代价是简单问题也要多等一次判断，复杂问题则要跑两遍。</li>
+          </ol>
+          <p>实际系统里三种常常叠加：规则先挡掉明显的闲聊，小模型做粗分类，重排分数做最后的兜底回退。</p>
+
+          <!-- ============ Section 7: 评估 ============ -->
+          <h2>怎么评估 Advanced RAG</h2>
+          <p>Advanced RAG 比 Naive RAG 难评估得多，因为它多了中间步骤，而中间步骤各自都可能出错。只看最终答案对不对，你会陷入「知道它错了但不知道错在哪」的困境。正确做法是<strong>分层打指标</strong>：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层次</th><th>指标</th><th>怎么算</th><th>指标掉了说明什么</th></tr></thead>
+              <tbody>
+                <tr><td><strong>改写层</strong></td><td>改写后召回率提升量</td><td>同一批问题，用原问题和改写后问题各跑一遍检索，比 Recall@K</td><td>改写在帮倒忙，或改写模型不稳定</td></tr>
+                <tr><td><strong>改写层</strong></td><td>拆解合理性</td><td>人工抽检子问题是否覆盖原问题的所有要点、有无过度拆解</td><td>Prompt 需要调，或拆解上限设得不对</td></tr>
+                <tr><td><strong>检索层</strong></td><td>上下文精确率 / 召回率</td><td>送进生成的片段里有多少真正相关；该找到的有没有都找到</td><td>精确率低说明噪声多，召回率低说明漏检</td></tr>
+                <tr><td><strong>多跳层</strong></td><td>中间答案正确率</td><td>逐跳标注中间答案，单独打分</td><td>第一跳就错的比例高，说明错误传播是主因</td></tr>
+                <tr><td><strong>生成层</strong></td><td>忠实度（faithfulness）</td><td>答案里的每条断言能否被给定上下文支撑</td><td>模型在自由发挥，Prompt 约束不够</td></tr>
+                <tr><td><strong>生成层</strong></td><td>答案相关性</td><td>答案是否真的在回答用户问的那件事</td><td>可能是改写跑偏，把问题改成了另一个问题</td></tr>
+                <tr><td><strong>系统层</strong></td><td>p95 延迟 / 单问平均调用数 / 单问成本</td><td>从 trace 里统计</td><td>Agentic 循环失控，或路由把简单问题送错了管道</td></tr>
+                <tr><td><strong>系统层</strong></td><td>拒答率与拒答准确率</td><td>该拒答时拒答了吗；不该拒答时误拒了吗</td><td>阈值设置过严或过松</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">别用同一个模型既生成又当裁判</span>
+            用 LLM 自动评估 RAG 是常见做法（忠实度、答案相关性这类指标基本只能这么算），但如果生成用的模型和评判用的模型是同一个，分数会系统性虚高——模型倾向于认可自己的输出。至少要换一个不同家族的模型当裁判，并且用一批人工标注过的样本去校准裁判本身的准确率。评估方法的偏差来源见 <a href="../13-evaluation/eval-methods.html">评估方法论</a>。
+          </div>
+
+          <!-- ============ Section 7.5: 生产级 RAG 深潜 ============ -->
+          <section id="production-rag-depth">
+          <h2>生产级 RAG 深潜：从“能答”到“可诊断、可运营”</h2>
+          <p>只看最终答案准确率，无法回答“为什么错、该改哪一层”。生产级 RAG 要把错误拆成可定位的环节，并把离线评测、线上指标和故障处置连成闭环。下面的分解既适用于 Naive RAG，也适用于 Agentic RAG；差别只是后者还要把每次路由、工具调用和迭代预算记进 trace。</p>
+
+          <h3>1. RAG 误差分解：先找错在哪一层</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>误差层</th><th>核心问题</th><th>典型症状</th><th>优先排查/修复</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Query understanding</strong><br>查询理解</td><td>是否正确理解实体、指代、时间范围、问题类型与权限边界？</td><td>用户问“今年”却检索成历史年份；对比题漏掉一方；多轮对话指代漂移</td><td>记录原 query 与 resolved query；做实体/时间抽取、指代消解和意图路由的单测</td></tr>
+                <tr><td><strong>Retrieval recall</strong><br>检索召回</td><td>包含答案的文档是否进入候选集？</td><td>Top-k 中根本没有金标准证据；换 query 或增大 k 才偶尔命中</td><td>对 dense、sparse、hybrid 分别测 Recall@k；补同义词、元数据过滤和 query 扩展</td></tr>
+                <tr><td><strong>Ranking precision</strong><br>排序精度</td><td>相关证据是否排在上下文预算能覆盖的位置？</td><td>候选集有答案但 Top-5 被噪声占满；相关片段排到末尾</td><td>增加 cross-encoder rerank；看 MRR/nDCG、Top-1 分数与分数阈值校准</td></tr>
+                <tr><td><strong>Context utilization</strong><br>上下文利用</td><td>模型是否真正使用了送入上下文中的相关证据？</td><td>证据在上下文里但答案遗漏；长上下文中间信息被忽略；冲突片段未处理</td><td>测 context precision/recall；去重、压缩、按证据强度排序并限制上下文预算</td></tr>
+                <tr><td><strong>Generation faithfulness</strong><br>生成忠实度</td><td>答案断言是否被证据支持，引用是否指向对应断言？</td><td>答案出现上下文没有的数字/因果；引用存在但不能支撑这句话</td><td>做 claim-level entailment 与 citation correctness；不确定时降级或拒答</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  Q["原始问题"] --> U{"查询理解\n实体/时间/意图正确?"}
+  U -->|否| U1["修正改写/路由"] --> U
+  U -->|是| R["候选检索"]
+  R --> RC{"Recall@k\n命中金标准?"}
+  RC -->|否| R1["扩大覆盖: sparse/dense/hybrid\n改 chunk/过滤/扩展"] --> R
+  RC -->|是| RK["重排与上下文组装"]
+  RK --> RP{"MRR/nDCG\n相关证据靠前?"}
+  RP -->|否| RK1["cross-encoder/去重/排序"] --> RK
+  RP -->|是| C["送入生成"]
+  C --> CU{"Context P/R\n证据被利用?"}
+  CU -->|否| C1["压缩/重排/减少噪声"] --> C
+  CU -->|是| G["生成答案与引用"]
+  G --> F{"Faithfulness +\nCitation correctness"}
+  F -->|失败| F1["重生成/补检索/拒答"] --> R
+  F -->|通过| O["带 trace 的输出"]
+  style U fill:#faeeda,stroke:#ba7517
+  style RC fill:#e6f1fb,stroke:#185fa5
+  style RP fill:#e6f1fb,stroke:#185fa5
+  style CU fill:#faeeda,stroke:#ba7517
+  style F fill:#fcebeb,stroke:#a32d2d
+  style O fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>误差分解闭环：先定位是“没理解、没召回、没排上来、没用好上下文”还是“生成不忠实”，再只改对应环节。每次实验应固定其他变量，并保留 query、候选文档、重排分数、最终 context、claims 与 citations。</figcaption>
+          </figure>
+
+          <h3>2. 指标定义：把“感觉变好了”变成可复现数字</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>定义（单问题）</th><th>适合回答</th><th>评测注意事项</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Recall@k</strong></td><td>前 k 个候选中包含至少一个相关文档的问题占比；单题可写为 <code>1{相关证据∈Top-k}</code></td><td>检索有没有把答案找回来？</td><td>标注“可回答所需的全部证据”，多跳问题不能只标一篇文档</td></tr>
+                <tr><td><strong>MRR</strong></td><td>第一个相关结果排名的倒数的平均值：<code>MRR = mean(1/rank_first_relevant)</code></td><td>第一个有用结果排得靠不靠前？</td><td>只关注第一个相关结果，适合单证据问答；不要替代多相关结果指标</td></tr>
+                <tr><td><strong>nDCG@k</strong></td><td>按相关性等级计算折损累计增益，并除以理想排序的增益：<code>nDCG = DCG / IDCG</code></td><td>多个相关性等级的排序质量如何？</td><td>先统一 0–3 等级标注标准；明确是否对位置做 log 折损</td></tr>
+                <tr><td><strong>Context precision</strong></td><td>送入生成的上下文中，排在前面的相关片段占比（位置敏感）</td><td>上下文是否被无关噪声淹没？</td><td>可按 chunk 或句子标注；长 chunk 会掩盖其中只有一句相关内容</td></tr>
+                <tr><td><strong>Context recall</strong></td><td>回答所需的参考证据，有多少被检索并放进上下文</td><td>是否漏掉回答所需信息？</td><td>需要 reference answer/证据集；对多跳问题按证据集合而非单文档计算</td></tr>
+                <tr><td><strong>Answer faithfulness</strong></td><td>答案中的原子断言，有多少可由给定上下文蕴含/支持：<code>supported_claims / all_claims</code></td><td>模型有没有基于证据作答？</td><td>先拆 claim 再判断，不能只用答案与上下文的整体相似度</td></tr>
+                <tr><td><strong>Citation correctness</strong></td><td>引用是否存在、指向可访问的证据，并且该证据确实支持所绑定的断言</td><td>“有引用”是否等于“引用正确”？</td><td>分开测 citation completeness（该引是否引）与 correctness（引得对不对）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">评测闭环</span>
+            离线建立按问题类型分层的 golden set（单跳、多跳、数值、时间敏感、权限敏感、不可回答）；每次改动同时跑检索层与生成层指标。上线后把真实 query、检索 trace、用户反馈和抽样人工标注回流，按错误分解聚类，形成“发现回归 → 定位层级 → 修改一个组件 → 重跑固定集 → 灰度观察”的闭环。不要只优化一个总分：Recall 上升但 faithfulness 下降，通常是噪声进入上下文；faithfulness 上升但 recall 下降，可能是模型更保守而不是检索变好。</div>
+
+          <h3>3. 检索与切分选型：先按数据和问题形态决策</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>组件</th><th>优点</th><th>代价/失效模式</th><th>默认建议</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Dense retrieval</strong></td><td>擅长语义改写、跨词表表达、自然语言问题</td><td>专名、错误码、精确数字可能漏召回；embedding 与索引有成本</td><td>开放式语义问答的基础候选源；用领域数据验证 embedding</td></tr>
+                <tr><td><strong>Sparse retrieval</strong><br>BM25/倒排</td><td>专名、产品号、错误码、数字和新词鲁棒；解释性强</td><td>同义表达与口语改写覆盖较弱；词法匹配不理解语义</td><td>企业知识库必须保留，尤其是代码、型号、政策条款</td></tr>
+                <tr><td><strong>Hybrid retrieval</strong></td><td>融合语义召回与词法精确匹配，降低单路盲区</td><td>需要分数/排名融合与更多索引维护；可能增加候选噪声</td><td>生产默认起点；用 RRF 或学习到的融合权重，并以 Recall@k 验证</td></tr>
+                <tr><td><strong>Cross-encoder rerank</strong></td><td>联合编码 query 与文档，排序精度通常高于单向量相似度</td><td>逐 query-doc 推理，候选太多会拉高 p95；需截断输入</td><td>先召回 30–100 条，再重排到 5–10 条；按延迟预算设置候选数</td></tr>
+                <tr><td><strong>固定长度 chunk</strong></td><td>实现简单、吞吐稳定、易增量更新</td><td>可能切断表格、定义、步骤和跨段依赖</td><td>按结构边界优先，长度只是上限；保留标题和层级元数据</td></tr>
+                <tr><td><strong>Parent-child chunk</strong></td><td>child 用于精确召回，parent 提供完整语境，兼顾排序与生成</td><td>存储与回填逻辑更复杂；parent 过大浪费上下文</td><td>规章、API 文档、长章节等结构稳定资料优先采用；限制 parent token</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>一个可解释的默认链路是：<strong>BM25 + dense 并行召回 → RRF 融合 → cross-encoder 重排 → parent 回填/去重 → 按证据强度组装上下文</strong>。不要把“混合”理解成永远更好：如果语料极短且术语固定，BM25 可能已经足够；如果流量极大且 p99 严格，cross-encoder 应只用于低置信度或高价值 query。每个组件都应有可关闭的 ablation 开关，避免无法知道收益来自哪里。</p>
+
+          <h3>4. 线上系统约束：准确率之外的六个 SLO</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>约束</th><th>设计问题</th><th>可观测指标/保护措施</th></tr></thead>
+              <tbody>
+                <tr><td><strong>延迟</strong></td><td>改写、双路检索、重排和生成如何并行？最慢一环是谁？</td><td>分段 p50/p95/p99；并行 dense/sparse；低置信度才触发重排或补查；硬性 deadline</td></tr>
+                <tr><td><strong>成本</strong></td><td>每问向量、重排、LLM、存储和网络成本是多少？</td><td>按 route 记录 token、调用次数、单问成本；小模型改写/判定；限制 top-k 与迭代预算</td></tr>
+                <tr><td><strong>缓存</strong></td><td>缓存什么才不会返回旧答案或越权答案？</td><td>query 规范化后缓存检索结果，key 必须包含 tenant、权限版本、索引版本；答案缓存需短 TTL 和引用校验</td></tr>
+                <tr><td><strong>索引更新</strong></td><td>增量写入、删除、重嵌入如何保持原子可见？</td><td>文档版本、embedding model/version、双索引切换；删除 tombstone 与后台 compaction；记录 freshness lag</td></tr>
+                <tr><td><strong>权限过滤</strong></td><td>用户无权文档是否会在召回、缓存、引用、日志任一环节泄露？</td><td>检索前强制 tenant/ACL filter，缓存隔离，引用再校验；权限测试集覆盖交叉租户与撤权</td></tr>
+                <tr><td><strong>数据新鲜度</strong></td><td>答案是否满足“刚发布/刚撤回”的时效要求？</td><td>记录 source_updated_at、indexed_at、served_at；按业务设 freshness SLO；热点文档主动失效缓存</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  W["文档写入/更新"] --> V["版本化 + ACL 校验"]
+  V --> E["异步 embedding"]
+  E --> I2["新索引构建"]
+  I2 --> HC{"健康检查\nRecall/延迟/文档数/权限测试"}
+  HC -->|通过| SW["原子切换 alias"]
+  HC -->|失败| RB["保留旧索引并告警"]
+  SW --> INV["按 tenant/文档/索引版本失效缓存"]
+  INV --> S["在线 hybrid 检索"]
+  S --> ACL["再次校验 ACL 与 freshness"]
+  ACL --> ANS["生成 + 引用校验"]
+  style HC fill:#faeeda,stroke:#ba7517
+  style ACL fill:#fcebeb,stroke:#a32d2d
+  style ANS fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>索引更新与在线服务要解耦：新索引先构建、测量、验权，再原子切换；切换后按版本失效缓存。ACL 不应只在写入时检查，在线检索和引用返回前仍需校验。</figcaption>
+          </figure>
+
+          <h3>5. 面试高频系统设计题：企业知识库问答如何演进到生产级？</h3>
+          <p><strong>答题主线：</strong>先问清数据规模、更新频率、租户/权限、答案时效、SLO、成本上限和可接受的拒答率；再给 Naive RAG 基线，最后按评测证据逐步升级，而不是一开始堆 Agent、GraphRAG 和多模型。</p>
+          <ol>
+            <li><strong>V0：Naive RAG 基线。</strong>文档解析与结构化切分，保存标题/来源/更新时间/ACL；embedding 建索引，Top-k 检索，带引用生成。先建立 200–1000 条覆盖真实问题分布的 golden set。</li>
+            <li><strong>V1：提升召回与排序。</strong>BM25 + dense hybrid，RRF 融合，cross-encoder 重排；对错误码、专名和数字保留 sparse 路径。用 Recall@k、MRR/nDCG 证明检索收益。</li>
+            <li><strong>V2：提升上下文与问题理解。</strong>多轮指代消解、条件式 query rewrite、parent-child 回填、去重和 context budget；用 context precision/recall 检查“找到了但没用好”。</li>
+            <li><strong>V3：可靠性与运营。</strong>claim-level faithfulness、citation correctness、低置信度降级/拒答、trace、p95 与成本监控；权限过滤贯穿检索、缓存、引用和日志。</li>
+            <li><strong>V4：按问题类型路由。</strong>简单事实走快速管道；对比/多跳再启用拆解和补检索；统计问题转 Text-to-SQL；只有存在明确收益时才引入 GraphRAG 或 Agentic RAG。</li>
+          </ol>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>面试追问</th><th>应答要点</th></tr></thead>
+              <tbody>
+                <tr><td>“召回率高但答案仍错，怎么办？”</td><td>区分 ranking precision、context utilization 和 faithfulness；查看 gold 是否排到上下文外、是否被噪声淹没、答案 claims 是否超出证据。</td></tr>
+                <tr><td>“如何保证权限安全？”</td><td>ACL 作为检索过滤条件而非生成后过滤；缓存 key 隔离租户/权限版本；引用与文档下载再次鉴权；撤权触发缓存失效与审计。</td></tr>
+                <tr><td>“文档每天更新，如何避免陈旧？”</td><td>增量解析与 embedding、版本化索引、双写/alias 原子切换、freshness lag 监控；热点文档主动失效，失败时保留上一稳定索引。</td></tr>
+                <tr><td>“p95 超标怎么降？”</td><td>先按 trace 定位慢段；并行 dense/sparse，减少候选数，cross-encoder 只对低置信度路由，缓存检索结果，小模型承担改写/判定，设置 deadline 与降级路径。</td></tr>
+                <tr><td>“什么时候拒答？”</td><td>达到迭代/时间预算仍无可引用证据、证据冲突无法消解、权限过滤后无结果时明确拒答；不要用无出处的流畅答案掩盖召回失败。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>6. 故障排查 checklist</h3>
+          <div class="callout">
+            <span class="callout-t">线上排障顺序（从便宜到昂贵）</span>
+            <ul style="margin-bottom:0">
+              <li>□ 复现请求是否记录了 tenant、权限版本、索引版本、原始 query、resolved query 和完整 trace？</li>
+              <li>□ query understanding：实体、时间、否定词、问题类型和语言是否被正确解析？</li>
+              <li>□ retrieval recall：gold evidence 是否出现在候选 Top-k？分别比较 dense、sparse、hybrid 的 Recall@k。</li>
+              <li>□ ranking precision：相关片段是否被 rerank 到上下文预算内？检查 MRR/nDCG、Top-1 分数和重复 chunk。</li>
+              <li>□ context utilization：上下文是否过长、冲突、顺序不佳或缺少 parent；context precision/recall 是否回归？</li>
+              <li>□ generation：逐条拆 claims，检查 faithfulness、citation completeness/correctness，区分“答错”与“证据不足”。</li>
+              <li>□ freshness：source_updated_at 到 indexed_at 的延迟是否超 SLO？是否命中旧缓存或旧 alias？</li>
+              <li>□ ACL：无权限文档是否在候选、缓存、引用或日志中出现；撤权后旧答案是否仍可命中？</li>
+              <li>□ 资源：该请求是否触发了异常多的改写、重排、补检索或 Agent 迭代；p95 与单问成本是否超过预算？</li>
+              <li>□ 修复后：先加到回归集，再做单组件 ablation 和灰度；不要只凭一个成功样例判断修复有效。</li>
+            </ul>
+          </div>
+
+          <p class="small muted">指标与实现可参考 <a href="https://nlp.stanford.edu/IR-book/html/htmledition/evaluation-of-ranked-retrieval-results-1.html" target="_blank" rel="noopener">Stanford IR Book：排序检索评估</a>、<a href="https://arxiv.org/abs/2309.15217" target="_blank" rel="noopener">RAGAS 评测论文</a>、<a href="https://arxiv.org/abs/2212.10496" target="_blank" rel="noopener">HyDE</a>、<a href="https://arxiv.org/abs/2401.15884" target="_blank" rel="noopener">CRAG</a> 与 <a href="https://arxiv.org/abs/2310.11511" target="_blank" rel="noopener">Self-RAG</a>。这些来源分别覆盖传统 IR 指标、RAG 生成/上下文评估和纠错式检索路线。</p>
+
+          <!-- ============ Section 8 ============ -->
+          <h2>实践陷阱：Advanced 不等于更好</h2>
+          <p>把前面各节的坑集中在一起，按踩中频率从高到低排列：</p>
+          <ul>
+            <li><strong>没有基线就上 Advanced</strong>。不先测 Naive RAG 的表现，直接搭一套复杂管道，最后既说不清收益来自哪个组件，也不知道复杂度是否必要。<strong>先把 Naive RAG 的评测跑出来，这是所有后续决策的锚点。</strong></li>
+            <li><strong>改写模块没有降级路径</strong>。查询改写返回了非法 JSON，整个请求 500。改写是<strong>可选增强</strong>，任何异常都应该退回原始 query 继续走。</li>
+            <li><strong>循环没有硬闸门</strong>。只靠 Prompt 里写「最多检索三次」是不够的，模型会忘。必须在代码层用计数器强制截断。</li>
+            <li><strong>只给最终答案的出处</strong>。多跳场景下用户需要看到完整证据链，否则无法判断中间某一跳是不是走错了。</li>
+            <li><strong>把 GraphRAG 当银弹</strong>。语料频繁更新、查询以「找相关文档」为主的场景，图谱的构建和维护成本远超收益。</li>
+            <li><strong>HyDE 用在私域知识上</strong>。模型不认识你的内部术语，编出来的假答案会把检索带向完全错误的方向。</li>
+            <li><strong>忽略拒答这条路径</strong>。系统必须能明确说「查不到」。为了不拒答而强行凑一个答案，是幻觉最大的制造机。</li>
+            <li><strong>成本压测只用精选样例</strong>。用 10 个精心挑选的多跳问题测出来的平均成本，和真实流量分布下的成本可能差一个量级。要用真实日志的问题分布来压测。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">边界声明</span>
+            本页讲的是怎么让 RAG 更准——查询改写、多跳检索、GraphRAG、自反思循环、Agentic 编排。怎么让 RAG 跑三个月不烂掉（陈旧 embedding、检索噪声监控、chunk 版本化）是另一个维度的问题，见 <a href="../12-llmops/rag-in-production.html">RAG 生产运维</a>。怎么搭一个基础 RAG 见 <a href="rag.html">RAG 检索增强生成</a>。检索回来的内容怎么在有限窗口里排布，见 <a href="context-engineering.html">上下文工程</a>。
+          </div>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：Advanced RAG 把直线管道（查一次答一次）变成带反思的循环（改写→检索→评估→生成→验证），核心是让检索变成可迭代的智能过程。</li>
+            <li><strong>三代范式的分水岭是控制权</strong>：Naive 由代码写死，Advanced 由代码编排更复杂流程，Agentic 把「下一步做什么」交给模型。</li>
+            <li><strong>查询改写</strong>：指代消解、子问题拆解、查询扩展、HyDE、Step-back——让 query 更适合检索，是 Advanced RAG 的第一步，也是收益最直接的一步。</li>
+            <li><strong>HyDE 有明确边界</strong>：适合通用知识零样本冷启动；用在私域术语上，假答案的幻觉会直接变成检索的偏移。</li>
+            <li><strong>多跳检索</strong>：每一跳的结果用于构造下一跳的 query。注意错误传播——第一跳错了后面全错，且错得很自洽。用 beam、置信度门限、反向验证三层缓解。</li>
+            <li><strong>GraphRAG</strong>：补的是向量检索在「关系推理」和「全局聚合」上的两个盲区。社区摘要把聚合工作提前到离线，代价是构建成本高、更新麻烦。</li>
+            <li><strong>自反思</strong>：先上最便宜的「重排分数阈值触发」，它几乎零成本却能拦住大部分完全没命中的情况；再考虑 Self-RAG、Corrective RAG 这类更重的方案。</li>
+            <li><strong>状态机必须有三个终态</strong>：正常输出、降级输出（标低置信度）、明确拒答。缺了拒答就是在制造幻觉。</li>
+            <li><strong>Agentic RAG</strong>：把检索变成工具交给模型自主决策，真正解锁的是多数据源编排；但必须有迭代上限、token 预算、重复查询检测三道硬闸门，且必须有完整 trace。</li>
+            <li><strong>路由是性价比最高的优化</strong>：让 80% 的简单问题走 1–3 秒的快速管道，只让真正复杂的问题付出高延迟。推荐「乐观执行 + 重排分数回退」的结构。</li>
+            <li><strong>评估要分层</strong>：改写层、检索层、多跳层、生成层、系统层各有指标。只看最终答案会陷入「知道错了但不知道错在哪」。</li>
+            <li><strong>常见坑</strong>：没基线就上复杂管道、改写模块没降级路径、循环没硬闸门、只给最终出处、把 GraphRAG 当银弹、成本压测只用精选样例。</li>
+          </ul>
+
+          <!-- ============ Section 7.5 continuation: 误差分解落地与面试问答 ============ -->
+          <h3>7. 误差预算与实验设计：不要把所有问题都归因于模型</h3>
+          <p>误差分解的价值不只是写一张漂亮的指标表，而是让每次优化都能回答“投入了什么、改善了什么、牺牲了什么”。建议为每个请求保存一份不可变的实验记录：原始问题、规范化问题、用户与租户、检索路由、dense/sparse 各自的候选、融合排名、rerank 分数、最终上下文、模型版本、引用绑定的 claim、耗时和 token。这样才能在同一条 query 上做逐组件 ablation，而不是凭主观印象比较两段答案。</p>
+          <p>可以把一次请求的成功概率近似看成多个环节共同约束的结果：<code>P(answer usable) ≈ P(understanding) × P(recall) × P(rank | recall) × P(utilize | context) × P(faithful | evidence)</code>。这不是严格的因果模型，但很适合指导排查。若 Recall@k 只有 0.60，生成 Prompt 再精细也无法弥补；若 Recall@k 已达 0.95 而 faithfulness 只有 0.70，则继续扩大 k 可能只会增加噪声，应优先检查上下文拼装、冲突处理与 claim 校验。</p>
+          <p>离线实验应固定随机种子、候选上限、上下文 token 预算和评测版本，并按问题族分桶：精确实体、错误码/编号、时间范围、对比、多跳、不可回答、权限过滤和刚更新文档。整体平均值会掩盖长尾：一个系统可能在单跳 FAQ 上 Recall@10 达到 98%，但在多跳问题上只有 55%。上线灰度时同时看效果、延迟、成本和安全四类门槛；任何一类越过红线，都不能只用另一类的提升来“平均掉”。</p>
+
+          <h3>8. 企业知识库的参考架构：写入、检索、生成、治理四条链</h3>
+          <p>企业系统不应只有“向量库 + LLM”两个盒子。写入链负责解析 PDF、网页、表格和工单，保留标题层级、来源、版本、作者、更新时间与 ACL；索引链分别维护倒排索引、向量索引和可选的实体图；在线链按 query 类型并行调用 sparse 与 dense，再用 RRF 融合、rerank、parent 回填和去重；治理链则负责审计、删除、权限、质量抽样、成本预算与新鲜度告警。</p>
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph INGEST["写入与治理"]
+    DOC["文档/工单/表格"] --> PARSE["解析与结构化"]
+    PARSE --> META["版本、ACL、更新时间"]
+    META --> IDX["倒排 + 向量 + 可选图索引"]
+  end
+  subgraph ONLINE["在线问答"]
+    Q["用户问题"] --> AUTH["身份与租户校验"]
+    AUTH --> ROUTE{"问题路由"}
+    ROUTE -->|"精确词/编号"| BM["BM25"]
+    ROUTE -->|"语义问题"| DE["Dense"]
+    ROUTE -->|"默认"| HY["Hybrid + RRF"]
+    BM --> RR["Rerank"]
+    DE --> RR
+    HY --> RR
+    RR --> CTX["去重、压缩、Parent 回填"]
+    CTX --> GEN["生成与逐条引用"]
+    GEN --> CHECK["Faithfulness/Citation 校验"]
+  end
+  IDX -.-> BM
+  IDX -.-> DE
+  IDX -.-> HY
+  CHECK --> OUT["输出或拒答"]
+  style AUTH fill:#fcebeb,stroke:#a32d2d
+  style RR fill:#e6f1fb,stroke:#185fa5
+  style CHECK fill:#faeeda,stroke:#ba7517
+            </div>
+            <figcaption>企业知识库的最小生产架构。权限校验既出现在入口，也要在检索候选和引用返回前再次执行；缓存不能绕过 ACL。写入链和在线链通过版本化索引解耦，避免重嵌入时阻塞线上流量。</figcaption>
+          </figure>
+          <p>缓存设计尤其容易被忽略。检索缓存的 key 至少应包含规范化 query、tenant、权限版本、过滤条件、embedding 版本和索引 alias；答案缓存还要包含模型与 Prompt 版本，并设置比文档新鲜度更短的 TTL。撤权、文档删除或热点文档更新时，按 tenant 与文档 ID 主动失效，而不是等待自然过期。任何“命中缓存直接返回”的分支都必须重新确认权限和文档版本，不能把缓存当成可信边界。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>面试问答</th><th>推荐回答结构</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Q1：Recall@k 很高，为什么用户仍说答案不准？</strong></td><td>先确认 gold evidence 是否真的进入上下文；再看 MRR/nDCG 判断相关片段是否靠前，context precision 判断噪声比例，context recall 判断多跳证据是否齐全，最后按 claim 检查 faithfulness 与 citation correctness。不要直接把 top-k 再调大，因为扩大候选可能提高召回却降低上下文利用率。</td></tr>
+                <tr><td><strong>Q2：dense、sparse、hybrid 和 rerank 怎么选？</strong></td><td>以 hybrid 作为企业默认：dense 解决同义表达，BM25 保护专名、错误码、数字和新词，RRF 只融合排名不强行比较异构分数，再用 cross-encoder 对有限候选重排。若 p95 紧张，先并行两路、降低候选数，并只对低置信度 query 触发 rerank；用 Recall@k、MRR/nDCG 和分段延迟做 ablation 证明收益。</td></tr>
+                <tr><td><strong>Q3：文档频繁更新且多租户，如何保证不陈旧、不越权？</strong></td><td>写入时生成文档版本和 ACL 快照，异步 embedding 后构建新索引，健康检查通过后原子切换 alias；记录 source_updated_at、indexed_at 与 freshness lag。在线检索强制 tenant/ACL filter，缓存 key 隔离权限版本，引用返回前再次鉴权；撤权和删除使用 tombstone 加主动失效。若新索引失败，保留旧索引但标记新鲜度告警，不能返回无来源的猜测。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>9. 可执行的最小伪代码与外部资料</h3>
+          <pre><code class="language-python">def answer(question, user):
+    q = normalize(question, history=user.history)
+    policy = acl_snapshot(user.tenant, user.id)
+    hits = hybrid_retrieve(q, filters=policy, top_k=50)
+    ranked = rerank(q, hits)[:8]
+    context = pack_parent_chunks(deduplicate(ranked), token_budget=6000)
+    if context_recall(context) &lt; MIN_CONTEXT_RECALL:
+        context = fallback_retrieve(q, filters=policy)
+    draft = generate_with_claims(q, context)
+    checked = verify_claims_and_citations(draft, context)
+    return checked if checked.ok else refuse_or_degrade(checked)</code></pre>
+          <p>伪代码中的关键不是函数名，而是边界顺序：先做权限过滤再检索，先做上下文检查再生成，先做逐条引用校验再输出。实现 BM25 时可参考 <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules-similarity.html" target="_blank" rel="noopener">Elasticsearch similarity 文档</a>；混合检索的查询融合可参考 <a href="https://qdrant.tech/documentation/concepts/hybrid-queries/" target="_blank" rel="noopener">Qdrant Hybrid Queries</a>；传统排序指标的定义见 <a href="https://nlp.stanford.edu/IR-book/html/htmledition/evaluation-of-ranked-retrieval-results-1.html" target="_blank" rel="noopener">Stanford IR Book</a>。真实系统还应把这些指标与业务成功事件（点击引用、解决工单、人工采纳）关联，避免只优化代理指标。</p>
+          <p>最终的工程原则是“证据优先、失败可见、成本可控”：没有召回证据就拒答，有证据但排序或引用不确定就降级并标低置信度；每次补检索都受 deadline、迭代数和 token 预算约束；每次优化都要留下 trace 和回归样本。这样 RAG 才从一次性的 Demo 变成能诊断、能审计、能持续演进的企业知识库系统。</p>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>HyDE: Precise Zero-Shot Dense Retrieval without Relevance Labels — 用假想文档改进检索 · <a href="https://arxiv.org/abs/2212.10496" target="_blank" rel="noopener">arXiv:2212.10496</a></li>
+            <li>From Local to Global: A Graph RAG Approach to Query-Focused Summarization — 微软 GraphRAG 的原始论文，社区摘要与全局问答的设计出处 · <a href="https://arxiv.org/abs/2404.16130" target="_blank" rel="noopener">arXiv:2404.16130</a></li>
+            <li>Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection — 自反思检索生成，用反思标记控制检索时机 · <a href="https://arxiv.org/abs/2310.11511" target="_blank" rel="noopener">arXiv:2310.11511</a></li>
+            <li>RAGAS: Automated Evaluation of Retrieval Augmented Generation — RAG 系统的自动评估框架，忠实度与答案相关性等指标的定义来源 · <a href="https://arxiv.org/abs/2309.15217" target="_blank" rel="noopener">arXiv:2309.15217</a></li>
+            <li>Corrective Retrieval Augmented Generation (CRAG) — 检索结果三档纠错与 web 搜索兜底 · <a href="https://arxiv.org/abs/2401.15884" target="_blank" rel="noopener">arXiv:2401.15884</a></li>
+            <li>Retrieval-Augmented Generation for Large Language Models: A Survey — 把 Naive / Advanced / Modular 三代范式梳理清楚的综述 · <a href="https://arxiv.org/abs/2312.10997" target="_blank" rel="noopener">arXiv:2312.10997</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            基础 RAG 的完整链路（切分、索引、检索、重排、生成）见 <a href="rag.html">RAG 检索增强生成</a>。把 RAG 跑成稳定的线上系统（陈旧 embedding、检索噪声、chunk 版本化）见 <a href="../12-llmops/rag-in-production.html">RAG 生产运维</a>。有限上下文预算的分配与压缩策略见 <a href="context-engineering.html">上下文工程</a>。Agentic RAG 依赖的 Agent 循环设计见 <a href="../11-agents/agent.html">Agent 基础范式</a>，工具调用的规范见 <a href="../11-agents/tool-use-mcp.html">工具调用与 MCP</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

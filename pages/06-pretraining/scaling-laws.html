@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Scaling Laws · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="06-pretraining" data-topic="scaling-laws">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>Scaling Laws：规模律</h1>
+            <p class="lead">大模型最反直觉也最有用的一件事是：在极宽的范围内，模型的「测试损失」只由「算力、参数量、数据量」三者决定，跟架构细节关系很小。规模律就是这条经验规律，它让你不训大模型也能预测大模型的 loss，从而把「该训多大、喂多少数据」从玄学变成可计算的方程。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>规模律的核心是一句话：<strong>给定一笔算力预算 $C$，存在一个「算力最优」的参数量 $N$ 和数据量 $D$ 的配比；算错了（要么模型太大没数据喂，要么数据太多模型装不下）都会让同样的钱换来更高的 loss</strong>。Kaplan（2020）认为应该把大头砸在参数上，Chinchilla（2022）用实验纠正为「参数和数据的量应该大致相等」。这张图给出从预算到配比的闭环。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  C["算力预算 C<br/>单位 FLOPs"] --> F["预算换算<br/>C = 6 N D"]
+  F --> SOLVE{"求解最优配比<br/>最小化 L(N D)"}
+  SOLVE --> N["参数量 N 最优"]
+  SOLVE --> D["数据量 D 最优"]
+  N --> T["按 N,D 训练"]
+  D --> T
+  T --> L["测得测试损失 L"]
+  L -->|"L 偏高"| F
+  L -->|"L 达标"| OK["发布模型"]
+  style C fill:#e3f2fd,stroke:#1976d2
+  style SOLVE fill:#fff3e0,stroke:#e08e0b
+  style OK fill:#e8f5e9,stroke:#4a4
+              </div>
+              <figcaption>规模律的规划闭环：把算力预算 C 拆成最优的 N 与 D，训出来测 loss，不达标就回到公式重新配比。所谓「经验规律」就是这套映射关系可重复、可外推。</figcaption>
+            </figure>
+          </div>
+
+          <h2>规模律在说什么：三个可预测的幂律</h2>
+          <p>规模律的本质是<strong>幂律（power law）</strong>。假设测试损失 $L$（通常是交叉熵，单位 nat/token）随某个量 $X$ 增大而下降，形式永远是：</p>
+          <div class="figure" style="text-align:center">
+            $$L(X) = \left(\frac{X_c}{X}\right)^{\alpha} + L_{\infty}$$
+          </div>
+          <p>其中 $X_c$ 是拟合出来的常数，$\alpha$ 是下降的「陡度」指数，$L_{\infty}$ 是当 $X\to\infty$ 时的不可约损失（irreducible loss，模型再大也学不会的那部分）。这个形式对<strong>参数 $N$、数据 $D$、算力 $C$</strong> 三个量都各自成立——这是 2020 年 Kaplan 等人《Scaling Laws for Neural Language Models》最核心的发现。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            规模律像「预算定律」：你手里的钱（算力）只能买到有限的总「信息吞吐」，$N$ 和 $D$ 是两种花钱方式——$N$ 决定模型容量，$D$ 决定它见过多少世界。幂律告诉你「花的钱越多，剩下的便宜越少」（边际收益递减），但关键是这两种花法的<strong>最优比例</strong>是多少。
+          </div>
+
+          <!-- ============ 论文原图：GPT-3 规模与性能（Brown et al., 2020, Figure 1.3） ============ -->
+          <figure class="paper-figure">
+            <img src="../../assets/figures/06-pretraining/scaling-laws/fig1.png"
+                 alt="论文原图：GPT-3 在 42 个基准上的综合性能随模型规模平滑增长（Brown et al., 2020, Figure 1.3）"
+                 loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：GPT-3 论文中的规模-性能曲线——模型越大，在 42 个基准上的聚合表现越强，且增长平滑可预测</span>
+              <span class="pf-src">论文原图 · Brown et al., <em>Language Models are Few-Shot Learners</em>, 2020, Figure 1.3 · <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener">arXiv:2005.14165</a></span>
+            </figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>规模律形式</th><th>控制变量</th><th>Kaplan 拟合指数</th><th>含义</th></tr></thead>
+              <tbody>
+                <tr><td><strong>参数量律</strong> $L(N)$</td><td>固定数据与算力，只放大模型</td><td>$\alpha_N \approx 0.076$</td><td>参数每翻 10 倍，loss 大约降 $10^{-0.076}\approx 0.83$ 倍</td></tr>
+                <tr><td><strong>数据量律</strong> $L(D)$</td><td>固定参数与算力，只加数据</td><td>$\alpha_D \approx 0.095$</td><td>数据每翻 10 倍，loss 大约降 $10^{-0.095}\approx 0.80$ 倍</td></tr>
+                <tr><td><strong>算力律</strong> $L(C)$</td><td>在最优配比下放大总算力</td><td>$\alpha_C \approx 0.073$</td><td>算力每翻 10 倍，loss 大约降 $10^{-0.073}\approx 0.84$ 倍</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>注意指数都只有 $0.07\sim0.10$ 这么小，这正是「边际收益递减」的数学表达：要让 loss 明显下降，算力得翻数量级。这也解释了为什么大模型训练是「以百倍资源换几个点」的游戏。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">幂律不是永动机</span>
+            幂律只在「平稳区」成立，两端都会失效：模型太小（参数远没被数据利用完）或数据太少（模型早就把数据背完了）时，曲线会拐弯；更危险的是当数据接近人类语料总量上限时，会出现「数据受限」的偏离（见后文）。外推时务必先确认还落在幂律区间内。
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("规模律三要素"))
+    参数 N
+      模型容量上限
+      Kaplan 指数 0.076
+      显存主要开销
+    数据 D
+      见过多少世界
+      Kaplan 指数 0.095
+      受语料总量约束
+    算力 C
+      训练总开销
+      Kaplan 指数 0.073
+      6ND 换算
+    可外推的下游
+      少样本准确率
+      推理任务得分
+      与架构弱相关
+            </div>
+            <figcaption>规模律三要素的「mindmap」：三者通过 $C \approx 6ND$ 耦合，但每个量有自己的衰减指数；下游能力（在平稳区）也能由 loss 外推。</figcaption>
+          </figure>
+
+          <h2>Kaplan 的结论与它的坑</h2>
+          <p>Kaplan 等人最早把这三条律放在一起，并回答了「给定算力 $C$，N 和 D 该怎么分」：把 $C$ 当作约束（当时估算训练算力 $C \approx 6ND$ FLOPs），在固定 $C$ 下同时变 $N$ 和 $D$ 求最小 loss，得到的结论是 <strong>$N \propto C^{0.73}$，$D \propto C^{0.27}$</strong>——也就是应该把大部分算力砸在扩大模型上，数据只随算力缓慢增长。</p>
+          <p>这条结论直接催生了一批「能大则大」的模型：GPT-3（175B 参数，约 300B tokens）、Gopher（280B 参数，300B tokens）都严重偏向大参数、相对少数据。直觉上「模型容量是瓶颈」似乎有道理。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">Kaplan 的错配</span>
+            Kaplan 的幂律指数来自在<strong>当时能训的较小模型范围</strong>内拟合。当把结论外推到 100B+ 量级时，参数指数 $\alpha_N$ 被高估了——也就是说「参数带来的收益」被想得太好，「数据带来的收益」被想得太差。两年后的 Chinchilla 用真正的 isoFLOP 实验纠正了这一点。
+          </div>
+
+          <h2>Chinchilla：算力最优配比</h2>
+          <p>2022 年 DeepMind 的《Training Compute-Optimal Large Language Models》（Chinchilla）做了一件更扎实的事：<strong>固定每一档算力 $C$，同时扫很多组 $(N, D)$ 组合，画出每条「等算力线」上 loss 随 $N$ 变化的 U 形曲线，取最低点作为该算力下的最优 $N$</strong>。这类实验叫 <strong>isoFLOP 分析</strong>。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  A["固定一档算力 C"] --> B["枚举多组 N 与 D<br/>满足 6ND = C"]
+  B --> C["每组训一个小模型<br/>记录最终 loss"]
+  C --> D["在等算力线上<br/>找 loss 最低点"]
+  D --> E["得到该 C 下<br/>最优 N 与 D"]
+  E --> F["换更大一档 C 重复"]
+  F --> G["所有 (C N_opt D_opt) 点<br/>拟合出外推公式"]
+  style D fill:#fff3e0,stroke:#e08e0b
+  style G fill:#e8f5e9,stroke:#4a4
+            </div>
+            <figcaption>Chinchilla 的 isoFLOP 方法：不是靠理论推导，而是「在每档算力上真把配比扫一遍」。这保证了结论落在真实训练区而非外推假想区。</figcaption>
+          </figure>
+
+          <p>结论很干净：在 Chinchilla 重估的幂律指数下（两者约 $\alpha \approx \beta \approx 0.5$），<strong>最优配比是 $N$ 和 $D$ 随 $C$ 等速增长</strong>，即 $N \propto C^{0.5}$，$D \propto C^{0.5}$。换句话说——<strong>参数和数据应该 1:1 地同步放大，而不是 Kaplan 说的 73:27</strong>。Chinchilla 还给出具体证据：一个 70B 参数、在 1.4T tokens 上训练的模型，超越了 280B 参数、300B tokens 的 Gopher，而两者算力预算相近。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模型（公开数据）</th><th>参数量 $N$</th><th>训练 tokens $D$</th><th>相对 Chinchilla 最优</th></tr></thead>
+              <tbody>
+                <tr><td>GPT-3</td><td>175B</td><td>约 300B</td><td>远未喂够数据（偏 Kaplan 式）</td></tr>
+                <tr><td>Gopher</td><td>280B</td><td>约 300B</td><td>严重欠数据</td></tr>
+                <tr><td><strong>Chinchilla</strong></td><td><strong>70B</strong></td><td><strong>1.4T</strong></td><td>接近同算力最优</td></tr>
+                <tr><td>LLaMA（7B）</td><td>7B</td><td>约 1T</td><td>略超 Chinchilla 最优（数据更充足时多喂有益）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这张表说明：Chinchilla 不是「数据越多越好」的极端，而是「在同算力下别让参数饿着数据」。当语料确实充足（如 LLaMA 系列、Llama 3 用远超 Chinchilla 最优的 tokens），多喂数据仍然能继续降 loss——因为约束从「算力」变成了「数据可获取量」，此时已不在同算力最优的讨论框内。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">怎么记这组关系</span>
+            记住两个数字即可：训练算力 $\approx 6ND$（每 token 前向+后向约 6 次浮点运算乘参数再乘 token 数）；Chinchilla 最优近似 $N_{\text{opt}} \approx D_{\text{opt}}$，且两者都约 $\propto \sqrt{C}$。反过来，$C \approx 6 N^2$ 在最优配比下成立，所以给定想训的参数量，最优数据量约为 $D = N$（以 token/param 比约 1:1 计，实际因具体实现而异）。
+          </div>
+
+          <div class="chart-box"><canvas id="chart-scaling-iso"></canvas></div>
+          <script>
+          (function(){
+            if (typeof Chart === 'undefined') return;
+            var ctx = document.getElementById('chart-scaling-iso');
+            if (!ctx) return;
+            // 固定算力 C，画出 loss 随 N 变化的 U 形（isoFLOP）曲线，最低点即 Chinchilla 最优
+            var C = 6e21;            // 演示用算力（FLOPs），仅为形状示意
+            var A = 350, B = 350, E = 1.8;  // 拟合常数（示意）
+            var ns = [], losses = [], optLoss = null, optN = null;
+            for (var i = 0; i <= 80; i++) {
+              var N = 1e9 * (0.5 + i * 0.18);     // 5亿 ~ 约 150亿
+              var D = C / (6 * N);
+              if (D < 1e8) continue;
+              var L = A * Math.pow(N, -0.5) + B * Math.pow(D, -0.5) + E;
+              ns.push(+(N/1e9).toFixed(1));
+              losses.push(+L.toFixed(3));
+              if (optLoss === null || L < optLoss) { optLoss = L; optN = N; }
+            }
+            var ch = new Chart(ctx, {
+              type: 'line',
+              data: {
+                labels: ns,
+                datasets: [{
+                  label: '测试损失 L（随参数量 N，固定算力 C）',
+                  data: losses,
+                  borderColor: window.CB_COLORS.blue,
+                  backgroundColor: window.CB_COLORS.blueSoft,
+                  fill: true, tension: 0.3, pointRadius: 0
+                }]
+              },
+              options: { responsive:true, maintainAspectRatio:false,
+                plugins:{ legend:{ display:true },
+                  title:{ display:true, text:'isoFLOP 曲线：每档算力下存在唯一最优参数量（U 形最低点）' } },
+                scales:{ x:{ title:{ display:true, text:'参数量 N（十亿）' } },
+                         y:{ title:{ display:true, text:'测试损失 L' } } } }
+            });
+            if (window.CB_CHARTS) window.CB_CHARTS.push(ch);
+          })();
+          </script>
+
+          <h2>用规模律「外推」：小模型预测大模型</h2>
+          <p>规模律最有工程价值的能力是<strong>外推</strong>：在几个 10^18~10^20 FLOPs 的小模型上测出 $(C, L)$ 点，拟合出幂律，就能预测 10^24 FLOPs 大模型大致会到多少 loss，而不必先花几百万美元训它。流程如下：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant R as 研究者
+  participant F as 规模律公式
+  participant S as 小规模实验
+  participant V as 外推验证
+  R->>S: 训 4-5 个不同 C 的小模型
+  S-->>R: 返回 (C_i, L_i) 实测点
+  R->>F: 把点喂给 L(C)= (C_c/C)^α + L_inf
+  F-->>R: 拟合出 C_c 与 α 和 L_inf
+  R->>F: 问「C_target 对应多少 L」
+  F-->>R: 给出预测 loss 与置信区间
+  R->>V: 训一个中等模型验证外推是否准
+  V-->>R: 实测点落在预测带内 -> 可放大到 C_target
+            </div>
+            <figcaption>用规模律外推的标准动作：先用小模型拟合，再外推目标算力，并用一个中等模型做「锚点验证」。外推倍数越大，越要先验证。</figcaption>
+          </figure>
+
+          <p>外推不是免费的：</p>
+          <ul>
+            <li><strong>幂律指数要靠自己数据重估</strong>。Kaplan/Chinchilla 的指数来自特定语料和设置，你换 tokenizer、换数据配比、换架构（如 MoE），指数都会漂。直接套用别人的指数外推，误差可能很大。</li>
+            <li><strong>外推要有「锚点」</strong>。不要从 10^18 直接跳到 10^24，中间至少在 10^20、10^22 各训一个模型确认曲线还直。曲线一旦拐弯（进入数据受限区或容量饱和区），外推立刻失效。</li>
+            <li><strong>下游能力需单独映射</strong>。规模律预测的是 loss（困惑度），而你想要的是 MMLU、代码通过率等。这些指标与 loss 在平稳区近似单调，但进入「涌现」附近会突然跳变，不能只靠 loss 线性外推。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">涌现 ≠ 规模律失效</span>
+            「涌现能力」（小模型不会、大模型突然会）常被误读成规模律失效。实际上在足够细粒度的评测指标（而非二值化通过率）上，能力随 loss 仍是平滑的；是「用阈值把连续分数切成通过/不通过」制造了看似突跳的假象。规模律管的是底层 loss，涌现管的是你选的指标怎么切。
+          </div>
+
+          <h2>规模律的边界：数据受限与过训练</h2>
+          <p>Chinchilla 假设「数据无限」，于是得出 $N:D \approx 1:1$。但现实是<strong>高质量人类文本有上限</strong>。2023 年 Muennighoff 等人的《Scaling Data-Constrained Language Models》研究了「数据不够时怎么办」：当可用数据 $D$ 卡死，继续加大 $N$ 会让模型「过训练」——loss 仍会降（因为反复看同样数据有正则化效果），但收益远低于同算力下增加多样性；而且反复刷同一批数据对真实泛化的增益有限。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>情形</th><th>约束</th><th>最优策略</th><th>规模律是否直接可用</th></tr></thead>
+              <tbody>
+                <tr><td>算力受限、数据充足</td><td>$C$ 是瓶颈</td><td>Chinchilla：$N\propto D\propto \sqrt{C}$</td><td>可用，最经典场景</td></tr>
+                <tr><td>数据受限</td><td>$D$ 是瓶颈</td><td>在数据上做多 epoch（repeat）、补合成数据，但警惕过拟合与模型坍缩</td><td>需修正，原律高估收益</td></tr>
+                <tr><td>推理成本敏感</td><td>想要小模型</td><td>给定 $N$ 用小数据多训（过训练），逼近该 $N$ 的 loss 下限</td><td>部分可用，偏向 $D$ 侧</td></tr>
+                <tr><td>架构变动大</td><td>MoE / 新注意力</td><td>必须重估幂律指数，不能套 Dense 的指数</td><td>指数要先拟合</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>近年还出现了「过训练比 Chinchilla 最优更划算」的产业实践：LLaMA、Llama 3、DeepSeek 等用远超同算力最优的数据量训练小模型，因为（1）数据确实拿得到，（2）推理时小模型更便宜、部署更广。这说明「最优」取决于你的真实目标——是「固定算力要最低 loss」还是「固定部署成本要最好效果」，两者答案不同。</p>
+
+          <h2>动手规划：用规模律给一次真实训练立项</h2>
+          <p>规模律不是论文里的曲线，而是一张「立项预算表」。当你要决定「训一个多大的模型、准备多少语料、大概烧多少算力」时，它给出第一版可计算的估计。下面用三个具体动作把它落到工程里。</p>
+
+          <h3>动作一：先由目标参数量反推数据和算力</h3>
+          <p>假设你想训一个 13B（约 $1.3\times10^{10}$ 参数）的 dense 模型，目标是「接近 Chinchilla 最优」而非极致过训练。代入 $C\approx 6ND$ 与最优配比 $N\approx D$：</p>
+          <ul>
+            <li><strong>数据量</strong>：先取 $D\approx N=13\text{B}$ tokens 作为下界；产业界通常会多喂到 3–15 倍（如 LLaMA 把 7B 模型喂到 1T tokens，约 $143\times N$），因为真实语料够、且推理时小模型更便宜、部署更广。</li>
+            <li><strong>算力</strong>：若取 $D=13\text{B}$，则 $C\approx 6\times13\text{B}\times13\text{B}\approx 1.0\times10^{21}$ FLOPs；若按 LLaMA 式过训练取到 $D=1\text{T}$，则 $C\approx 6\times13\text{B}\times1\text{T}\approx 7.8\times10^{22}$ FLOPs——两者相差近 80 倍，这就是「要不要过训练」在算力账单上的真实差距。</li>
+          </ul>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>目标模型（示意）</th><th>参数量 $N$</th><th>数据量 $D$（Chinchilla 最优）</th><th>训练算力 $C\approx 6ND$</th></tr></thead>
+              <tbody>
+                <tr><td>7B 模型</td><td>$7\times10^9$</td><td>≈7B tokens</td><td>≈$2.9\times10^{20}$ FLOPs</td></tr>
+                <tr><td>13B 模型</td><td>$1.3\times10^{10}$</td><td>≈13B tokens</td><td>≈$1.0\times10^{21}$ FLOPs</td></tr>
+                <tr><td>70B 模型</td><td>$7\times10^{10}$</td><td>≈70B tokens</td><td>≈$2.9\times10^{22}$ FLOPs</td></tr>
+                <tr><td>过训练示例（7B, 1T tokens）</td><td>$7\times10^9$</td><td>$1\times10^{12}$</td><td>≈$4.2\times10^{22}$ FLOPs</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这张表的意义不在精确数字（常数与具体实现会改），而在<strong>数量级直觉</strong>：每升一档参数，最优数据量同比例升，而算力按两者乘积升——所以「大一点」的成本是乘性的，不是加性的。立项时先拿这张表给老板一个量级，再进入 isoFLOP 细调。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一条省钱的提醒</span>
+            如果你的最终目标是「部署后推理便宜」，规模律会建议你<strong>偏向小模型 + 过训练</strong>（在 $N$ 固定时多喂数据，逼近该 $N$ 的 loss 下限），而不是盲目堆 $N$。同效果下小模型每 token 推理成本更低，这正是 LLaMA、Llama 3、DeepSeek 等普遍选择过训练的根本原因。
+          </div>
+
+          <h3>动作二：用 isoFLOP 定你自己的常数</h3>
+          <p>上文所有「最优配比」都依赖一个由你自己数据/架构拟合出来的常数。最稳的做法不是套 Chinchilla 的 $k$，而是在你拟训的 $N$ 附近、用你自己的 tokenizer 和数据，训 3–4 个不同 $D$ 的小模型，画出属于你的那条等算力 U 形曲线、取最低点。这一步多花的几万美元，能避免后面上亿预算押错配比。</p>
+
+          <h3>动作三：把算力换算成钱和时间</h3>
+          <p>$C$ 算出来后还要落到现实：用集群单卡吞吐（如某卡约有 150–300 TFLOPs 的 BF16 有效算力，MFU 取 40%–50%）除以 $C$，得到大致挂钟时间；再乘卡数与电价/租金，得到预算。这步把「规模律的预测」翻译成「立项文档里的两行数字」，也是它工程价值的最后一公里。</p>
+
+          <details class="deep">
+            <summary>展开：Chinchilla 最优配比是怎么从导数算出来的</summary>
+            <div class="deep-body">
+              <p>把损失写成双变量幂律，约束用训练算力 $C = 6ND$：</p>
+              $$L(N,D) = A N^{-\alpha} + B D^{-\beta} + E,\qquad 6ND = C$$
+              <p>把 $D = C/(6N)$ 代入，得到只关于 $N$ 的函数：</p>
+              $$L(N) = A N^{-\alpha} + B\left(\frac{6N}{C}\right)^{\beta} + E = A N^{-\alpha} + B\,6^{\beta} C^{-\beta} N^{\beta} + E$$
+              <p>对 $N$ 求导并令其为 0：</p>
+              $$\frac{dL}{dN} = -\alpha A N^{-\alpha-1} + \beta B\,6^{\beta} C^{-\beta} N^{\beta-1} = 0$$
+              <p>移项整理：</p>
+              $$\alpha A N^{-\alpha-\beta} = \beta B\,6^{\beta} C^{-\beta}
+              \;\Longrightarrow\;
+              N^{\alpha+\beta} = \frac{\alpha A}{\beta B\,6^{\beta}}\, C^{\beta}$$
+              <p>当 $\alpha = \beta = 0.5$（Chinchilla 重估的指数）时，$\alpha+\beta = 1$，于是：</p>
+              $$N = \left(\frac{A}{B}\right) \cdot 6^{-0.5} \cdot C^{0.5} \quad\Longrightarrow\quad N \propto C^{0.5}$$
+              <p>再由 $D = C/(6N)$ 得 $D \propto C / C^{0.5} = C^{0.5}$，即 <strong>$N$ 和 $D$ 同步随 $\sqrt{C}$ 增长</strong>。对比 Kaplan 的 $N\propto C^{0.73}$，差别全在那个指数——Chinchilla 的功劳是用 isoFLOP 实验把 $\alpha$ 重新估得更小，从而把「钱」从参数挪回数据。</p>
+              <p style="margin-bottom:0">实务上你不必手推，直接用公式：给定 $C$，先估 $N_{\text{opt}}\approx \sqrt{C/6}\times\text{常数}$，再令 $D=C/(6N_{\text{opt}})$。更稳的做法是用自己小模型的 isoFLOP 曲线去定那个常数，而不是套别人的。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：动手算——用 Python 拟合一小段规模律并预测</summary>
+            <div class="deep-body">
+              <p>下面这段脚本演示「测几个小模型 → 在 log-log 空间线性拟合 → 外推」。数据点是你自己的实测 $(C, L)$；这里用一组示意值，运行前请替换成真实实验。</p>
+              <pre><code class="language-python">import numpy as np
+
+# 示意：4 个小模型测得的 (算力 C FLOPs, 测试损失 L)
+C = np.array([1e18, 3e18, 1e19, 3e19], dtype=float)
+L = np.array([3.20, 2.95, 2.70, 2.48], dtype=float)
+
+# 幂律 L = (Cc/C)^alpha + Linf  ->  在 log 空间近似线性
+# 简化：先忽略 Linf，拟合 log L 对 log C 的斜率
+logC, logL = np.log(C), np.log(L)
+alpha, intercept = np.polyfit(logC, logL, 1)   # 斜率就是 -alpha
+alpha = -alpha
+print(f"拟合指数 alpha ≈ {alpha:.3f}")          # 应接近 0.07~0.10
+
+# 外推到目标算力
+C_target = 1e24
+L_target = np.exp(np.polyval([ -alpha, intercept ], np.log(C_target)))
+print(f"C={C_target:.0e} 预测 loss ≈ {L_target:.3f}")
+# 注意：外推 5 个数量级，必须先在中段训锚点验证</code></pre>
+              <p style="margin-bottom:0">另一段是算力→最优配比的快速换算，基于 $C\approx 6ND$ 与 $N\approx D$：</p>
+              <pre><code class="language-python">def chinchilla_plan(compute_flops):
+    """给定算力预算(FLOPs)，返回近似最优参数量与 token 数(示意常数)。"""
+    # N_opt ≈ sqrt(C / 6) * k，这里 k 取 1 仅作量级演示，实务需自己 isoFLOP 定标
+    N_opt = (compute_flops / 6) ** 0.5
+    D_opt = compute_flops / (6 * N_opt)        # 即也 ≈ N_opt
+    return N_opt, D_opt
+
+for C in [1e21, 1e22, 1e23]:
+    n, d = chinchilla_plan(C)
+    print(f"C={C:.0e} -> N≈{n/1e9:.1f}B params, D≈{d/1e9:.0f}B tokens")</code></pre>
+            </div>
+          </details>
+
+          <h2>为什么指数会漂移：换数据、换架构就要重拟合</h2>
+          <p>很多人把 Kaplan 和 Chinchilla 的指数当成"物理常数"，直接套在自己的模型上做预算。这其实是个误解：幂律的<strong>形状（形式）</strong>是普适的——只要在平稳区，损失随规模下降总近似幂律；但<strong>指数本身</strong>是实验拟合出来的参数，它由你的 tokenizer、语料分布、模型架构共同决定。换掉任何一样，指数就会漂。</p>
+          <p>举几个会实质改变指数的具体因素：</p>
+          <ul>
+            <li><strong>tokenizer 与词表</strong>：同样的语料，用更大的词表切出更短的 token 序列，每个 token 携带的信息更多，"看似更小"的 loss 其实换了计量单位。跨 tokenizer 比较 loss 绝对值没有意义，指数也会随之偏移。</li>
+            <li><strong>数据配比</strong>：代码与自然语言的衰减速度不同。代码数据的冗余度低、可学信息密度高，把代码占比拉高，数据律的指数会明显变陡，直接套用原指数会低估代码侧的数据收益。</li>
+            <li><strong>模型架构</strong>：MoE 是典型例子——激活参数远小于总参数，同样的算力换来更低的 loss。直接用 dense 模型的指数套 MoE，会严重低估它的能力曲线，做预算时会给出错误的最优配比。</li>
+          </ul>
+          <p>工程上的正确姿势是：<strong>把指数当成自己实验的参数，而不是继承的遗产</strong>。在目标规模附近训 3–4 个小模型，重新拟合一条属于自己的幂律，再拿去做外推和预算。这比"引用 Chinchilla 的 0.5"要慢几天，但换来的是预算不被押错方向。</p>
+
+          <h2>什么时候该信规模律：一张决策清单</h2>
+          <p>规模律不是什么时候都该用。初学者最容易犯的错是"无脑放大"——反正幂律说越大越好。下面这张清单帮你判断"当前这个决策，规模律能不能给答案"：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>决策场景</th><th>规模律能否直接回答</th><th>正确做法</th></tr></thead>
+              <tbody>
+                <tr><td>固定预算下选参数量与数据量</td><td>能（Chinchilla 配比）</td><td>先用公式估量级，再用 isoFLOP 校准自己的常数</td></tr>
+                <tr><td>要不要过训练小模型</td><td>部分能</td><td>看数据可获取量与推理成本，不能只看 loss</td></tr>
+                <tr><td>换了新 tokenizer / 新架构</td><td>不能直接套</td><td>先重拟合幂律指数再外推</td></tr>
+                <tr><td>评估"该不该上 MoE"</td><td>不能（指数不同）</td><td>分开拟合两套幂律对比，别混用指数</td></tr>
+                <tr><td>预测下游能力（如 MMLU）</td><td>间接</td><td>loss 与下游近似单调，但要单独标定映射</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这张清单背后的统一原则是：规模律回答的是"同一种训练方式下，把资源翻倍会发生什么"。一旦你改变了训练方式——新架构、新数据、新目标函数——原来的指数就不作数了。判断依据不是"数字多权威"，而是"我是不是还落在这条幂律拟合的范围内"。这也是为什么成熟团队的预算文档里，永远有一行"幂律指数来源与拟合范围"。</p>
+
+          <p>对初学者还有个提醒：规模律的结论来自"平均表现"，不代表你手里的具体任务也会同样缩放。某些对精确度极其敏感的窄任务（如固定格式的翻译），放大模型带来的收益可能远小于幂律预测；反之，某些"涌现型"任务在跨过规模阈值后会突然变好。正确姿势是把规模律当先验、把下游评测当裁判，两者结合才不会走偏。</p>
+
+          <h2>规模律的近似性：预算要留安全边际</h2>
+          <p>规模律的一切输出都是"点估计"，而工程决策需要的是"区间"。拟合常数本身有统计误差，外推距离越远误差越大，再加上集群利用率、断点续训损耗这些实现因素，直接按公式算出来的算力去下单，通常会差出百分之几十。这不是公式错了，而是公式本来就只承诺"数量级正确"。</p>
+          <p>三条实操建议：一是预算在公式结果基础上<strong>上浮百分之三十到五十</strong>，把拟合误差和工程损耗一起吃掉；二是把规模律当作"比较工具"而非"绝对值"——它的价值在于回答"A 方案比 B 方案省多少算力"，而不是"精确到小数点后一位是多少 FLOPs"；三是每个里程碑设置一个<strong>验证锚点</strong>，如果实测 loss 偏离预测带，第一时间回到公式重新拟合，而不是硬着头皮继续放大。</p>
+          <div class="callout tip">
+            <span class="callout-t">一句话收束</span>
+            规模律是"预算仪表盘"，不是"财务审计报告"：用来导航方向，不要用来记账到分。真正下单之前，永远用一个中规模实验校准一次。
+          </div>
+
+          <h2>规模律与数据工程的交叉</h2>
+          <p>规模律不是只给预训练团队看的。它直接约束了 <a href="data-engineering.html">数据工程</a> 和 <a href="synthetic-data.html">合成数据</a> 的工作目标：</p>
+          <ul>
+            <li><strong>数据量决定天花板</strong>。Chinchilla 告诉我们，在同算力下数据不够就是浪费了参数。数据工程的「质量过滤 + 去重 + 配比」本质上是在<strong>提升有效 $D$</strong>——同样 1T tokens，干净去重的比脏的要当更多「有效 token」用。</li>
+            <li><strong>合成数据是在补 $D$ 的上限</strong>。当真实语料逼近上限，合成数据成为继续沿规模律下行的燃料，但必须配合 <a href="../13-evaluation/contamination.html">去污染</a>，否则 benchmark 虚高、真实 loss 没降。</li>
+            <li><strong>配比（domain mix）也进入规模律</strong>。更精细的规模律研究开始把「数据来自哪」作为变量，不同域衰减指数不同——这把纯幂律推进到了「带域权重的规模律」。</li>
+          </ul>
+
+          <h2>规模律研究的演进时间线</h2>
+          <p>从「能预测」到「会修正」，规模律本身也是一条快速演进的线。下面把关键节点摆出来，方便你定位自己读到的结论属于哪一棒。</p>
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 规模律研究演进
+  2020 : Kaplan 提出 N/D/C 三条幂律 : 给出算力最优配比 N 偏重参数 73:27
+  2022 : Chinchilla 用 isoFLOP 实验纠正 : N 与 D 应 1:1 随 sqrt(C) 增长
+  2023 : 数据受限规模律 : 数据不够时 repeat 与合成数据补 D 的边界
+  2023+ : 过训练与域加权规模律 : 推理成本敏感时小模型多训 : 不同域衰减指数不同
+            </div>
+            <figcaption>规模律研究从「纯幂律 + 算力最优」走向「考虑数据上限、过训练、域权重」的精细模型。读任何一条结论前，先确认它假设了哪个约束。</figcaption>
+          </figure>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：在平稳区，测试 loss 只由算力 $C$、参数量 $N$、数据量 $D$ 三者决定，且都是幂律；与架构弱相关。</li>
+            <li><strong>三个指数</strong>：Kaplan 拟合 $\alpha_N\approx0.076, \alpha_D\approx0.095, \alpha_C\approx0.073$；指数小=边际收益递减快。</li>
+            <li><strong>Kaplan 配比</strong>：$N\propto C^{0.73}, D\propto C^{0.27}$（偏重参数）——后被证伪为外推过头。</li>
+            <li><strong>Chinchilla 配比</strong>：$N\propto D\propto C^{0.5}$，参数与数据 1:1 同步放大；70B/1.4T 超越 280B/300B 的 Gopher。</li>
+            <li><strong>算力换算</strong>：训练浮点算力 $C \approx 6ND$（每 token 前向+后向约 6 次乘加）。</li>
+            <li><strong>外推方法</strong>：小模型测点 → log-log 拟合 → 外推目标；必须留中段锚点验证，指数要自己重估。</li>
+            <li><strong>边界</strong>：数据受限时要修正；推理成本敏感时可过训练小模型；指数随架构（MoE 等）漂移。</li>
+            <li><strong>常见坑</strong>：把别人的指数直接套自己场景；外推倍数过大不验证就放大；用二值「涌现」误判规模律失效。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Kaplan et al., "Scaling Laws for Neural Language Models" (2020) — 规模律奠基论文，给出 $N/D/C$ 三条幂律与最初的算力最优配比 · <a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener">arXiv:2001.08361</a></li>
+            <li>Hoffmann et al., "Training Compute-Optimal Large Language Models" (Chinchilla, 2022) — 用 isoFLOP 实验纠正 Kaplan，给出 $N\propto D\propto C^{0.5}$ 的算力最优配比 · <a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener">arXiv:2203.15556</a></li>
+            <li>Muennighoff et al., "Scaling Data-Constrained Language Models" (2023) — 研究数据不够时反复训练（repeat）、合成数据补 $D$ 的边界情形 · <a href="https://arxiv.org/abs/2305.16264" target="_blank" rel="noopener">arXiv:2305.16264</a></li>
+            <li>Sardana et al., "Beyond Chinchilla: Scaling the Training of Language Models" (2023) — 探讨 Chinchilla 最优在「过训练」场景下的修正 · <a href="https://arxiv.org/abs/2306.07915" target="_blank" rel="noopener">arXiv:2306.07915</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            规模律定下了「训多大、喂多少」，真正把这些算力铺到上千张卡上靠的是并行策略：<a href="distributed-training.html">并行策略：5D 并行的原理与组合</a>。想看数据量怎么凑出来，回到 <a href="data-engineering.html">数据工程</a> 与 <a href="synthetic-data.html">合成数据与数据飞轮</a>；算力与显存怎么手算见 <a href="../05-systems/compute-budget.html">FLOP、显存核算与性能剖析</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

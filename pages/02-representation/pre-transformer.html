@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Transformer 前史:RNN / LSTM / Seq2Seq · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="02-representation" data-topic="pre-transformer">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>Transformer 前史:RNN / LSTM / Seq2Seq</h1>
+            <p class="lead">注意力机制不是凭空掉下来的，它是循环网络两大致命伤——「读不快」和「记不住」——被逼出来的答案。读懂这段历史，你才会真正理解 Transformer 的每一个设计选择到底在解决什么问题。这一节从 RNN 的一行递推公式讲到梯度为什么会消失，从 LSTM 的三道门讲到 Seq2Seq 的信息瓶颈，最后交代注意力是怎么在 2014 年被「逼」出来的。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>整条主线只有一句话：为了让机器处理变长文本，先让它一个字一个字「循环」地读（RNN），再给记忆加上门控（LSTM / GRU），接着用「编码器压缩 + 解码器展开」做翻译（Seq2Seq）——直到压缩的瓶颈逼出了注意力（Attention），最终注意力彻底取代循环，Transformer 登场。<strong>每一步都不是灵光一闪，而是上一步暴露的缺陷把人逼到墙角后的必然解法。</strong></p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  A["RNN<br/>顺序读<br/>隐状态传递"] -->|"记不住长依赖"| B["LSTM / GRU<br/>门控记忆<br/>缓解遗忘"]
+  B -->|"要做翻译<br/>输入输出不等长"| C["Seq2Seq<br/>编码压缩<br/>解码生成"]
+  C -->|"一个向量装不下<br/>整个句子"| D["注意力<br/>软查表<br/>免压缩"]
+  D -->|"既然注意力这么好用<br/>循环还要吗"| E["Transformer<br/>并行 + 全局交互"]
+
+  style A fill:#fcebeb,stroke:#a32d2d
+  style B fill:#faeeda,stroke:#ba7517
+  style C fill:#faeeda,stroke:#ba7517
+  style D fill:#e6f1fb,stroke:#185fa5
+  style E fill:#eaf3de,stroke:#639922
+              </div>
+              <figcaption>从 RNN 到 Transformer 的演进链条：箭头上写的是「上一代被什么问题卡住了」。读历史的关键就是读这些箭头，而不是读方框。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 1: 为什么读历史 ============ -->
+          <h2>为什么值得花时间读这段历史</h2>
+          <p><strong>先用一个生活化的类比开场</strong>：想理解为什么汽车最终取代了马车，你不能只看汽车的构造图，还得知道马车当年的两个致命伤——跑不快、装得少——以及人们为了修好马车做过的种种尝试（给马换好鞍、加弹簧减震），最后才明白「换动力方式」才是正解。Transformer 的历史同理：循环网络（RNN，Recurrent Neural Network，一种把序列信息逐步传递的网络）就是那辆马车，LSTM（长短时记忆网络，Long Short-Term Memory，给 RNN 加门控以缓解遗忘）是各种打补丁的尝试，而注意力（Attention，让模型在生成时回头「查阅」输入中任意位置的机制）是那个「干脆换引擎」的决定。不知道马车为什么坏，就读不懂引擎为什么这样设计。</p>
+          <p>2026 年的大模型清一色是 Decoder-only 的 Transformer，RNN 在主流架构上已经退场。既然退场了，为什么还要读？因为这段历史留下的不是「过时知识」，而是三块仍然活跃的遗产。</p>
+          <ul>
+            <li><strong>序列建模的直觉</strong>——「状态」如何随时间累积、更新，这个心智模型在理解 <a href="../04-modern-arch/kv-cache.html">KV Cache</a>、<a href="../04-modern-arch/linear-attention.html">状态空间模型（Mamba / SSM）</a> 时仍然是最快的入口。事实上，线性注意力那一支正是把「循环状态」重新请了回来。</li>
+            <li><strong>为什么注意力是必然的</strong>——只有知道循环网络被「信息瓶颈」卡死在哪里，才能明白注意力「不压缩、直接查」的设计有多关键。不然你只会背下 $\text{softmax}(QK^\top/\sqrt{d_k})V$ 这个公式，却讲不出它为什么长这样。</li>
+            <li><strong>术语的源头</strong>——编码器（Encoder）、解码器（Decoder）、隐状态（hidden state）、门控（gating）、teacher forcing、束搜索（beam search），这些词今天散落在手册各篇里，源头全在这一节。</li>
+          </ul>
+
+          <div class="callout tip">
+            <span class="callout-t">阅读建议</span>
+            本节只求读懂脉络，不必深挖公式。看到公式能理解「它在表达什么」即可，推导细节放在 <code>展开</code> 块里，跳过也不影响主线。真正要记住的只有两句话：<strong>RNN 的问题是「串行 + 遗忘」，注意力的答案是「并行 + 直查」</strong>。
+          </div>
+
+          <h3>一条十年时间线</h3>
+          <p>把关键节点按年份排开，你会看到一条相当清晰的因果链：每一年解决的，都是前一两年被广泛抱怨的问题。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+timeline
+  title 从循环网络到注意力的关键节点
+  1997 : LSTM 提出 : 用门控和细胞状态对抗梯度消失
+  2013 : 梯度困难被系统分析 : 明确了梯度爆炸与消失的数学来源
+  2014 : Seq2Seq 与 GRU : 编码解码框架成型 : 门控被进一步简化
+  2014 : 注意力诞生 : 解码时对源端做软对齐 : 不再依赖单一压缩向量
+  2015 : 注意力被简化推广 : 点积打分等更轻的对齐方式
+  2017 : Transformer : 彻底丢掉循环 : 只保留注意力
+            </div>
+            <figcaption>循环网络时代的关键节点。注意 2014 年的密集程度——Seq2Seq 和注意力几乎同时出现，因为前者一落地，信息瓶颈立刻就暴露了。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>年份</th><th>工作</th><th>它解决了什么</th><th>它留下了什么问题</th></tr></thead>
+              <tbody>
+                <tr><td>1997</td><td><strong>LSTM</strong></td><td>用细胞状态 + 三道门给梯度开一条「传送带」，长依赖显著改善</td><td>只是缓解不是根治；串行瓶颈原封不动；参数多、算得慢</td></tr>
+                <tr><td>2014</td><td><strong>GRU</strong></td><td>把三门简化为两门，参数更少、训练更快，多数任务上与 LSTM 接近</td><td>同样没有触碰串行这个根本问题</td></tr>
+                <tr><td>2014</td><td><strong>Seq2Seq</strong></td><td>用「编码器 + 解码器」处理输入输出不等长的任务，机器翻译一举突破</td><td>整句被压成一个固定向量，长句性能断崖式下滑</td></tr>
+                <tr><td>2014</td><td><strong>注意力</strong></td><td>解码每一步都回头查编码器的<strong>全部</strong>隐状态，长句问题被显著缓解</td><td>循环骨架还在，仍然不能并行；复杂度变成 $O(n^2)$</td></tr>
+                <tr><td>2017</td><td><strong>Transformer</strong></td><td>把循环整个丢掉，只留注意力，训练完全并行</td><td>$O(n^2)$ 成为长上下文的主要瓶颈，后续十年都在优化它</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- ============ Section 2: RNN ============ -->
+          <h2>RNN：一个字一个字地读</h2>
+          <p><strong>先给一个生活化类比</strong>：RNN 的工作方式，很像一个手写笔记的人读一本厚书——他每读一句话，就把这句话的要点浓缩成一行笔记，然后忘掉原句；读下一句时，他同时参考「上一行笔记」和「眼前这句话」再写新笔记。读到第 100 页时，他手里的笔记只剩最后一行，而这本书开头讲了什么，早就被后来几十行笔记层层覆盖得只剩模糊印象。这个类比同时预告了 RNN 的两大致命伤：笔记只能顺序写（读不快），以及开头的信息会被稀释（记不住）。下面的公式，就是把「写笔记」这件事数学化。</p>
+          <p>循环神经网络（Recurrent Neural Network）的想法很朴素：处理序列时，维护一个不断更新的「记忆」，读到一个新词就把新信息揉进记忆里，并用这份记忆预测下一个词。写成公式只有一行：</p>
+          <div class="figure" style="text-align:center">
+            $$h_t = \tanh\!\left(W_{ih}\, x_t + W_{hh}\, h_{t-1} + b\right)$$
+          </div>
+          <p>这里的 $h_t$ 是第 $t$ 步的隐状态，它既受当前输入 $x_t$ 影响，也受上一步隐状态 $h_{t-1}$ 影响——这就是「循环」二字的意思。特别要注意：<strong>同一组参数 $W_{hh}$、$W_{ih}$ 在每个时间步被反复使用</strong>，所以 RNN 处理 10 个词和处理 1000 个词用的是同一套权重，参数量与序列长度无关。这在 2014 年是个了不起的性质，它让「变长输入」第一次变得可训练。</p>
+
+          <p>用一句话给 RNN 定性：<strong>它把「整个历史」压缩成一个固定维度的向量，并让信息像接力棒一样沿时间轴逐棒传递</strong>。这个定性同时解释了它的优点（参数少、天然处理变长）和它的两个结构性缺陷。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant X as 输入序列
+  participant H as 隐状态 h
+  participant O as 输出层
+  X->>H: t=1 读入「今天」，h1 = f(x1, h0)
+  H->>O: 用 h1 预测
+  X->>H: t=2 读入「天气」，h2 = f(x2, h1)
+  Note over H: h2 里已混入 h1 的信息
+  H->>O: 用 h2 预测
+  X->>H: t=3 读入「很」，h3 = f(x3, h2)
+  H->>O: 用 h3 预测
+  X->>H: t=N 读入最后一个词，hN = f(xN, hN-1)
+  Note over H: hN 理论上包含全部历史<br/>实际上早期信息已被稀释
+  H->>O: 用 hN 预测
+            </div>
+            <figcaption>RNN 一次前向的时序：每一步都必须等上一步的 h 算完才能开始。这张图里每一条从 X 到 H 的箭头都是一次不可跳过的等待，这就是「串行」的可视化形态。</figcaption>
+          </figure>
+
+          <h3>缺陷一：读不快，只能顺序处理</h3>
+          <p>第 $t$ 步的计算依赖第 $t-1$ 步的输出，天然无法并行。句子越长，算得越慢，而且这个「慢」不是常数倍的慢，是<strong>结构性的慢</strong>——GPU 有上万个计算核心，但 RNN 在任一时刻只能让其中极小一部分工作，其余全在等。</p>
+          <p>给个具体感受：处理一条 2048 token 的序列，RNN 必须依次执行 2048 次矩阵乘法，每次的规模都很小（一个 $d \times d$ 矩阵乘一个 $d$ 维向量）；而自注意力可以把这 2048 个位置打包成一次大矩阵乘法交给 GPU。前者是「两千次小活」，后者是「一次大活」，在现代硬件上后者的吞吐要高出一两个数量级。今天动辄 128K 上下文的训练，用 RNN 在物理上就跑不动。</p>
+
+          <h3>缺陷二：记忆接力棒会「掉」</h3>
+          <p>梯度在时间轴上反向传播时是连乘的：每回退一个时间步就乘一次 $\frac{\partial h_{t+1}}{\partial h_t}$。当这些因子的范数普遍小于 1 时，远处的梯度指数级衰减，这就是<strong>梯度消失</strong>；普遍大于 1 时则指数级爆炸，这就是<strong>梯度爆炸</strong>。</p>
+          <p>数字最直观：假设每步的雅可比范数是 0.9，回退 50 步后梯度只剩 $0.9^{50} \approx 0.005$，回退 100 步只剩 $0.9^{100} \approx 2.7 \times 10^{-5}$。也就是说，句子开头那个词对句尾预测的影响，在梯度层面几乎已经不存在了——模型学不会「五十个词之前那个主语，决定了现在这个动词的单复数」这类规律。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            梯度消失 ≠ 「信息真的被删掉了」。它说的是<strong>学习困难</strong>：模型理论上可以把远距离信息存在隐状态里，但梯度传不回去，网络无法<em>学会</em>「把远处的词和当前的预测关联起来」。前向的信息通道是通的，反向的学习通道断了——这是两件事。
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">爆炸比消失好治</span>
+            梯度爆炸有一个粗暴但极其有效的解法：<strong>梯度裁剪</strong>（gradient clipping）——把梯度范数超过阈值的部分按比例缩回去。这个技巧至今仍是大模型训练的标配，见 <a href="../06-pretraining/stability-optimizer.html">训练稳定性与优化器</a>。而梯度消失没有这么便宜的解药，只能改结构，这才有了 LSTM。
+          </div>
+
+          <details class="deep">
+            <summary>展开：梯度为什么恰好是「连乘」——最小推导</summary>
+            <div class="deep-body">
+              <p>设损失 $\mathcal{L}$ 只在最后一步 $T$ 计算，我们关心它对早期隐状态 $h_k$（$k \ll T$）的梯度。由链式法则：</p>
+              <div class="figure" style="text-align:center">
+                $$\frac{\partial \mathcal{L}}{\partial h_k} = \frac{\partial \mathcal{L}}{\partial h_T} \prod_{t=k+1}^{T} \frac{\partial h_t}{\partial h_{t-1}}$$
+              </div>
+              <p>对 $h_t = \tanh(W_{ih}x_t + W_{hh}h_{t-1} + b)$ 求偏导：</p>
+              <div class="figure" style="text-align:center">
+                $$\frac{\partial h_t}{\partial h_{t-1}} = \mathrm{diag}\!\left(1 - h_t^2\right) W_{hh}$$
+              </div>
+              <p>注意两点。第一，$\tanh$ 的导数是 $1 - \tanh^2$，取值范围是 $(0, 1]$，且只有输入接近 0 时才接近 1——一旦隐状态被推向饱和区，这个因子就迅速趋近 0。第二，$W_{hh}$ 在每一步都是<strong>同一个矩阵</strong>，所以连乘 $T-k$ 次约等于对 $W_{hh}$ 求幂。</p>
+              <p>矩阵求幂的行为由它的最大奇异值 $\sigma_{\max}$ 主导：$\sigma_{\max} &lt; 1$ 则整体指数收缩（消失），$\sigma_{\max} &gt; 1$ 则指数膨胀（爆炸）。而 $\tanh$ 导数那个恒 $\le 1$ 的因子只会让情况更偏向消失。<strong>这就是为什么 RNN 天然偏向梯度消失而不是爆炸</strong>——除非 $W_{hh}$ 被初始化得很大。</p>
+              <p>这也顺带解释了残差连接为什么有效：它把 $\frac{\partial h_t}{\partial h_{t-1}}$ 从「一个可能很小的矩阵」变成「单位矩阵 $I$ 加上一个可能很小的矩阵」，连乘时永远有一条不衰减的通路。详见 <a href="../03-transformer/residual.html">残差连接与深层稳定</a>。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：三十行代码亲眼看见梯度消失</summary>
+            <div class="deep-body">
+              <p>与其记住结论，不如跑一遍。下面这段 PyTorch 代码手写一个最朴素的 RNN，前向跑 100 步，然后看损失对<strong>每一步隐状态</strong>的梯度范数如何随「距离终点的步数」变化。</p>
+              <pre><code class="language-python">import torch
+
+torch.manual_seed(0)
+d, T = 64, 100                      # 隐藏维度, 时间步数
+W_hh = torch.randn(d, d) * 0.5 / (d ** 0.5)   # 谱半径偏小的循环矩阵
+W_ih = torch.randn(d, d) * 0.5 / (d ** 0.5)
+
+xs = [torch.randn(d) for _ in range(T)]
+h = torch.zeros(d, requires_grad=True)
+hs = []                             # 保留每一步的 h 以便观察梯度
+
+for t in range(T):
+    h = torch.tanh(W_ih @ xs[t] + W_hh @ h)
+    h.retain_grad()                 # 非叶子张量也保留梯度
+    hs.append(h)
+
+loss = hs[-1].sum()                 # 损失只依赖最后一步
+loss.backward()
+
+for k in [99, 90, 80, 60, 40, 20, 0]:
+    g = hs[k].grad.norm().item()
+    print(f"距终点 {99 - k:3d} 步  ->  梯度范数 {g:.3e}")</code></pre>
+              <p>典型输出的形状是：距终点 0 步时梯度范数是 $O(1)$ 量级，往回每退 20 步就掉一到两个数量级，退到序列开头时已经是 $10^{-8}$ 甚至更小。把 <code>W_hh</code> 的缩放系数从 <code>0.5</code> 调到 <code>2.0</code> 再跑一次，你会看到反向的现象——梯度一路暴涨到溢出，这就是梯度爆炸。</p>
+              <p style="margin-bottom:0">这个实验的价值在于：<strong>梯度消失不是某个实现的 bug，而是「同一个矩阵连乘很多次」这件事的数学必然</strong>。换任何激活函数、换任何初始化，都只能改变衰减的速度，改变不了指数衰减的性质。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section 3: LSTM / GRU ============ -->
+          <h2>LSTM / GRU：给记忆装上门</h2>
+          <p>长短时记忆网络（Long Short-Term Memory）的解法是：<strong>把「记忆」和「输出」分开管理</strong>。它引入一条独立的细胞状态 $C_t$——相当于一条横贯时间的「传送带」——并用三个门决定信息如何进出这条传送带。</p>
+
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">遗忘门 $f_t$</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">决定旧记忆里哪些该丢弃。输出 0 到 1 之间的向量，逐元素乘到 $C_{t-1}$ 上。像整理房间时先扔掉不需要的东西。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">输入门 $i_t$</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">决定新信息里哪些值得写进传送带。它和一个候选记忆 $\tilde{C}_t$ 相乘后加到细胞状态上。像判断手里的东西值不值得收藏。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">输出门 $o_t$</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">决定当前记忆对外展示多少，产出隐状态 $h_t$。传送带上的东西不一定全要拿出来用。像决定把收藏的哪部分给别人看。</p>
+            </div>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  direction LR
+  state "细胞状态 C 上一步" as Cprev
+  state "乘遗忘门 f" as Forget
+  state "加输入门乘候选记忆" as Write
+  state "细胞状态 C 本步" as Cnow
+  state "过 tanh 再乘输出门 o" as Out
+  state "隐状态 h 本步" as Hnow
+
+  [*] --> Cprev
+  Cprev --> Forget: 先决定丢什么
+  Forget --> Write: 再决定写什么
+  Write --> Cnow: 传送带完成更新
+  Cnow --> Out: 决定对外露出多少
+  Out --> Hnow
+  Hnow --> [*]: 传给下一时间步
+  Cnow --> [*]: 传送带本身也传给下一步
+
+  note right of Cnow
+    这条路上只有逐元素乘和加
+    没有反复的矩阵相乘
+    所以它是梯度的高速通道
+  end note
+            </div>
+            <figcaption>LSTM 内部的状态流转：细胞状态 $C$ 与隐状态 $h$ 是两条独立的通路。$C$ 这条路上只有「乘一个 0 到 1 的门」和「加一点新东西」，没有反复的矩阵乘法，所以梯度衰减得慢得多。</figcaption>
+          </figure>
+
+          <p>关键技巧在于：<strong>遗忘门给梯度开了一条「高速通道」</strong>。细胞状态的更新是 $C_t = f_t \odot C_{t-1} + i_t \odot \tilde{C}_t$，对 $C_{t-1}$ 求导得到的是 $f_t$ 本身（一个逐元素的门），而不是普通 RNN 里那个反复相乘的 $W_{hh}$。只要遗忘门学会在需要记住的维度上输出接近 1，误差就能几乎无损地沿传送带传回很远。</p>
+
+          <p>GRU（Gated Recurrent Unit）则把三个门简化成「更新门 + 重置门」两个，并且不再区分细胞状态和隐状态，参数量减少约四分之一，训练更快。大量对比实验的结论是：<strong>两者在多数任务上难分伯仲，具体谁好取决于任务和超参，没有普适赢家</strong>。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>朴素 RNN</th><th>LSTM</th><th>GRU</th></tr></thead>
+              <tbody>
+                <tr><td><strong>状态</strong></td><td>只有隐状态 $h$</td><td>细胞状态 $C$ + 隐状态 $h$（两条）</td><td>只有隐状态 $h$（一条）</td></tr>
+                <tr><td><strong>门数量</strong></td><td>0</td><td>3（遗忘 / 输入 / 输出）</td><td>2（更新 / 重置）</td></tr>
+                <tr><td><strong>每步参数量</strong></td><td>基准 $\approx 1\times$</td><td>约 $4\times$（四组权重）</td><td>约 $3\times$（三组权重）</td></tr>
+                <tr><td><strong>长依赖能力</strong></td><td>差，几十步就丢</td><td>明显更好，但仍有上限</td><td>与 LSTM 接近</td></tr>
+                <tr><td><strong>训练速度</strong></td><td>最快（但没法用）</td><td>最慢</td><td>介于两者之间</td></tr>
+                <tr><td><strong>能否并行</strong></td><td colspan="3" style="text-align:center"><strong>都不能</strong>——门控只治遗忘，不治串行</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">最重要的一句话</span>
+            门控只是<strong>延缓</strong>而非<strong>根治</strong>问题。传送带能传多远仍然有上限，且<strong>串行计算的瓶颈原封不动</strong>。真正需要被推翻的是整个「逐词接力」的范式，而不是再给它打补丁——这个认知直到 2017 年才被彻底贯彻。
+          </div>
+
+          <details class="deep">
+            <summary>展开：LSTM 的六个公式（看懂即可，不必背）</summary>
+            <div class="deep-body">
+              <p>记 $[h_{t-1}, x_t]$ 为拼接后的向量，$\sigma$ 为 sigmoid，$\odot$ 为逐元素乘：</p>
+              <div class="figure" style="text-align:center">
+                $$\begin{aligned}
+                f_t &amp;= \sigma\!\left(W_f \cdot [h_{t-1}, x_t] + b_f\right) &amp;&amp;\text{遗忘门}\\
+                i_t &amp;= \sigma\!\left(W_i \cdot [h_{t-1}, x_t] + b_i\right) &amp;&amp;\text{输入门}\\
+                \tilde{C}_t &amp;= \tanh\!\left(W_C \cdot [h_{t-1}, x_t] + b_C\right) &amp;&amp;\text{候选记忆}\\
+                C_t &amp;= f_t \odot C_{t-1} + i_t \odot \tilde{C}_t &amp;&amp;\text{更新传送带}\\
+                o_t &amp;= \sigma\!\left(W_o \cdot [h_{t-1}, x_t] + b_o\right) &amp;&amp;\text{输出门}\\
+                h_t &amp;= o_t \odot \tanh(C_t) &amp;&amp;\text{对外的隐状态}
+                \end{aligned}$$
+              </div>
+              <p>只需要盯住第四行。它的梯度是：</p>
+              <div class="figure" style="text-align:center">
+                $$\frac{\partial C_t}{\partial C_{t-1}} = f_t$$
+              </div>
+              <p>——一个逐元素的门，而不是矩阵。这与朴素 RNN 的 $\mathrm{diag}(1-h_t^2)W_{hh}$ 形成鲜明对比：后者必然引入矩阵求幂，前者只是若干个 $(0,1)$ 数字连乘，且模型可以主动把需要长期保留的那些维度上的 $f_t$ 学到接近 1。</p>
+              <p style="margin-bottom:0">一个常见的工程细节：<strong>遗忘门的偏置 $b_f$ 通常初始化为 1 或 2 而不是 0</strong>，这样训练初期 $f_t \approx 1$，传送带默认「什么都记住」，梯度先能传回去，之后再慢慢学会遗忘。这个小技巧当年对 LSTM 的可训练性影响很大，思路和今天大模型里的 ZeroInit 残差如出一辙——<strong>让网络从一个梯度友好的初始状态出发</strong>。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section 4: Seq2Seq ============ -->
+          <h2>Seq2Seq：编码器压缩，解码器展开</h2>
+          <p><strong>先给一个生活化类比</strong>：机器翻译就像「同声传译员听一段演讲，先在心里把整段话压成一个要点，再用另一种语言把它完整讲出来」。前面讲的 RNN 只能「一对一」地处理——读一个词、吐一个词，输入和输出长度必须一样长。但「我爱你」译成英文是三个词，译成西班牙语是两个词，长度对不上。Seq2Seq（序列到序列，Sequence-to-Sequence，输入一个序列、输出另一个序列的框架）把翻译拆成「先压缩、后展开」两段，第一次让「变长到变长」成为可能。下面先看论文原图，再看它的致命伤。</p>
+          <p>前面讲的 RNN 做的是「读一个序列，每步预测一个东西」，输入和输出长度必须一一对应。但机器翻译不是这样：中文 5 个字可能对应英文 9 个词，长度对不上，而且译文的语序还可能整体颠倒。</p>
+          <p>序列到序列（Sequence-to-Sequence）框架的解法是把翻译拆成两段：<strong>编码器</strong>把整个源句子读成一个固定向量（通常取最后一步的隐状态），<strong>解码器</strong>从这个向量出发，逐词生成目标句子，直到生成结束符。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph ENC["编码器 Encoder"]
+    direction LR
+    E1["我"] --> E2["爱"] --> E3["你"] --> EV["语义向量 c<br/>固定长度"]
+  end
+  subgraph DEC["解码器 Decoder"]
+    direction LR
+    EV --> D0["起始符"] --> D1["I"] --> D2["love"] --> D3["you"] --> D4["结束符"]
+  end
+  style ENC fill:#e6f1fb,stroke:#185fa5
+  style DEC fill:#eaf3de,stroke:#639922
+  style EV fill:#fcebeb,stroke:#a32d2d
+            </div>
+            <figcaption>Seq2Seq：整句信息被压进一个固定长度向量 $c$，解码器再把它「展开」成目标句。红色的那个 $c$ 就是整个架构的咽喉——所有信息都要从这里过。</figcaption>
+          </figure>
+
+          <p>上面那张自制图画的是「理想态」，真正 2014 年论文里的原图长下面这样——它更朴素，但信息量其实更大，值得逐块读一遍：</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/02-representation/pre-transformer/fig1.png" alt="论文原图：Seq2Seq 编码-解码架构——左侧 A、B、C、E 四个输入 token 依次进入 LSTM 编码器（绿色），W 是句尾标记，解码器（红色）依次生成 W、X、Y、Z、结束符" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：Seq2Seq 的编码器-解码器架构——左半绿色部分把「ABC」读成一个向量，右半红色部分用它逐词生成「WXYZ」</span>
+              <span class="pf-src">论文原图 · Sutskever et al., <em>Sequence to Sequence Learning with Neural Networks</em>, 2014, Figure 1 · <a href="https://arxiv.org/abs/1409.3215" target="_blank" rel="noopener">arXiv:1409.3215</a></span>
+            </figcaption>
+          </figure>
+
+          <p>逐块读这张图。第一块是<strong>左下角那个横排的 LSTM 编码器（绿色方块）</strong>：输入是「A、B、C、E」这四个 token（论文里的 <code>&lt;EOS&gt;</code> 即 End-Of-Sentence 句尾标记，写作 E），它们按顺序被依次读入，每个 LSTM 方块就是前面学过的一个时间步。读完最后一个 token 时，编码器内部的隐状态就承载了整个句子的「摘要」——注意图上没有显式画出「摘要向量」，它就是编码器最后那个方块的状态，用一个<strong>固定的向量</strong>把长度可变的整句话装下，这正是本页反复强调的「信息瓶颈」的物理位置。</p>
+          <p>第二块是<strong>右下角那个横排的 LSTM 解码器（红色方块）</strong>：它以句尾标记 <code>&lt;EOS&gt;</code>（图中的 W）为起点，把编码器给的摘要当初始状态，然后逐词生成目标句「W、X、Y、Z、句尾」。注意生成方向是自回归的——每生成一个词，就把这个词作为下一步的输入（论文里叫 teacher forcing 的训练技巧，后面会讲）。第四列那根虚线箭头，表示解码器在生成下一个词之前，还要参考自己上一步的输出。看懂这两块，你就掌握了 2014 到 2017 年之间所有翻译系统的骨架。</p>
+          <p>论文里还配了第二张图，把 LSTM 学到的表示投影到二维平面——它是理解「编码器到底压缩出了什么」的最直观证据：</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/02-representation/pre-transformer/fig2.png" alt="论文原图：LSTM 隐状态经二维 PCA 投影——短语按语义聚成若干簇，论文指出簇内距离主要由词序决定，两簇内部结构相似" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：LSTM 隐状态二维 PCA 投影——短语按「语义」聚成簇，论文指出这种聚类主要由词序决定，是词袋模型抓不到的</span>
+              <span class="pf-src">论文原图 · Sutskever et al., <em>Sequence to Sequence Learning with Neural Networks</em>, 2014, Figure 2 · <a href="https://arxiv.org/abs/1409.3215" target="_blank" rel="noopener">arXiv:1409.3215</a></span>
+            </figcaption>
+          </figure>
+
+          <p>读这张图的要点有二。第一，<strong>横竖两个轴没有名字</strong>——PCA（主成分分析，Principal Component Analysis，把高维向量投影到少数几个正交方向上、尽量保留方差的降维方法）投影出来的坐标轴不直接对应任何语义标签，但它把「高维空间里谁离谁近」保真地压到了二维上。图上每个点是编码器处理完一个短语后的隐状态。第二，<strong>点按意思成簇</strong>——论文的图注写得很明确：「短语按语义聚类」；同一意思的不同说法在图上靠得近，不同意思的短语彼此分开。注意图注里那句容易被略过的补充——这里的语义「主要是词序决定的」，也就是说 LSTM 捕获了顺序敏感的结构，而这恰恰是词袋模型（只统计词有哪些、不管顺序）做不到的。这张图虽然只是可视化，却说明了一件更重要的事：编码器最后的那个向量里装的不是「词」，而是经过整个句子调和的<strong>语义</strong>——这个「语义向量」的直觉，正是后来注意力机制和预训练表示学习的种子。</p>
+
+          <p>这个设计有个致命瓶颈：无论源句子多长，<strong>所有信息都必须塞进同一个固定维度的向量</strong>。句子一长，开头的信息要么被挤丢，要么被「平均」掉。直觉上就像要求一个人听完一整场演讲，只准记住一句话，再让他完整复述全场内容。当年的实验现象非常明确：<strong>Seq2Seq 的翻译质量随源句长度增加而单调下降，超过三四十个词后下滑尤其明显</strong>。这就是著名的「信息瓶颈」问题。</p>
+
+          <h3>两个至今还在用的训练与解码技巧</h3>
+          <p>Seq2Seq 时代还留下了两个今天仍然通用的做法，值得单独点名：</p>
+          <ul>
+            <li><strong>Teacher Forcing（教师强制）</strong>：训练时解码器每一步的输入不用「模型自己上一步的预测」，而是直接喂「真实的上一个词」。好处是训练可以并行、收敛快；代价是训练和推理的输入分布不一致（推理时只能用自己的预测），一旦某步错了就可能连锁错下去，这叫 <strong>exposure bias</strong>。今天大模型的预训练本质上也是 teacher forcing，见 <a href="../06-pretraining/objectives.html">预训练目标</a>。</li>
+            <li><strong>Beam Search（束搜索）</strong>：生成时不只保留概率最高的那一个词，而是同时保留 $k$ 条候选路径，最后选整体概率最高的一条。它至今仍是 <a href="../08-inference/decoding.html">解码策略</a> 里的基础选项之一，只不过在开放式生成场景已被 Top-p 采样取代。</li>
+          </ul>
+
+          <!-- ============ Section 5: 注意力 ============ -->
+          <h2>注意力：从「全记住」到「需要时现查」</h2>
+          <p>2014 年，注意力机制登场，思路彻底反转：<strong>解码器不再依赖一个压缩向量，而是保留编码器的全部隐状态，在生成每一步时「回头查」最相关的部分</strong>。这就像开卷考试——不用把书全背下来，答题时翻到对应那页就行。</p>
+
+          <p>具体分成四个动作，这四个动作的名字你在后面每一篇里都会反复遇到：</p>
+          <ul>
+            <li><strong>Query（查询）</strong>：解码器当前的状态，代表「我现在想知道什么」。</li>
+            <li><strong>Key（键）</strong>：编码器每个位置对外的「标签」，用来被查询匹配。</li>
+            <li><strong>Value（值）</strong>：编码器每个位置实际存的内容，被取走的就是它。</li>
+            <li><strong>打分 + 加权求和</strong>：算 Query 和每个 Key 的相似度，softmax 归一化成权重，再对 Value 加权求和。</li>
+          </ul>
+
+          <p>在 2014 年的原始版本里，打分函数是一个小神经网络（所谓「加性注意力」）；2015 年的后续工作把它简化成直接做点积（「乘性注意力」），计算更省、更适合矩阵化——这条简化路线，正是 Transformer 里那个 $QK^\top$ 的直接前身。</p>
+
+          <p>「回头查」具体是怎么算的？用一个三位置的玩具例子手算一遍。假设解码器当前状态是查询 $q$，编码器三个位置的键分别是 $k_1, k_2, k_3$，点积打分得到原始分数 $s = [q \cdot k_1,\, q \cdot k_2,\, q \cdot k_3] = [2.0,\, 0.5,\, -1.0]$。做 softmax 归一化：先求 $\exp$，$e^{2.0} \approx 7.39$、$e^{0.5} \approx 1.65$、$e^{-1.0} \approx 0.37$，三者相加约 9.41，于是权重是 $[7.39/9.41,\, 1.65/9.41,\, 0.37/9.41] \approx [0.785,\, 0.175,\, 0.039]$。可以看出，<strong>第一个位置几乎独占了注意力（78.5%），第三位置基本被忽略（3.9%）</strong>——这就是「软对齐」：不是硬选一个位置，而是按相似度给每个位置一个权重。解码器最终的这一步表示，就是把编码器三个位置的 value 向量按这三个权重加权求和。所有「注意力让模型学会对齐」的说法，落到算数上就是这么一次打分、一次归一化、一次加权平均。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            RNN 是「带着一句话的记忆走完全程」，LSTM 是「给记忆装上门」，Seq2Seq 是「把整本书压缩成一页摘要再复述」，注意力是「开卷考试，随时翻书」——Transformer 把最后一种做到极致，并顺手甩掉了循环。
+          </div>
+
+          <p>注意力的出现解决了两件事：<strong>一是长依赖</strong>——任何两个位置都可以直接交互，距离不再是障碍；<strong>二是否定了「压缩」这个前提</strong>——信息按需取用，不再强制塞进一个向量。而它的代价是计算复杂度变成 $O(n^2)$（$n$ 为序列长度），这直接埋下了后来 <a href="../05-systems/flash-attention.html">FlashAttention</a> 和 <a href="../04-modern-arch/attention-variants.html">各类注意力变体</a> 那一大串优化故事的伏笔。</p>
+
+          <h3>三种序列建模方式的硬指标对比</h3>
+          <p>Transformer 论文里有一张常被引用的对比表，用三个指标衡量不同建模方式。$n$ 是序列长度，$d$ 是表示维度，$k$ 是卷积核大小：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>建模方式</th><th>每层计算复杂度</th><th>必须串行的操作数</th><th>任意两位置的最长路径</th></tr></thead>
+              <tbody>
+                <tr><td><strong>自注意力</strong></td><td>$O(n^2 \cdot d)$</td><td><strong>$O(1)$</strong></td><td><strong>$O(1)$</strong></td></tr>
+                <tr><td><strong>循环网络 RNN</strong></td><td>$O(n \cdot d^2)$</td><td><strong>$O(n)$</strong></td><td><strong>$O(n)$</strong></td></tr>
+                <tr><td><strong>卷积网络 CNN</strong></td><td>$O(k \cdot n \cdot d^2)$</td><td>$O(1)$</td><td>$O(\log_k n)$</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这张表把整段历史浓缩成了三列数字，值得逐列读：</p>
+          <ul>
+            <li><strong>第二列</strong>：当 $n &lt; d$ 时（在 2017 年是常态，$n$ 通常几十到几百，$d$ 是 512），自注意力的计算量其实<em>不比</em> RNN 大。这就是为什么它当年不是「用算力换效果」，而是纯赚。但当 $n$ 涨到几万，$n^2$ 就成了灾难——今天长上下文的所有麻烦都源于此。</li>
+            <li><strong>第三列</strong>：这是决定训练速度的那一列。$O(1)$ 意味着整层可以一次算完，$O(n)$ 意味着必须排队 $n$ 次。这一列直接决定了能不能吃满 GPU。</li>
+            <li><strong>第四列</strong>：这是决定长依赖能力的那一列。路径越短，梯度经过的连乘次数越少，长距离关系越好学。注意力的 $O(1)$ 意味着<strong>第 1 个词和第 1000 个词是「直接邻居」</strong>。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错：注意力 ≠ Transformer</span>
+            2014 到 2016 年的注意力，是<strong>加在 RNN 上的一个补丁</strong>——骨架仍是循环，注意力只负责解码器看编码器（也就是今天说的 cross-attention）。Transformer 的真正突破在于两点：把注意力用在<strong>序列内部</strong>（self-attention），以及<strong>把循环整个删掉</strong>。所以「Attention Is All You Need」这个标题的重音在 <em>All</em> 上，不在 <em>Attention</em> 上。
+          </div>
+
+          <!-- ============ Section 6: 遗产 ============ -->
+          <h2>遗产盘点：循环的思想今天还活在哪里</h2>
+          <p>RNN 作为主干架构退场了，但它的三个核心概念被完整继承了下来，只是换了名字和位置。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root((循环时代的遗产))
+    概念被继承
+      隐状态 变成 KV Cache
+      门控 变成 SwiGLU 与 MoE 路由
+      细胞状态直通 变成 残差连接
+    术语被继承
+      编码器 解码器
+      teacher forcing
+      束搜索 beam search
+    架构被复活
+      状态空间模型 SSM
+      线性注意力
+      混合层设计
+    教训被记住
+      串行是硬伤
+      压缩必然丢信息
+      结构问题不能靠调参解决
+            </div>
+            <figcaption>循环网络留下的四类遗产。最有意思的是右下那一支：2024 年之后线性注意力与 SSM 的兴起，本质上是把「固定大小的循环状态」重新请了回来，用来对抗注意力的 $O(n^2)$。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>循环时代的概念</th><th>今天的对应物</th><th>关系说明</th></tr></thead>
+              <tbody>
+                <tr><td><strong>隐状态 $h_t$</strong></td><td><a href="../04-modern-arch/kv-cache.html">KV Cache</a></td><td>都是「把历史压成可复用的状态」。区别是 RNN 的状态大小固定，KV Cache 随长度线性增长——用显存换了不丢信息</td></tr>
+                <tr><td><strong>细胞状态传送带</strong></td><td><a href="../03-transformer/residual.html">残差连接</a></td><td>同一个思想的两种形态：给梯度一条不经过复杂变换的直通路径</td></tr>
+                <tr><td><strong>门控 $\sigma(\cdot)\odot$</strong></td><td><a href="../03-transformer/ffn-activation.html">SwiGLU</a>、<a href="../04-modern-arch/moe.html">MoE 路由</a></td><td>「让网络自己学习该放行什么」的思路被完整保留，只是从时间维搬到了特征维和专家维</td></tr>
+                <tr><td><strong>编码器 / 解码器</strong></td><td><a href="../03-transformer/architecture.html">Transformer 三形态</a></td><td>名字原封不动地继承，含义也基本一致：编码器双向看全局，解码器单向逐步生成</td></tr>
+                <tr><td><strong>循环递推本身</strong></td><td><a href="../04-modern-arch/linear-attention.html">Mamba / SSM / 线性注意力</a></td><td>2024 年后的「复活」：为了避开 $O(n^2)$，重新用固定大小的状态做递推，但用现代技巧解决了并行训练问题</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>最后这一行值得多说一句。线性注意力和 SSM 之所以能绕开 RNN 当年的串行诅咒，靠的是<strong>把递推写成可以并行扫描（parallel scan）的形式</strong>——训练时按并行模式算，推理时按循环模式算，两种模式数学等价。这是一个漂亮的工程解法，也说明：<strong>当年 RNN 输掉的不是「循环」这个思想，而是「循环的那种实现方式」</strong>。历史很少简单地淘汰一个思想，它更常做的是把思想拆开、换个位置重新装上。</p>
+
+          <!-- ============ 要点速查 ============ -->
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：RNN 用固定维度的隐状态「接力」传递序列信息；LSTM / GRU 用门控给它装上传送带；Seq2Seq 把编解码串起来做变长任务；注意力用「软查表」取代强制压缩，最终催生 Transformer。</li>
+            <li><strong>RNN 的一行公式</strong>：$h_t = \tanh(W_{ih}x_t + W_{hh}h_{t-1} + b)$。参数在所有时间步共享，所以参数量与序列长度无关。</li>
+            <li><strong>两大结构缺陷</strong>：① 串行计算无法并行，吃不满 GPU；② 梯度沿时间连乘导致长依赖难学（消失为主，爆炸次之）。</li>
+            <li><strong>为什么梯度必然消失</strong>：$\partial h_t/\partial h_{t-1} = \mathrm{diag}(1-h_t^2)W_{hh}$，同一个矩阵反复求幂，由最大奇异值主导指数行为。</li>
+            <li><strong>LSTM 的关键</strong>：细胞状态更新 $C_t = f_t \odot C_{t-1} + i_t \odot \tilde{C}_t$，对 $C_{t-1}$ 的梯度就是遗忘门 $f_t$ 本身，不再是矩阵连乘。</li>
+            <li><strong>GRU</strong>：两门（更新 + 重置）、单状态，参数更少更快，效果与 LSTM 大体持平，没有普适赢家。</li>
+            <li><strong>Seq2Seq 的瓶颈</strong>：整句被压成一个固定向量，长句翻译质量单调下降。这是注意力被发明的直接动因。</li>
+            <li><strong>三指标对比</strong>：自注意力的串行操作数 $O(1)$、最长路径 $O(1)$，代价是每层复杂度 $O(n^2 d)$；RNN 恰好相反。</li>
+            <li><strong>常见坑</strong>：误以为 LSTM 解决了长依赖（只是显著缓解）；误以为注意力是「加了个组件」（它推翻了压缩式记忆的范式）；把 2014 年的注意力等同于 Transformer（前者是 RNN 的补丁，后者删掉了循环）。</li>
+            <li><strong>遗产</strong>：隐状态 → KV Cache，传送带 → 残差连接，门控 → SwiGLU / MoE 路由，循环递推 → Mamba / 线性注意力。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Sequence to Sequence Learning with Neural Networks — Seq2Seq 框架的奠基论文，确立编码器-解码器范式，也第一次暴露了信息瓶颈 · <a href="https://arxiv.org/abs/1409.3215" target="_blank" rel="noopener">arXiv:1409.3215</a></li>
+            <li>Neural Machine Translation by Jointly Learning to Align and Translate — 注意力机制的原始论文，提出对齐与软查表，长句翻译质量的转折点 · <a href="https://arxiv.org/abs/1409.0473" target="_blank" rel="noopener">arXiv:1409.0473</a></li>
+            <li>Learning Phrase Representations using RNN Encoder-Decoder for Statistical Machine Translation — GRU 的出处，同时也是编码器-解码器结构的早期形态 · <a href="https://arxiv.org/abs/1406.1078" target="_blank" rel="noopener">arXiv:1406.1078</a></li>
+            <li>On the difficulty of training Recurrent Neural Networks — 系统分析梯度消失与爆炸的成因，并给出梯度裁剪方案 · <a href="https://arxiv.org/abs/1211.5063" target="_blank" rel="noopener">arXiv:1211.5063</a></li>
+            <li>Effective Approaches to Attention-based Neural Machine Translation — 把注意力打分简化为点积等轻量形式，是 $QK^\top$ 的直接前身 · <a href="https://arxiv.org/abs/1508.04025" target="_blank" rel="noopener">arXiv:1508.04025</a></li>
+            <li>Empirical Evaluation of Gated Recurrent Neural Networks on Sequence Modeling — LSTM 与 GRU 的系统对比，结论是难分伯仲 · <a href="https://arxiv.org/abs/1412.3555" target="_blank" rel="noopener">arXiv:1412.3555</a></li>
+            <li>Long Short-Term Memory（Hochreiter &amp; Schmidhuber, 1997）— LSTM 原始论文，门控记忆的源头。发表于 Neural Computation，非 arXiv 收录，请自行搜索获取</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            弄清了注意力「为什么被发明」，下一步看它如何变成完整的 Transformer 架构——先读 <a href="../03-transformer/attention.html">注意力机制</a> 弄懂 QKV 与缩放点积，再读 <a href="../03-transformer/architecture.html">Transformer 完整架构</a> 看零件如何组装。如果想先回到序列表示的地基，复习 <a href="embeddings.html">词嵌入与向量空间</a> 与 <a href="language-model.html">语言模型是什么</a>。想看循环思想在 2024 年之后如何「复活」，跳到 <a href="../04-modern-arch/linear-attention.html">线性与混合注意力</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

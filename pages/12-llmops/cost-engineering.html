@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>推理成本工程 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="12-llmops" data-topic="cost-engineering">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>推理成本工程</h1>
+            <p class="lead">团队第一次收到 LLM 账单时通常会震惊——月成本比预估高了 3 倍。原因很简单：大家按"模型报价 × 请求量"算账，但真实的 token 消耗被系统提示、对话历史、RAG 上下文、重排模型、重试和 fallback 共同推高。本节讲怎么把成本拆到看得见的颗粒度，以及两个真正有效的省钱杠杆：语义缓存和前缀缓存。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>推理成本不是"模型单价 × 请求量"这么简单。一次请求的真实成本像洋葱一样有多层：你看到的是最终账单，剥开第一层是模型调用，再剥是系统提示和上下文，最里面是重试和 fallback 的隐性成本。成本工程就是把这颗洋葱一层层剥开，按工作流、租户、用户、版本四个维度归因，然后针对性优化。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  BILL["月度账单<br/>你看到的"] --> CALL["模型调用成本<br/>单价 × token"]
+  CALL --> SYS["系统提示<br/>每次请求都带"]
+  CALL --> HIST["对话历史<br/>越聊越长"]
+  CALL --> RAG["RAG 上下文<br/>检索注入的 chunk"]
+  CALL --> RERANK["重排模型调用<br/>Cross-Encoder"]
+  SYS --> RETRY["重试与 fallback<br/>失败换更贵的模型"]
+  HIST --> RETRY
+  RAG --> RETRY
+
+  style BILL fill:#fce4e4,stroke:#c0392b
+  style RETRY fill:#fff8e6,stroke:#d4a017
+  style SYS fill:#eaf3de,stroke:#639922
+              </div>
+              <figcaption>推理成本洋葱：账单只是最外层。系统提示、历史、RAG 上下文、重排、重试/fallback 共同推高真实消耗</figcaption>
+            </figure>
+          </div>
+
+          <h2>为什么按模型报价算账必然算不准</h2>
+          <p>先做一个类比。想象你开一家复印店，招了台"高级复印机"按张收费。报价单上写着"单面 0.1 元/张"。可到月底账单出来，你发现实际成本是"单面 0.1 × 打印张数"的三倍。问题出在哪？每份文件你都会附带一页"公司抬头 + 免责声明"，这页每次都要重新收费；客户改稿时你打印了废弃稿；网络不稳定时同一份文档打印了两遍。这些都不是"内容本身"的费用，但都进了账单。<strong>LLM 成本账单里的系统提示、对话历史、重试，就是那几页"抬头纸"和"废弃稿"。</strong></p>
+          <p>产品经理算成本的方式通常是：查一下 gpt-4o 的价格表，输入 $2.5/百万 token，输出 $10/百万 token，然后乘以预估请求量。这个数字几乎一定是偏低的，因为它忽略了几个"隐藏的 token 消耗者"：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>隐藏消耗</th><th>怎么发生的</th><th>典型占比</th></tr></thead>
+              <tbody>
+                <tr><td><strong>系统提示</strong></td><td>角色设定、约束规则、few-shot 示例，每次请求都原样带上。500-2000 token 很常见</td><td>10-30% 输入 token</td></tr>
+                <tr><td><strong>对话历史</strong></td><td>多轮对话把之前的消息都带上，第 5 轮的输入可能包含前 4 轮的全部内容</td><td>随对话轮次线性增长</td></tr>
+                <tr><td><strong>RAG 上下文</strong></td><td>检索到的 chunk 注入 prompt，top-5 每个 500 token 就是 2500 token</td><td>20-50% 输入 token</td></tr>
+                <tr><td><strong>重排模型</strong></td><td>Cross-Encoder 重排虽然不调大模型，但也有推理成本，经常被忽略</td><td>固定开销</td></tr>
+                <tr><td><strong>重试</strong></td><td>超时、限流、格式错误后自动重试，每次重试都消耗 token</td><td>5-15% 额外消耗</td></tr>
+                <tr><td><strong>Fallback 路由</strong></td><td>主模型失败后切到备用模型（通常更贵），差价是隐性成本</td><td>因策略而异</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout warn">
+            <span class="callout-t">最容易被忽略的成本：重试 + fallback</span>
+            假设主模型（$2.5/百万 token）有 10% 的失败率，fallback 到备用模型（$10/百万 token）。你以为 90% 的请求花 $2.5、10% 花 $10，但实际是：90% 花了 $2.5 + 10% 先花了 $2.5 再花 $10。重试的<strong>沉没成本</strong>加上 fallback 的<strong>差价</strong>，总成本比公式算的高出 15-30%。
+          </div>
+
+          <h2>手算一遍：一次 RAG 问答到底花了多少钱</h2>
+          <p>抽象的百分比不如一次具体的手算有说服力。下面用一个典型的企业知识库问答请求走一遍全流程，把每个环节的 token 和调用都摊开。为了不和任何真实报价绑定，这里用一组<strong>假设单价</strong>：输入 $2.5 / 百万 token、输出 $10 / 百万 token。请自行替换成你实际合同里的价格——数字会变，但结论的结构不会变。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as 用户
+  participant GW as 网关与护栏
+  participant EMB as Embedding 服务
+  participant VDB as 向量库
+  participant RR as 重排模型
+  participant M1 as 主模型
+  participant M2 as Fallback 模型
+
+  U->>GW: 提问（38 token）
+  GW->>GW: 输入护栏检查
+  GW->>EMB: 问题向量化
+  EMB-->>GW: 查询向量
+  GW->>VDB: top-10 检索
+  VDB-->>GW: 10 个候选 chunk
+  GW->>RR: 重排 10 个候选
+  RR-->>GW: top-3（约 1500 token）
+  GW->>M1: 系统提示 900 + 历史 600 + 上下文 1500 + 问题 38
+  M1--xGW: 超时（输入 token 已计费）
+  GW->>M2: 同样的 prompt 重发
+  M2-->>GW: 答案（420 输出 token）
+  GW->>U: 返回答案
+            </div>
+            <figcaption>一次 RAG 问答的真实调用链。注意第 10 步：主模型超时，但已经送进去的输入 token 通常仍然计费，这部分是纯沉没成本</figcaption>
+          </figure>
+
+          <p>把上面这条链路按 token 摊开，就是下面这张账：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>环节</th><th>输入 token</th><th>输出 token</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>用户问题</td><td>38</td><td>—</td><td>这才是产品经理心里"这次请求的内容"</td></tr>
+                <tr><td>系统提示</td><td>900</td><td>—</td><td>角色设定 + 输出格式约束 + 3 条 few-shot</td></tr>
+                <tr><td>对话历史</td><td>600</td><td>—</td><td>只保留最近 2 轮，再多会线性增长</td></tr>
+                <tr><td>RAG 上下文</td><td>1500</td><td>—</td><td>重排后的 top-3 chunk</td></tr>
+                <tr><td>模型输出</td><td>—</td><td>420</td><td>带引用来源的完整回答</td></tr>
+                <tr><td>失败重试</td><td>3038</td><td>0</td><td>主模型超时，输入算钱、输出为空</td></tr>
+                <tr><td><strong>合计</strong></td><td><strong>6076</strong></td><td><strong>420</strong></td><td>输入 token 是"38 token 问题"的 160 倍</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>按假设单价算：输入 6076 ÷ 1,000,000 × $2.5 ≈ <strong>$0.0152</strong>，输出 420 ÷ 1,000,000 × $10 ≈ <strong>$0.0042</strong>，单请求约 <strong>$0.019</strong>。而按"用户问题 + 模型回答"的朴素口径算，只有 38 输入 + 420 输出 ≈ <strong>$0.0043</strong>。<strong>两者差了大约 4.5 倍</strong>——这就是"月账单比预估高 3 倍"的全部秘密，没有任何玄学。</p>
+          <p>还有两笔钱甚至没进这张表：<strong>Embedding 服务</strong>的调用（单价低但每次请求都有）和<strong>重排模型</strong>的推理开销（自部署的话是 GPU 时间，托管的话是另一张账单）。它们单看都不起眼，但因为和请求量严格成正比，规模上来之后会变成一条稳定的固定成本曲线。做成本预估时把它们漏掉，等于系统性地低估了单位成本。</p>
+          <div class="callout tip">
+            <span class="callout-t">先量后优：不要凭直觉优化</span>
+            上面这张表最大的价值不是那个 $0.019，而是它告诉你<strong>钱主要花在哪一格</strong>。这个例子里输入 token 占了成本的 78%，其中一半又是重试造成的浪费——那么第一优先级显然是<strong>降低超时率</strong>，而不是去纠结"要不要把回答写短一点"。换一个业务（比如代码生成，输出可能有 2000 token），结论会完全相反。<strong>先把自己的这张表算出来，再决定优化什么。</strong>
+          </div>
+
+          <details class="deep">
+            <summary>展开：把"失败率"换算成钱——一个两分钟能做的预算修正</summary>
+            <div class="deep-body">
+              <p>很多成本预估模型只有一个参数"请求量"，把失败完全排除在外。这里给一个两分钟能算完的修正公式。定义：主模型单价 $P_m$（每百万输入 token）、fallback 模型单价 $P_f$（通常更贵）、主模型失败率 $r$、单请求平均输入 token $I$。</p>
+              <p>一次请求的<strong>期望输入成本</strong>是：$$P_m \cdot I \cdot (1 - r) + (P_m \cdot I + P_f \cdot I) \cdot r = P_m \cdot I \cdot (1 + r) + P_f \cdot I \cdot r$$</p>
+              <p>这个式子在算：$1-r$ 比例的请求只花主模型的钱，$r$ 比例的请求先花主模型钱（沉没成本）再花 fallback 钱。把它改写一下就看出"失败率的杠杆"：$$\text{期望成本} = P_m \cdot I \cdot (1 + r \cdot \frac{P_f}{P_m})$$</p>
+              <p>代入数字：$P_m = 2.5$、$P_f = 10$、$r = 0.1$，则括号里是 $1 + 0.1 \times 4 = 1.4$——仅失败一项就把期望成本抬高了 40%，而这还没算输出 token 和重试的次数放大。如果你把失败率从 10% 压到 2%，括号里变成 $1 + 0.02 \times 4 = 1.08$，期望成本直接下降约 23%。<strong>所以"降低超时率"往往比"砍 prompt 长度"更划算——它削掉的不是一个固定比例，而是带杠杆的复合成本。</strong>用你自己合同里的单价替换 $P_m$、$P_f$，这 30 秒的换算能帮你把成本优化的优先级排清楚。</p>
+            </div>
+          </details>
+
+          <h2>四维成本归因：把账单拆开看</h2>
+          <p>知道成本被什么推高还不够，你需要知道是<strong>谁</strong>在消耗。四维归因把每笔请求的成本分配到四个正交维度上，让成本可见、可追责、可优化。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  REQ["单笔请求成本"] --> D1["工作流维度<br/>哪个功能产生的"]
+  REQ --> D2["租户维度<br/>哪个客户/团队"]
+  REQ --> D3["用户维度<br/>哪个终端用户"]
+  REQ --> D4["版本维度<br/>哪个 prompt/模型版本"]
+
+  D1 --> W1["RAG 问答<br/>高 token / 低单价"]
+  D1 --> W2["代码生成<br/>高输出 token"]
+  D1 --> W3["意图分类<br/>低 token / 高频"]
+
+  D2 --> T1["大客户 A<br/>占 40% 成本"]
+  D2 --> T2["免费用户<br/>ROI 需评估"]
+
+  style REQ fill:#e6f1fb,stroke:#185fa5
+  style D1 fill:#eaf3de,stroke:#639922
+  style D2 fill:#fff8e6,stroke:#d4a017
+            </div>
+            <figcaption>四维成本归因：同一笔请求从四个角度切片。工作流看功能 ROI，租户看客户盈利性，用户看异常消耗，版本看变更影响</figcaption>
+          </figure>
+
+          <h3>维度一：按工作流归因</h3>
+          <p>你的应用可能有多个功能：RAG 问答、代码生成、意图分类、文档摘要。它们的 token 消耗特征完全不同——意图分类可能每次只消耗 100 token，而 RAG 问答每次消耗 3000 token。按工作流归因能回答：<strong>"哪个功能在烧钱？它的业务价值配得上这个成本吗？"</strong></p>
+          <p>实践中常见的情况是：某个低频但高价值的功能（如代码生成）成本可控，而某个高频低价值的功能（如闲聊兜底）在悄悄烧钱。不做工作流归因，你根本看不到这个分配。</p>
+
+          <h3>维度二：按租户归因</h3>
+          <p>B2B 场景下，不同客户（租户）的用量差异极大。按租户归因能回答：<strong>"这个客户付的费覆盖得了他的推理成本吗？"</strong>这是单位经济（unit economics）的核心问题。</p>
+          <p>一个常见的发现是：免费用户或低价套餐用户消耗了不成比例的推理资源——他们用得最频繁、问的最多轮、触发 RAG 最多。按租户归因后，可以针对性地设置限额、降级模型（免费用户用小模型）或调整定价。</p>
+
+          <h3>维度三：按用户归因</h3>
+          <p>比租户更细一层，到终端用户。主要用于发现<strong>异常消耗者</strong>：个别用户通过脚本高频调用、超长上下文攻击、或触发大量重试。按用户归因是滥用检测的基础，和<a href="guardrails.html">护栏</a>配合使用——护栏拦住恶意输入，成本归因发现异常模式。</p>
+
+          <h3>维度四：按发布版本归因</h3>
+          <p>每次改 prompt 或换模型版本后，对比新旧版本的平均单请求成本。这和<a href="prompt-eval-ci.html">Prompt 版本管理</a>的 canary 流程对接：canary 期间不仅看质量分和延迟，也看成本。<strong>一个让质量提升 2% 但成本增加 30% 的 prompt 改动，大概率不值得</strong>。版本维度的成本归因让这个 trade-off 可见、可决策。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">归因的工程实现</span>
+            在<a href="observability.html">全链路 trace</a>的每个 Span 上记录 token 数和模型单价，然后按工作流标签、租户 ID、用户 ID、prompt 版本号做聚合。不需要额外系统，trace 数据天然支持多维聚合。关键是<strong>在请求入口打上这四个标签</strong>，让它们随 trace 传播。
+          </div>
+
+          <details class="deep">
+            <summary>展开：成本归因中间件的最小实现（Python 骨架）</summary>
+            <div class="deep-body">
+              <p>四维归因听起来像要上一套系统，实际上核心只有三件事：<strong>入口打标签、调用处记账、落库时带上标签</strong>。下面是一个与具体框架无关的最小骨架，可以直接嵌进你现有的 LLM 调用封装里。</p>
+              <pre><code class="language-python">from dataclasses import dataclass, asdict
+from contextvars import ContextVar
+
+# 单价表：每百万 token 的价格，按你的实际合同填写
+PRICING = {
+    "main-model":     {"in": 2.5,  "out": 10.0},
+    "fallback-model": {"in": 10.0, "out": 30.0},
+    "small-router":   {"in": 0.15, "out": 0.60},
+}
+
+@dataclass
+class CostTags:
+    workflow: str        # 维度一：rag_qa / code_gen / intent_cls
+    tenant_id: str       # 维度二：客户或团队
+    user_id: str         # 维度三：终端用户
+    prompt_version: str  # 维度四：prompt 与模型版本号
+
+# 请求入口写入一次，后续所有调用自动继承
+_tags: ContextVar[CostTags] = ContextVar("cost_tags")
+
+def record_llm_call(model, in_tok, out_tok, status, sink):
+    """status: ok / timeout / rejected / cache_hit"""
+    p = PRICING[model]
+    cost = 0.0 if status == "cache_hit" else (
+        in_tok / 1e6 * p["in"] + out_tok / 1e6 * p["out"]
+    )
+    sink.emit({
+        **asdict(_tags.get()),
+        "model": model,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "status": status,
+        "is_wasted": status in ("timeout", "rejected"),
+        "cost_usd": cost,
+    })
+    return cost
+</code></pre>
+              <p>三个容易踩坑的细节：</p>
+              <ul>
+                <li><strong>失败的调用也必须记账。</strong><code>is_wasted</code> 这个字段的唯一目的，就是让"沉没成本"可以被单独聚合出来。很多团队的看板只统计成功请求，于是永远看不到自己在为超时付多少钱。</li>
+                <li><strong>缓存命中同样要发一条记录</strong>，只是 <code>cost_usd</code> 记 0、<code>status</code> 标成 <code>cache_hit</code>。否则命中率一旦下滑，你会在下个月的账单里才发现。</li>
+                <li><strong>标签必须放在 ContextVar 或 trace baggage 里</strong>，不要靠函数参数一层层传。异步任务、线程池、后台重试这些边界上，手动传参几乎必然会丢标签，最后聚合出来一堆 <code>tenant_id=unknown</code>。</li>
+              </ul>
+            </div>
+          </details>
+
+          <h2>语义缓存：命中就免费</h2>
+          <p>语义缓存是 LLM 成本优化中 ROI 最高的手段之一。它的思路是：如果用户问了一个和之前某个问题语义相近的问题，直接返回之前的答案，不再调用模型。</p>
+
+          <h3>和传统缓存的区别</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>传统 KV 缓存</th><th>语义缓存</th></tr></thead>
+              <tbody>
+                <tr><td><strong>匹配方式</strong></td><td>精确键匹配（hash）</td><td>向量相似度匹配（embedding）</td></tr>
+                <tr><td><strong>"今天天气怎么样" vs "今天天气如何"</strong></td><td>不命中（键不同）</td><td>命中（语义相同）</td></tr>
+                <tr><td><strong>命中率</strong></td><td>低（用户措辞千变万化）</td><td>高（能覆盖同义改写）</td></tr>
+                <tr><td><strong>误命中风险</strong></td><td>无</td><td>有（语义相近但意图不同的问题可能被误判）</td></tr>
+                <tr><td><strong>过期策略</strong></td><td>TTL</td><td>TTL + 语义相似度阈值</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>怎么用</h3>
+          <p>语义缓存的实现流程：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  Q["用户提问"] --> EM["问题向量化"]
+  EM --> SEARCH["在缓存库中<br/>向量相似度检索"]
+  SEARCH --> HIT{"相似度 &gt; 阈值?"}
+  HIT -->|"是"| RET["返回缓存答案"]
+  HIT -->|"否"| LLM["调用模型生成"]
+  LLM --> STORE["问题+答案存入缓存"]
+  STORE --> A["返回用户"]
+  RET --> A
+  style RET fill:#eaf3de,stroke:#639922
+  style LLM fill:#e6f1fb,stroke:#185fa5
+            </div>
+            <figcaption>语义缓存流程：用向量相似度判断是否有足够接近的历史问答。阈值越高越保守（命中少但误命中少），越低越激进（命中多但可能答错）</figcaption>
+          </figure>
+          <p>关键参数是<strong>相似度阈值</strong>。设太高（如 0.99）命中率接近传统缓存，设太低（如 0.80）会误命中——"怎么退款"和"怎么退货"向量很近但答案完全不同。<strong>不同业务场景需要不同阈值</strong>：FAQ 类问题可以激进些，专业问答必须保守。建议从 0.92 左右开始，根据实际命中准确率调整。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">语义缓存的适用边界</span>
+            语义缓存适用于<strong>答案不随时间变化</strong>的场景（FAQ、知识库问答）。不适用于：需要实时数据的场景（"现在几点"）、依赖用户上下文的场景（"我昨天的订单呢"）、对正确性要求极高的场景（医疗、法律）。另外，缓存命中时也要记录——不要把缓存答案当"免费"的就不追踪，否则你看不到命中率下降的问题。
+          </div>
+
+          <h3>把缓存当成一个需要运营的系统</h3>
+          <p>很多团队上线语义缓存后就不管了，三个月后回头一看，命中率从 40% 掉到了 8%。原因通常是三件事叠加：知识库更新了、用户问法漂移了、失效的条目堆在库里拖慢检索。<strong>缓存不是"配一次就完事"的组件，它有生命周期。</strong></p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 未命中: 新问题进入
+  未命中 --> 已写入: 模型生成成功后落缓存
+  已写入 --> 热条目: 被反复命中
+  热条目 --> 已写入: 命中频次回落
+  已写入 --> 过期: TTL 到期
+  已写入 --> 失效: 源文档版本变更
+  热条目 --> 失效: 源文档版本变更
+  已写入 --> 误命中: 相似度阈值过低
+  过期 --> [*]
+  失效 --> [*]: 主动清除并按需重建
+  误命中 --> [*]: 由负反馈或抽检剔除
+            </div>
+            <figcaption>缓存条目的生命周期。真正需要工程投入的是两条路径：源文档变更触发的主动失效，以及误命中的发现与剔除——它们都不会自己发生</figcaption>
+          </figure>
+          <p>与之配套，缓存需要有自己的一组运营指标。只看"命中率"是不够的，因为命中率高也可能是<strong>误命中多</strong>造成的假象：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>怎么算</th><th>看它是为了发现什么</th></tr></thead>
+              <tbody>
+                <tr><td><strong>命中率</strong></td><td>命中次数 ÷ 总请求数</td><td>缓存的整体收益。持续下滑说明问法漂移或失效策略过于激进</td></tr>
+                <tr><td><strong>节省金额</strong></td><td>命中次数 × 该工作流平均单请求成本</td><td>唯一能向上汇报的硬指标，也用来判断缓存基础设施本身是否划算</td></tr>
+                <tr><td><strong>误命中率</strong></td><td>抽样人工复核 + 用户负反馈率</td><td>相似度阈值是否设得太激进。这是缓存唯一的质量风险</td></tr>
+                <tr><td><strong>陈旧命中率</strong></td><td>命中条目中源文档已更新的比例</td><td>失效机制有没有跟上知识库的变更节奏</td></tr>
+                <tr><td><strong>缓存库规模</strong></td><td>条目数与向量存储占用</td><td>缓存自身的成本，以及检索延迟随规模上升的拐点</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout tip">
+            <span class="callout-t">和 RAG 的失效机制共用一套开关</span>
+            如果缓存里的答案是基于 RAG 生成的，那么文档更新时不仅要重建索引，还要清掉相关的缓存条目——否则用户拿到的是基于旧文档的答案，而且这次连"检索到了旧 chunk"的痕迹都看不到，排查难度比单纯的索引陈旧高一个量级。具体做法参见 <a href="rag-in-production.html">RAG 生产运维</a>中的 chunk 版本管理。
+          </div>
+
+          <h2>前缀缓存：系统提示不重复算</h2>
+          <p>前缀缓存（也叫 prompt caching / KV cache）解决的是另一个问题：你的系统提示有 1000 token，每个请求都带它，每个请求都要重新计算这 1000 token 的 attention。能不能算一次就复用？</p>
+
+          <h3>原理</h3>
+          <p>Transformer 的自回归生成中，输入 prompt 的 KV cache（Key 和 Value 矩阵）是可以复用的。如果两个请求的前缀完全一样（同样的系统提示 + few-shot），第二个请求可以直接复用第一个请求算好的 KV cache，跳过前缀部分的计算。</p>
+          <div class="callout tip">
+            <span class="callout-t">前缀缓存 vs 语义缓存</span>
+            前缀缓存复用的是<strong>计算过程</strong>（KV cache），需要前缀<strong>逐字相同</strong>；语义缓存复用的是<strong>答案</strong>，只需要语义相似。前缀缓存降低单次请求的延迟和成本，但不跳过请求；语义缓存直接跳过请求。两者可以叠加使用。
+          </div>
+
+          <h3>权威图：KV Cache 为什么能省、为什么难省</h3>
+          <p>"复用 KV cache"到底复用什么、为什么传统做法会浪费显存？这是 vLLM 系统论文（SOSP 2023）里的 Figure 1 要回答的问题。它是推理引擎领域的奠基原图，理解它，前缀缓存和 KV cache 管理的所有讨论都有了落脚点。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/09-efficiency/inference-engines/fig1.png" alt="论文原图：PagedAttention 分页 KV Cache 管理——左侧展示连续显存存储导致的内部碎片与共享受限，右侧展示按页分配、可共享的显存布局" loading="lazy" style="max-width:620px">
+            <figcaption>
+              <span class="pf-title">图：PagedAttention 的 KV Cache 显存管理——把连续存储改成按页分配，碎片被消除，同一前缀的 KV 页可以在多个请求间共享（正是前缀缓存的底层机制）</span>
+              <span class="pf-src">论文原图 · Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>, SOSP 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，抓两个对比即可。左边画的是<strong>传统"连续分配"方式</strong>：每个请求的 KV cache 必须在显存里找一块连续空间，空间不够就装不下；不同的格子颜色深浅代表不同请求的 KV 页，可以看到空间被切成一段段的、中间留着大量装不满的"洞"（碎片），而且两个请求之间几乎没法共享任何一段。右边画的是<strong>vLLM 的分页方式</strong>：KV cache 像操作系统分页一样按固定大小的"页"分配，用到哪里分配到哪里，碎片消失了；更重要的是——<strong>如果两个请求的前缀相同，它们可以指向同一批 KV 页</strong>，这正是前缀缓存的底层实现。你的模型服务框架（vLLM、SGLang 等）能对相同系统提示自动复用缓存，靠的就是这一机制。理解了这张图，你就明白了为什么"把固定内容放前面、动态内容放后面"的 prompt 结构能让前缀缓存生效：<strong>前缀逐字相同，KV 页才能被共享；前缀里插一个动态日期，整个共享就断了。</strong></p>
+
+          <h3>怎么用</h3>
+          <p>部分模型供应商已经原生支持前缀缓存：</p>
+          <ul>
+            <li><strong>Anthropic Claude</strong>：支持 prompt caching，显式标记可缓存的前缀段，命中后输入 token 价格大幅降低（具体折扣以官方文档为准）。</li>
+            <li><strong>OpenAI</strong>：对重复的前缀自动应用缓存折扣，无需显式标记，但要求前缀足够长（通常 1024+ token）且完全匹配。</li>
+            <li><strong>自部署模型</strong>：vLLM、SGLang 等推理框架支持 Automatic Prefix Caching，对相同前缀的 KV cache 自动复用。</li>
+          </ul>
+          <p>要让前缀缓存生效，prompt 结构的设计很重要：<strong>把固定内容（系统提示、few-shot）放在前面，把可变内容（用户输入、RAG 上下文）放在后面</strong>。如果系统提示里有动态变量（如当前日期、用户名），放在前缀的最末尾，让前面的固定部分尽可能长。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            两个最容易被混为一谈的省钱手段：<strong>前缀缓存和语义缓存不是一回事，也别指望"自动生效"。</strong>前缀缓存要求前缀<strong>逐字完全一致</strong>，你的系统提示里哪怕有一个动态时间戳、一个随机用户名的拼接位置不对，缓存命中率就可能归零——它不是"开了就灵"的开关，而是需要你重新设计 prompt 结构才吃得上的折扣。反过来，语义缓存要求<strong>语义一致</strong>，不要求逐字一致，但它有误命中风险，且答案不能随时间变化。很多团队两个都部署了，但命中率都很低，原因是同一个：<strong>没为自己的系统分别检查"为什么没命中"</strong>——前者查前缀逐字一致性，后者查相似度阈值和失效策略。
+          </div>
+
+          <details class="deep">
+            <summary>展开：前缀缓存友好的 prompt 结构</summary>
+            <div class="deep-body">
+              <pre><code class="language-text"># 前缀缓存不友好：动态内容在前面
+你是 {user_name} 的助手。今天是 {date}。
+请根据以下规则回答问题：...（500 token 规则）
+用户问题：{question}
+
+# 前缀缓存友好：固定内容在前面，动态内容在后面
+你是一个问答助手。请根据以下规则回答问题：...（500 token 规则）
+以下是几个示例：...（300 token few-shot）
+
+--- 以下为动态内容 ---
+当前用户：{user_name}
+当前日期：{date}
+用户问题：{question}</code></pre>
+              <p>第二种结构中，前 800 token 是固定的，可以被前缀缓存命中。第一种结构中，前几行就包含动态变量，几乎无法命中缓存。<strong>Prompt 结构的一个小调整，可能让前缀缓存命中率从 0% 提升到 80%</strong>。</p>
+            </div>
+          </details>
+
+          <h2>其他成本优化杠杆</h2>
+          <p>语义缓存和前缀缓存是两大杠杆，但还有几个值得做的优化：</p>
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">模型路由</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">简单问题用小模型，复杂问题才用大模型。用一个小模型或分类器做意图判断，把请求路由到合适的模型。80% 的请求可以用便宜 10 倍的小模型解决。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">对话历史截断</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">多轮对话不要把全部历史带上。用滑动窗口（保留最近 N 轮）或摘要策略（旧轮次压缩成摘要）。第 10 轮对话的输入 token 可能是第 1 轮的 10 倍。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">RAG 上下文裁剪</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">检索了 top-10 但只重排后喂 top-3 给模型。不要把 10 个 chunk 都塞进 prompt——既烧 token 又稀释注意力。RAG 上下文的 token 优化详见 <a href="../10-applications/context-engineering.html">上下文工程</a>。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">输出长度控制</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">在 prompt 里加"请简洁回答"，设置合理的 max_tokens。输出 token 通常比输入贵 3-4 倍，控制输出长度的成本收益更大。</p>
+            </div>
+          </div>
+
+          <h2>成本治理：让超支在发生前被拦住</h2>
+          <p>前面讲的都是"怎么把成本降下来"，但生产系统还得回答另一个问题：<strong>成本失控的那一刻，谁会知道，系统会怎么办？</strong>没有预算护栏的成本优化是脆弱的——一次死循环的 Agent、一个没加限流的批处理脚本、一次让输出变长 3 倍的 prompt 回归，都能把一个月省下来的钱在一天里吃光。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root((成本治理))
+    可见
+      四维归因看板
+      单位经济指标
+      沉没成本单列
+    预警
+      日预算消耗速率
+      租户配额水位
+      单请求成本 p99
+    限制
+      租户级配额
+      单请求 token 上限
+      Agent 最大步数
+    降级
+      切换到小模型
+      关闭重排
+      收紧检索 top-k
+            </div>
+            <figcaption>成本治理的四层：可见 → 预警 → 限制 → 降级。多数团队只做到了第一层，结果就是"事后知道花超了"</figcaption>
+          </figure>
+          <p>这四层是递进的，缺一层就会在某个环节断掉：只有"可见"没有"预警"，看板得有人盯着才有用；有"预警"没有"限制"，值班同学只能眼睁睁看着数字往上走；有"限制"没有"降级"，超限的结果是服务直接不可用，业务方宁可花钱也不愿意接受。建议按下面的分级把动作写成明确的运行手册：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>分级</th><th>触发条件（示例）</th><th>系统动作</th><th>人工动作</th></tr></thead>
+              <tbody>
+                <tr><td><strong>L3 观察</strong></td><td>当日消耗达到预算的 70%</td><td>看板标黄，不做任何限制</td><td>无，例行周会复盘即可</td></tr>
+                <tr><td><strong>L2 预警</strong></td><td>当日消耗达到预算的 90%，或单租户消耗速率突增 3 倍</td><td>告警推到值班群，附上四维归因的 top-5</td><td>值班判断是真实业务增长还是异常调用</td></tr>
+                <tr><td><strong>L1 限制</strong></td><td>单租户超出配额</td><td>该租户请求排队或返回额度提示，不影响其他租户</td><td>联系客户，决定临时提额还是维持</td></tr>
+                <tr><td><strong>L0 降级</strong></td><td>全局日预算耗尽</td><td>切小模型 + 关闭重排 + 收紧上下文长度</td><td>决策是否临时放开预算，事后必须复盘</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout warn">
+            <span class="callout-t">降级策略必须提前演练</span>
+            "预算耗尽就切小模型"这句话写进文档很容易，真到那一刻却经常执行不了：小模型没有对应版本的 prompt、输出格式不兼容、下游 JSON 解析直接崩溃。<strong>降级路径要像容灾一样定期演练</strong>——至少保证小模型分支有自己的 <a href="prompt-eval-ci.html">golden set 回归</a>，并且在 <a href="observability.html">trace</a> 里能一眼看出当前处于降级态，否则用户投诉"回答质量变差了"的时候你会查半天。
+          </div>
+
+          <h2>和训练侧成本的关系</h2>
+          <p>本书 <a href="../05-systems/compute-budget.html">计算预算</a> 一节讲的是训练侧的成本——GPU 选型、混合精度、梯度累积。本节讲的是推理侧的成本。两者的优化逻辑完全不同：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>训练侧成本</th><th>推理侧成本</th></tr></thead>
+              <tbody>
+                <tr><td><strong>成本结构</strong></td><td>固定投入（GPU 小时），可精确预估</td><td>按量计费（token），随用户行为波动</td></tr>
+                <tr><td><strong>优化杠杆</strong></td><td>并行策略、精度、梯度检查点</td><td>缓存、路由、上下文裁剪、模型选择</td></tr>
+                <tr><td><strong>优化时机</strong></td><td>训练前规划，训练中执行</td><td>上线后持续，随业务迭代</td></tr>
+                <tr><td><strong>效果衡量</strong></td><td>单次训练总成本</td><td>单位经济（每用户/每请求成本）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：从"每请求成本"到"单位经济"——把技术指标翻译成生意语言</summary>
+            <div class="deep-body">
+              <p>工程团队汇报"我们把平均单请求成本从 $0.019 降到了 $0.011"，业务侧往往没什么感觉。真正能对话的指标是<strong>单位经济</strong>：一个付费用户每月带来多少收入、消耗多少推理成本、毛利率是多少。换算链条并不复杂。</p>
+              <p>先给活跃用户定义一个<strong>行为画像</strong>：平均每月对话轮数 R、每轮触发的模型调用数 Q（注意一轮对话往往不止一次调用——意图分类、检索改写、生成、输出校验可能各是一次）、平均单请求成本 C。那么单用户月推理成本就是 R × Q × C。把它和该套餐的月费 P 相除，得到<strong>推理成本占收入比</strong> = R × Q × C ÷ P。</p>
+              <p>这个比值才是决策依据，而且它是双向的：</p>
+              <ul>
+                <li>如果<strong>超过 30%</strong>，说明定价或用量策略需要调整，通常是"设限额、做降级、涨价"三选一，光靠工程优化很难把 30% 压到健康区间。</li>
+                <li>如果<strong>长期低于 5%</strong>，反而要警惕过度优化：为了省钱把检索 top-k 砍到 2、把输出压到 100 token，省下的钱可能远不如流失的留存值钱。<strong>成本优化的目标是毛利率，不是最低成本。</strong></li>
+              </ul>
+              <p>更细的做法是按<strong>用户分位</strong>看这个比值，而不是只看平均值。典型的分布是：p50 用户的成本占比只有 8%，p99 用户却能到 200%——少数重度用户完全不赚钱，甚至把整个套餐的毛利拉成负数。这时候正确的动作不是全局降级（会伤害所有人），而是对 p99 用户单独设配额或引导升级套餐。这也正是<strong>用户维度归因不能省</strong>的原因：只有平均值的时候，你连"是不是少数人拖垮了毛利"这个问题都没法回答。</p>
+              <p>最后一个容易造假的地方：成本占比必须用<strong>含沉没成本的口径</strong>。重试消耗的 token、fallback 的差价、被护栏拒绝后重新生成的那一轮，都是真金白银付出去的。如果只统计成功请求的成本，报出去的毛利率是虚高的，而且越是系统不稳定的时候虚得越多——这恰恰是你最需要真实数字的时候。</p>
+            </div>
+          </details>
+
+          <div class="callout">
+            <span class="callout-t">边界声明</span>
+            <a href="../09-efficiency/">效率篇</a>讲的是"怎么让推理更快"（量化、投机解码、batching），本节讲的是"怎么让推理不烧钱"。快和省有关联但不等价——投机解码让延迟更低但可能增加总 token 消耗（草稿模型也花钱）。效率篇关注吞吐和延迟，本篇关注账单和单位经济。
+          </div>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：推理成本 ≠ 模型单价 × 请求量。系统提示、历史、RAG 上下文、重排、重试、fallback 共同推高账单，只按报价算必然偏低。</li>
+            <li><strong>四维归因</strong>：按工作流（功能 ROI）、租户（客户盈利性）、用户（异常检测）、版本（变更影响）拆分成本。在 trace 上打标签即可实现。</li>
+            <li><strong>语义缓存</strong>：用向量相似度匹配历史问答，命中直接返回。ROI 最高但有误命中风险，阈值因业务而异，不适用于实时/个性化场景。</li>
+            <li><strong>前缀缓存</strong>：复用相同前缀的 KV cache，降低延迟和成本。要求前缀逐字相同，需把固定内容放前面、动态内容放后面，并检查命中率。底层机制见 PagedAttention。</li>
+            <li><strong>其他杠杆</strong>：模型路由（80% 请求用小模型）、历史截断、RAG 裁剪、输出长度控制。输出 token 比输入贵 3-4 倍，控制输出长度收益更大。</li>
+            <li><strong>先量后优</strong>：把自己业务的那张"单请求 token 账"手算一遍，再决定优化什么。输入密集型（RAG）和输出密集型（代码生成）的优化优先级完全相反。失败率是带杠杆的复合成本，先降失败率往往最划算。</li>
+            <li><strong>成本治理四层</strong>：可见 → 预警 → 限制 → 降级，缺一层就会在某个环节断掉。降级路径必须提前演练，否则真到 L0 时执行不了。</li>
+            <li><strong>汇报口径</strong>：对内看单请求成本，对外看单位经济（推理成本 ÷ 收入）。要按用户分位看，且必须包含重试与 fallback 的沉没成本。</li>
+            <li><strong>常见坑</strong>：忽略重试和 fallback 的隐性成本；语义缓存阈值设太低导致误命中；prompt 结构不对导致前缀缓存命中率为 0；只盯模型成本忽略重排与 embedding 开销；缓存上线后无人运营，命中率悄悄归零；把前缀缓存和语义缓存混为一谈。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：如何估算一次 RAG 请求的真实成本？</h3>
+              <p><span class="answer-label">标准回答：</span>先按调用链拆分，而不是只看最后一次生成：<strong>期望成本 = Embedding 成本 + 检索/重排成本 + 主模型调用成本 + 重试成本 + fallback 成本</strong>。主模型调用成本按输入、输出 token 分开计价；重试要把已失败请求的 token 计入沉没成本；fallback 要按触发概率乘以备用模型完整调用成本；Embedding 即使单价低，也要乘以每次查询次数；重排则按托管 API 调用量或自部署的 GPU/CPU 时间折算。可以用 trace_id 关联每一段调用，并按 workflow、tenant、model、status 汇总。</p>
+              <p>一个可执行的估算式是：<code>C = C_emb + C_rerank + C_primary + p_retry·C_retry + p_fallback·C_fallback</code>。若重试和 fallback 可能叠加，应按实际状态机统计联合概率，避免简单相加造成重复计算。最终同时报 p50/p95 单请求成本和成功请求成本、失败沉没成本，不能只报平均成功请求。</p>
+              <details class="deep">
+                <summary>追问：为什么不能用「平均 token × 平均单价」直接估算？</summary>
+                <div class="deep-body">
+                  <p>因为输入输出单价通常不同，路由后的模型单价不同，长尾请求的上下文和输出也不同，失败调用还会产生没有业务产出的 token。工程上应先记录每次调用的 provider、model、prompt_tokens、completion_tokens、cached_tokens、attempt、fallback_from、status，再按请求聚合，最后按租户和工作流观察分布。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：语义缓存和前缀缓存有什么区别？边界与失效策略怎么定？</h3>
+              <p><span class="answer-label">标准回答：</span>语义缓存比较问题或请求的<strong>含义</strong>，命中后直接复用完整答案，适合 FAQ、低个性化、答案变化慢的场景；前缀缓存复用完全相同前缀对应的 KV Cache，仍会执行后续推理，适合固定系统提示、长文档前缀和多轮会话。前者是应用层的答案级缓存，后者是推理层的计算级缓存；语义相似不代表答案等价，而前缀缓存要求字节级前缀一致。</p>
+              <p>语义缓存必须把租户、权限、语言、产品版本、时间敏感性纳入 key 或过滤条件，并用离线相似度/误命中评测选择阈值；高风险、个性化、实时库存/价格、带权限上下文的请求默认旁路。失效可采用 TTL、知识库版本号、文档变更事件和人工 purge。前缀缓存则要把稳定内容前置、动态内容后置，模型版本、采样相关配置或系统提示变更时切换 namespace；淘汰主要按容量、TTL 和 LRU，不应把它当作答案正确性的保障。</p>
+              <p><span class="pitfall-label">常见误区：</span>命中率高不等于收益高。语义缓存要同时监控误命中率和缓存答案的业务采纳率；前缀缓存要监控真正的 prefix hit rate、节省 token/延迟以及缓存占用，不能用接口整体命中率代替。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：如何设计多租户 LLM 成本治理？</h3>
+              <p><span class="answer-label">标准回答：</span>按「可见、预警、限制、降级」四层设计。每个请求在网关生成 tenant_id、project_id、user_id、workflow、model、版本和成本标签；预算层设置月度预算、日预算和工作流预算，并预留平台基础设施成本；配额层限制 token、请求数、并发和最大上下文长度；限流层采用按租户的 token bucket/并发信号量，区分交互流量与批处理流量；降级层预先定义模型路由、关闭非关键 RAG/重排、缩短历史和输出、排队或友好拒绝。</p>
+              <p>预算不能只在月末结算：应有实时累计、预测消耗和阈值告警（例如 70%/90%/100%），并把超额策略写成可审计的 policy。公平性上要采用租户级隔离和优先级队列，避免单个租户的突发流量挤占全局 SLO；异常租户先限流或暂停高成本 workflow，不要直接把所有租户全局降级。</p>
+              <details class="deep">
+                <summary>追问：预算耗尽时为什么不直接返回 429？</summary>
+                <div class="deep-body">
+                  <p>预算耗尽是业务策略，不一定是瞬时过载。可以按优先级切换到小模型、缓存、异步队列或模板答案；只有在配额、合规或系统保护要求下才拒绝。降级必须记录原因和 policy_version，否则用户投诉时无法解释，也无法评估降级是否伤害转化。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q4：如何判断质量提升是否值得成本增加？</h3>
+              <p><span class="answer-label">标准回答：</span>不能只看离线 benchmark 的分数。先定义与业务目标对应的质量指标（任务成功率、事实正确率、人工转接率、解决时长、转化率或留存），再计算增量收益与增量成本：<strong>单位增量收益 = (业务指标提升带来的毛利) ÷ (新增推理成本 + 新增运维成本)</strong>。通过同流量 A/B 或分层 canary 比较质量、成本、延迟和失败率，并按用户/租户/长尾任务分位观察，而不是只看平均值。</p>
+              <p>若质量提升只发生在低价值请求，通常不值得全量切换；更合理的是按意图、风险、置信度路由到高质量模型。决策应看 Pareto 前沿：在质量、成本、延迟和可靠性之间不存在明显劣势的方案才进入生产；同时设置回滚阈值，避免短期质量收益掩盖毛利和容量风险。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q5：设计一个企业客服/Agent 成本优化系统，你会怎么做？</h3>
+              <p><span class="answer-label">标准回答：</span>我会先把目标定为「在客服解决率和安全约束不下降的前提下，降低每次解决成本」，而不是单纯追求最低 token。核心指标包括：每次解决成本、成功率/转人工率、事实错误率、P95 延迟、重试率、fallback 率、缓存命中与误命中率、各租户预算消耗、每个 workflow 的毛利贡献，以及审计覆盖率。</p>
+              <p>链路上由网关做身份、租户、权限和预算检查；轻量意图分类后进行模型路由：FAQ/结构化查询优先缓存或小模型，高风险、复杂推理和工具调用才升级大模型。RAG 侧做查询改写、top-k/重排预算控制和文档版本绑定；稳定系统提示启用前缀缓存，低风险标准问答启用带权限隔离的语义缓存。Agent 工具调用设置最大步数、超时、单步预算和幂等键，失败时走有限重试与安全 fallback。</p>
+              <p>审计方面，保存 request_id/trace_id、租户与用户授权、路由决策、模型版本、输入输出 token、缓存命中、工具调用、policy_version、拒绝/降级原因和成本明细；敏感内容脱敏后再落日志。上线采用 shadow → 小流量 canary → 分租户放量，按质量、成本和 SLO 自动门禁。任何模型、prompt、路由或缓存策略都保留版本，出现误命中、成本突增或质量回退时可按租户/版本一键回滚，并能重放代表性 trace 定位。</p>
+              <details class="deep">
+                <summary>追问：最先优化哪一个环节？</summary>
+                <div class="deep-body">
+                  <p>先用账单和 trace 找出最大成本项及其失败长尾：若是重复 FAQ，优先语义缓存；若是固定长提示，优先前缀缓存；若是大量低难度请求，优先路由；若是重试率高，先修稳定性。每次只改一个主要变量，用同一批离线样本和线上分流验证，避免把多个优化叠加后无法归因。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q6：成本优化上线后，常见误区和排障 checklist 是什么？</h3>
+              <p><span class="answer-label">标准回答：</span>常见误区包括：只统计成功请求而漏掉重试沉没成本；把 embedding、重排、工具调用和 GPU 空闲算力排除在单位成本外；把语义缓存当作前缀缓存；只看平均值而忽略 p95/p99 和重度租户；为省钱无条件缩短上下文或输出，导致解决率下降；预算策略没有版本和回滚，发生异常时无法复现。</p>
+              <p><span class="answer-label">排障 checklist：</span>① 账单总额与网关 usage、provider usage 对账；② 按 trace 检查每次 attempt、token、模型、价格版本和 fallback；③ 拆分缓存 lookup、hit、miss、误命中、过期和旁路原因；④ 检查 prompt 是否发生动态字段前移导致前缀缓存失配；⑤ 对比路由前后质量、延迟、失败率和租户分布；⑥ 查看限流/降级命中、队列积压及是否存在重试风暴；⑦ 验证知识库版本、权限过滤和缓存 namespace；⑧ 用固定样本回放并确认修复后能灰度、监控和回滚。</p>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Efficient Memory Management for LLM Serving with PagedAttention — vLLM 系统论文，本页前缀缓存图的出处 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arxiv.org/abs/2309.06180</a></li>
+            <li>Anthropic Prompt Caching 文档 — 前缀缓存的官方实现、定价折扣与使用指南 · <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" target="_blank" rel="noopener">docs.anthropic.com/en/docs/build-with-claude/prompt-caching</a></li>
+            <li>OpenAI API Pricing & Caching — 模型定价与自动前缀缓存机制 · <a href="https://openai.com/api/pricing/" target="_blank" rel="noopener">openai.com/api/pricing</a></li>
+            <li>GPTCache — 开源语义缓存方案，支持自定义 embedding 与相似度评估 · <a href="https://github.com/zilliztech/GPTCache" target="_blank" rel="noopener">github.com/zilliztech/GPTCache</a></li>
+            <li>SGLang: RadixAttention 论文 — 用基数树组织 KV cache，实现跨请求的自动前缀复用 · <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">arxiv.org/abs/2312.07104</a></li>
+            <li>LiteLLM 文档 — 统一多模型网关，内置按 key/租户的用量与预算控制 · <a href="https://docs.litellm.ai/" target="_blank" rel="noopener">docs.litellm.ai</a></li>
+            <li>OpenTelemetry GenAI 语义约定 — 在 Span 上记录 token 数与模型信息的标准字段命名 · <a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/" target="_blank" rel="noopener">opentelemetry.io/docs/specs/semconv/gen-ai</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            成本管好了，还要保证系统跑得稳。<a href="rag-in-production.html">RAG 生产运维</a>讲 RAG 系统三个月不烂掉的运维方法，<a href="guardrails.html">护栏与输出校验</a>讲怎么拦住不安全内容。成本监控的基础设施见 <a href="observability.html">可观测性与全链路追踪</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

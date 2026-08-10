@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>数据工程 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="06-pretraining" data-topic="data-engineering">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>数据工程</h1>
+            <p class="lead">「Garbage in, garbage out」这句话在大模型时代被放大了一万倍：用 15T tokens 的高质量数据训练，和用 15T tokens 的垃圾训练，结果天差地别。数据工程不是预处理脚手架，而是预训练的核心竞争力。这一节讲真实语料从互联网原始 HTML 到可训练 token 的完整管线。</p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">本页定位</span>
+            本页讲<strong>真实语料</strong>的处理管线。与 <a href="synthetic-data.html">合成数据与数据飞轮</a> 构成「真实语料 + 合成语料」的并列对子——前者从互联网挖，后者用模型生成。两者的质量过滤和去重方法有重叠，但来源和风险不同。
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>预训练数据管线的核心流程：从互联网原始数据出发，经过<strong>抽取 → 质量过滤 → 去重 → 配比 → 课程设计</strong>五步，最终产出训练用的 token 流。每一步都在「留好的、去掉坏的」，而且<strong>后一步的效率依赖前一步的干净度</strong>——在垃圾上做去重只是浪费算力。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  A["Common Crawl<br/>原始 HTML"] --> B["抽取<br/>HTML→纯文本"]
+  B --> C["质量过滤<br/>启发式 + 分类器"]
+  C --> D["去重<br/>精确 + MinHash"]
+  D --> E["配比<br/>语言/领域混合"]
+  E --> F["课程设计<br/>训练顺序安排"]
+  F --> G["训练 Token 流"]
+  style A fill:#fde8e8,stroke:#c44
+  style C fill:#fff3e0,stroke:#e8a738
+  style D fill:#e3f2fd,stroke:#1976d2
+  style G fill:#e8f5e9,stroke:#4a4
+              </div>
+              <figcaption>预训练数据管线五步：抽取、过滤、去重、配比、课程设计</figcaption>
+            </figure>
+          </div>
+
+          <h2>先建立一个数量级直觉</h2>
+          <p>在讲每一步之前，先感受一下这条管线的「漏斗形状」。这是理解为什么每一步都值得投入工程资源的前提：假设你从一次 Common Crawl 快照出发，每一步大致会剩下多少？</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>步骤</th><th>典型留存比例</th><th>被砍掉的主要是什么</th><th>这一步的单位成本</th></tr></thead>
+              <tbody>
+                <tr><td>HTML → 正文抽取</td><td>体积上只剩个位数百分比</td><td>标签、脚本、样式、导航、广告</td><td>低（纯 CPU，可并行）</td></tr>
+                <tr><td>语言识别 + 分流</td><td>看目标语言，单一语种通常留 5%–10%</td><td>其他语种、无法判定语种的碎片</td><td>低（fastText 每秒可处理上万篇）</td></tr>
+                <tr><td>启发式规则过滤</td><td>留 30%–60%</td><td>过短页面、乱码、符号刷屏、重复行</td><td>低</td></tr>
+                <tr><td>分类器 / 模型打分</td><td>留 10%–40%（阈值决定）</td><td>SEO 垃圾、机翻、内容农场</td><td>中（需批量推理）</td></tr>
+                <tr><td>去重</td><td>再去掉 30%–50%</td><td>转载、模板页、近似复制</td><td>高（要做全局比对，内存与 IO 密集）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:13px;color:var(--text-3)">上表是各家公开管线报告中的常见区间，用于建立数量级直觉，不是精确标准；实际留存率高度依赖阈值设定与目标语言。</p>
+
+          <p>把这几个比例连乘一下你就明白了：<strong>原始网页里最终能进入训练集的，往往是很小的一个零头</strong>。这也解释了为什么各家都在拼「同样的 CC 快照，谁能榨出更多可用 token」——这不是省钱，是在数据墙面前抢时间。</p>
+
+          <h3>手算：一份网页变成几份 token 的漏斗</h3>
+          <p>用具体的数字走一遍，能立刻感受到这条管线的「榨取率」有多低。假设你从一次 Common Crawl 快照里拿到 100 万篇文档，按本页开头那张表的典型留存率连乘：</p>
+          <ul>
+            <li>正文抽取后只剩 5%（模板、脚本、广告被剥掉）：100 万 → 5 万篇。</li>
+            <li>英语分流留下约 8%：5 万 → 4000 篇。</li>
+            <li>启发式规则再过滤掉约 40%：4000 → 2400 篇。</li>
+            <li>分类器打分再留约 30%：2400 → 720 篇。</li>
+            <li>去重再去掉约 40%：720 → <strong>约 430 篇</strong>。</li>
+          </ul>
+          <p>也就是一百万篇原始网页，最终只有约 0.04% 能进训练集。这个数字听起来夸张，但它的工程含义非常实在：<strong>数据管线的单位成本必须按「处理 100 万篇 → 产出 430 篇」来算</strong>——所以去重这类「越到后面越贵」的步骤，一定要在充分过滤之后再做，否则就是在浪费算力处理注定会被丢掉的文档。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            留存比例是<strong>按文档数</strong>算的，不是按 token 数算的。垃圾网页往往又短又碎，一份高质量长文档（论文、书籍）的 token 量可能是几十份垃圾网页的总和。所以「过滤后只剩 10% 的文档」并不等于「过滤后只剩 10% 的 token」——<strong>高质量语料的 token 占比通常远高于文档占比</strong>。评估管线效率时，两个口径都要看，只看文档数会被严重误导。
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 原始WARC记录
+  原始WARC记录 --> 已抽取正文: trafilatura 等工具
+  原始WARC记录 --> 丢弃: 抽取失败或正文过短
+  已抽取正文 --> 已判语种: fastText 语言识别
+  已判语种 --> 丢弃: 非目标语种或置信度过低
+  已判语种 --> 通过启发式: 长度 符号比 重复率 检查
+  通过启发式 --> 丢弃: 触发任一硬规则
+  通过启发式 --> 通过分类器: 质量分高于阈值
+  通过分类器 --> 丢弃: 质量分过低
+  通过分类器 --> 唯一文档: 精确与模糊去重
+  唯一文档 --> 丢弃: 与已保留文档近似重复
+  唯一文档 --> 入库: 写入分片并记录质量信号
+  入库 --> [*]
+            </div>
+            <figcaption>一份文档在管线中的状态流转。注意每个环节都有一条通往「丢弃」的边——数据工程的绝大部分工作量花在决定这些边的阈值上。</figcaption>
+          </figure>
+
+          <h2>Common Crawl 抽取：从 HTML 到纯文本</h2>
+          <p><strong>Common Crawl</strong> 是目前最大的公开网页爬虫数据集，定期抓取覆盖数十亿网页，以 WARC 格式存储（具体规模以官方每期公告为准）。它是几乎所有大模型预训练数据的基础来源——GPT-3、LLaMA、RedPajama、Dolma 等都以 CC 为主干。</p>
+          <p>但 Common Crawl 是原始网页快照（WARC 文件），里面包含 HTML 标签、JavaScript、CSS、导航栏、广告、页脚等大量噪声。第一步——也是最容易被低估的一步——是把 HTML <strong>干净地</strong>转成纯文本。</p>
+          <p>这一步该怎么系统化地做？CCNet 论文（LLaMA 系列数据管线的基础）给出了一张完整的处理流程图，是这一领域最常被引用的第一手图。它把「从一次 CC 快照到可训练语料」的整条链路画了出来。</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/1911.00359/assets/x1.png" alt="论文原图：CCNet 的 Common Crawl 处理管线——下载 WARC/WET 文件后逐文档做语言识别、困惑度过滤、近重复去重，最后按语言分桶输出训练语料" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：CCNet 处理一次 Common Crawl 快照的完整管线——下载 → 逐文档语言识别 → 困惑度分档过滤 → 去重 → 按语言输出训练语料</span>
+              <span class="pf-src">论文原图 · Wenzek et al., <em>CCNet: Extracting High Quality Monolingual Datasets from Web Crawl Data</em>, 2019, Figure 1 · <a href="https://arxiv.org/abs/1911.00359" target="_blank" rel="noopener">arXiv:1911.00359</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，按流水方向抓四个环节：<strong>① 最左侧是数据源</strong>——把 Common Crawl 的 WET 文件（已抽取过的纯文本，见下文）下载下来，并对每个段落做哈希、按哈希分组保存成二进制文件。<strong>② 语言识别（LID）</strong>——用 fastText 语言分类器逐文档判断语种，只有目标语言（如英语）的文档继续往下走。<strong>③ 困惑度分档（Perplexity Filtering）</strong>——对每篇文档用语言模型算困惑度，按困惑度分档（如「高质量 / 中质量 / 低质量」三个桶），下游按需取档。<strong>④ 去重（Deduplication）</strong>——去掉近重复文档后，输出按语言分桶的训练语料。整条管线每一环都连着一个「丢弃」的分支，和本页前面那张状态图是完全一致的思路。</p>
+          <p>这张图的价值还在于它点明了两个工程决策：<strong>一是「先 LID 再去重」还是「先去重再 LID」</strong>——论文里专门做了实验（Figure 3），结论是顺序会影响各语言的数据量，需要按你的目标语言分布来选择；<strong>二是困惑度过滤的阈值</strong>——CCNet 按困惑度把语料分成三档而不是一刀切，因为有些下游任务需要「低困惑度」（更干净的文本），而有些任务其实能容忍甚至需要更多样的文本。把「过滤」做成「分档存储」而不是「直接删除」，是这条管线最有借鉴价值的工程习惯——正好呼应了本页后面「保留质量信号」的建议。</p>
+
+          <h3>「干净」到底难在哪</h3>
+          <p>难点不在于去掉标签，而在于<strong>区分「正文」和「模板」</strong>。一个典型的新闻页面上，正文可能只占页面文字的三成，剩下七成是导航菜单、相关推荐、评论区、Cookie 提示、版权声明。这些模板文字有两个恶劣性质：</p>
+          <ul>
+            <li><strong>它们在整站的每一页都一样</strong>。抽取时不去掉，去重阶段就会发现「这个网站的一万个页面高度相似」，要么误删了真正有内容的页面，要么留下了一万份相同的导航栏。</li>
+            <li><strong>它们语法完整、看起来很像正常文本</strong>。「登录 注册 首页 关于我们 联系我们」在困惑度上并不异常，启发式规则很难识别。</li>
+          </ul>
+          <p>所以抽取质量决定了后续所有步骤的效果上限。上游多留一点垃圾，下游要花十倍的力气去补救，而且往往补不干净。</p>
+
+          <h3>主流抽取工具</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>工具</th><th>方法</th><th>特点</th></tr></thead>
+              <tbody>
+                <tr><td><strong>trafilatura</strong></td><td>规则 + 启发式</td><td>对新闻/博客正文抽取效果好，开源 Python 库</td></tr>
+                <tr><td><strong>resiliparse</strong></td><td>规则 + DOM 树分析</td><td>高性能 C++ 实现，适合大规模批量处理</td></tr>
+                <tr><td><strong>jusText</strong></td><td>段落级启发式</td><td>基于 HTML 结构的段落保留/丢弃决策</td></tr>
+                <tr><td><strong>Boilerplate removal</strong></td><td>模板检测</td><td>识别并移除重复的页面模板（导航、页脚）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            很多人用 BeautifulSoup 简单提取 <code>&lt;p&gt;</code> 标签就当正文用了。这会留下大量导航链接、评论区、Cookie 提示等噪声文本。LLaMA 论文专门提到用 CCNet 管线做语言识别和文档质量评分——抽取质量直接决定后续所有步骤的效果上限。
+          </div>
+
+          <p>抽取后还需要做<strong>语言识别</strong>（用 fastText 或 CLD3 分类），将文档按语言分流。CCNet 管线是 LLaMA 系列使用的事实标准：它把每篇文档用语言模型打 perplexity 分，保留低困惑度（更像自然语言）的文档。</p>
+          <p>还有一个常被忽略的选项：Common Crawl 除了 WARC，也提供已经抽取过的 WET 格式纯文本。用 WET 省事，但 RefinedWeb 的作者明确指出，WET 的抽取质量不足以支撑高质量语料，他们选择从 WARC 重新抽取。这是一个典型的「上游多花一分力气、下游省十分」的决策。</p>
+
+          <h2>质量过滤：留好的，去掉坏的</h2>
+          <p>抽取出来的文本仍然包含大量低质量内容：乱码、重复短语、SEO 垃圾、机器翻译、极短页面等。质量过滤分两个层次：<strong>启发式规则</strong>和<strong>分类器过滤</strong>。</p>
+
+          <h3>启发式规则</h3>
+          <p>这是最便宜也最有效的第一道关卡，几乎所有数据管线都用。它们的共同特点是<strong>单文档可判、无需模型、可以在流式处理中完成</strong>：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>规则</th><th>常见阈值量级</th><th>拦截的典型内容</th><th>误伤风险</th></tr></thead>
+              <tbody>
+                <tr><td><strong>文档词数下限</strong></td><td>少于几十个词即丢弃</td><td>404 页、导航碎片、纯图片页</td><td>误伤短小精悍的问答、诗歌</td></tr>
+                <tr><td><strong>平均词长</strong></td><td>过短或过长都异常</td><td>乱码、被切碎的编码、超长拼接串</td><td>误伤化学式、代码片段</td></tr>
+                <tr><td><strong>符号与文字比</strong></td><td>非文字字符占比过高即丢弃</td><td>乱码、表格残渣、颜文字刷屏</td><td>误伤数学公式、代码</td></tr>
+                <tr><td><strong>重复行 / 重复 n-gram 占比</strong></td><td>重复段落占比过高即丢弃</td><td>模板刷屏、列表页、SEO 关键词堆砌</td><td>误伤歌词、法律条文、目录</td></tr>
+                <tr><td><strong>结尾标点的行占比</strong></td><td>正常句子结尾的行应占多数</td><td>导航菜单、标签云、商品列表</td><td>误伤诗歌、字幕、聊天记录</td></tr>
+                <tr><td><strong>脏词命中数</strong></td><td>命中若干个即丢弃或降权</td><td>成人内容、垃圾广告</td><td>误伤医学、法律、社会学讨论</td></tr>
+                <tr><td><strong>语言识别置信度</strong></td><td>低于阈值即丢弃</td><td>多语言混排、机器乱码</td><td>误伤中英夹杂的技术文档</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:13px;color:var(--text-3)">具体阈值各家差异很大，且必须针对目标语言重新校准——中日韩不分词，按「词数」设阈值会全军覆没。</p>
+
+          <p>写成代码，一组启发式规则大致长这样。注意每一条都返回具体原因而不只是布尔值——这样才能统计「到底是哪条规则砍掉了多少数据」，这是调阈值时唯一靠谱的依据：</p>
+
+          <pre><code class="language-python">import re
+
+PUNCT_END = ("。", "！", "？", ".", "!", "?", "\u201d")
+
+def quality_reject_reason(text, min_words=50, max_symbol_ratio=0.4,
+                          max_dup_line_ratio=0.3, min_end_punct_ratio=0.3):
+    """返回 None 表示通过；否则返回被拒的原因字符串"""
+    words = text.split()
+    if len(words) &lt; min_words:
+        return "too_short"
+
+    non_alnum = sum(1 for c in text if not c.isalnum() and not c.isspace())
+    if non_alnum / max(len(text), 1) &gt; max_symbol_ratio:
+        return "symbol_ratio"
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if lines:
+        dup = 1 - len(set(lines)) / len(lines)
+        if dup &gt; max_dup_line_ratio:
+            return "duplicate_lines"
+        ended = sum(1 for ln in lines if ln.endswith(PUNCT_END))
+        if ended / len(lines) &lt; min_end_punct_ratio:
+            return "not_sentences"          # 多半是导航或列表页
+    return None
+
+# 统计各规则的拦截量，是调阈值的唯一靠谱依据
+from collections import Counter
+stats = Counter(quality_reject_reason(doc) for doc in corpus)
+print(stats)   # 例如 Counter({None: 41230, 'too_short': 18022, ...})</code></pre>
+
+          <h3>三代质量过滤方法</h3>
+          <p>启发式过滤后，用更强的判别手段做精细筛选。这条路线大致经历了三代，越往后越贵、也越准：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>代际</th><th>做法</th><th>判据是什么</th><th>成本</th><th>典型问题</th></tr></thead>
+              <tbody>
+                <tr><td><strong>第一代：困惑度打分</strong></td><td>用小语言模型给文档打 perplexity，保留低困惑度的</td><td>「像不像自然语言」</td><td>低</td><td>偏爱平庸文本，通顺的废话得分很高</td></tr>
+                <tr><td><strong>第二代：参考语料分类器</strong></td><td>用 fastText 训一个二分类器，区分「像维基/像 Reddit 高赞」和「像随机网页」</td><td>「像不像某个参考语料」</td><td>低到中</td><td>标杆语料的风格偏见会被整体放大</td></tr>
+                <tr><td><strong>第三代：LLM 标注 + 蒸馏打分器</strong></td><td>用大模型对样本按「教育价值 / 信息密度」打分，再蒸馏成一个小分类器批量跑全量</td><td>「有没有学习价值」</td><td>中到高</td><td>大模型的偏好即评判标准，长尾领域可能被系统性低估</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">维基百科分类器</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">训练一个二分类器区分「像维基百科的高质量文本」和「不像」。LLaMA 和 RedPajama 用 fastText 做这个分类，保留评分高的文档。简单有效，但以维基百科为标杆可能过于「正式」。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">模型打分</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">用一个小而强的语言模型给文档打 perplexity 或 log-likelihood 分。保留「好模型觉得正常」的文档。GPT-3 和 PaLM 都用了这种方法。可以理解为：如果一个文档连 GPT-2 都觉得不像人话，它大概率不是好训练数据。</p>
+            </div>
+          </div>
+
+          <p>第三代方法是近两年最明显的变化：FineWeb-Edu 的做法是先用大模型给数十万篇样本按「教育价值」打 0 到 5 分，再用这些标注训一个轻量分类器，把评分能力铺到全量语料上。这条路线的价值在于，它第一次把过滤判据从「像不像人写的」变成了<strong>「值不值得学」</strong>——两者是完全不同的问题。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">过度过滤的风险</span>
+            质量过滤是把双刃剑——过滤太狠会丢失口语化文本、方言、非主流领域内容，导致模型对正式文本过拟合、对日常用语不友好。以参考语料为标杆做分类的做法，还会把标杆本身的地域、人群、话题偏见整体放大到训练集里。稳妥的做法是保留一定比例的「中等质量」文本，而不是只保留最高分档，并且对被过滤掉的样本做人工抽检。
+          </div>
+
+          <h2>去重：最有效的质量提升手段</h2>
+          <p>互联网数据天然充斥着重复——同一篇文章被转载无数次，同一模板生成无数个垃圾页面。研究表明，<strong>去重是所有数据清洗步骤中投入产出比最高的一项</strong>：Lee et al. (2022) 的实验显示，在 C4 上做去重后训练的模型，在相同训练量下性能显著优于未去重版本，同时明显降低了模型逐字背出训练数据的概率。</p>
+          <p>去重带来收益的机制有三条，值得分开理解：</p>
+          <ul>
+            <li><strong>算力不被浪费</strong>：同一段文本出现 100 次，模型对它的第 100 次前向几乎学不到新东西，但依然要花完整的 FLOP。</li>
+            <li><strong>抑制逐字记忆</strong>：重复次数越多，模型越容易把这段文本逐字背下来。这既是隐私风险，也会占用本该用于泛化的容量。</li>
+            <li><strong>避免评测污染放大</strong>：如果某个评测题恰好被转载了几千次，它在训练集里的权重会被放大几千倍，评测分数完全失真。</li>
+          </ul>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  subgraph Dedup["去重两层策略"]
+    direction TB
+    A["文档集合"] --> B["精确去重<br/>Exact Dedup"]
+    B -->|"哈希完全匹配"| C["移除完全相同文档"]
+    A --> D["模糊去重<br/>MinHash + LSH"]
+    D -->|"局部敏感哈希<br/>相似度 &gt; 阈值"| E["移除近似重复文档"]
+    C --> F["干净语料"]
+    E --> F
+  end
+  style B fill:#e3f2fd,stroke:#1976d2
+  style D fill:#e8f5e9,stroke:#4a4
+            </div>
+            <figcaption>去重的两个层次：精确去重处理完全相同的文档，模糊去重处理近似重复（转载改写、模板生成）</figcaption>
+          </figure>
+
+          <h3>先想清楚：在什么粒度上去重</h3>
+          <p>「去重」不是一个动作，而是一个需要选粒度的决策。不同粒度的效果和代价差别巨大：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>粒度</th><th>怎么做</th><th>抓得到什么</th><th>代价与副作用</th></tr></thead>
+              <tbody>
+                <tr><td><strong>文档级精确</strong></td><td>整篇取哈希，哈希相同即重复</td><td>完全一致的转载</td><td>极便宜；改一个标点就漏</td></tr>
+                <tr><td><strong>文档级模糊</strong></td><td>MinHash + LSH 估 Jaccard 相似度</td><td>改标题、加广告的转载</td><td>主流方案；阈值难调，太松会误删同题材文章</td></tr>
+                <tr><td><strong>段落 / 行级</strong></td><td>对每行取哈希，跨文档删重复行</td><td>整站共用的导航栏、免责声明</td><td>会把文档切得支离破碎，需谨慎</td></tr>
+                <tr><td><strong>子串级</strong></td><td>后缀数组找出所有超长重复子串并删除</td><td>嵌在正文中间的模板段落</td><td>效果最彻底，但内存与实现复杂度最高</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>精确去重</h3>
+          <p>对整篇文档做哈希（如 SHA-256），哈希值相同的就是完全重复文档。实现简单、速度极快，能去掉相当比例的明显重复。但只对<strong>完全一致</strong>的文本有效——一个标点不同就会逃过。工程上通常先做一次归一化（统一空白符、统一全半角、去掉不可见字符）再取哈希，能显著提高命中率。</p>
+
+          <h3>模糊去重（MinHash + LSH）</h3>
+          <p>真实场景中的重复往往不是完全一致的：转载时改了标题、加了广告、换了排版。模糊去重用 <strong>MinHash</strong> 算法估计文档间的 Jaccard 相似度，再用 <strong>LSH（Locality-Sensitive Hashing）</strong> 加速近似最近邻搜索：</p>
+          <ol>
+            <li>把每篇文档切成 n-gram（通常 5-gram 或 13-gram）集合。</li>
+            <li>对每个 n-gram 集合计算多个哈希函数的 MinHash 签名（如 128 或 256 个哈希）。</li>
+            <li>用 LSH 把签名切成若干「band」分桶，相似文档大概率落进同一个桶。</li>
+            <li>同桶内的文档做精确 Jaccard 比较，相似度超阈值（如 0.8）的只保留一篇。</li>
+          </ol>
+
+          <pre><code class="language-python">import hashlib
+
+def shingles(text, n=5):
+    """把文档切成 n-gram 集合（按字符，适合中文；英文可按词）"""
+    return {text[i:i + n] for i in range(max(len(text) - n + 1, 1))}
+
+def minhash_signature(sh, num_perm=128):
+    """对每个哈希种子取集合内的最小哈希值，得到长度 num_perm 的签名"""
+    sig = []
+    for seed in range(num_perm):
+        m = min(
+            int(hashlib.md5(f"{seed}:{s}".encode()).hexdigest()[:16], 16)
+            for s in sh
+        )
+        sig.append(m)
+    return sig
+
+def lsh_buckets(sig, bands=16):
+    """把签名切成 bands 段，每段整体作为一个桶键"""
+    rows = len(sig) // bands
+    return [tuple(sig[b * rows:(b + 1) * rows]) for b in range(bands)]
+
+# 只要两篇文档在任意一个 band 上完全相同，就进入候选集做精确比对
+buckets = {}
+for doc_id, text in corpus.items():
+    for key in lsh_buckets(minhash_signature(shingles(text))):
+        buckets.setdefault(key, []).append(doc_id)</code></pre>
+          <p style="font-size:13px;color:var(--text-3)">上面是便于理解的教学实现；生产环境请用 datasketch 等成熟库，并把分桶放到分布式框架上做。</p>
+
+          <p>MinHash 的优势是线性时间复杂度，能处理 TB 级数据。CCNet 和 BigScience 的数据管线都用这个方法。实际操作中，模糊去重能再去掉相当比例的近似重复，与精确去重合计的去重率通常在 30%–50% 这个量级。</p>
+
+          <details class="deep">
+            <summary>展开：MinHash 为什么能估计 Jaccard？顺便算清楚 LSH 的阈值</summary>
+            <div class="deep-body">
+              <p>设两篇文档的 n-gram 集合为 $A$ 和 $B$。取一个把所有可能 n-gram 随机打乱的置换 $\pi$，定义 $h_\pi(A) = \min_{a \in A} \pi(a)$，也就是「$A$ 里排名最靠前的那个元素」。</p>
+              <p>关键观察：$h_\pi(A) = h_\pi(B)$ 当且仅当 $A \cup B$ 中排名最靠前的那个元素恰好落在交集 $A \cap B$ 里。由于置换是均匀随机的，并集里每个元素排第一的概率相等，所以</p>
+              <div class="figure" style="text-align:center;background:transparent;border:none">
+                $$\Pr\!\left[h_\pi(A) = h_\pi(B)\right] = \frac{|A \cap B|}{|A \cup B|} = J(A, B)$$
+              </div>
+              <p>也就是说，<strong>单个哈希碰撞的概率恰好等于 Jaccard 相似度</strong>。用 $k$ 个独立哈希各算一次，统计相同的比例，就是 $J$ 的无偏估计，估计的标准差约为 $\sqrt{J(1-J)/k}$。取 $k=128$ 时，标准差不超过 0.045，对 0.8 这种阈值判断已经够用。</p>
+              <p>LSH 在此之上再加一层：把 $k$ 个哈希切成 $b$ 个 band、每个 band $r$ 行（$k = b \times r$）。两篇文档在某个 band 上完全相同的概率是 $J^r$，在至少一个 band 上相同（即成为候选对）的概率是</p>
+              <div class="figure" style="text-align:center;background:transparent;border:none">
+                $$P_{\text{candidate}} = 1 - \left(1 - J^{\,r}\right)^{b}$$
+              </div>
+              <p>这条曲线是 S 形的，拐点约在 $J^* \approx (1/b)^{1/r}$。举个能算的例子：$k=128$、$b=16$、$r=8$，则 $J^* \approx (1/16)^{1/8} \approx 0.71$。也就是说这套参数会把相似度 0.71 以上的文档对高概率捞出来，0.5 以下的基本放过。</p>
+              <p style="margin-bottom:0"><strong>调参的实际含义</strong>：$b$ 调大（band 更多、每 band 更短）→ 阈值下降 → 召回更多重复但误伤上升；$r$ 调大 → 阈值上升 → 更保守。想去重更狠就加 $b$，怕误删就加 $r$。</p>
+            </div>
+          </details>
+
+          <div class="callout">
+            <span class="callout-t">实践建议</span>
+            去重要在<strong>语料级别</strong>做，不是在批次级别。即：把所有数据源（CC、维基、书籍、代码）合在一起做去重，因为不同来源之间也有重复（维基内容会被大量网站转载）。同时要做<strong>与评测集的比对</strong>——确保训练数据和评测集不重叠，否则就是数据污染，详见 <a href="../13-evaluation/contamination.html">数据污染与评估可信度</a>。
+          </div>
+
+          <h2>数据配比：不只是「混在一起」</h2>
+          <p>清洗完的数据来自不同来源：网页、维基百科、书籍、代码、论文、对话。直接混在一起训练通常不是最优的——不同来源的数据质量和信息密度差异巨大。<strong>配比</strong>（mixture ratio）决定了模型「吃到」的知识结构。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>数据来源</th><th>典型配比</th><th>主要作用</th></tr></thead>
+              <tbody>
+                <tr><td>网页（CC 等）</td><td>50-70%</td><td>覆盖面广、通用知识、口语化</td></tr>
+                <tr><td>维基百科</td><td>3-5%</td><td>高质量结构化知识</td></tr>
+                <tr><td>书籍</td><td>5-15%</td><td>长文本理解、深度知识</td></tr>
+                <tr><td>代码</td><td>5-15%</td><td>逻辑推理、代码能力</td></tr>
+                <tr><td>论文</td><td>2-5%</td><td>学术知识、专业领域</td></tr>
+                <tr><td>对话</td><td>1-5%</td><td>对话格式感知</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:13px;color:var(--text-3)">上表为常见经验范围，具体配比因模型和团队而异，非精确标准。</p>
+
+          <p>这里有个容易搞混的概念：配比说的是<strong>训练时看到的 token 占比</strong>，不是磁盘上的数据量占比。维基百科只有几十 GB，但如果你把它重复采样 4 遍（epoch = 4），它在训练 token 里的占比就翻了 4 倍。<strong>「重复采样几遍」是配比的隐藏旋钮</strong>——高质量小语料通常会被重复多遍，低质量大语料反而只过一遍。研究表明少量重复（约 4 个 epoch 以内）损失几乎不受影响，但重复太多次收益会快速衰减。</p>
+
+          <p>配比的确定没有理论最优解，通常靠<strong>消融实验</strong>：在小模型上试不同配比，看下游任务表现。几个已知经验：</p>
+          <ul>
+            <li><strong>代码数据提升推理能力</strong>：加入代码数据后，模型在数学和逻辑推理任务上显著提升，即使评测不含代码题。这也是为什么 LLaMA 2/3、DeepSeek 都大幅提高了代码配比。</li>
+            <li><strong>多语言配比要小心</strong>：中文只占互联网内容的很小比例，但中文能力需求大。需要刻意提高中文数据配比，否则模型英文远好于中文。</li>
+            <li><strong>质量 vs 数量</strong>：高质量数据（维基、书籍）占比不高但信息密度大，低质量数据（CC）占比大但需要更强的过滤。配比和过滤是联动的。</li>
+            <li><strong>可以让算法来定配比</strong>：DoReMi 之类的方法先训一个小的代理模型，用分组分布鲁棒优化自动搜出各域权重，再把这套权重用到大模型上，省去手工网格搜索。</li>
+          </ul>
+
+          <h2>课程设计：先学什么后学什么</h2>
+          <p><strong>数据课程</strong>（Data Curriculum）是指在训练过程中<strong>改变数据分布</strong>——不同阶段喂不同配比或难度的数据。这借鉴了人类学习的「由易到难」思路。</p>
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">来源课程</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">训练前期多给通用网页数据铺覆盖面，后期提高高质量来源（维基、书籍、精选代码）的比例。这是目前落地最广的一类课程。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">难度课程</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">按文本复杂度排序，先学短文本、简单句式，再学长文本、复杂句式。一些小模型实验显示有效，但大规模验证尚不充分。</p>
+            </div>
+          </div>
+          <p>课程设计的研究结论尚不统一：部分实验显示有效（尤其在数据量有限时），部分实验显示在充分大数据量下收益不显著。实操中的常见做法是<strong>训练后期加入更高比例的高质量数据</strong>，配合学习率衰减一起进行，业内一般称为「退火」或「中期训练」阶段——让模型在最后一段用最好的语料「复习」。长上下文能力的注入通常也放在这个阶段：前期用 4K 或 8K 序列高效训练，最后几个百分点的 token 才切到长序列，避免全程为长上下文买单。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">课程设计的陷阱</span>
+            如果训练后期突然切换数据分布（如从网页硬切到纯维基），模型可能出现 loss spike 甚至训练不稳定。切换应该是渐进的——用指数或线性衰减调整混合比例，而非硬切换。另外，课程设计的效果很难在小规模实验中验证后直接外推——大模型的课程敏感性可能与小模型不同。相关的训练不稳定现象见 <a href="stability-optimizer.html">训练稳定性与优化器</a>。
+          </div>
+
+          <h2>数据质量的量化评估</h2>
+          <p>数据管线的每一步都在做取舍，需要量化指标来指导决策。常见评估方法：</p>
+          <ul>
+            <li><strong>下游任务消融</strong>：用不同数据配置训练小模型（如 1B），在标准 benchmark 上比较。这是最可靠但最贵的方法。做消融时务必固定 token 预算而不是固定 epoch，否则你比的是「谁的数据多」而不是「谁的数据好」。</li>
+            <li><strong>困惑度监控</strong>：在 held-out 高质量数据上监控困惑度。如果某批数据的加入导致困惑度跳升，可能引入了噪声。</li>
+            <li><strong>数据污染检测</strong>：检查训练集和评测集的重叠度。n-gram 匹配是最基本的方法——8-gram 或 13-gram 重叠率高说明评测集泄漏进了训练集。详见 <a href="../13-evaluation/contamination.html">数据污染与评估可信度</a>。</li>
+            <li><strong>保留全过程的质量信号</strong>：不要在过滤时直接把文档删掉，而是把每条规则的打分作为字段存下来。这样换阈值时不必重跑整条管线，只需重新筛选——这是数据工程里回报最高的一个工程决策。</li>
+          </ul>
+
+          <h2>开源管线与语料的演进</h2>
+          <p>数据工程的门槛这几年被开源社区显著拉低了。了解这条演进线，可以帮你判断该拿哪个数据集做起点：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 公开预训练语料的演进
+  2019 : C4 从单次 CC 快照清洗出规模化英文语料
+  2020 : The Pile 用多来源精选组合对抗单一网页偏置
+  2022 : ROOTS 面向多语言 强调数据治理与来源可追溯
+  2023 : RefinedWeb 证明纯网页强去重即可超越精选语料 : RedPajama 复现 LLaMA 配方并开放全流程
+  2024 : Dolma 与 DataComp-LM 把管线与消融基准一起开源 : FineWeb 与 FineWeb-Edu 引入模型标注的教育价值打分
+            </div>
+            <figcaption>公开语料的三个阶段：从「能用就行」到「精选组合」，再到「用模型判断值不值得学」。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>数据集 / 管线</th><th>主要来源</th><th>公开规模</th><th>它解决了什么问题</th></tr></thead>
+              <tbody>
+                <tr><td><strong>CCNet</strong></td><td>Common Crawl</td><td>管线，非固定数据集</td><td>语言识别 + 困惑度分档 + 去重的标准流程，LLaMA 系列采用</td></tr>
+                <tr><td><strong>The Pile</strong></td><td>22 个精选来源混合</td><td>约 825 GB</td><td>证明「多来源精选」能显著优于纯网页</td></tr>
+                <tr><td><strong>RefinedWeb</strong></td><td>纯 Common Crawl</td><td>公开释出约 600B tokens</td><td>反过来证明：只要过滤和去重够狠，纯网页也能打赢精选语料</td></tr>
+                <tr><td><strong>RedPajama-V2</strong></td><td>Common Crawl</td><td>约 30T tokens</td><td>不做硬过滤，而是把大量质量信号作为字段随数据一起发布</td></tr>
+                <tr><td><strong>Dolma</strong></td><td>网页 + 代码 + 论文 + 书籍</td><td>约 3T tokens</td><td>数据集与处理工具链一并开源，可复现</td></tr>
+                <tr><td><strong>FineWeb / FineWeb-Edu</strong></td><td>Common Crawl</td><td>约 15T / 约 1.3T tokens</td><td>把「教育价值打分」这一代过滤方法做成公开基线</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:13px;color:var(--text-3)">规模数字取自各数据集的公开说明，具体以官方发布页为准；使用前务必确认各自的许可条款，相关合规问题见 <a href="../14-governance/data-copyright.html">数据版权与合规</a>。</p>
+
+          <details class="deep">
+            <summary>展开：动手 30 分钟——在一小批文档上跑通迷你管线</summary>
+            <div class="deep-body">
+              <p>数据工程的直觉很难靠读文档建立，但可以靠一个小实验建立。下面这个流程不需要集群，一台笔记本、几千篇文档就能跑：</p>
+              <ol>
+                <li><strong>准备样本</strong>：从任意一个公开网页语料里抽 2000 篇文档（或自己抓 200 个网页保存 HTML）。</li>
+                <li><strong>抽取</strong>：分别用 <code>BeautifulSoup.get_text()</code> 和 trafilatura 各抽一遍，随机挑 20 篇人工对比。你会直观看到「导航栏噪声」到底长什么样。</li>
+                <li><strong>过滤</strong>：跑上文那段 <code>quality_reject_reason</code>，打印 Counter。<strong>重点看被各条规则砍掉的样本</strong>——随机抽 10 条读一读，判断是真垃圾还是误伤。</li>
+                <li><strong>去重</strong>：跑 MinHash + LSH，打印被判为重复的文档对。检查阈值 0.7 和 0.9 分别会捞出什么，你会发现 0.7 已经开始把「同一事件的两篇不同报道」误判为重复。</li>
+                <li><strong>算账</strong>：统计每一步的留存率，和本页开头那张漏斗表对比。</li>
+              </ol>
+              <p>这个实验能带走三个无法从文字里获得的认知：一是抽取工具的差距远比想象中大；二是启发式阈值几乎一定会误伤，问题只是能不能接受；三是去重阈值是个主观选择，没有「正确答案」。</p>
+              <p style="margin-bottom:0">跑完之后如果想继续往下走，可以接上 <a href="../02-representation/tokenization.html">分词与词表</a> 看看清洗后的文本怎么变成 token，或看 <a href="../15-practice/build-minigpt.html">实战：手写 MiniGPT</a> 把这批数据真的喂进一个小模型。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>管线五步</strong>：抽取 → 质量过滤 → 去重 → 配比 → 课程设计。后一步依赖前一步的干净度。</li>
+            <li><strong>漏斗形状</strong>：从原始网页到可训练 token 会砍掉绝大部分内容，各步骤留存率连乘后只剩很小的零头。</li>
+            <li><strong>抽取</strong>：HTML → 纯文本是最容易被低估的步骤。难点是区分正文与模板，用 trafilatura / CCNet 等专业工具，不要用简单 BeautifulSoup。</li>
+            <li><strong>质量过滤</strong>：启发式规则（长度、符号比、重复行、结尾标点）做第一道关卡；分类器分三代演进，最新一代用大模型标注「教育价值」再蒸馏成小打分器。过滤太狠会丢多样性。</li>
+            <li><strong>去重</strong>：先选粒度（文档 / 段落 / 子串），再选方法（精确哈希 / MinHash+LSH）。MinHash 碰撞概率恰好等于 Jaccard 相似度，LSH 阈值约为 $(1/b)^{1/r}$。合计去重率通常 30%–50%。</li>
+            <li><strong>配比</strong>：配的是训练 token 占比而非磁盘占比，重复采样次数是隐藏旋钮。代码数据提升推理能力，多语言需刻意提配比，也可用 DoReMi 这类方法自动搜权重。</li>
+            <li><strong>课程设计</strong>：训练后期提高高质量数据比例（退火 / 中期训练）是目前最广泛使用的做法，长上下文注入通常也放在这一阶段。切换需渐进，硬切会引发 loss spike。</li>
+            <li><strong>常见坑</strong>：过滤时不要直接删数据，把质量信号存成字段；消融要固定 token 预算而不是固定 epoch。</li>
+          </ul>
+
+          <section id="advanced-data-engineering">
+            <h2>进阶：把数据管线做成可验证、可治理的系统</h2>
+            <p>前面的五步解决了“怎样得到一批能训练的数据”，但面试和生产系统还会追问三个问题：为什么这条样本被保留、它是否与评测集泄漏、下个月能否用同一版本重新得到完全相同的 token 流。答案不是再加一个过滤器，而是把质量信号、去重证据、采样决策和版本元数据一起保存，形成可审计的数据产品。本节给出一套适用于约 15T tokens 规模的落地框架；阈值是起始点，必须用分层抽检和固定 token 预算的消融实验校准。</p>
+
+            <h3>数据质量分层：规则拦截，模型排序，人工校准</h3>
+            <p>不要把质量设计成一个不可解释的总分。推荐把文档分成四层，并保留每层的原因码：<strong>L0 硬规则</strong>只处理确定性坏数据，例如空文档、编码损坏、明显恶意脚本和极端重复行；<strong>L1 统计与语言信号</strong>记录长度、语言置信度、符号率、困惑度、重复 n-gram 比例等连续特征；<strong>L2 分类器/模型打分</strong>估计“教育价值、信息密度、自然度、代码可执行性”等软指标；<strong>L3 人工抽检</strong>对每个域、语言、来源、分数桶做分层采样，检查误杀和长尾覆盖。L0 可以直接丢弃，L1/L2 更适合排序、分桶和采样，L3 用来校准阈值及发现分布漂移。</p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>质量层</th><th>主要信号</th><th>决策方式</th><th>必须记录的证据</th></tr></thead>
+                <tbody>
+                  <tr><td>L0 硬规则</td><td>空值、乱码、恶意脚本、极端长度</td><td>确定性拒绝或隔离</td><td>rule_id、版本、命中字段</td></tr>
+                  <tr><td>L1 可解释特征</td><td>LID、困惑度、符号比、重复率、语言覆盖</td><td>分桶、排序、域内阈值</td><td>特征值、模型版本、阈值</td></tr>
+                  <tr><td>L2 模型评分</td><td>教育价值、信息密度、毒性/广告风险、代码质量</td><td>软权重或分层采样</td><td>score、校准集、置信区间</td></tr>
+                  <tr><td>L3 人工抽检</td><td>按域/语言/分数/来源分层抽样</td><td>修订规则、阈值、抽样权</td><td>样本 ID、标注者、复核结论</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>抽检不能只看“通过样本”。每个桶至少同时抽取通过、拒绝和边界样本，并计算 precision、recall、误杀率和域覆盖率。对模型评分要做校准：同一分数在中文技术文档、论坛口语、代码和法律文本中的含义可能不同。生产上可以采用“硬规则保底 + 域内分位数阈值 + 少量低分探索”的策略，避免模型只学到百科式正式语言。所有被拒样本也应保留轻量 manifest 和质量原因，而不是把原始内容无限期复制到多个地方。</p>
+            <p>质量分层还应关注“样本之间的关系”，而不只是单篇文档的分数。一个站点连续产生的数百万页面可能共享同一模板、同一作者或同一事实来源；如果只按文档级分数排序，模型会把站点规模误认为信息价值。可在 manifest 中增加来源域、作者/组织、抓取月份、主题簇和 cluster 规模，按这些维度做配额与上限。人工抽检也要覆盖低资源语言、少数代码语言、短文本、表格、公式和带噪 OCR，因为这些样本最容易被通用分类器低估。对争议样本建议双人复核并保留分歧标签，后续可把分歧最大的桶送去主动学习，而不是简单提高拒绝阈值。</p>
+            <p>阈值调优应先建立一套固定的 golden set：每个域有明确的“可训练、可探索、应拒绝”示例，并在规则、分类器和模型升级后重复评测。观察指标不应只有总体通过率，还包括按域的通过率、质量分布、token 贡献、重复簇大小、语言覆盖和文档新鲜度。若总体质量升高但某个领域的样本量骤降，应优先认为是分布偏移或误杀，而不是“清洗成功”。将数据切成 train、shadow 和 audit 三个视图：train 供训练，shadow 用于比较新旧策略但不进入训练，audit 保存抽检和污染证据，可大幅降低频繁调参的回滚成本。</p>
+
+            <h3>Exact hash、MinHash 与 SimHash：边界不同，不能混为一谈</h3>
+            <p><strong>Exact hash</strong>（归一化后 SHA-256 等）判断的是字节/字符序列是否完全相同，适合去掉重复下载、完全转载和同一文档的多份副本；它不理解语义，改一个词就可能漏检。<strong>MinHash + LSH</strong>先把文本转换为 shingle 集合，近似估计 Jaccard 相似度，适合“加了标题、广告或少量改写”的近重复；它依赖 n-gram 粒度和 band/row 参数，短文本、代码和模板文本需要单独校准。<strong>SimHash</strong>把词或 n-gram 的特征加权投影为固定长度指纹，使用汉明距离找近邻，速度和存储都很好，适合流式候选召回；但它近似的是特征方向，不等价于 Jaccard，也不适合直接当语义相似度。工程上常用三级级联：先归一化 Exact hash，再用 SimHash 找低成本候选，最后对候选做 MinHash/Jaccard 或业务规则复核。</p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>方法</th><th>擅长边界</th><th>典型漏检/误报</th><th>适合位置</th></tr></thead>
+                <tbody>
+                  <tr><td>Exact hash</td><td>完全相同文本</td><td>微小改写即漏；归一化过强会误合并</td><td>第一道全量去重</td></tr>
+                  <tr><td>MinHash + LSH</td><td>集合 Jaccard 高的近重复</td><td>短文本方差大；同主题文章可能误删</td><td>候选对精排与全局 dedup</td></tr>
+                  <tr><td>SimHash</td><td>特征分布相近、流式近邻</td><td>对改写/重排敏感；汉明阈值依域变化</td><td>低成本召回、在线去重</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>近重复不是“重复越多越好”。同一事实的独立报道可能共享实体和术语，却提供不同证据；若阈值过低，会损失多样性和长尾表达。反之，保留大量转载会让某个观点、网页模板或 benchmark 答案在 token 预算中获得异常高权重，导致过拟合、逐字记忆、评测虚高和隐私风险。建议按来源质量、时间、新鲜度和长度定义保留优先级，并将被合并文档存成 cluster_id、代表文档 ID、相似度和决策规则，支持之后重放。</p>
+            <p>去重阈值最好按文档长度设定，而不是全局只设一个数。长文档的 Jaccard 估计较稳定，短文档中几个共同的 boilerplate 就可能造成很高相似度；因此短文本可要求更高阈值或直接采用精确 hash，代码可按函数/文件粒度结合 AST 或 token shingles，表格和公式则要避免把列名模板当作正文重复。对于同一 cluster 的代表文档，通常优先选择质量分更高、来源更可靠、发布日期更早或许可证更清晰者，但保留少量独立来源作为多样性样本，并设置 cluster 的最大曝光次数。</p>
+            <p>还要区分“训练集内部去重”和“跨数据集去重”。前者控制重复曝光，后者处理网页与维基、书籍、论文之间的转载关系；如果各来源分别去重再拼接，跨源重复会重新出现。一个稳健流程是先做每源的 Exact hash 降低体积，再将所有来源映射到统一规范化文本空间，用 SimHash/MinHash 建跨源候选，最后按质量和许可证策略选择代表。去重统计应报告候选对数量、最终合并簇数、被删 token、各域损失和阈值敏感性，而不是只报一个“去重率”。</p>
+            <pre><code class="language-python">def dedup_decision(doc):
+    normalized = normalize(doc.text)
+    exact = sha256(normalized.encode()).hexdigest()
+    if exact_index.contains(exact):
+        return "drop", {"reason": "exact_hash", "cluster": exact}
+    simhash = make_simhash(normalized)
+    candidates = simhash_index.nearby(simhash, max_hamming=3)
+    for other in candidates:
+        jaccard = minhash_jaccard(normalized, other.text, ngram=5)
+        if jaccard &gt;= threshold_for(doc.domain, doc.language):
+            return "drop", {"reason": "near_duplicate", "cluster": other.cluster_id,
+                             "similarity": jaccard}
+    return "keep", {"exact_hash": exact, "simhash": simhash}</code></pre>
+
+            <h3>数据混合、temperature sampling 与课程设计</h3>
+            <p>配比必须分清三个口径：原始数据量、去重后可用量、训练时实际 token 曝光量。若域 $i$ 的可用 token 为 $N_i$，直接按数据量采样会使大域支配训练；temperature sampling 常写为 $p_i \propto N_i^\alpha$，其中 $\alpha&lt;1$ 会提高小域的相对概率，$\alpha=1$ 是按规模采样。它不是越小越好：过度上采样会重复小语料，放大记忆和域偏差。可为每个域设最小/最大曝光上限，再用有效 token 数计算实际比例。</p>
+            <p><strong>Domain balance</strong>不只看语言。至少要同时监控语言、主题、来源、时间、文档长度、质量桶和代码语言等边际分布，避免“中文比例达标但中文全来自同一站点”的假平衡。对低资源域，可以保留一个小的探索配额；对已经饱和的网页域，则采用去重后的新鲜文档优先。每次配比变更都应在固定 token budget、相同 tokenizer、相同优化器和随机种子下做 ablation，比较总 loss、域内 held-out loss、通用 benchmark、代码/数学能力和记忆性指标。</p>
+            <p>课程设计可以分为三段：前期以多样、低成本的通用数据建立覆盖；中期提高高质量知识、代码和长文档；末期进行质量退火与长上下文注入。混合权重应线性或平滑变化，避免硬切换引起 loss spike。消融至少包括：固定混合 vs 温度采样、无课程 vs 质量退火、不同 $\alpha$、不同代码/书籍上限、以及去重前后对照。必须报告“相同训练 token 下的收益”，不能用更多 epoch 掩盖重复采样的代价。</p>
+            <p>配比实验还要控制数据“新鲜度”和来源泄漏，否则结论可能被某个偶然快照主导。建议为每个域维护固定的 train/validation shadow 切分，记录实际看到的 token 数和有效 epoch；对上采样域报告 unique token 与 exposed token 两个指标。若代理模型给出的最优权重与人工经验差异很大，先检查代理模型是否在某个域过拟合、验证集是否含转载、以及权重是否把重复文本当成有效信号。对 15T 级别的正式实验，可先在 100M–1B token 的小预算上筛掉明显劣解，再在固定 compute 预算下验证前两三个候选，最后才投放全量。</p>
+
+            <h3>Contamination / benchmark leakage：先隔离，再证明没有泄漏</h3>
+            <p>评测污染检测要在训练前做，也要在训练后抽查。第一道防线是<strong>时间切分</strong>：为每条文档保留抓取时间、来源快照和发布日期；若 benchmark 发布日在 $t$，训练集原则上只允许使用 $t$ 之前的内容，发布日期缺失时进入风险桶。第二道防线是<strong>train/eval 去重</strong>：对评测题目、答案、题干变体和解释文本分别做归一化 Exact hash，并以字符/词 n-gram 做 MinHash、SimHash 近邻扫描。第三道防线是<strong>语义与模板审查</strong>：对高相似候选人工复核，因为只比答案会漏掉题干改写，只比 n-gram 又可能把同领域背景误判成泄漏。</p>
+            <p>检测报告至少给出：命中文档 ID、数据源、时间、重叠区间、相似度、匹配方法、是否进入训练、处置动作和复核人。对公开 benchmark，建议建立冻结的 eval fingerprint 库，在每次管线构建时自动门禁；对内部评测，要把测试集权限与生产数据写入隔离存储。发现泄漏后，不要只删一行数据，应按 cluster 追溯转载家族、重新计算 token 计数，并重跑受影响的训练/评测版本。</p>
+            <p>时间切分也有边界：网页的抓取时间不等于内容首次发表时间，转载页可能在 benchmark 发布后才抓到旧答案。因此应同时保存 <code>crawl_time</code>、页面发布日期、HTTP headers、快照批次和来源链；无法确认发布时间的文档放入“未知时间”风险桶，不能默认当作安全。对需要严格新鲜度的评测，可采用 benchmark 发布前若干月的安全缓冲区，并对高重叠但时间不明的样本人工复核。对于动态页面和代码仓库，则按 commit 时间或 release tag 切分，并在训练 manifest 中锁定 commit/快照，而不是只存 URL。</p>
+
+            <h3>15T token 数据管线设计题：可追溯、可回滚、可重放</h3>
+            <p>一个可回答面试、也可上线的架构是“不可变原始层 + 可重建中间层 + 内容寻址产物层”。原始 WARC/WET 只读保存，按抓取批次、来源、许可证和校验和登记；规范化文本、质量特征、去重索引、混合清单和 tokenizer 输出全部写入带版本号的分片，不原地覆盖。每个文档使用稳定 <code>doc_id</code>，每一步写入 <code>parent_artifact</code>、代码提交、配置哈希、模型版本、输入输出计数、随机种子和时间窗口。这样既能回答“这 512 tokens 从哪里来”，也能定位“哪一版规则删掉了它”。</p>
+            <figure class="figure">
+              <div class="mermaid">
+flowchart LR
+  A[不可变原始 WARC] --> B[规范化文本分片]
+  B --> C[质量特征与分桶]
+  C --> D[全局去重索引]
+  D --> E[混合/课程 manifest]
+  E --> F[Tokenizer shards]
+  F --> G[训练快照]
+  M[(元数据注册表)] -.记录版本/校验和/依赖.-> A
+  M -.-> C
+  M -.-> D
+  M -.-> E
+  M -.-> F
+  R[回滚：切换 manifest 指针] --> E
+  P[重放：按 DAG 重算受影响分片] --> C
+              </div>
+              <figcaption>15T token 管线用内容寻址分片和 DAG 元数据实现追溯、回滚与局部重放；训练只消费冻结快照。</figcaption>
+            </figure>
+            <p>吞吐设计上，按来源和时间切成可并行分片，避免把 15T token 当成一个巨型文件；每个分片产出 manifest、行数、字节数、token 数、质量分布、重复 cluster 数及 SHA-256。构建新版本时采用 copy-on-write：新分片全部通过校验后，原子地将“生产 manifest”指针切换到新版本；回滚只切回旧指针，不删除旧数据。重放时根据配置哈希和 DAG 依赖做增量计算，例如只改质量阈值就复用抽取和 hash，只改 tokenizer 才重跑 tokenization。上线前做小样本 golden set、分片校验、token 计数对账和 train/eval 门禁；任何失败都不能发布半成品 manifest。</p>
+            <p>可追溯不等于无限期保存原文。对受许可证、隐私或删除请求约束的来源，原始层应记录最小必要指针、哈希和访问策略，内容按保留期限管理；收到删除或授权变更时，通过 doc_id 和 cluster_id 找到所有派生分片、manifest 与训练快照影响范围。对于已经训练出的模型，治理系统至少要能定位受影响 checkpoint、停止继续分发并触发再训练评估。权限上将原始内容、质量特征、训练 manifest 和审计日志分级隔离，审计日志本身不可变，避免“为了可追溯而复制出更多敏感数据”。</p>
+            <pre><code class="language-python"># 伪代码：构建可重放的不可变 artifact
+cfg_hash = sha256(canonical_json(config))
+input_manifest = registry.require(input_version)
+out = run_stage(stage="quality", input=input_manifest,
+               code_commit=GIT_SHA, config_hash=cfg_hash, seed=SEED)
+registry.put(out.version, {
+    "parents": [input_manifest.version],
+    "shards": out.shards, "sha256": out.checksums,
+    "doc_count": out.docs, "token_count": out.tokens,
+    "quality_histogram": out.histogram
+})
+# 发布只更新指针；回滚/重放不改历史 artifact
+registry.promote("train-prod", out.version)</code></pre>
+
+            <h3>面试高频问答</h3>
+            <dl>
+              <dt><strong>问：为什么不只用一个 LLM 给全量文档打分？</strong></dt>
+              <dd>答：成本、吞吐、可解释性和偏差都不可接受。用 LLM 标注分层样本，再蒸馏轻量分类器；规则负责确定性坏数据，模型负责排序，人工抽检负责校准和长尾保护。</dd>
+              <dt><strong>问：MinHash 和 SimHash 怎么选？</strong></dt>
+              <dd>答：要近似集合 Jaccard 就选 MinHash；要固定指纹、低延迟地召回汉明距离近邻就选 SimHash。两者都只是候选或相似度信号，最终阈值必须按语言、域、长度和误删成本校准。</dd>
+              <dt><strong>问：temperature 的 α 应该设多少？</strong></dt>
+              <dd>答：没有通用答案。α&lt;1 才会提高小域概率，但要配合曝光上限、重复率和域内 held-out 指标；在固定 token budget 下做 α 的消融，并检查小语料记忆风险。</dd>
+              <dt><strong>问：如何证明 benchmark 没有污染？</strong></dt>
+              <dd>答：时间切分只是必要条件；还要做 exact、n-gram、MinHash/SimHash 和语义复核，冻结 fingerprint 库，输出可审计命中报告，并在训练结束后对高分 benchmark 做抽查。</dd>
+              <dt><strong>问：规则改了能否不重跑 15T？</strong></dt>
+              <dd>答：若质量特征和抽取版本不变，只重建筛选 manifest；靠不可变分片、配置哈希和父子依赖复用上游结果。只有改变抽取、归一化或 tokenizer 才需要重算相应下游。</dd>
+            </dl>
+
+            <h3>故障排查 checklist</h3>
+            <ul>
+              <li>留存率突然下降：先按来源、语言、分片和 rule_id 对比；检查编码、HTML 抽取器、阈值配置是否变化。</li>
+              <li>去重率异常升高：检查归一化是否把不同文档清空、SimHash 汉明阈值是否误设、短文本是否进入全局索引。</li>
+              <li>训练 loss spike：核对新旧 manifest 的域分布、质量桶、长度分布、重复曝光和课程切换斜率。</li>
+              <li>某语言能力退化：查看语言识别置信度、域内采样概率、tokenizer 覆盖率和该语言的 train/eval 重叠。</li>
+              <li>benchmark 分数异常上涨：冻结 checkpoint，导出命中文档与相似区间，复核发布日期、转载 cluster 和答案模板。</li>
+              <li>无法复现：检查代码提交、配置哈希、模型版本、随机种子、输入 manifest、分片校验和外部依赖版本；缺任一项就先停止发布。</li>
+              <li>回滚失败：不要删除新数据，确认旧 manifest 仍通过 checksum、权限和 tokenizer 兼容性校验，再原子切换生产指针。</li>
+            </ul>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Penedo et al., "The RefinedWeb Dataset for Falcon LLM: Outperforming Curated Corpora with Web Data, and Web Data Only" (2023) — 证明了纯网页数据经强去重后可超越精选语料，也说明了为何要从 WARC 而非 WET 抽取 · <a href="https://arxiv.org/abs/2306.01116" target="_blank" rel="noopener">arXiv:2306.01116</a></li>
+            <li>Lee et al., "Deduplicating Training Data Makes Language Models Better" (2022) — 系统验证去重对模型性能与逐字记忆的影响，含精确去重和模糊去重的对比 · <a href="https://arxiv.org/abs/2107.06499" target="_blank" rel="noopener">arXiv:2107.06499</a></li>
+            <li>Wenzek et al., "CCNet: Extracting High Quality Monolingual Datasets from Web Crawl Data" (2019) — 语言识别 + 困惑度分档 + 去重的标准管线，LLaMA 系列的数据处理基础 · <a href="https://arxiv.org/abs/1911.00359" target="_blank" rel="noopener">arXiv:1911.00359</a></li>
+            <li>Gao et al., "The Pile: An 800GB Dataset of Diverse Text for Language Modeling" (2020) — 多来源精选组合的代表作，配比设计的经典参考 · <a href="https://arxiv.org/abs/2101.00027" target="_blank" rel="noopener">arXiv:2101.00027</a></li>
+            <li>Li et al., "DataComp-LM: In Search of the Next Generation of Training Sets for Language Models" (2024) — 把数据管线本身做成可比较的基准，提供了大量过滤策略的对照实验 · <a href="https://arxiv.org/abs/2406.11794" target="_blank" rel="noopener">arXiv:2406.11794</a></li>
+            <li>Xie et al., "DoReMi: Optimizing Data Mixtures Speeds Up Language Model Pretraining" (2023) — 用小代理模型自动搜索各数据域权重，配比自动化的代表方法 · <a href="https://arxiv.org/abs/2305.10429" target="_blank" rel="noopener">arXiv:2305.10429</a></li>
+            <li>Common Crawl 官方站点 — 数据格式（WARC/WAT/WET）说明与每期抓取的规模公告 · <a href="https://commoncrawl.org/" target="_blank" rel="noopener">commoncrawl.org</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            真实语料讲完了，另一条路线是用模型生成训练数据：<a href="synthetic-data.html">合成数据与数据飞轮</a>。想了解训练数据量与模型规模的最优配比，跳转 <a href="scaling-laws.html">Scaling Laws</a>；数据备好之后怎么真正训起来，见 <a href="distributed-training.html">并行策略</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

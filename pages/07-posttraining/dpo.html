@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>免奖励模型对齐 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="07-posttraining" data-topic="dpo">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>免奖励模型对齐</h1>
+            <p class="lead">RLHF 里最脆弱的零件是奖励模型——它会被钻空子、会过拟合，训练它还要额外一组标注数据和一轮训练。DPO 及其变体（IPO、KTO、SimPO）问了一个尖锐的问题：既然最终目标只是让策略满足人类偏好，为什么不直接用偏好数据训练策略，跳过中间那个「打分裁判」？这一跳，砍掉了四模型显存里的两个（奖励模型和价值模型），让对齐训练的门槛骤降。这一节从数学消元讲到一步梯度里到底发生了什么，再讲清它会在什么地方翻车。</p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">前置知识</span>
+            本页假定你已读过 <a href="rlhf.html">RLHF</a>，理解奖励模型、PPO 目标函数、KL 惩罚的作用；也假定你知道 <a href="sft.html">SFT</a> 是怎么回事，因为 DPO 几乎总是接在 SFT 后面跑。如果 Bradley-Terry 模型和策略梯度的概念还不熟，建议先回看 <a href="../01-foundations/rl-basics.html">强化学习基础</a>。
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>RLHF 是「先学裁判再学选手」——训练一个奖励模型打分，再用 PPO 优化策略去追高分。DPO 的关键洞察是：RLHF 的最优策略有<strong>闭式解</strong>，可以把奖励函数用策略本身表示出来，代回损失后奖励模型就消掉了。于是偏好数据直接变成策略的梯度信号，一个模型、一次前向、一次反向，对齐完成。用一句大白话说：<strong>不用先请一个裁判来给每场比赛打分，直接拿「谁赢了谁输了」的比赛录像去练选手</strong>。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  subgraph R["RLHF 路线"]
+    R1["偏好数据"] -->|训练| R2["奖励模型"]
+    R2 -->|打分| R3["PPO 优化策略"]
+    R4["参考模型"] -->|KL| R3
+    R3 --> R5["对齐模型"]
+  end
+  subgraph D["DPO 路线"]
+    D1["偏好数据"] -->|直接训练| D2["策略模型"]
+    D3["参考模型<br/>冻结"] -->|隐式 KL| D2
+    D2 --> D4["对齐模型"]
+  end
+  R -.->|"去掉奖励模型<br/>去掉价值模型"| D
+  style D2 fill:#e6f1fb,stroke:#185fa5
+  style R2 fill:#fcebeb,stroke:#a32d2d
+              </div>
+              <figcaption>RLHF vs DPO：DPO 把奖励模型和价值模型都省掉，偏好数据直接驱动策略更新。注意参考模型没被省掉——它变成了一个只做前向、不做反向的「锚点」。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section: 演进脉络 ============ -->
+          <h2>先看地图：偏好对齐这条路是怎么走过来的</h2>
+          <p>DPO 不是凭空冒出来的。它站在一条清晰的技术脉络上：<strong>每一步都在把「对齐」这件事的工程复杂度往下砍一刀</strong>。理解这条脉络，比死记每个方法的公式更有用——因为你会发现每个新方法都在回答「上一个方法的哪个零件太贵、太脆」。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 偏好对齐方法的演进：一路做减法
+  2017 : PPO 提出 : 通用策略优化算法 : 后来成为 RLHF 的标配优化器
+  2022 : InstructGPT : 奖励模型 + PPO 的完整配方 : 四个模型同时驻留显存
+  2023 : DPO : 用闭式解消去奖励模型 : 四模型降到两模型 : IPO 指出 DPO 会过拟合
+  2024 : KTO : 单点好坏标签也能训 : SimPO 连参考模型也不要 : ORPO 把 SFT 与偏好合成一步
+  2025 : 在线与迭代 DPO : 用当前策略采样再打标 : 把离线方法拉回半 on-policy
+            </div>
+            <figcaption>偏好对齐方法的时间线。主线是「做减法」：先减掉奖励模型（DPO），再减掉成对数据的要求（KTO），再减掉参考模型（SimPO）。副线是「补回来」：在线 / 迭代 DPO 把 on-policy 采样这个被砍掉的东西部分补了回来。</figcaption>
+          </figure>
+
+          <p>看这条时间线要抓住一个反复出现的模式：<strong>每砍掉一个零件，就会丢掉这个零件原本提供的某种保护</strong>。砍掉奖励模型，丢掉的是它对标注噪声的平滑作用；砍掉 on-policy 采样，丢掉的是策略偏移时的自动纠错；砍掉参考模型，丢掉的是显式的 KL 锚点。后面每一节讲的失效模式，本质上都是这些「被丢掉的保护」在事后讨债。</p>
+
+          <!-- ============ 论文原图：DPO vs 传统 RLHF 对比（Rafailov et al., 2023, Figure 1） ============ -->
+          <figure class="paper-figure">
+            <img src="../../assets/figures/07-posttraining/dpo/fig1.png"
+                 alt="论文原图：DPO 直接优化人类偏好，避免显式奖励建模与强化学习（Rafailov et al., 2023, Figure 1）"
+                 loading="lazy" style="max-width:480px">
+            <figcaption>
+              <span class="pf-title">图：DPO 与传统 RLHF 的路线对比——DPO 通过闭式解直接优化偏好，绕开显式奖励模型与 RL 采样循环</span>
+              <span class="pf-src">论文原图 · Rafailov et al., <em>Direct Preference Optimization: Your Language Model is Secretly a Reward Model</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">arXiv:2305.18290</a></span>
+            </figcaption>
+          </figure>
+
+          <!-- ============ Section: 数学内核 ============ -->
+          <h2>DPO 的数学内核：奖励模型的消去法</h2>
+          <p>理解 DPO 不需要新数学，只需要一个代数技巧。我们从 RLHF 的目标出发：在 KL 约束下最大化奖励，等价于求解</p>
+          <div class="figure" style="text-align:center">
+            $$\max_\pi \; \mathbb{E}_{x \sim D,\, y \sim \pi(\cdot|x)}\!\left[r(x,y)\right] - \beta \, \text{KL}\!\left(\pi(\cdot|x) \,\|\, \pi_{\text{ref}}(\cdot|x)\right)$$
+          </div>
+          <p>这个 constrained optimization 有<strong>闭式最优解</strong>——即最优策略 $\pi^*$ 可以用奖励函数 $r$ 显式写出：</p>
+          <div class="figure" style="text-align:center">
+            $$\pi^*(y|x) = \frac{1}{Z(x)} \, \pi_{\text{ref}}(y|x) \, \exp\!\left(\frac{r(x,y)}{\beta}\right)$$
+          </div>
+          <p>其中 $Z(x) = \sum_y \pi_{\text{ref}}(y|x) \exp\!\left(r(x,y)/\beta\right)$ 是配分函数，保证 $\pi^*$ 是合法的概率分布。这个式子的物理含义很直白：<strong>最优策略 = 参考策略在奖励高的地方加权、在奖励低的地方减权，再归一化</strong>。$\beta$ 控制加权的激进程度——$\beta$ 越小，指数项越陡，最优策略越敢于偏离参考模型。</p>
+          <p>但这个闭式解<strong>不能直接拿来用</strong>：$Z(x)$ 要对所有可能的回答 $y$ 求和，而回答空间是词表大小的序列长度次方，天文数字，算不出来。历史上大家因此才退回去用 PPO 做迭代优化。</p>
+          <p>DPO 的关键一步是把这个等式<strong>反过来</strong>——不去求 $\pi^*$，而是用策略表示奖励：</p>
+          <div class="figure" style="text-align:center">
+            $$r(x,y) = \beta \log \frac{\pi^*(y|x)}{\pi_{\text{ref}}(y|x)} + \beta \log Z(x)$$
+          </div>
+          <p>现在把这个奖励表达式代回 Bradley-Terry 偏好模型（「A 优于 B 的概率 = $\sigma(r(A) - r(B))$」）。神奇的事情发生了：$\log Z(x)$ 在 $r(A) - r(B)$ 中被消掉（因为两个回答共享同一个 prompt $x$，那个算不出来的配分函数在做差时正好相互抵消），最终得到：</p>
+          <div class="figure" style="text-align:center">
+            $$P(A \succ B) = \sigma\!\left(\beta \log \frac{\pi(A|x)}{\pi_{\text{ref}}(A|x)} - \beta \log \frac{\pi(B|x)}{\pi_{\text{ref}}(B|x)}\right)$$
+          </div>
+          <p>奖励模型消失了。整个表达式只剩下<strong>策略模型和参考模型的对数概率比</strong>。DPO 的损失函数就是对这个概率取负对数似然：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{DPO}} = -\mathbb{E}_{(x, y_w, y_l)}\!\left[\log \sigma\!\left(\beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right)\right]$$
+          </div>
+          <p>其中 $y_w$ 是偏好标注中更好的回答（winner），$y_l$ 是更差的回答（loser）。梯度会推高 $\pi_\theta(y_w|x)$ 相对于参考模型的比例，同时压低 $\pi_\theta(y_l|x)$ 的比例——KL 约束被「内置」进了对数比里，不需要额外维护。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>推导步骤</th><th>做了什么</th><th>为什么这一步是关键</th></tr></thead>
+              <tbody>
+                <tr><td><strong>① 写出 KL 约束下的最优解</strong></td><td>$\pi^* \propto \pi_{\text{ref}} \exp(r/\beta)$</td><td>这一步是 RLHF 目标函数的标准结论，不是 DPO 的发明</td></tr>
+                <tr><td><strong>② 反解出奖励</strong></td><td>$r = \beta \log(\pi^*/\pi_{\text{ref}}) + \beta \log Z$</td><td><strong>视角翻转</strong>：不再把 $r$ 当输入，而是把它当 $\pi$ 的函数</td></tr>
+                <tr><td><strong>③ 代入 Bradley-Terry</strong></td><td>$P(y_w \succ y_l) = \sigma(r_w - r_l)$</td><td>偏好只关心奖励<strong>差值</strong>，这给了消元的机会</td></tr>
+                <tr><td><strong>④ $\log Z(x)$ 抵消</strong></td><td>两项共享同一个 $x$，做差即消</td><td>那个算不出来的配分函数被绕过了——<strong>整套方法能成立全靠这一步</strong></td></tr>
+                <tr><td><strong>⑤ 取负对数似然</strong></td><td>得到 $\mathcal{L}_{\text{DPO}}$</td><td>目标从「强化学习」退化成「二分类监督学习」</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            DPO 把「训练一个裁判再训练选手」变成「直接用比赛录像训练选手」。裁判（奖励模型）不是真的不需要了，而是被数学消去了——它隐含在策略与参考模型的对数比里。论文标题里那句 <em>Your Language Model is Secretly a Reward Model</em> 就是这个意思：<strong>任何一个语言模型，配上一个参考模型，本身就定义了一个奖励函数</strong>。
+          </div>
+
+          <!-- ============ Section: 一步梯度 ============ -->
+          <h2>把公式拆开看：一次 DPO 更新里到底发生了什么</h2>
+          <p>公式看懂了不等于知道训练时在发生什么。这一节用具体数字走一遍单步更新，你会对后面所有失效模式的成因有更直观的把握。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant B as 数据批次
+  participant P as 策略模型<br/>可训练
+  participant R as 参考模型<br/>冻结
+  participant L as DPO 损失
+  B->>P: 前向 chosen 回答
+  P-->>L: logpi_theta y_w
+  B->>P: 前向 rejected 回答
+  P-->>L: logpi_theta y_l
+  B->>R: 前向 chosen 回答
+  R-->>L: logpi_ref y_w
+  B->>R: 前向 rejected 回答
+  R-->>L: logpi_ref y_l
+  Note over L: 算两个对数比之差<br/>过 sigmoid 再取负对数
+  L->>P: 反向传播只更新策略
+  Note over R: 参考模型永不更新<br/>可提前缓存其输出
+            </div>
+            <figcaption>一个 DPO training step 的数据流：<strong>四次前向、一次反向</strong>。参考模型的两次前向结果与训练无关，因此工程上常常预先离线算好缓存起来，把每步开销降到两次前向。</figcaption>
+          </figure>
+
+          <h3>一个具体的数值例子</h3>
+          <p>设 $\beta = 0.1$。训练刚开始时，策略模型就是 SFT 模型的拷贝，也就是 $\pi_\theta = \pi_{\text{ref}}$。此时两个对数比都精确为 0，它们的差也是 0，于是</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{DPO}}^{(0)} = -\log \sigma(0) = -\log 0.5 = \log 2 \approx 0.693$$
+          </div>
+          <p><strong>这是一个非常有用的健全性检查</strong>：任何一次正确配置的 DPO 训练，第 0 步的 loss 都应该等于 0.693 左右。如果第一步的 loss 明显偏离这个值，说明参考模型和策略模型的初始化没对上——最常见的原因是参考模型加载错了权重，或者两者的对话模板、特殊 token 处理不一致。</p>
+          <p>训练若干步之后，假设某个样本上：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>量</th><th>训练前</th><th>训练后</th><th>变化</th><th>解读</th></tr></thead>
+              <tbody>
+                <tr><td>$\log \pi_\theta(y_w|x)$</td><td>-12.0</td><td>-11.4</td><td><strong>+0.6</strong></td><td>好回答的概率被推高</td></tr>
+                <tr><td>$\log \pi_{\text{ref}}(y_w|x)$</td><td>-12.0</td><td>-12.0</td><td>0</td><td>参考模型冻结，永不变</td></tr>
+                <tr><td>$\log \pi_\theta(y_l|x)$</td><td>-13.0</td><td>-15.4</td><td><strong>-2.4</strong></td><td>差回答的概率被大幅压低</td></tr>
+                <tr><td>$\log \pi_{\text{ref}}(y_l|x)$</td><td>-13.0</td><td>-13.0</td><td>0</td><td>同上</td></tr>
+                <tr><td><strong>隐式奖励差（margin）</strong></td><td>0</td><td>$0.1 \times (0.6 + 2.4) = 0.3$</td><td>+0.3</td><td>模型学会了区分好坏</td></tr>
+                <tr><td><strong>loss</strong></td><td>0.693</td><td>$-\log \sigma(0.3) \approx 0.554$</td><td>-0.139</td><td>下降，训练在进行</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>注意这张表里最值得玩味的一行：<strong>差回答概率下降的幅度（2.4）远大于好回答概率上升的幅度（0.6）</strong>。这不是偶然，而是 DPO 的典型行为——压低差回答比推高好回答「容易」得多，因为概率空间下方有的是空间，往上却要跟其他所有候选回答抢概率质量。这个不对称是后面很多问题的源头。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">训练监控必看</span>
+            实践中最该盯的不是 loss 本身，而是<strong>隐式奖励的三个派生量</strong>：好回答的隐式奖励、差回答的隐式奖励、以及「好回答隐式奖励大于差回答」的样本占比（即 accuracy）。主流训练框架（如 HuggingFace TRL 的 DPOTrainer）都会记录这几个量，<strong>具体指标名称以官方文档为准</strong>。健康的训练是：accuracy 稳步上升到 0.7 以上，margin 缓慢增大，而好回答的隐式奖励<strong>不要跌得太深</strong>。
+          </div>
+
+          <!-- ============ Section: 反直觉现象 ============ -->
+          <details class="deep">
+            <summary>展开：为什么训练中「好回答」的概率也在下降？</summary>
+            <div class="deep-body">
+              <p>刚上手 DPO 的人几乎都会碰到这个困惑：打开训练日志，发现 chosen 回答的对数概率 $\log \pi_\theta(y_w|x)$ 是<strong>负增长</strong>的——它在往下走，只是走得比 rejected 慢。这看起来完全违反直觉：我们不是在「奖励」好回答吗？</p>
+              <p>原因在于 DPO 的损失函数<strong>只约束两者之差，完全不约束绝对值</strong>。回看目标：</p>
+              <div class="figure" style="text-align:center">
+                $$\text{margin} = \beta\left[\left(\log \pi_\theta(y_w) - \log \pi_{\text{ref}}(y_w)\right) - \left(\log \pi_\theta(y_l) - \log \pi_{\text{ref}}(y_l)\right)\right]$$
+              </div>
+              <p>只要这个差在增大，损失就在下降。至于是「$y_w$ 涨 1、$y_l$ 跌 0」还是「$y_w$ 跌 1、$y_l$ 跌 4」，损失函数一视同仁。而优化器会挑<strong>阻力最小</strong>的那条路——由于语言模型的输出是一个 softmax 分布，同时压低两个具体序列的概率、把概率质量分散给其他海量未被观测的序列，往往比精确抬高某一条序列容易得多。</p>
+              <p>后果是什么？<strong>模型对训练集里出现过的所有回答（包括好的那些）都变得更不自信，概率质量流向了没人监督过的第三方区域</strong>。这块区域里可能是别的好回答，也可能是胡言乱语。这就是 DPO 有时会出现「跑分涨了但实际输出变怪」的机理性原因。</p>
+              <p style="margin-bottom:0">缓解手段有几种：一是在 DPO 损失上叠加一个针对 chosen 回答的 SFT 交叉熵项（有些实现叫 DPO+SFT 或加 NLL 正则），把「好回答的绝对概率」也约束住；二是提高 $\beta$，让策略整体不敢跑太远；三是用 SimPO 这类做了长度归一化并引入固定 margin 的变体。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section: 工程优势 ============ -->
+          <h2>DPO 的工程优势：从四模型到两模型</h2>
+          <p>数学上的优雅直接转化为工程上的简化。对比 RLHF 和 DPO 的训练资源需求：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>RLHF（PPO）</th><th>DPO</th></tr></thead>
+              <tbody>
+                <tr><td><strong>驻留模型数</strong></td><td>4（策略 + 参考 + 奖励 + 价值）</td><td>2（策略 + 参考）</td></tr>
+                <tr><td><strong>需要训练的模型</strong></td><td>3（策略 + 奖励 + 价值）</td><td>1（策略）</td></tr>
+                <tr><td><strong>需要反传的模型</strong></td><td>3（含优化器状态与激活）</td><td>1</td></tr>
+                <tr><td><strong>采样阶段</strong></td><td>需要 on-policy rollout（策略生成回答）</td><td>不需要（直接用离线偏好数据）</td></tr>
+                <tr><td><strong>训练循环</strong></td><td>多轮迭代（采样 → 打分 → 更新）</td><td>单轮（像 SFT 一样跑 epoch）</td></tr>
+                <tr><td><strong>超参数敏感度</strong></td><td>高（$\beta$、clip、学习率、GAE 相互耦合）</td><td>低（主要调 $\beta$ 和学习率）</td></tr>
+                <tr><td><strong>7B 模型权重显存（BF16 粗算）</strong></td><td>约 56GB（四份 14GB）</td><td>约 28GB（两份 14GB）</td></tr>
+                <tr><td><strong>调试难度</strong></td><td>高：训崩了要判断是奖励模型的问题还是 PPO 的问题</td><td>低：只有一条 loss 曲线要看</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>上表的显存数按 7B 模型 BF16 权重约 14GB 粗算，只统计权重、不含优化器状态和激活值——实际显存要在此基础上乘几倍，具体取决于并行方案与是否开梯度检查点。但<strong>「四份 vs 两份」这个比例关系是稳定的</strong>，这才是重点。</p>
+          <p>显存减半只是表面好处。更大的优势是<strong>训练流程的简化</strong>：DPO 不需要 on-policy 采样——不用在训练循环中反复让策略模型生成回答，不用维护 rollout 的基础设施，不用处理生成与训练的节奏配合。整个训练过程退化成类似 SFT 的监督学习：读一批偏好数据，算 loss，反向传播，下一个 batch。</p>
+          <p>这也是为什么 DPO 成为 2024 年之后开源社区对齐的事实标准：它把「对齐」从一个需要 RL 工程团队的项目，变成了一个会跑 SFT 就能上手的任务。参考模型甚至可以进一步省掉——如果策略模型用 <a href="peft-lora.html">LoRA</a> 训练，那么「关掉 adapter 的同一个底座」就是参考模型，两个模型共享一份基座权重，显存再省一半。这是 LoRA + DPO 组合在消费级显卡上如此流行的原因。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">工程小技巧</span>
+            参考模型的输出与训练进程完全无关，因此可以<strong>提前离线算好并缓存</strong>：遍历一遍数据集，把每条 chosen / rejected 的 $\log \pi_{\text{ref}}$ 存成一列，训练时直接读。这样训练循环里只剩策略模型的两次前向，速度接近翻倍，代价是多一个预处理步骤和一点磁盘空间。注意缓存必须与 tokenizer、对话模板、截断长度严格绑定——<strong>任何一项变了都要重算，否则会得到一个静默错误的参考基线</strong>。
+          </div>
+
+          <!-- ============ Section: 代码 ============ -->
+          <h2>动手：DPO 损失的最小实现</h2>
+          <p>把公式翻译成代码只有十几行。下面这段是可读性优先的实现，帮助你把每个符号和张量操作对应起来：</p>
+
+          <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+
+def sequence_logprob(logits, labels, loss_mask):
+    """把 token 级 logits 汇总成整条回答的对数概率。
+
+    logits:    (batch, seq_len, vocab)  模型输出，已经右移对齐
+    labels:    (batch, seq_len)         目标 token id
+    loss_mask: (batch, seq_len)         1 表示属于回答部分，0 表示 prompt 或 padding
+    返回:      (batch,)                 每条序列的 log p(y|x)
+    """
+    logp = F.log_softmax(logits, dim=-1)                    # (b, s, v)
+    token_logp = torch.gather(
+        logp, dim=2, index=labels.unsqueeze(2)
+    ).squeeze(2)                                            # (b, s)
+    # 只累加回答部分:prompt 的 token 不参与,padding 也不参与
+    return (token_logp * loss_mask).sum(dim=-1)             # (b,)
+
+
+def dpo_loss(policy_chosen_logp, policy_rejected_logp,
+             ref_chosen_logp, ref_rejected_logp, beta=0.1):
+    """DPO 损失。四个入参都是形状 (batch,) 的整句对数概率。"""
+    # 策略相对参考模型的对数比 —— 这就是 DPO 的"隐式奖励"
+    chosen_reward = beta * (policy_chosen_logp - ref_chosen_logp)
+    rejected_reward = beta * (policy_rejected_logp - ref_rejected_logp)
+
+    margin = chosen_reward - rejected_reward                # (batch,)
+    loss = -F.logsigmoid(margin).mean()
+
+    # 训练监控用的三个量:好/差回答的隐式奖励,以及区分准确率
+    metrics = {
+        "rewards_chosen": chosen_reward.mean().item(),
+        "rewards_rejected": rejected_reward.mean().item(),
+        "rewards_margin": margin.mean().item(),
+        "rewards_accuracy": (margin &gt; 0).float().mean().item(),
+    }
+    return loss, metrics</code></pre>
+
+          <p>两个容易踩的实现细节，值得单独强调：</p>
+          <ul>
+            <li><strong>loss_mask 必须只覆盖回答部分</strong>。如果你不小心把 prompt 的 token 也算进 $\log \pi(y|x)$，那么 chosen 和 rejected 共享的那段 prompt 概率会同时出现在两边——理论上做差会抵消，但只要两条样本的 prompt 长度或 padding 位置有任何不一致，就会引入难以察觉的偏差。</li>
+            <li><strong>不要对 token 数取平均</strong>。上面用的是 <code>sum</code> 而不是 <code>mean</code>，这是原始 DPO 的定义：整句的对数概率是各 token 对数概率之和。改成 <code>mean</code> 就变成了长度归一化，那已经是 SimPO 的思路了，两者行为差别很大——用错了你会发现模型对回答长度的偏好完全变了。</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">不必自己造轮子</span>
+            上面的代码是为了讲清原理。生产训练建议直接用成熟框架（如 HuggingFace TRL 的 DPOTrainer），它已经处理好了参考模型缓存、LoRA 场景下的 adapter 开关、多种损失变体的切换、以及各类监控指标的记录。<strong>具体的参数名与支持的变体列表以官方文档为准</strong>，本页不复述可能过时的 API 细节。
+          </div>
+
+          <!-- ============ Section: beta ============ -->
+          <h2>只有一个旋钮：$\beta$ 怎么调</h2>
+          <p>DPO 相比 PPO 最舒服的一点是超参极少。真正需要你决策的基本只有两个：学习率和 $\beta$。学习率的经验是<strong>比 SFT 再小一个量级</strong>（SFT 常用 $2\times10^{-5}$ 量级，DPO 常落在 $5\times10^{-7}$ 到 $5\times10^{-6}$ 之间，具体随模型规模和是否用 LoRA 而变）。$\beta$ 则值得单独说清楚。</p>
+          <p>$\beta$ 在公式里出现在两个地方，含义是统一的：<strong>它是 KL 约束的强度</strong>。$\beta$ 越大，同样的对数比变化产生的 margin 越大，损失越快饱和，于是策略越早停止偏离参考模型；$\beta$ 越小，模型越敢跑远。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>$\beta$ 取值</th><th>行为</th><th>典型症状</th><th>什么时候选它</th></tr></thead>
+              <tbody>
+                <tr><td><strong>偏小（约 0.01–0.05）</strong></td><td>KL 约束松，策略大幅偏离 SFT</td><td>偏好指标涨得快，但通用能力（如知识问答、代码）明显掉点；输出风格突变</td><td>偏好数据量大且质量高，且你确实想让风格发生较大改变</td></tr>
+                <tr><td><strong>常用默认（约 0.1）</strong></td><td>平衡点，社区最常见的起手值</td><td>—</td><td><strong>不知道选什么就从这里开始</strong></td></tr>
+                <tr><td><strong>偏大（约 0.3–0.5）</strong></td><td>KL 约束紧，策略贴近 SFT</td><td>偏好指标几乎不动，accuracy 长期卡在 0.5 附近</td><td>偏好数据量少或噪声大，主要目的是「微调风格、别搞坏基座」</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>调 $\beta$ 的正确姿势不是盲试，而是<strong>看隐式奖励曲线</strong>：如果 chosen 的隐式奖励很快跑到很大的负值（说明策略把好回答的概率也砍了很多），说明约束太松，加大 $\beta$；如果 margin 长期趴在 0 附近不动，说明约束太紧或学习率太小。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">一个高频翻车点</span>
+            <strong>DPO 通常只跑 1 个 epoch，最多 2 个。</strong>这跟 SFT 的直觉完全相反。原因见下一节的「概率塌缩」：DPO 的损失在训练集上可以无限下降，多跑几轮几乎必然过拟合到偏好数据的表面特征（比如「更长的回答更好」「带 markdown 列表的更好」），而不是真正的质量差异。如果你的 DPO 训到第 3 个 epoch 还在「进步」，请立刻去看人工样例，那多半不是好消息。
+          </div>
+
+          <!-- ============ Section: 失效模式 ============ -->
+          <h2>DPO 的失效模式：什么情况下会翻车</h2>
+          <p>DPO 不是银弹。它省掉了奖励模型，但也丢掉了奖励模型提供的「缓冲层」，带来三类独特的失效模式。下面这张状态图把一次 DPO 训练可能经历的阶段画了出来——理想情况是停在「有效分离」，现实中很多训练滑进了后面两个状态还浑然不觉。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 初始对齐
+  初始对齐: 策略等于参考 loss 约 0.693 margin 为 0
+  有效分离: accuracy 上升 margin 稳步增大 人工评测同步变好
+  损失饱和: 差回答概率已极低 梯度趋近于零 指标看着还在涨
+  概率塌缩: 好回答概率也在暴跌 多样性下降 出现重复与胡言
+
+  初始对齐 --> 有效分离: 正常训练
+  有效分离 --> 损失饱和: 训练轮次过多或 beta 过小
+  损失饱和 --> 概率塌缩: 继续训练
+  有效分离 --> [*]: 及时早停
+  概率塌缩 --> [*]: 需要回滚重训
+
+  note right of 损失饱和
+    危险区 自动指标仍在改善
+    但人工评测已经开始下降
+  end note
+            </div>
+            <figcaption>DPO 训练的四个状态。关键在于「损失饱和」这个危险区：此时 loss 还在下降、accuracy 还在上升，但模型实际上已经在退化。<strong>只看自动指标会漏掉这个转折点，必须配合定期的人工抽样。</strong></figcaption>
+          </figure>
+
+          <h3>问题 1：退化与概率塌缩</h3>
+          <p>DPO 的损失在 $\pi_\theta(y_l|x) \to 0$ 时趋于饱和——一旦差回答的概率被压到极低，$\sigma$ 已经接近 1，梯度就消失了，但训练不会停。模型会继续寻找新的方式来拉大 $y_w$ 和 $y_l$ 的概率差距，而如前面深入块所述，最省力的手段是<strong>全局降低所有被观测回答的概率</strong>，让概率质量流向未被监督的区域。极端情况下，策略退化成只会输出少数几种模式，或者开始产生重复、截断的输出。</p>
+          <p>RLHF 的 PPO 不会这样，因为 on-policy 采样会持续暴露退化行为——模型生成出奇怪回答时，奖励模型会给低分，负反馈会把它拉回来。<strong>DPO 没有这个闭环：它永远只看那几条固定的离线样本，看不到自己现在真实生成的是什么。</strong></p>
+
+          <h3>问题 2：离线数据的分布偏移</h3>
+          <p>DPO 用的是<strong>离线</strong>偏好数据——这些回答是某个旧模型（或人类）生成的，不是当前策略 $\pi_\theta$ 生成的。随着训练进行，$\pi_\theta$ 越来越偏离生成这些数据的分布，偏好标签的准确性也在下降。一个在旧模型上标注「更好」的回答，在当前策略的分布下未必仍然更好；更糟的是，当前策略最可能生成的那些回答，在偏好数据里<strong>根本没有出现过</strong>，DPO 对它们没有任何约束。</p>
+          <p>这个问题在实践中有一个明确的缓解方案：<strong>迭代 DPO / 在线 DPO</strong>。做法是把训练切成若干轮，每一轮开始时先用<em>当前</em>策略对一批 prompt 采样出成对回答，再用一个打分器（可以是奖励模型、可以是更强的 LLM 做 judge、也可以是可验证的规则）给出偏好标签，然后跑一轮 DPO；下一轮再重新采样。这相当于把被砍掉的 on-policy 环节部分补了回来，代价是重新引入了采样基础设施和一个打分器——某种意义上是向 RLHF 回退了半步。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Off["离线 DPO"]
+    O1["固定偏好数据集"] --> O2["跑 1 epoch"] --> O3["结束"]
+  end
+  subgraph On["迭代 / 在线 DPO"]
+    N1["当前策略采样<br/>同一 prompt 出多条回答"] --> N2["打分器给偏好标签<br/>奖励模型 / LLM judge / 规则"]
+    N2 --> N3["跑一轮 DPO"]
+    N3 --> N4{"轮次用完?"}
+    N4 -->|否| N1
+    N4 -->|是| N5["结束"]
+  end
+  Off -.->|"补回 on-policy<br/>缓解分布偏移"| On
+  style N1 fill:#eaf3de,stroke:#639922
+  style O1 fill:#faeeda,stroke:#ba7517
+            </div>
+            <figcaption>离线 DPO vs 迭代 DPO。迭代版本每轮都用当前策略重新采样，让训练数据始终落在策略自己的分布上——这正是 PPO 天然具备而离线 DPO 缺失的性质。代价是需要一个打分器，复杂度回升。</figcaption>
+          </figure>
+
+          <h3>问题 3：对数据质量极度敏感</h3>
+          <p>RLHF 的奖励模型起到了「噪声过滤器」的作用——它在大量偏好数据上训练，学到了一个平滑的奖励函数，个别标注错误会被平均掉，而且它对训练集里没见过的回答也能给出一个泛化的分数。DPO 没有这个中间层，<strong>每一条偏好标注都直接变成梯度</strong>。标注噪声会一比一地传导到策略上。</p>
+          <p>更隐蔽的是<strong>系统性偏置</strong>而非随机噪声。人类标注者（以及 LLM judge）普遍存在几种可预测的偏好：更长的回答、带格式排版的回答、语气更自信的回答。如果你的偏好数据没有控制这些混淆变量，DPO 会非常高效地学会「把回答写长、加列表、语气笃定」，因为这是提升 margin 最省力的路径——而这跟真正的回答质量只有微弱关联。这就是为什么很多 DPO 之后的模型「看起来更专业了但实际没更对」。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>失效模式</th><th>观察到的信号</th><th>根因</th><th>应对</th></tr></thead>
+              <tbody>
+                <tr><td><strong>概率塌缩</strong></td><td>chosen 隐式奖励持续走深负值；输出重复、多样性下降</td><td>损失只约束差值不约束绝对值</td><td>加大 $\beta$；叠加 SFT/NLL 正则项；<strong>早停</strong></td></tr>
+                <tr><td><strong>长度膨胀</strong></td><td>平均回答长度显著变长，内容却没变充实</td><td>标注偏置 + 长序列对数概率天然更低带来的不对称</td><td>数据侧做长度配平；改用 SimPO 的长度归一化</td></tr>
+                <tr><td><strong>分布偏移</strong></td><td>离线指标好，实际生成质量不涨甚至倒退</td><td>训练数据不是当前策略生成的</td><td>迭代 DPO；缩短训练轮次；混入 on-policy 样本</td></tr>
+                <tr><td><strong>通用能力掉点</strong></td><td>偏好评测涨，但知识 / 代码 / 数学基准跌</td><td>KL 约束太松，策略跑离基座太远</td><td>加大 $\beta$；降学习率；偏好数据里混入通用能力样本</td></tr>
+                <tr><td><strong>margin 不动</strong></td><td>accuracy 长期在 0.5 附近</td><td>$\beta$ 过大 / 学习率过小 / 偏好对本身区分度低</td><td>先人工看 20 条数据——很多时候是数据里 chosen 和 rejected 根本没差别</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            「DPO 就是 RLHF 的简化版，效果差不多」——不对。DPO 在数据质量高、分布偏移小的场景下可以媲美 RLHF，但在数据噪声大或需要持续探索的场景下，RLHF 的 on-policy 闭环仍然有不可替代的优势。生产环境中，很多团队采用 DPO 做快速迭代、RLHF（或迭代 DPO）做最终对齐的混合策略。<strong>把 DPO 当成「省事版 PPO」是错的，它是一个有不同偏差-方差取舍的另一种方法。</strong>
+          </div>
+
+          <!-- ============ Section: 变体家族 ============ -->
+          <h2>DPO 的变体家族：各补一块短板</h2>
+          <p>DPO 的三个失效模式催生了一系列变体。它们共享「免奖励模型」的核心思路，但在损失函数的设计上各有取舍。下面这张思维导图先给全景，再逐个展开。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("免奖励模型对齐"))
+    DPO 基础版
+      成对偏好数据
+      需要参考模型
+      sigmoid 分类损失
+    改损失形式
+      IPO
+        平方回归损失
+        固定目标 margin
+        防止无限拉大
+      加 SFT 正则
+        约束 chosen 绝对概率
+    改数据要求
+      KTO
+        单点好坏标签
+        前景理论加权
+        可用点赞点踩日志
+    改参考基线
+      SimPO
+        无参考模型
+        长度归一化
+        固定 margin gamma
+      ORPO
+        SFT 与偏好合一
+        赔率比正则
+    改采样方式
+      迭代 DPO
+        当前策略采样
+        打分器给标签
+        缓解分布偏移
+            </div>
+            <figcaption>免奖励对齐方法族的四条改进轴：改损失形式、改数据要求、改参考基线、改采样方式。<strong>选型时先想清楚你卡在哪一轴上</strong>，再去找对应分支的方法，比逐个试有效得多。</figcaption>
+          </figure>
+
+          <h3>IPO：用正则化对抗过拟合</h3>
+          <p>IPO（Identity Preference Optimization）针对的是 DPO 的概率塌缩问题。它的观察是：DPO 的损失在偏好数据上可以无限下降（因为 $\sigma$ 函数在输入极大时趋于 1，$\log \sigma$ 趋于 0），这鼓励模型无限拉大好回答和差回答的概率比，最终导致过拟合。特别是当某个 prompt 的偏好标注是「确定性」的（同一对回答总是同一个赢），DPO 的最优解会把 margin 推向无穷大——KL 约束在这种情况下实际上失效了。</p>
+          <p>IPO 的做法是加一个<strong>恒等正则项</strong>，把损失改为：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{IPO}} = \left(\log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)} - \frac{1}{2\beta}\right)^2$$
+          </div>
+          <p>这是一个<strong>回归损失而不是分类损失</strong>——它不追求「越大越好」，而是把对数概率差推向一个固定目标 $\frac{1}{2\beta}$。到了目标就停，超过了还会被拉回来。这从结构上阻止了概率比的无限放大，代价是收敛更保守、在数据充足时上限可能不如 DPO。</p>
+
+          <h3>KTO：从成对偏好到单点标签</h3>
+          <p>DPO 和 IPO 都需要<strong>成对偏好数据</strong>——同一问题下必须同时有好回答和差回答。这种数据的采集成本高：标注者需要看两个回答再比较，而且两个回答必须来自同一个 prompt。现实中大量已有的数据是<strong>单点标签</strong>——「这个回答好」或「这个回答差」，比如用户点赞 / 点踩、客服系统的满意度评分、人工审核的通过 / 打回记录。</p>
+          <p>KTO（Kahneman-Tversky Optimization）的突破在于：它借鉴行为经济学中的前景理论（prospect theory），用单点标签就能训练。损失函数为：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{KTO}} = \mathbb{E}_{y_w}\!\left[\log \sigma\!\left(\beta \log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - z_{\text{ref}}\right)\right] + \lambda \, \mathbb{E}_{y_l}\!\left[\log \sigma\!\left(z_{\text{ref}} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right)\right]$$
+          </div>
+          <p>其中 $z_{\text{ref}}$ 是参考模型在数据集上的对数概率比的移动平均，起到基线作用——它替代了「成对比较」中另一条回答扮演的角色。好回答推高概率比，差回答压低概率比，但不需要它们成对出现。前景理论的部分体现在两侧可以用不同的权重 $\lambda$：人对「损失」的敏感度高于「收益」，因此在数据不平衡时（比如点踩远少于点赞）可以调这个权重做补偿。</p>
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            KTO 用的逻辑是「这个回答好就多生成类似的，差就少生成」——不需要同时看好坏两个版本来比较，只看一个就知道该往哪个方向调。就像你在餐厅吃饭不需要同时吃两盘菜才知道哪盘好吃，一盘好吃你就记住了。<strong>它的最大实用价值是让线上日志直接变成训练数据</strong>：点赞点踩本来就在数据库里躺着，不需要再花钱做成对标注。
+          </div>
+
+          <h3>SimPO：扔掉参考模型</h3>
+          <p>SimPO（Simple Preference Optimization）进一步砍掉了参考模型 $\pi_{\text{ref}}$。DPO 系列的所有方法都依赖参考模型来计算 KL——你需要一个冻结的 SFT 模型驻留在显存里，或者至少缓存一遍它的输出。SimPO 的观察是：如果对策略的 log 概率做<strong>长度归一化</strong>，就可以用一个固定的阈值替代参考模型的比例：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{SimPO}} = -\mathbb{E}\!\left[\log \sigma\!\left(\frac{\beta}{|y_w|} \log \pi_\theta(y_w|x) - \frac{\beta}{|y_l|} \log \pi_\theta(y_l|x) - \gamma\right)\right]$$
+          </div>
+          <p>其中 $|y|$ 是回答的 token 长度，$\gamma$ 是目标裕度（margin）。SimPO 有两个实际好处：</p>
+          <ul>
+            <li><strong>省掉参考模型的显存与前向开销</strong>，训练更简单更快。</li>
+            <li><strong>长度归一化消除了长度偏置</strong>。DPO 里，一条回答的对数概率是所有 token 对数概率之和，token 越多这个和就越负——长回答天然「概率更低」。这个纯粹由长度导致的差异会混进 margin 里，让 DPO 的行为对长度敏感。SimPO 除以长度后，比较的是「平均每个 token 的对数概率」，长短回答处在同一量纲上。</li>
+          </ul>
+          <p>代价是：没有了参考模型这个锚点，防止策略跑偏的责任全压在 $\gamma$ 和学习率上，训练的稳定性对超参更敏感。此外「长度归一化」本身也是一种取舍——有些任务里回答长确实意味着信息量大，一刀切归一化会抹掉这个真实信号。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方法</th><th>需要参考模型</th><th>数据类型</th><th>损失形式</th><th>核心改进</th><th>典型场景</th></tr></thead>
+              <tbody>
+                <tr><td><strong>DPO</strong></td><td>是</td><td>成对偏好</td><td>sigmoid 分类</td><td>消除奖励模型</td><td>通用对齐首选</td></tr>
+                <tr><td><strong>IPO</strong></td><td>是</td><td>成对偏好</td><td>平方回归</td><td>固定目标 margin，防塌缩</td><td>数据少、易过拟合</td></tr>
+                <tr><td><strong>KTO</strong></td><td>是</td><td>单点好 / 坏标签</td><td>前景理论加权</td><td>不需要成对数据</td><td>用户点赞点踩日志</td></tr>
+                <tr><td><strong>SimPO</strong></td><td>否</td><td>成对偏好</td><td>长度归一 + 固定裕度</td><td>无参考模型 + 消长度偏置</td><td>显存受限、长回答场景</td></tr>
+                <tr><td><strong>迭代 DPO</strong></td><td>是</td><td>在线采样 + 打分器</td><td>同 DPO</td><td>补回 on-policy 采样</td><td>有打分器且追求上限</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- ============ Section: 数据 ============ -->
+          <h2>偏好数据从哪来：四种来源与各自的坑</h2>
+          <p>前面反复强调「DPO 对数据质量极度敏感」，那么这些数据具体怎么造？实践中主要有四条路，成本和质量差异巨大。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>来源</th><th>怎么做</th><th>成本</th><th>主要风险</th></tr></thead>
+              <tbody>
+                <tr><td><strong>人工成对标注</strong></td><td>同一 prompt 生成两条回答，请标注员选一条</td><td>高</td><td>标注员间一致性低；长度 / 格式偏置；规模上不去</td></tr>
+                <tr><td><strong>AI 反馈（RLAIF）</strong></td><td>用更强的模型当 judge 给出偏好</td><td>低</td><td>继承 judge 的偏见；位置偏置（judge 倾向选第一个）；能力上限受 judge 限制</td></tr>
+                <tr><td><strong>线上用户信号</strong></td><td>点赞点踩、重新生成按钮、会话是否继续</td><td>极低（本来就有）</td><td>是<strong>单点标签</strong>不是成对，需用 KTO；信号极稀疏且有幸存者偏差</td></tr>
+                <tr><td><strong>拒绝采样构对</strong></td><td>同一 prompt 采 N 条，用验证器 / 奖励模型选出最好和最差配成一对</td><td>中（算力换标注）</td><td>依赖打分器质量；N 太小则 chosen 与 rejected 差异不明显</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>无论哪条路，有三条数据卫生规则值得写进流程：</p>
+          <ul>
+            <li><strong>控制长度混淆</strong>。统计一下你的数据集里 chosen 平均长度是不是显著大于 rejected。如果是，DPO 学到的多半是「写长点」。可以做长度分层配平，或至少在评测时把长度作为协变量报出来。</li>
+            <li><strong>过滤「没有区分度」的对</strong>。如果 chosen 和 rejected 质量其实差不多（标注员是随机选的），这条数据不但没用，还会往梯度里注入纯噪声。可以用打分器的分差做阈值过滤，或看标注员的一致性。</li>
+            <li><strong>chosen 必须落在策略的分布内</strong>。如果 chosen 是人类精心写的、模型根本写不出来的回答，DPO 试图去抬高一个它几乎不可能生成的序列的概率，效率极低且容易引发前面说的塌缩。这也是为什么<strong>「用当前模型自己采样出来的回答做偏好对」通常比「用人类写的黄金答案做 chosen」效果更好</strong>——这条经验很反直觉，但在实践中相当稳固。</li>
+          </ul>
+
+          <!-- ============ Section: 选择 ============ -->
+          <h2>实践选择：什么时候用 DPO 系，什么时候回到 RLHF</h2>
+          <p>理解了各方法的优劣，选择策略可以归结为一棵决策树：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Start["我要做偏好对齐"] --> Q0{"做过 SFT 了吗?"}
+  Q0 -->|否| DoSFT["先去做 SFT<br/>DPO 不能跳过这步"]
+  Q0 -->|是| Q1{"数据是成对的吗?"}
+  Q1 -->|"否<br/>只有点赞点踩"| KTO["选 KTO"]
+  Q1 -->|是| Q2{"显存够放两个模型吗?"}
+  Q2 -->|"不够"| Q2b{"能用 LoRA 吗?"}
+  Q2b -->|能| LoRADPO["LoRA + DPO<br/>关掉 adapter 即参考模型"]
+  Q2b -->|不能| SimPO["选 SimPO<br/>不需要参考模型"]
+  Q2 -->|够| Q3{"数据量大吗?"}
+  Q3 -->|"少<br/>不足万条量级"| IPO["选 IPO<br/>抗过拟合"]
+  Q3 -->|多| DPO["选 DPO<br/>默认起手"]
+  DPO --> Q4{"效果到瓶颈了?"}
+  Q4 -->|是| Q5{"有可用的打分器吗?"}
+  Q5 -->|有| Iter["迭代 DPO<br/>补回 on-policy"]
+  Q5 -->|"没有,但有 RL 团队"| PPO["回到 RLHF/PPO"]
+  Q4 -->|否| Done["收工"]
+
+  style DPO fill:#e6f1fb,stroke:#185fa5
+  style DoSFT fill:#faeeda,stroke:#ba7517
+  style Iter fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>免奖励对齐的选型决策树。<strong>起点永远是「先做完 SFT」</strong>——DPO 依赖参考模型在目标分布上有合理的概率，一个没经过 SFT 的基座模型给不出这个基线。</figcaption>
+          </figure>
+
+          <ul>
+            <li><strong>默认从 DPO 起步</strong>：资源消耗低、超参少、效果在大多数场景下够用。开源社区的大量对齐实践都基于 DPO。</li>
+            <li><strong>数据是单点标签 → KTO</strong>：如果你有的是点赞 / 点踩日志而不是成对比较，KTO 是唯一直接可用的选项。</li>
+            <li><strong>过拟合严重 → IPO</strong>：偏好数据量小、训练轮次多时，DPO 容易塌缩，换 IPO。</li>
+            <li><strong>显存极度紧张 → SimPO 或 LoRA + DPO</strong>：前者去掉参考模型，后者让参考模型和策略共享基座权重。</li>
+            <li><strong>需要持续探索和 on-policy 修正 → 迭代 DPO 或回到 RLHF</strong>：如果你的场景中奖励环境会变化（比如用户偏好漂移），或者需要策略主动探索新的回答模式，离线数据无法覆盖这些。</li>
+          </ul>
+          <p>实际生产中，一个常见的混合策略是：<strong>先用 DPO 快速迭代验证数据质量，确认偏好信号有效后再投入迭代 DPO 或 RLHF 做精细对齐</strong>。这比上来就跑 PPO 的试错成本低得多——毕竟如果你的偏好数据本身就有问题，用什么算法都救不回来，而 DPO 能用最低的成本把这个事实暴露出来。</p>
+
+          <!-- ============ Section: 评估 ============ -->
+          <h2>怎么知道 DPO 训好了：评估的三层</h2>
+          <p>DPO 训练的最大陷阱是<strong>自动指标与真实质量脱钩</strong>。前面的状态图已经指出，进入「损失饱和」区之后 loss 和 accuracy 还在改善，但模型已经在退化。因此评估必须分三层来看，缺一层都会误判。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层级</th><th>看什么</th><th>能发现什么</th><th>发现不了什么</th></tr></thead>
+              <tbody>
+                <tr><td><strong>① 训练内指标</strong></td><td>loss、margin、accuracy、chosen / rejected 隐式奖励</td><td>训练是否在跑、是否已饱和、是否配置错误（看第 0 步是否为 0.693）</td><td>真实生成质量；一切没在训练集里出现的行为</td></tr>
+                <tr><td><strong>② 通用能力回归</strong></td><td>知识 / 推理 / 代码等标准基准跑一遍，与 SFT 模型对比</td><td><strong>对齐税</strong>——为了对齐掉了多少基础能力</td><td>回答风格是否讨喜；是否出现重复退化</td></tr>
+                <tr><td><strong>③ 生成侧人工 / judge 评测</strong></td><td>固定一批 held-out prompt，实际生成后做成对比较</td><td>塌缩、重复、长度膨胀、风格突变</td><td>成本高，不能每步都做；judge 自身有偏置</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>一个务实的做法是：<strong>训练时每隔固定步数存一个 checkpoint，训完后把这几个 checkpoint 一起做第 ② ③ 层评估，选最好的那个</strong>，而不是无脑用最后一步。因为 DPO 的最优 checkpoint 经常不在训练末尾——它在「有效分离」到「损失饱和」的那个转折点附近，而这个点用训练内指标是看不出来的。</p>
+
+          <details class="deep">
+            <summary>展开：DPO 的梯度直觉，以及它为什么会「学不动」</summary>
+            <div class="deep-body">
+              <p>DPO 损失对 $\theta$ 的梯度可以整理成一个很有解释力的形式：</p>
+              <div class="figure" style="text-align:center">
+                $$\nabla_\theta \mathcal{L}_{\text{DPO}} = -\beta \, \mathbb{E}\!\left[\underbrace{\sigma(\hat{r}_l - \hat{r}_w)}_{\text{权重}} \cdot \left(\nabla_\theta \log \pi_\theta(y_w|x) - \nabla_\theta \log \pi_\theta(y_l|x)\right)\right]$$
+              </div>
+              <p>其中 $\hat{r} = \beta \log(\pi_\theta / \pi_{\text{ref}})$ 是隐式奖励。这个形式说明两件事：</p>
+              <p><strong>第一，梯度方向永远是「抬 chosen、压 rejected」</strong>，方向是固定的，变化的只有步长。</p>
+              <p><strong>第二，权重项 $\sigma(\hat{r}_l - \hat{r}_w)$ 是一个自动的样本加权器。</strong>当模型把这个样本判错了（差回答的隐式奖励反而更高），括号内为正，$\sigma$ 接近 1，权重大，这条样本被重点学习；当模型已经能很好区分好坏时，括号内是大负数，$\sigma \to 0$，梯度自动衰减。这是一种<strong>内建的 curriculum</strong>：难样本权重大，已经会的样本自动淡出。</p>
+              <p>好处很明显：不需要手工设计课程，模型自动聚焦在还没学会的地方。但坏处同样明显：<strong>一旦模型对训练数据「记住」了，梯度就消失了，泛化能力不再提升——它没有任何机制去改善那些训练集里没出现的输入上的行为。</strong>这就是 DPO 容易在少量数据上过拟合、且「多训几轮也不会更好只会更坏」的梯度层面原因。</p>
+              <p style="margin-bottom:0">对比 PPO 的梯度：PPO 的优势函数 $A$ 是 on-policy 计算的，策略变了 $A$ 就跟着变，梯度不会因为「记住训练数据」而消失，模型始终在自己当前的分布上接受评判。这是 on-policy 方法在探索性上的结构性优势，也解释了为什么迭代 DPO（每轮重新采样）能部分找回这个性质。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：利用 RLHF 最优策略的闭式解，把奖励函数用策略自身表示，代回 Bradley-Terry 模型后配分函数 $Z(x)$ 相消、奖励模型被消去——偏好数据直接变成策略梯度。</li>
+            <li><strong>核心公式</strong>：$\mathcal{L}_{\text{DPO}} = -\mathbb{E}\!\left[\log \sigma\!\left(\beta \log \frac{\pi(y_w)}{\pi_{\text{ref}}(y_w)} - \beta \log \frac{\pi(y_l)}{\pi_{\text{ref}}(y_l)}\right)\right]$，KL 约束内建在对数比中。</li>
+            <li><strong>健全性检查</strong>：训练第 0 步的 loss 应为 $\log 2 \approx 0.693$。不是这个值说明参考模型或模板配错了。</li>
+            <li><strong>工程优势</strong>：四模型 → 两模型；离线训练不需要 rollout；超参基本只有 $\beta$ 和学习率；LoRA 场景下参考模型可与策略共享基座。</li>
+            <li><strong>$\beta$ 的含义</strong>：KL 约束强度。默认从 0.1 起手；掉通用能力就调大，指标不动就调小或检查数据。</li>
+            <li><strong>只训 1 个 epoch</strong>：DPO 损失可以无限下降，多训必过拟合。最优 checkpoint 常在中途而非末尾。</li>
+            <li><strong>三大失效模式</strong>：概率塌缩（只约束差值不约束绝对值，好回答概率也被压低）、离线分布偏移（数据不是当前策略生成的）、数据噪声与偏置敏感（无奖励模型做缓冲，会高效学会「写长写花」）。</li>
+            <li><strong>变体分工</strong>：IPO 换平方损失防塌缩、KTO 用单点标签、SimPO 去参考模型 + 长度归一化、迭代 DPO 补回 on-policy 采样。</li>
+            <li><strong>数据卫生三条</strong>：控制长度混淆、过滤无区分度的对、让 chosen 落在策略自己的分布内。</li>
+            <li><strong>评估三层</strong>：训练内指标（看配置对不对）、通用能力回归（看对齐税）、生成侧评测（看塌缩与风格）。缺一层就会误判。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：DPO 为什么可以不训练显式奖励模型？</h3>
+              <p><span class="answer-label">标准回答：</span>在带 KL 约束的偏好优化中，最优策略可以写成参考策略与奖励函数的关系。把这个关系代回 Bradley-Terry 偏好模型后，奖励函数被策略与参考策略的 log-probability ratio 替代，于是可以直接用 chosen/rejected 数据训练策略。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：DPO 的 beta 参数控制什么？</h3>
+              <p><span class="answer-label">标准回答：</span>beta 控制偏好优化相对参考模型的尺度，也可理解为 KL 约束强度的相关温度参数。beta 太大，策略容易激进、概率塌缩；beta 太小，更新保守，偏好信号不明显。</p>
+              <details class="deep">
+                <summary>追问：为什么初始化时 DPO loss 常接近 0.693？</summary>
+                <div class="deep-body">
+                  <p>如果策略模型初始等于参考模型，那么 chosen 和 rejected 的 log-ratio 都接近 0，margin 接近 0，损失约为 $-\log\sigma(0)=\log 2\approx0.693$。这是非常实用的实现健全性检查。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：DPO 常见的训练失效模式是什么？</h3>
+              <p><span class="answer-label">标准回答：</span>包括 chosen 概率也下降、chosen/rejected margin 极端化、长度偏置、离线数据分布偏移和过拟合偏好格式。评估时不能只看训练 loss，还要看胜率、KL、长度、拒答率和通用能力回归。</p>
+              <p><span class="pitfall-label">常见误区：</span>DPO 省掉奖励模型不等于没有奖励偏差；偏差仍可能藏在偏好数据、参考模型和采样分布里。</p>
+            </div>
+          </section>
+
+          <!-- ============ Section: 方法选型、数据卫生与故障排查 ============ -->
+          <h2>方法横向对比：从离线偏好到可验证奖励</h2>
+          <p>前面的变体家族按“各自解决什么短板”来讲，这里给出一张可直接用于面试和方案评审的选型表。要特别区分两类问题：DPO/IPO/KTO/ORPO/SimPO 主要学习<strong>人类或模型给出的偏好</strong>；GRPO 主要利用<strong>可计算的奖励</strong>（规则验证器、单元测试、数学答案检查器或奖励模型）做在线/半在线探索。GRPO 不是“DPO 的又一个损失函数”，而是另一条需要 rollout 的强化学习训练路线。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方法</th><th>目标与核心损失</th><th>数据格式</th><th>参考模型</th><th>reward model / verifier</th><th>适用场景与主要代价</th></tr></thead>
+              <tbody>
+                <tr><td><strong>DPO</strong></td><td>最大化 chosen 相对 rejected 的隐式奖励 margin；sigmoid 分类损失</td><td><code>{prompt, chosen, rejected}</code> 成对偏好</td><td>需要（可缓存 logprob；LoRA 可共享底座）</td><td>不需要显式 RM</td><td>高质量离线偏好、快速对齐的默认起点；对噪声和分布偏移敏感</td></tr>
+                <tr><td><strong>IPO</strong></td><td>把 log-ratio 差回归到固定目标 $1/(2\beta)$，防止 margin 无限增大</td><td>同 DPO</td><td>需要</td><td>不需要显式 RM</td><td>偏好数据少、标签确定性强、DPO 过拟合明显；收敛更保守</td></tr>
+                <tr><td><strong>KTO</strong></td><td>以参考基线和前景理论权重分别推高 good、压低 bad</td><td><code>{prompt, completion, label}</code>，label 为 good/bad</td><td>需要</td><td>不需要显式 RM</td><td>已有点赞/点踩等单点日志；标签不平衡时需校准权重</td></tr>
+                <tr><td><strong>ORPO</strong></td><td>SFT 的 NLL 加 odds-ratio preference 项，单阶段优化</td><td><code>{prompt, chosen, rejected}</code> 成对偏好</td><td>不需要</td><td>不需要显式 RM</td><td>希望把 SFT 与偏好合并、减少显存；NLL 与偏好项的权重需要调节</td></tr>
+                <tr><td><strong>SimPO</strong></td><td>长度归一化的 policy logprob 加固定 margin $\gamma$</td><td><code>{prompt, chosen, rejected}</code> 成对偏好</td><td>不需要</td><td>不需要显式 RM</td><td>显存紧张或长度偏置突出；失去 reference 锚点后更依赖 $\beta,\gamma$ 与早停</td></tr>
+                <tr><td><strong>GRPO</strong></td><td>同一 prompt 采样一组回答，用组内相对优势更新策略，通常附加 KL 正则</td><td><code>{prompt, group_answers[], rewards[]}</code>，或 prompt + verifier</td><td>通常需要冻结 reference 计算 KL；实现也可关闭</td><td>需要 reward function；可为 verifier，不一定是 RM</td><td>数学/代码等可验证任务、需要探索与 on-policy 修正；需要 rollout、采样和奖励基础设施</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <pre><code class="language-json">// DPO / IPO / ORPO / SimPO：成对偏好
+{"prompt":"解方程 2x+1=5","chosen":"x=2，因为 2×2+1=5。","rejected":"x=3。"}
+
+// KTO：单点反馈
+{"prompt":"解释 TCP 三次握手","completion":"...","label":"good"}
+{"prompt":"解释 TCP 三次握手","completion":"...","label":"bad"}
+
+// GRPO：同一 prompt 的多条 rollout + 可验证奖励
+{"prompt":"计算 17×19","answers":["323","317","323\n推导略"],"rewards":[1.0,0.0,1.0]}</code></pre>
+
+          <p>一个常见误解是“GRPO 不需要 reward model，所以和 DPO 一样免奖励”。准确说法是：GRPO 不一定需要<strong>学习型奖励模型</strong>，但必须有奖励来源；在可验证任务中这个来源通常是程序验证器。没有 verifier、RM 或其他可计算反馈时，GRPO 没有优势函数可用，应该优先选择离线偏好方法。</p>
+
+          <h3>偏好数据卫生：先证明信号可靠，再调损失</h3>
+          <p>偏好数据的第一步不是训练，而是审计。建议按 prompt 分组切分 train/validation，避免同一 prompt 的近重复回答泄漏；同时统计 chosen/rejected 的长度、来源模型、语言、领域和标注者一致性。对每条样本记录一个可复现的 <code>pair_id</code>，便于回溯错误标签。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>审计项</th><th>建议统计</th><th>危险信号</th><th>处理动作</th></tr></thead>
+              <tbody>
+                <tr><td><strong>长度混淆</strong></td><td>$\Delta L=\mathrm{len}(chosen)-\mathrm{len}(rejected)$ 的均值、分位数，以及长度分桶后的 chosen 胜率</td><td>chosen 显著更长；胜率随 $\Delta L$ 单调上升</td><td>长度分层配平、同长度重采样；评测同时报告平均长度</td></tr>
+                <tr><td><strong>标签噪声</strong></td><td>多标注者一致率、judge 交换顺序一致率、重复样本冲突率</td><td>同一 pair 反复标注结果冲突；换位置后胜负翻转</td><td>剔除低置信样本；对 judge 做位置随机化和双向评审</td></tr>
+                <tr><td><strong>区分度</strong></td><td>两答案的 reward/judge 分差与人工“明显优于”比例</td><td>chosen 与 rejected 几乎相同或均不可用</td><td>设最小分差阈值；增加 hard negative 而不是重复 easy pair</td></tr>
+                <tr><td><strong>来源偏差</strong></td><td>按生成模型、领域、语言、模板分组统计</td><td>模型只在某个来源或模板上提升</td><td>分层采样、去重、留出跨来源验证集</td></tr>
+                <tr><td><strong>分布覆盖</strong></td><td>prompt 长度、任务类型、拒答/安全样本占比</td><td>训练集窄，线上 prompt 不在覆盖范围</td><td>混入 on-policy 样本；对关键领域单独设回归集</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>长度偏置尤其容易被忽视。原始 DPO 使用序列 log-probability 的<strong>求和</strong>，长度越长数值通常越负；但如果标注者又偏好更长、更完整的回答，优化器会同时面对“长回答的概率惩罚”和“标签要求更长”两个相反信号，最终可能通过模板化填充来取巧。不要只看全局平均长度，应画出 $\Delta L$ 与 margin、win rate 的散点或分桶曲线；若控制长度后胜率明显回落，说明模型学到的是长度代理而非质量。</p>
+
+          <h3>工程参数：beta、学习率、batch 与 reference logprob 缓存</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>参数</th><th>增大后的典型影响</th><th>过大症状</th><th>过小症状</th><th>调参顺序</th></tr></thead>
+              <tbody>
+                <tr><td><strong>$\beta$</strong></td><td>放大 log-ratio margin 的尺度，使偏好信号更快进入饱和区；实践上也加强对 reference 的约束</td><td>margin 很快变大、loss 饱和、策略几乎不动或梯度变小</td><td>策略远离 reference，KL/长度/通用能力异常</td><td>先固定学习率做小网格，再用 KL 与 held-out win rate 选点</td></tr>
+                <tr><td><strong>学习率</strong></td><td>单步改变更大，收敛快但方差高</td><td>loss 抖动、chosen reward 下坠、KL 爆炸</td><td>margin 长期近 0，像没有训练</td><td>DPO 通常从 SFT 的 1/10 至 1/100 起步，按模型与 LoRA 规模复核</td></tr>
+                <tr><td><strong>有效 batch</strong></td><td>梯度估计更稳定，pair 难度分布更平滑</td><td>吞吐下降、单步延迟高；若总 token 不变未必更好</td><td>margin/accuracy 高噪声，对少数 pair 过拟合</td><td>优先保证每步足够多的 prompt，再用 gradient accumulation 补齐</td></tr>
+                <tr><td><strong>epoch / max steps</strong></td><td>更多遍历会继续压低离线 loss</td><td>训练集 accuracy 很高但人工 win rate、KL 或多样性恶化</td><td>偏好信号尚未学到</td><td>通常 1 epoch 起步，保存中间 checkpoint 做外部评测</td></tr>
+                <tr><td><strong>reference logprob cache</strong></td><td>去掉 reference 的训练时前向，显著节省算力</td><td>缓存与 tokenizer/template/截断不一致，loss 仍下降但结果静默错误</td><td>每步重复 reference 前向，吞吐低</td><td>缓存记录模型 hash、tokenizer hash、模板、max_length、dtype 和数据版本</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>缓存的正确性可以用一个小批次做“在线-离线双算”：随机抽样 32 条，比较实时 reference logprob 与缓存值的最大绝对误差；只有在误差低于设定阈值后才启动长训练。注意 padding、EOS、chat template 和只计算 completion 的 mask 必须完全一致。</p>
+
+          <h3>训练指标与故障排查：不要只盯 loss</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>定义/观察方式</th><th>健康趋势</th><th>异常组合与定位</th></tr></thead>
+              <tbody>
+                <tr><td><strong>loss</strong></td><td>DPO/IPO/ORPO 的训练目标；同时看 train 与 held-out</td><td>前期下降，后期趋稳</td><td>第 0 步非 $\log2$：初始化、模板或 mask 错；train 降而 valid 升：过拟合</td></tr>
+                <tr><td><strong>reward margin</strong></td><td>$r_w-r_l$，即 chosen/rejected 隐式奖励差</td><td>缓慢增大并在合理范围稳定</td><td>陡增且 loss 饱和：$\beta$/学习率过激或 pair 太容易；不动：数据无区分度或约束太强</td></tr>
+                <tr><td><strong>KL</strong></td><td>策略相对 reference 的 token-level 或 sequence-level KL</td><td>小幅上升后稳定</td><td>KL 爆炸伴随能力掉点：降 LR/增大约束；KL 近零且 win rate 不动：信号没传进去</td></tr>
+                <tr><td><strong>win rate</strong></td><td>held-out pair 或独立 judge 上策略胜率；不要只用训练 pair</td><td>与人工质量同向上升</td><td>train margin 上升但 win rate 不升：数据泄漏、长度/格式偏置或过拟合</td></tr>
+                <tr><td><strong>长度变化</strong></td><td>固定 prompt 集的平均、P50/P90 completion tokens</td><td>变化可解释且与质量同步</td><td>长度暴涨、重复、拒答率变化：模型学到长度代理或出现 reward hacking</td></tr>
+                <tr><td><strong>chosen/rejected reward</strong></td><td>分别记录绝对隐式奖励，不只记录 margin</td><td>chosen 不应持续深跌</td><td>margin 上升但两者都下跌：概率塌缩；考虑 NLL/SFT 正则、增大 $\beta$、早停</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  A[训练指标异常] --> B{第0步 loss 约等于 0.693?}
+  B -->|否| C[检查 reference 权重、chat template、EOS、completion mask、缓存版本]
+  B -->|是| D{train loss 降、valid loss/胜率不升?}
+  D -->|是| E[减少 epoch/学习率；清理重复与噪声 pair；按 prompt 切分]
+  D -->|否| F{margin 上升但 KL/长度暴涨?}
+  F -->|是| G[增大 beta 或加入 NLL；降低学习率；检查长度偏置]
+  F -->|否| H{margin 长期约等于 0?}
+  H -->|是| I[抽查 chosen/rejected 区分度；核对梯度、batch、缓存与 beta]
+  H -->|否| J[固定 checkpoint 做独立 win rate、通用能力和人工评测]
+            </div>
+            <figcaption>排障顺序：先排除实现错误，再区分过拟合、激进更新和无效数据。只有训练内指标与独立生成评测一致，才说明“训练有效”。</figcaption>
+          </figure>
+
+          <pre><code class="language-python"># 伪代码：每隔 N 步做统一监控，避免只记录 loss
+metrics = {
+    "loss": loss.item(),
+    "margin": (chosen_reward - rejected_reward).mean().item(),
+    "chosen_reward": chosen_reward.mean().item(),
+    "rejected_reward": rejected_reward.mean().item(),
+    "pair_acc": (chosen_reward &gt; rejected_reward).float().mean().item(),
+    "length_chosen": chosen_mask.sum(-1).float().mean().item(),
+    "length_rejected": rejected_mask.sum(-1).float().mean().item(),
+    "kl_to_ref": estimate_token_kl(policy_logits, ref_logits, completion_mask),
+}
+# 训练集指标只用于定位；定期在 held-out prompts 生成并计算 win rate
+if step % eval_every == 0:
+    checkpoint = save_checkpoint(step)
+    win_rate = pairwise_eval(checkpoint, heldout_prompts)
+    if win_rate &lt; best_win_rate and metrics["margin"] &gt; last_margin:
+        flag("可能是长度偏置、数据泄漏或过拟合")</code></pre>
+
+          <section class="interview-box">
+            <h2>面试回答模板：把“会背公式”讲成“会做决策”</h2>
+            <div class="interview-q">
+              <h3>Q4：为什么说 DPO 不是无损的 RLHF？</h3>
+              <p><span class="answer-label">标准回答：</span>DPO 不是把 RLHF 完整等价地搬到监督学习里，而是在 Bradley-Terry 偏好模型、KL 参考策略、离线数据和策略最优解等假设下，得到一个可优化的替代目标。它省掉了显式 reward/value model 与 on-policy rollout，因此降低了工程成本，但也失去了奖励模型的平滑、在线探索和对当前策略分布的反馈。离线标签噪声、长度偏置和分布偏移会直接进入梯度；所以 DPO 是不同 bias-variance 与探索-稳定性取舍的方法，不是“零损失压缩版 PPO”。</p>
+            </div>
+            <div class="interview-q">
+              <h3>Q5：如何选择 DPO、IPO、KTO、ORPO、SimPO 和 GRPO？</h3>
+              <p><span class="answer-label">标准回答：</span>先看反馈形态和是否可验证：有成对偏好且数据质量尚可，先用 DPO；数据少或 DPO margin 无限制增大，用 IPO；只有点赞/点踩单点标签，用 KTO；希望 SFT 与偏好单阶段完成且不维护 reference，可试 ORPO；显存受限或长度偏置突出，用 SimPO；有数学/代码 verifier、需要当前策略持续探索时用 GRPO。最后用 held-out win rate、KL、长度和通用能力回归共同选 checkpoint，而不是只看训练 loss。</p>
+            </div>
+            <div class="interview-q">
+              <h3>Q6：DPO 训练 loss 下降但效果变差，你怎么排查？</h3>
+              <p><span class="answer-label">标准回答：</span>我会按顺序检查第 0 步 loss 是否约为 0.693、reference/cache 与 tokenizer/template/mask 是否一致；再比较 train/valid margin 和 win rate，确认是否过拟合或数据泄漏；随后看 chosen/rejected 的绝对 reward、KL、长度分布和拒答率，识别概率塌缩或长度代理。处理上优先早停、降低学习率/epoch、提高 $\beta$、加 NLL 正则并清理噪声 pair，最后用独立 prompt 做人工和自动评测。</p>
+            </div>
+          </section>
+
+          <h3>真实来源</h3>
+          <ul class="refs">
+            <li>ORPO: Monolithic Preference Optimization without Reference Model — ORPO 原始论文 · <a href="https://arxiv.org/abs/2403.07691" target="_blank" rel="noopener">arXiv:2403.07691</a></li>
+            <li>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models — 介绍 GRPO 与可验证奖励训练配方 · <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">arXiv:2402.03300</a></li>
+            <li>Hugging Face TRL Trainer 文档 — DPO、KTO、ORPO、GRPO 等训练器及监控参数 · <a href="https://huggingface.co/docs/trl/" target="_blank" rel="noopener">官方文档</a></li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Direct Preference Optimization: Your Language Model is Secretly a Reward Model — DPO 原始论文，提出闭式解消去奖励模型的核心推导 · <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">arXiv:2305.18290</a></li>
+            <li>A General Theoretical Paradigm to Understand Learning from Human Preferences — IPO 原始论文，分析 DPO 过拟合问题并提出恒等偏好目标 · <a href="https://arxiv.org/abs/2310.12036" target="_blank" rel="noopener">arXiv:2310.12036</a></li>
+            <li>KTO: Model Alignment as Prospect Theoretic Optimization — KTO 原始论文，用前景理论实现单点标签对齐 · <a href="https://arxiv.org/abs/2402.01306" target="_blank" rel="noopener">arXiv:2402.01306</a></li>
+            <li>SimPO: Simple Preference Optimization with a Reference-Free Reward — SimPO 原始论文，去掉参考模型并引入长度归一化 · <a href="https://arxiv.org/abs/2405.14734" target="_blank" rel="noopener">arXiv:2405.14734</a></li>
+            <li>Training language models to follow instructions with human feedback — InstructGPT 论文，DPO 所要替代的那套 RLHF 配方的原始出处 · <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener">arXiv:2203.02155</a></li>
+            <li>HuggingFace TRL DPO Trainer — 开源社区最广泛使用的偏好优化训练实现，支持 DPO 及多种变体损失，参数与指标名称以文档为准 · <a href="https://huggingface.co/docs/trl/dpo_trainer" target="_blank" rel="noopener">官方文档</a></li>
+            <li>ORPO: Monolithic Preference Optimization without Reference Model — 把 SFT 与偏好优化合并为单阶段的路线（论文名，可自行检索）</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            DPO 系方法解决了「偏好对齐」的问题，但偏好数据只能告诉模型「什么更好」，不能告诉它「什么是对的」。当奖励信号来自数学证明的正确性、代码的通过率等<strong>可验证</strong>的来源时，强化学习可以跳出人类标注的天花板——见 <a href="grpo-rlvr.html">推理强化学习</a>。想省显存把 DPO 跑在单卡上，见 <a href="peft-lora.html">参数高效微调</a>。对齐之后模型会不会变得太保守、为了无害而牺牲有用？这个权衡的机制和缓解见 <a href="safety-alignment.html">对齐税与安全对齐</a>。偏好数据本身怎么低成本造出来，见 <a href="../06-pretraining/synthetic-data.html">合成数据与数据飞轮</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

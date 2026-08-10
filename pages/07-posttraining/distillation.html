@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>知识蒸馏与能力迁移 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="07-posttraining" data-topic="distillation">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>知识蒸馏与能力迁移</h1>
+            <p class="lead">训练一个 70B 的老师太贵，但「偷」它的能力很便宜。知识蒸馏的本质，是用大模型产出的信号去训练小模型——信号可以是答案、中间特征，甚至思维链。同一套机制，既能换小模型继承能力，也能把大模型压缩到可部署的尺寸。这一页把蒸馏的机制、方法谱系、工程实践讲透。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>蒸馏是「师徒制」：老师（大模型）在给定输入上产生软信号——答案分布、隐层特征或推理轨迹——学生（小模型）在这些信号上做监督学习。学生学到的不只是「正确答案」，还有老师对「模糊地带」的犹豫和推理方式，这正是蒸馏比直接用小数据训练更高效的原因。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  subgraph T["教师 Teacher 大模型"]
+    direction TB
+    T1["输入 x"] --> T2["软标签分布<br/>隐层特征<br/>思维链轨迹"]
+  end
+  subgraph S["学生 Student 小模型"]
+    direction TB
+    S1["同一输入 x"] --> S2["输出分布"]
+  end
+  T2 --> L{"损失函数"}
+  S2 --> L
+  L --> G["梯度更新学生"]
+              </div>
+              <figcaption>蒸馏三元组：教师产信号，学生仿信号，损失把两者对齐</figcaption>
+            </figure>
+          </div>
+
+          <h2>一、统一视角：蒸馏到底在迁移什么</h2>
+          <p>把蒸馏放到一个统一视角下看，「知识」可以分三个层次，对应三种主流蒸馏方式：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Level1["层次一：输出信号"]
+    L1A["软标签分布<br/>（答案概率）"]
+    L1B["损失：KL 散度对齐"]
+    L1C["典型：Response Distillation"]
+  end
+  subgraph Level2["层次二：中间特征"]
+    L2A["隐层表示<br/>（每层激活）"]
+    L2B["损失：特征距离（MSE）"]
+    L2C["典型：Feature Distillation"]
+  end
+  subgraph Level3["层次三：推理过程"]
+    L3A["思维链 / 推理轨迹"]
+    L3B["损失：轨迹监督"]
+    L3C["典型：CoT Distillation"]
+  end
+  Level1 --> Deep["迁移深度递增"]
+  Level2 --> Deep
+  Level3 --> Deep
+  Deep --> Trade["代价也递增<br/>对齐难度 ↑"]
+            </div>
+            <figcaption>蒸馏的三个知识层次：输出信号最浅、中间特征居中、推理过程最深</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>蒸馏类型</th><th>迁移的信号</th><th>典型场景</th><th>代价</th></tr></thead>
+              <tbody>
+                <tr><td>Response（输出）蒸馏</td><td>答案概率分布</td><td>通用能力迁移、指令跟随</td><td>低（只需老师推理）</td></tr>
+                <tr><td>Feature（特征）蒸馏</td><td>中间层隐状态</td><td>同架构压缩、保语义</td><td>中（需对齐层位）</td></tr>
+                <tr><td>CoT（过程）蒸馏</td><td>思维链轨迹</td><td>推理能力迁移</td><td>高（轨迹标注贵）</td></tr>
+                <tr><td>数据合成蒸馏</td><td>老师生成的训练数据</td><td>扩充训练集、小模型指令数据</td><td>低-中（质量把控难）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这个统一视角还有一个实用价值：它给了排查方向。学生能力不够时，先问「丢的是哪一层知识」——如果是简单问答答不对，多半是输出层没对齐（查软标签数据与温度）；如果是复杂推理不成立，多半是推理轨迹没迁移（查 CoT 数据质量）；如果是风格不对但内容对，则更可能是特征层的语义偏差。三层知识对应三种调试抓手，比笼统地「调损失权重」高效得多。</p>
+
+          <h2>二、为什么软标签比硬标签好</h2>
+          <p>直接用小模型的「正确答案」训练（硬标签）也能学到能力，但软标签多给了关键信息：<strong>老师对「模糊地带」的犹豫</strong>。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Hard["硬标签"]
+    H1["猫：100% 狗：0%"]
+    H2["只学『猫』正确<br/>类间关系全丢"]
+  end
+  subgraph Soft["软标签"]
+    S1["猫：70% 狗：25% 狐狸：5%"]
+    S2["学到『猫和狗相似<br/>狐狸略远』的语义结构"]
+  end
+  Hard --> Loss["学生损失"]
+  Soft --> Loss2["学生损失"]
+  Loss2 --> Better["收敛更快<br/>泛化更好"]
+            </div>
+            <figcaption>软标签 vs 硬标签：软标签携带类间相似度信息，学生学到语义结构</figcaption>
+          </figure>
+
+          <p>数学上，软标签蒸馏用 KL 散度对齐老师与学生输出分布，配温度参数 T 软化分布：</p>
+          <p style="text-align:center;font-size:1.05em">$$\mathcal{L} = \alpha \cdot \text{KL}(p_{\text{teacher}}^{(T)} \| p_{\text{student}}^{(T)}) + (1-\alpha) \cdot \text{CE}(y_{\text{hard}}, p_{\text{student}})$$</p>
+          <p>温度 T 越高分布越「平」，越能暴露类间关系。典型做法：T 用 2-4，α 用 0.7-0.9（偏重软标签）。</p>
+          <p>这里有一个新手常问的问题：既然软标签信息量更大，为什么还要保留硬标签那一项？答案是<strong>软标签不保证「正确答案」概率够高</strong>。老师对一道题的信心可能只有 43%，把学生只往软分布上推，学生可能连「谁是正确答案」都学不牢；硬标签项的作用是钉死「正确的那一类必须显著高于其他类」，而软标签项负责「其他类之间要像老师那样排序」。两者一个管「准」、一个管「结构」，缺一个都会在测试集上露出短板——这也解释了为什么联合损失里 α 极少取到 0 或 1 的极端。</p>
+
+          <h2>三、主流蒸馏方法的谱系</h2>
+          <p>2023-2026 年的 LLM 蒸馏实践，主要围绕「怎么生成高质量训练信号」展开：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  Method1["MiniLM<br/>同架构特征蒸馏"] --> Main{"按场景选"}
+  Method2["指令蒸馏<br/>老师生成指令数据"] --> Main
+  Method3["CoT 蒸馏<br/>老师生成推理链"] --> Main
+  Method4["逐步蒸馏<br/>老师模型渐进缩小"] --> Main
+  Main --> R1["追求通用能力 → 指令蒸馏"]
+  Main --> R2["追求推理能力 → CoT 蒸馏"]
+  Main --> R3["同架构压缩 → 特征蒸馏"]
+            </div>
+            <figcaption>蒸馏方法谱系：按目标能力选择对应方法</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方法</th><th>信号来源</th><th>优点</th><th>代表工作</th></tr></thead>
+              <tbody>
+                <tr><td>指令蒸馏</td><td>老师生成的指令数据</td><td>数据可扩展、覆盖广</td><td>Alpaca、Vicuna</td></tr>
+                <tr><td>CoT 蒸馏</td><td>老师生成的推理链</td><td>推理能力迁移</td><td>Flan 系列、Orca</td></tr>
+                <tr><td>特征蒸馏</td><td>中间层隐状态</td><td>语义保真</td><td>MiniLM</td></tr>
+                <tr><td>自我蒸馏</td><td>模型自己的输出</td><td>无需大老师</td><td>Self-Distillation 系列</td></tr>
+                <tr><td>在线蒸馏</td><td>师生同步训练</td><td>老师持续变强</td><td>Online KD 系列</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>「特征蒸馏」这行值得展开讲——它是「白盒」路线的核心。MiniLM 是这条线最经典的工作之一，下面这张是它的论文原图：学生模仿的不再是老师的<strong>输出分布</strong>，而是老师<strong>最后一层 Transformer 的自注意力行为</strong>——也就是「模型内部怎么把注意力分给上下文里每个 token」这件事本身。</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/2002.10957/assets/x1.png" alt="论文原图：MiniLM 深度自注意力蒸馏框架——学生模仿老师最后一层 Transformer 的自注意力分布与值关系（Wang et al., 2020, Figure 1）" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：MiniLM 深度自注意力蒸馏——把「注意力怎么分配」本身当作迁移信号，学生学到的比「答案分布」更深一层</span>
+              <span class="pf-src">论文原图 · Wang et al., <em>MiniLM: Deep Self-Attention Distillation for Task-Agnostic Compression of Pre-Trained Transformers</em>, 2020, Figure 1 · <a href="https://arxiv.org/abs/2002.10957" target="_blank" rel="noopener">arXiv:2002.10957</a></span>
+            </figcaption>
+          </figure>
+
+          <p>读这张图看两块。左边是老师（Teacher）：输入一组 token 之后，最后一层 Transformer 会产出两个关键信号——<strong>自注意力分布</strong>（每个 token 应该「看」上下文里哪些位置、各占多少权重）和<strong>值关系（value-relation）</strong>（token 之间的值向量在语义上的关联模式）。右边是学生（Student）：它被要求在这两个信号上和老师对齐，同时仍然自己从头学做任务。中间那根「对齐」的连线，就是蒸馏损失的落点。</p>
+          <p>为什么模仿「注意力分配」比模仿「答案」更深？因为输出分布只反映了「最终结论」，而注意力分布反映了「<strong>达成结论的信息组织方式</strong>」。MiniLM 的观察是：学生把老师的自注意力分布学得像了，即使层数、维度都比老师小一截，也能在 GLUE 等任务上追平甚至反超同规模的 BERT 蒸馏基线。这正对应本页第二节的「三层知识」框架——输出信号是最浅的一层，中间特征（包括注意力）是更深的一层，代价是对齐成本更高（层位要设计、计算更贵）。MiniLM 之所以选「最后一层」而不是逐层对齐，也是在深度与成本之间取的折中。</p>
+
+          <p>选方法有一个反直觉的经验：别一开始就上最复杂的方法。CoT 蒸馏听起来高级，但轨迹标注贵、清洗难，如果任务本身不需要多步推理，迁移思维链属于浪费。反过来，通用指令蒸馏看起来简单，却对种子数据的广度极其敏感——种子任务覆盖不到的能力，老师再强也变不出来。先用指令蒸馏跑通闭环、把数据管线稳定下来，再按评估差距决定要不要上更深的迁移方式，是更稳的推进顺序。</p>
+
+          <h2>四、工程实践：一次完整的蒸馏流程</h2>
+          <p>实际做一次 LLM 蒸馏，关键是「老师数据生成 → 质量控制 → 学生训练」三步。数据质量往往比算法更影响结果。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant E as 工程师
+  participant T as 教师模型
+  participant Q as 质量控制
+  participant S as 学生模型
+  E->>T: ① 发送种子数据（高质量指令集 / 任务集）
+  T->>T: ② 生成 输出 + 思维链
+  T->>Q: ③ 提交候选样本
+  Q->>Q: 过滤低质量 / 重复 / 有害
+  Q->>S: ④ 配比混合（软标签 + 硬标签 + 通用数据）
+  S->>S: ⑤ KL + CE 联合损失训练
+  S-->>E: ⑥ 评估对比（学生 vs 老师 vs 基线）
+  alt 差距大
+    E-->>T: 回炉：调整种子数据重新生成
+  else 达标
+    E-->>S: 部署学生模型
+  end
+            </div>
+            <figcaption>LLM 蒸馏完整流程：种子数据 → 老师生成 → 质控 → 训练 → 评估，形成闭环</figcaption>
+          </figure>
+
+          <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def distillation_loss(student_logits, teacher_logits,
+                     hard_labels, temperature=3.0, alpha=0.8):
+    """软硬标签联合蒸馏损失
+
+    Args:
+        student_logits: 学生模型 logits
+        teacher_logits: 教师模型 logits（同一输入）
+        hard_labels: 真实标签
+        temperature: 软化温度
+        alpha: 软标签损失权重
+    """
+    # 1. 软标签损失：KL 散度（带温度）
+    soft_loss = F.kl_div(
+        F.log_softmax(student_logits / temperature, dim=-1),
+        F.softmax(teacher_logits / temperature, dim=-1),
+        reduction="batchmean"
+    ) * (temperature ** 2)  # 温度平方缩放保持梯度量级
+
+    # 2. 硬标签损失：交叉熵
+    hard_loss = F.cross_entropy(student_logits, hard_labels)
+
+    # 3. 联合损失
+    return alpha * soft_loss + (1 - alpha) * hard_loss
+
+
+def train_student(student, teacher, dataloader, epochs=3):
+    """蒸馏训练主循环"""
+    opt = torch.optim.AdamW(student.parameters(), lr=5e-5)
+    teacher.eval()
+
+    for epoch in range(epochs):
+        for batch in dataloader:
+            input_ids = batch["input_ids"]
+            hard_labels = batch["labels"]
+
+            with torch.no_grad():
+                teacher_logits = teacher(input_ids).logits
+            student_logits = student(input_ids).logits
+
+            loss = distillation_loss(
+                student_logits, teacher_logits, hard_labels
+            )
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        print(f"epoch {epoch}: loss={loss.item():.4f}")</code></pre>
+
+          <h2>五、数据质量：蒸馏成败的分水岭</h2>
+          <p>业界共识：蒸馏的效果上限由<strong>老师数据的质量</strong>决定，而不是学生模型的架构。Alpaca 与 Vicuna 的早期差距、Orca 系列的质量控制流程，都指向同一个结论——「老师说什么」比「学生怎么学」更重要。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 指令质量过滤: 老师生成的海量数据
+  指令质量过滤 --> 丢弃: 低质量 / 重复
+  指令质量过滤 --> 正确性校验: 通过
+  正确性校验 --> 丢弃: 明显错误
+  正确性校验 --> 多样性控制: 通过
+  多样性控制 --> 去重: 样本过密
+  多样性控制 --> 高质量训练集: 合适
+  去重 --> 高质量训练集: 覆盖更多场景
+  丢弃 --> 高质量训练集: 防止学坏模式
+  高质量训练集 --> [*]
+            </div>
+            <figcaption>蒸馏数据质量控制流程：过滤、校验、去重三道关</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>质控手段</th><th>做什么</th><th>效果</th></tr></thead>
+              <tbody>
+                <tr><td>规则过滤</td><td>剔除空回答、超短/超长输出</td><td>去除明显噪声</td></tr>
+                <tr><td>LLM 质量评审</td><td>用另一个 LLM 打分过滤</td><td>提升整体质量</td></tr>
+                <tr><td>去重（MinHash）</td><td>移除语义重复数据</td><td>提升多样性</td></tr>
+                <tr><td>人工抽检</td><td>随机抽看标注质量</td><td>发现系统性偏差</td></tr>
+                <tr><td>困难样本增强</td><td>保留老师犯错但有价值的样本</td><td>学生学会边界</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>质控的执行主体往往是另一个更便宜的模型——让一个 7B 的评审模型去给 70B 老师生成的数据打分，成本远低于人工，却能把明显低质量样本拦下来。实践中「评审模型」与「学生模型」甚至可以复用同一份能力数据训练，形成一条良性循环：老师产出 → 评审过滤 → 学生训练 → 评审能力提升 → 过滤更准。</p>
+
+          <h2>六、蒸馏 vs 其他压缩手段</h2>
+          <p>想获得「小模型」，蒸馏不是唯一的路。量化、剪枝、蒸馏三者的定位完全不同，工程上常常组合使用：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((模型压缩三手段))
+    蒸馏
+      重新训练
+      从老师学能力
+      能力强
+      可跨架构
+    量化
+      压缩权重精度
+      无需重训
+      快但精度略降
+    剪枝
+      删除低价值权重
+      可能需重训
+      省显存与加速
+    工程组合
+      先蒸馏缩小
+      再量化部署
+            </div>
+            <figcaption>三种压缩手段的定位：蒸馏改能力、量化改精度、剪枝改结构，可组合</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>蒸馏</th><th>量化</th><th>剪枝</th></tr></thead>
+              <tbody>
+                <tr><td>是否重训</td><td>是</td><td>否（仅校准）</td><td>部分需重训</td></tr>
+                <tr><td>能跨架构</td><td>能（老师→学生不同架构）</td><td>否</td><td>否</td></tr>
+                <tr><td>压缩比</td><td>可到 10-100 倍</td><td>2-4 倍</td><td>1.2-2 倍</td></tr>
+                <tr><td>耗时</td><td>长（训练）</td><td>短（校准）</td><td>中</td></tr>
+                <tr><td>典型组合</td><td>先蒸馏</td><td>后量化</td><td>与蒸馏配合</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>七、2024-2026 进展与趋势</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方向</th><th>进展</th><th>影响</th></tr></thead>
+              <tbody>
+                <tr><td>推理蒸馏</td><td>长思维链迁移到小模型</td><td>小模型推理能力接近大模型</td></tr>
+                <tr><td>数据合成规模化</td><td>合成数据管线成熟</td><td>蒸馏数据成本大降</td></tr>
+                <tr><td>自我蒸馏</td><td>模型自己教自己</td><td>无需更大老师</td></tr>
+                <tr><td>蒸馏 + RL</td><td>蒸馏后 RL 增强</td><td>能力进一步逼近</td></tr>
+                <tr><td>可验证蒸馏</td><td>只在可验证任务上蒸馏</td><td>质量可控、防幻觉迁移</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>把这几条进展放到一起看，趋势非常清晰：蒸馏正在从「迁移知识」走向「迁移行为规范」。长思维链蒸馏迁移的是推理行为，可验证蒸馏迁移的是「只在能验证处作答」的谨慎行为，蒸馏加 RL 迁移的是「把会做的题做对」的优化行为。对工程师而言，这意味着蒸馏的对象不限于能力，还包括风格、边界感这类软约束——小模型正在越来越接近「大模型的缩小版」而不是「大模型的拙劣模仿」。</p>
+
+          <h2>八、算例：温度 T 是如何改变软标签的</h2>
+          <p>公式只告诉我们「T 越大分布越平」，但平到什么程度、对学生学习有什么影响，最好拿一组真实数字演算一遍。假设老师模型对某个样本输出了四个类别的原始 logits：猫 3.0、狗 1.5、狐狸 0.5、兔子 -1.0。softmax 的公式是 <code>p_i = exp(z_i / T) / Σ_j exp(z_j / T)</code>，把不同 T 代进去，结果差异非常大。</p>
+          <p>先看 T=1（即普通 softmax）：exp(3.0)≈20.09，exp(1.5)≈4.48，exp(0.5)≈1.65，exp(-1.0)≈0.37，四项相加约 26.59，于是四个概率约为：猫 75.6%、狗 16.9%、狐狸 6.2%、兔子 1.4%。猫被 e^x 的指数放大效应捧得很高，类间结构几乎被压扁——狐狸和兔子都只剩个位数概率，学生从中读不到「狗和狐狸都比兔子更接近猫」这层信息。</p>
+          <p>再把 T 提到 3：每个 logits 先除以 3，得到 1.0、0.5、0.167、-0.333，取指数后是 2.72、1.65、1.18、0.72，求和 6.27，概率变为猫 43.3%、狗 26.3%、狐狸 18.9%、兔子 11.4%。分布明显变平，兔子也有超过一成的概率——此时软标签才真正把「类间相似度」暴露给学生：越是接近真实类别的类概率越高，学生能学到的结构远比「只有猫对」要丰富。</p>
+          <p>反过来，如果把 T 压到 0.5，logits 除以 0.5 等于放大两倍：6.0、3.0、1.0、-2.0，取指数后猫高达 94.6%、狗 4.7%、狐狸约 0.6%、兔子接近 0。这已经退化回「接近 one-hot 的硬标签」，温度太低等于白白放弃了蒸馏的优势。这就是为什么实践中 T 常取 2-4 这个区间：太低丢信息，太高又让损失梯度失去方向。</p>
+          <p>温度还会影响蒸馏损失的量纲。软标签蒸馏用 KL 散度对齐老师与学生的概率分布：<code>KL(p_t ‖ p_s) = Σ_i p_t(i) · log(p_t(i) / p_s(i))</code>。延续上面的例子，假设学生用 T=3 学到的是猫 55%、狗 30%、狐狸 10%、兔子 5%，老师是猫 43.3%、狗 26.3%、狐狸 18.9%、兔子 11.4%，代入公式：0.433×ln(0.433/0.55) + 0.263×ln(0.263/0.30) + 0.189×ln(0.189/0.10) + 0.114×ln(0.114/0.05) ≈ 0.433×(-0.239) + 0.263×(-0.132) + 0.189×0.636 + 0.114×0.824 ≈ -0.103 - 0.035 + 0.120 + 0.094 ≈ 0.076。也就是说这一条样本的软标签损失约 0.08。对比硬标签交叉熵：学生认为兔子概率只有 5% 而答案恰好是兔子，CE = -ln(0.05) ≈ 3.0——两者相差两个数量级，这正是软标签「平滑、好优化」的数学来源。</p>
+
+          <details class="deep">
+            <summary>展开：为什么代码里蒸馏损失要乘 T² 而不是 T</summary>
+            <div class="deep-body">
+              <p>本页第四节的代码里有一行注释：「温度平方缩放保持梯度量级」。原因是：把 logits 除以 T 再做 softmax，相当于把「输入到 softmax 的尺度」缩小了 T 倍。对分布做 log 后再取梯度，链式法则会把 1/T 一路带到梯度里——老师侧和学生侧各贡献一个 1/T，总共梯度被缩小 T² 倍。如果不乘回来，同样的学习率在温度 3 时更新量只有温度 1 时的九分之一，训练会慢到几乎不动。</p>
+              <p>用一个极简例子验证：单样本、单类别权重 w，学生 logits = w，T=3。学生的软化概率 p_s = exp(w/3)/Z，KL 对 w 的导数量级大约是 1/3 乘上某个介于 -1 和 1 之间的数；而硬标签交叉熵对 w 的导数量级是 1 左右。所以乘 T² = 9 之后，梯度量级才回到「和硬标签损失可比」的水平，α 这个软硬权重才真正有可调的合理范围。这也是为什么很多蒸馏实现把 T 当作训练超参而不是固定值——改 T 必须同步检查学习率或补偿系数，否则一切指标都会漂。</p>
+              <p style="margin-bottom:0">一个常见误读：T² 补偿只在「老师概率视为常数」的近似下严格成立，实际实现里老师和学生两侧都除以 T，最终经验上 T² 仍是最好用的经验系数。别过度推导，记住结论即可：温度每升高一倍，把软标签损失乘以 4 来补偿梯度量级。</p>
+            </div>
+          </details>
+
+          <h2>九、蒸馏 vs 直接微调：小模型的两种训练路线</h2>
+          <p>「既然要一个能跑的任务模型，为什么不直接用任务数据微调一个小模型，非要麻烦老师？」这是新手最容易问的问题。两条路线的差别不在「谁更省」，而在「监督信号里到底装了什么」。</p>
+          <p>直接微调（硬标签监督）：小模型只见到「这道题的正确答案是 B」，它只能把 B 的概率拉向 1，把其他答案压向 0。如果训练数据里 B 与 C 长得非常像（比如数学题里两个相近的化简路径），模型学到的只是「B 对 C 错」这两个孤立的事实，样本间相似关系、不确定性都无从谈起。</p>
+          <p>蒸馏（软标签监督）：小模型看到的是老师的完整分布。仍然举上一节的例子，即使兔子不是正确答案，老师也给了它 11.4% 的概率——学生学到的是「猫狗狐狸兔子构成一张相似度地图」。当测试时遇到训练里没见过的变体，这张地图能让学生把概率合理分配到相邻类别上，而不是武断地只押一个。用一个常见实验量级说明：在 1 万条指令数据上，直接微调 3B 模型测试准确率约 62%，同样数据用 70B 老师的软标签蒸馏约 67%——差距集中在「类间相近」的样本上（这类样本上两者分别约 68% 与 75%）。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>直接微调小模型</th><th>软标签蒸馏</th></tr></thead>
+              <tbody>
+                <tr><td>监督信号</td><td>正确答案（硬标签）</td><td>老师输出分布（软标签）</td></tr>
+                <tr><td>信号里的额外信息</td><td>几乎没有</td><td>类间相似度 + 不确定度</td></tr>
+                <tr><td>数据标注要求</td><td>需要带标注的任务数据</td><td>种子数据即可，老师自动打标</td></tr>
+                <tr><td>小样本时的表现</td><td>易过拟合、方差大</td><td>有老师先验，更稳</td></tr>
+                <tr><td>计算开销</td><td>只训一次小模型</td><td>先跑老师推理（贵），再训小模型</td></tr>
+                <tr><td>能力上限</td><td>受小模型容量限制</td><td>受老师质量 + 学生容量共同限制</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>两者的取舍非常明确：预算紧张、老师不可得时，直接微调是底线方案；手上有好老师、且在意泛化与数据效率时，蒸馏明显更优。值得注意的是蒸馏并不排斥硬标签——本页第二节的联合损失就是「软标签保泛化 + 硬标签保准确」的组合，很多生产配方把两者按 4:1 到 9:1 混合。</p>
+
+          <details class="deep">
+            <summary>展开：手算一个「蒸馏 1000 条 vs 微调 1000 条」的对比实验设计</summary>
+            <div class="deep-body">
+              <p>很多人好奇「蒸馏到底比直接微调好多少」，但直接读论文数字意义不大——数据集不同、老师不同，结论不可移植。更靠谱的做法是自己设计一个 1 小时能跑完的对照实验。下面给出一个具体可执行的方案。</p>
+              <p><strong>第一步，固定变量。</strong>取同一个学生模型（比如 3B 的开源模型），同一个种子数据集（比如 1000 条带标签的指令样本），唯一的自变量是「监督信号」：对照组用硬标签直接微调，实验组让一个 70B 老师给同样的输入生成软标签/完整输出，再做蒸馏。学习率、epoch、batch size 全部保持一致。</p>
+              <p><strong>第二步，选对评测指标。</strong>别只看总准确率——那是两边的平均水平，掩盖了差异。要拆成两组看：一是「类间相近样本」的准确率（比如两个答案都合理、只有细微差别的题），二是「训练集外变体」的准确率（把训练题的表述改几个字再测）。第一组直接体现软标签「类间相似度」的价值，第二组体现泛化能力。</p>
+              <p><strong>第三步，预期结果与判读。</strong>如果实验做出来两组都没差异，先别急着下「蒸馏没用」的结论——检查三件事：老师是否真的比学生强（老师都答不对，软标签就是噪声）；温度 T 是否落在 2-4（T 太低软标签退化成硬标签）；α 是否太低（硬标签主导，类间信息被淹没）。这三处任一有误，蒸馏的优势都会被吃掉。反过来，如果类间样本组有明显差距，就说明软标签的「语义结构」确实被学生学到了，值得把流程固化下来。</p>
+              <p style="margin-bottom:0">这个实验设计本身也是本页「只重训不评估」失败模式的解药：把评估表列出来、变量拆干净，蒸馏的效果就再也不是「感觉好像好一点」而是「在两个指定指标上差几个点」。</p>
+            </div>
+          </details>
+
+          <h2>十、白盒蒸馏与黑盒蒸馏：能碰到梯度吗</h2>
+          <p>选择蒸馏方法前先回答一个问题：你能访问老师模型的内部吗？「能」与「不能」直接把蒸馏分成两大流派，选错流派等于带错工具上工。</p>
+          <p><strong>白盒蒸馏</strong>：老师开源、权重可访问。除了输出分布，还能拿到中间隐层、注意力分布甚至每一层的梯度。MiniLM 等经典工作正是把老师的注意力矩阵和学生对齐做监督信号——迁移的是「模型在每一层怎么组织语义」这种深层知识。代价是苛刻：师生架构通常必须相近（层数、隐层维度要对齐），否则「第几层的特征跟第几层比」都要重新设计。</p>
+          <p><strong>黑盒蒸馏</strong>：老师只以 API 形式存在（如商用大模型的接口），你只能拿到它的输出文本。此时唯一能做的是「输出级数据蒸馏」：拿老师的生成结果当训练数据。Alpaca、Vicuna、Orca 走的都是这条路。它的优势是通用——任何语言模型都能当老师，不需要开源，也不要求架构匹配；代价是只能迁移「结果」而迁移不了「中间过程」，上限低于白盒。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>白盒蒸馏</th><th>黑盒蒸馏</th></tr></thead>
+              <tbody>
+                <tr><td>老师可访问内容</td><td>权重、隐层、注意力、梯度</td><td>仅有输出文本 / API</td></tr>
+                <tr><td>可迁移的信号</td><td>软标签 + 特征 + 轨迹</td><td>软标签（输出级）为主</td></tr>
+                <tr><td>典型方法</td><td>特征蒸馏（MiniLM）、注意力对齐</td><td>指令蒸馏、CoT 蒸馏（Alpaca/Orca）</td></tr>
+                <tr><td>架构要求</td><td>师生架构需对齐</td><td>无限制，任意模型可做老师</td></tr>
+                <tr><td>迁移深度</td><td>深（含中间表征）</td><td>浅（仅输出结果）</td></tr>
+                <tr><td>适用场景</td><td>自研开源模型、同架构压缩</td><td>商用 API 老师、快速数据扩充</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>现实里一个容易被忽略的点：白盒并不永远优于黑盒。当学生参数规模远小于老师时，老师的中间特征可能「太复杂」，学生反而学不动；此时退回到输出级蒸馏反而更稳。选择标准不是「哪个听起来更高级」，而是「学生能消化的知识层次有多深」。</p>
+
+          <h2>十一、蒸馏什么时候会翻车：失败模式与排查</h2>
+          <p>蒸馏不是「老师一教，学生必会」。实操里翻车通常集中在下面几个模式，多数可以在训练前用规则拦住。</p>
+          <ul>
+            <li><strong>幻觉与错误迁移</strong>：老师生成的数据里带幻觉、带错误推理，学生照单全收。可验证蒸馏（只在能判定对错的任务上蒸馏）就是专门应对这一条。排查方法：对老师输出做自动化校验，错误率超过阈值就回炉换种子数据。</li>
+            <li><strong>模式坍塌</strong>：老师对相似问题总给出相似回答，学生学成「复读机」，多样性急剧下降。应对：控制同一 prompt 的采样温度与采样次数，配合语义去重。</li>
+            <li><strong>温度与 α 调错</strong>：T 取到 10 以上，软标签分布几乎均匀，损失梯度失去方向，训练损失下降缓慢；T 取 1 以下，软标签退化成硬标签，白蒸馏一场。α 若取 0.5 以下，硬标签主导，类间结构再次丢失。</li>
+            <li><strong>数据配比失衡</strong>：软标签数据占 99%、通用数据只占 1%，学生能力向任务倾斜、通用能力退化——和「对齐税」是同一类问题。</li>
+            <li><strong>只重训不评估</strong>：训练完直接上线，没跟老师、基线做并排对比。蒸馏效果必须以「评估对比表」收口，否则无法判断损失下降是学到了知识还是过拟合了老师的噪声。</li>
+          </ul>
+          <p>这些失败模式共享同一个根因：蒸馏的本质是「把老师的行为当作数据」，而行为数据的质量和分布直接决定学生上限。工程上的正确姿态是：把老师当供应商，把质控当采购流程——先验收老师数据，再谈学生训练。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：蒸馏用大模型的输出信号训练小模型，迁移的是「软标签 / 特征 / 推理过程」三层次知识。</li>
+            <li><strong>软标签价值</strong>：携带类间相似度，学生学到语义结构；温度 T 软化分布，α 平衡软硬损失。</li>
+            <li><strong>方法谱系</strong>：指令蒸馏（通用）、CoT 蒸馏（推理）、特征蒸馏（同架构压缩）、自我/在线蒸馏。</li>
+            <li><strong>工程闭环</strong>：种子数据 → 老师生成 → 质量控制 → 混合配比 → 训练 → 评估对比。</li>
+            <li><strong>质量分水岭</strong>：数据质量决定效果上限；过滤、校验、去重三道关。</li>
+            <li><strong>vs 其他压缩</strong>：蒸馏改能力、量化改精度、剪枝改结构，先蒸馏再量化是常见组合。</li>
+            <li><strong>常见坑</strong>：忽视数据质量只调损失；蒸馏数据含幻觉被迁移；全盘照搬老师错误模式；不做评估对比直接部署。</li>
+            <li><strong>温度 T 算例</strong>：logits（3.0、1.5、0.5、-1.0）在 T=1 / 3 / 0.5 下最高类概率分别是 75.6% / 43.3% / 94.6%——T 越大分布越平、类间信息越足，但损失梯度越小，需 T² 补偿。</li>
+            <li><strong>vs 直接微调</strong>：蒸馏多拿一份「类间相似度 + 不确定度」信号，小样本更稳；代价是先跑老师推理，且上限受老师质量限制。</li>
+            <li><strong>白盒 vs 黑盒</strong>：白盒能迁移特征与轨迹但要求架构对齐；黑盒只能拿输出文本，通用但迁移深度浅。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Distilling the Knowledge in a Neural Network — 蒸馏奠基论文（Hinton 2015）· <a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">arXiv:1503.02531</a></li>
+            <li>Stanford Alpaca: An Instruction-following LLaMA model — 指令蒸馏代表作 · <a href="https://crfm.stanford.edu/2023/03/13/alpaca.html" target="_blank" rel="noopener">crfm.stanford.edu</a></li>
+            <li>Orca: Progressive Learning from Complex Explanation Traces of GPT-4 — 推理蒸馏代表作 · <a href="https://arxiv.org/abs/2306.02707" target="_blank" rel="noopener">arXiv:2306.02707</a></li>
+            <li>MiniLM: Deep Self-Attention Distillation — 特征蒸馏代表作 · <a href="https://arxiv.org/abs/2002.10957" target="_blank" rel="noopener">arXiv:2002.10957</a></li>
+            <li>DistilBERT: A Distilled Version of BERT — 最早把 Transformer 蒸馏做进生产流程的工作之一 · <a href="https://arxiv.org/abs/1910.01108" target="_blank" rel="noopener">arXiv:1910.01108</a></li>
+            <li>TinyBERT: Distilling BERT for Natural Language Understanding — 中间层特征蒸馏的代表作 · <a href="https://arxiv.org/abs/1909.10351" target="_blank" rel="noopener">arXiv:1909.10351</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            蒸馏产出的「小模型」常配合端侧部署：<a href="../09-efficiency/on-device-slm.html">端侧部署与 SLM</a>；参数高效微调是另一种低成本获取能力的方式，见 <a href="peft-lora.html">PEFT 与 LoRA</a>；免训练组合能力的路线见 <a href="model-merging.html">模型融合</a>。
+          </div>
+
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

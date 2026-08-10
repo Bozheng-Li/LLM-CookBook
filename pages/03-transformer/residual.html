@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>残差连接与深层稳定 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="03-transformer" data-topic="residual">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>残差连接与深层稳定</h1>
+            <p class="lead">为什么 ResNet 之前网络堆到二三十层就训不动，而今天的 Transformer 可以轻松到上百层？答案藏在一个极其简单的设计里：残差连接——给梯度一条"绕过"每层的直通通道。它是一行加法，却撑起了整个深度学习时代。这一节把这行加法拆到底：它在数学上做了什么、在工程上有哪些坑、以及如何用 20 行代码亲眼看见梯度消失。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>残差连接做的事一句话：<strong>把每层的输出改成"输入 + 这层的变换"，而不是"只有这层的变换"</strong>。这样哪怕这层学不到有用的东西（变换接近零），信息也能原封不动地通过"输入"这条捷径传到下一层。就像给每层楼装一部直通电梯——住几楼都不影响你直接走到一楼。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  X["输入 x"] --> S["子层 SubLayer<br/>注意力 / FFN"]
+  X -->|"残差捷径<br/>直接绕过"| A["+"]
+  S --> A
+  A --> Y["输出 y = x + F 的变换结果"]
+  style X fill:#e6f1fb,stroke:#185fa5
+  style A fill:#faeeda,stroke:#ba7517
+              </div>
+              <figcaption>残差连接的核心：输入 x 绕过子层直接加到输出上，形成 y = x + SubLayer 的输出。整节内容都是围绕这一个加号展开的。</figcaption>
+            </figure>
+          </div>
+
+          <h2>深层网络的致命问题：梯度消失</h2>
+          <p>在残差连接出现之前，网络越深效果越好——但只到一个临界点。超过二三十层后，网络不仅不提升，反而变差。根本原因是<strong>梯度消失</strong>。</p>
+          <p>反向传播用链式法则把损失对参数的梯度层层传递。对一个 $L$ 层的网络，第一层的梯度是 $L$ 个雅可比矩阵的连乘：</p>
+          <div class="figure" style="text-align:center">
+            $$\frac{\partial \mathcal{L}}{\partial \mathbf{x}_0} = \frac{\partial \mathcal{L}}{\partial \mathbf{x}_L} \cdot \prod_{l=1}^{L} \frac{\partial \mathbf{x}_l}{\partial \mathbf{x}_{l-1}}$$
+          </div>
+          <p>如果每个 $\frac{\partial \mathbf{x}_l}{\partial \mathbf{x}_{l-1}}$ 的范数平均小于 1（这很常见，因为激活函数如 ReLU/Sigmoid 会压缩梯度），连乘 $L$ 次后梯度就指数级趋近于 0——第一层几乎收不到学习信号。反之，如果平均大于 1，梯度就会指数级爆炸，训练直接发散。</p>
+
+          <p>"指数级"三个字很抽象，代进数字就非常直观了。假设每层雅可比范数是一个固定值 $\rho$，那么第一层收到的梯度大约被缩放了 $\rho^L$ 倍：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层数 $L$</th><th>$\rho=0.9$（略微压缩）</th><th>$\rho=0.95$（几乎不压缩）</th><th>$\rho=1.1$（略微放大）</th><th>结论</th></tr></thead>
+              <tbody>
+                <tr><td>10</td><td>0.35</td><td>0.60</td><td>2.6</td><td>都还能训</td></tr>
+                <tr><td>30</td><td>0.042</td><td>0.22</td><td>17</td><td>浅层学得明显更慢</td></tr>
+                <tr><td>50</td><td>0.0052</td><td>0.077</td><td>117</td><td>浅层基本停止学习</td></tr>
+                <tr><td>100</td><td>$2.7\times10^{-5}$</td><td>0.0059</td><td>$1.4\times10^{4}$</td><td><strong>不加残差已经训不动</strong></td></tr>
+                <tr><td>400</td><td>$5.0\times10^{-19}$</td><td>$1.2\times10^{-9}$</td><td>$3.6\times10^{16}$</td><td>要么消失要么爆炸</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>注意最关键的一点：<strong>$\rho$ 只要不是精确等于 1，深度一上去就必然走向两个极端之一</strong>。而让每一层的雅可比范数都恰好等于 1，靠调初始化和学习率是做不到的——它是一个不稳定的平衡点。残差连接的价值就在于：它不是"把 $\rho$ 调到 1 附近"，而是<strong>从结构上强行给每层的雅可比加了一个单位矩阵</strong>。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">关键认知</span>
+            梯度消失不是"梯度变成精确的零"，而是"经过层层连乘后数值小到浮点精度无法表示"。FP32 的最小正常数约 $1.2 \times 10^{-38}$，一个范数 0.9 的雅可比连乘 400 次就到了 $10^{-19}$ 量级——梯度虽在，但已经小到对参数更新毫无意义。在 FP16 下更早失效：FP16 的最小正常数约 $6.1 \times 10^{-5}$，一个 0.9 的雅可比连乘 100 次就已经掉到这个量级以下，直接下溢为零。这也是<a href="../06-pretraining/mixed-precision.html">混合精度训练</a>要配 loss scaling 的原因之一。
+          </div>
+
+          <h3>它不是过拟合，这一点很容易搞混</h3>
+          <p>深层网络退化最容易被误判成"参数太多、过拟合了"。但 ResNet 论文里的关键实验恰恰否定了这个解释：在同一份数据上分别训练一个 20 层和一个 56 层的普通卷积网络（没有残差），结果 56 层网络的<strong>训练误差</strong>也比 20 层更高。</p>
+          <p>训练误差更高意味着模型连训练集都拟合不了，这跟过拟合是反过来的。逻辑上，56 层网络完全可以把多出来的 36 层学成恒等映射，从而至少复现 20 层的表现——但优化器就是找不到这个解。<strong>所以问题出在"优化"而不是"容量"</strong>。残差连接干的事，就是把"学成恒等映射"这件事从"很难学到"变成"默认状态"。</p>
+
+          <h2>残差连接：给梯度一条高速公路</h2>
+          <p>2015 年，何恺明等人在 ResNet 论文里提出了一个极其简单的改动：把每层的输出从 $\mathbf{y} = F(\mathbf{x})$ 改成：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathbf{y} = \mathbf{x} + F(\mathbf{x})$$
+          </div>
+          <p>$F(\mathbf{x})$ 是这层的变换（在 Transformer 里就是注意力或 FFN）。多出来的那个 $\mathbf{x}$ 就是<strong>残差连接</strong>（也叫 shortcut / skip connection）。它让信息有两条路可走：经过 $F$ 变换，或者直接通过 $\mathbf{x}$ 绕过去。</p>
+
+          <p>这个改动对梯度的影响是决定性的。对 $\mathbf{y} = \mathbf{x} + F(\mathbf{x})$ 求导：</p>
+          <div class="figure" style="text-align:center">
+            $$\frac{\partial \mathbf{y}}{\partial \mathbf{x}} = \mathbf{I} + \frac{\partial F(\mathbf{x})}{\partial \mathbf{x}}$$
+          </div>
+          <p>这里的 $\mathbf{I}$ 是单位矩阵——<strong>不管 $\frac{\partial F}{\partial \mathbf{x}}$ 有多小，加上 $\mathbf{I}$ 后总有一份原样的梯度会穿过去</strong>。梯度不再需要通过 $F$ 的雅可比矩阵才能传回去，它有一条"加 1"的直通通道。100 层也好，1000 层也好，都存在一条乘积项全为 $\mathbf{I}$ 的路径，把梯度原封不动地送回第一层。</p>
+
+          <h3>手把手读 ResNet 论文原图</h3>
+          <p>残差连接的第一手出处，是 2015 年何恺明等人的 ResNet 论文《Deep Residual Learning for Image Recognition》。论文 Figure 2 画的就是那个著名的「残差学习块」——整个深度学习史被引用最多的结构图之一。它只有一条主分支和一条捷径，但把「学残差」这件事讲得清清楚楚。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/03-transformer/residual/fig2.png" alt="论文原图：残差学习块——输入 x 经权重层与 ReLU 变换成 F(x)，再由恒等捷径 x 直接相加得到输出" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：残差学习块——上面是带 ReLU 的两层变换 F(x)，右侧虚线是一条无参数的恒等捷径 identity，二者在 + 处相加</span>
+              <span class="pf-src">论文原图 · He et al., <em>Deep Residual Learning for Image Recognition</em>, 2015, Figure 2 · <a href="https://arxiv.org/abs/1512.03385" target="_blank" rel="noopener">arXiv:1512.03385</a></span>
+            </figcaption>
+          </figure>
+
+          <p>逐块读这张图，一共四个元素。第一块，<strong>左上角的输入 $\mathbf{x}$</strong>：它是这一层的输入向量，也是后面那条捷径的起点。第二块，<strong>中间的主分支</strong>：$\mathbf{x}$ 向下依次经过「权重层 → ReLU → 权重层」，这段变换在论文里记作 $F(\mathbf{x})$——对应到 Transformer，就是注意力或 FFN 子层。第三块，<strong>右侧那条标着 identity 的虚线捷径（shortcut）</strong>：它把 $\mathbf{x}$ 原封不动地绕开主分支，直接引到右下角的 $\oplus$ 求和处。注意捷径上<strong>没有任何可学习参数</strong>，所以它不增加参数量，也正因为它是恒等映射，梯度穿过它时不会被缩放。第四块，<strong>右下角的加法器</strong>：$F(\mathbf{x})$ 与 $\mathbf{x}$ 在这里逐元素相加，得到 $\mathbf{y} = F(\mathbf{x}) + \mathbf{x}$，再加一个 ReLU 作为这层的输出。</p>
+          <p>把这张图和上一节的梯度推导对照看，逻辑完全闭合：<strong>捷径给梯度提供了一条「不必穿过 $F$」的回传通道</strong>，主分支负责学「还差多少」，捷径负责「原样保底」。图里那句「identity」正是全图的灵魂——正因为捷径是恒等映射而非可学变换，深层训练才从「很难」变成「默认可行」。而图的右侧通常还有一条带注释的虚线标注：当输入输出维度不一致时（比如通道数减半的过渡层），捷径需要换成 $1\times1$ 卷积做投影——这就是本页后面要讲的「投影残差」。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            看到 $\mathbf{y} = \mathbf{x} + F(\mathbf{x})$ 里的「$+$」，有人会误以为残差是把两层网络「并联」起来——不对，<strong>主分支 $F$ 依然是串联依赖在 $\mathbf{x}$ 上的</strong>，只是输出时额外加了一份原始输入。另一个高频误解是把残差和归一化混为一谈：<strong>残差管的是「梯度直通」，归一化管的是「数值幅度」</strong>，两个解决的是不同问题。最后一个常见错误是维度——加法是<strong>逐元素向量加法</strong>，要求 $\mathbf{x}$ 与 $F(\mathbf{x})$ 维度完全一致，不一致时必须先做投影残差对齐，否则就是形状报错或静默的错位相加。
+          </div>
+
+          <details class="deep">
+            <summary>踩坑实录：残差分支初始化过大，训练第一步就 NaN</summary>
+            <div class="deep-body">
+              <p>一个典型的翻车过程：搭建深层 Transformer 时沿用了默认的线性层初始化，残差分支（注意力输出投影、FFN 输出投影）用常见的 Xavier / 均匀分布初始化，结果训练开始几百步，loss 直接变成 NaN，怎么调学习率都救不回来。</p>
+              <p>原因要回到残差的前向累加上去看。残差让 $N$ 层各自往残差流上加一份增量，如果每份增量的标准差是 $s$，$N$ 层之后总方差的量级就是 $\sqrt{N}\,s$。层数一多、初始化又偏大，深层的激活值很快就会涨到溢出的边缘，再叠上 FP16 的低精度范围，一轮反向传播就能把数值推到无穷。</p>
+              <p>正确的修法通常按严重程度分三步：最轻的是<strong>加 warmup 或调小学习率</strong>；更彻底的是<strong>对残差分支的输出投影做缩小初始化</strong>——GPT-2 的做法是按 $1/\sqrt{N}$ 缩放，让 $N$ 层累加后方差回到 $O(1)$；最稳的是<strong>把残差分支最后一层权重初始化为零</strong>（zero-init），让训练从严格恒等映射 $\mathbf{y}=\mathbf{x}$ 出发，再慢慢学增量。排查时先用「逐层激活 RMS 曲线」确认是哪一层先爆的，再对症下药。</p>
+              <p style="margin-bottom:0">这个坑的教训是：<strong>残差虽然给梯度开了绿灯，但也把前向的累加风险转嫁给了初始化</strong>——所以「深度 + 残差」的架构里，初始化策略不是细节，而是稳定性的一部分。</p>
+            </div>
+          </details>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  subgraph NoRes["无残差连接：梯度层层衰减"]
+    N1["Layer 1"] -->|"∂F₁ 范数 0.9"| N2["Layer 2"]
+    N2 -->|"∂F₂ 范数 0.9"| N3["Layer 3"]
+    N3 -->|"∂F₃ 范数 0.9"| N4["..."]
+    N4 -->|"∂F_L 范数 0.9"| N5["Layer L"]
+    N5 -.->|"梯度 ≈ 0.9^L<br/>指数衰减"| N1
+  end
+  subgraph WithRes["有残差连接：梯度直通"]
+    W1["Layer 1"] -->|"I + ∂F₁"| W2["Layer 2"]
+    W2 -->|"I + ∂F₂"| W3["Layer 3"]
+    W3 -->|"I + ∂F₃"| W4["..."]
+    W4 -->|"I + ∂F_L"| W5["Layer L"]
+    W5 -.->|"存在恒为 I 的路径<br/>无损传回"| W1
+  end
+  style N5 fill:#fcebeb,stroke:#a32d2d
+  style W5 fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>有无残差连接的梯度流对比：左边梯度经过连乘指数衰减，右边每层都有一条"加 I"的直通路径，因此总存在一条不衰减的回传通道。</figcaption>
+          </figure>
+
+          <p>把这条路径在时间轴上走一遍会更清楚。下面这张时序图模拟一次反向传播：损失从最后一层往回传，每经过一个 Block，梯度都会"分叉"成两份——一份钻进子层被缩放，一份沿残差通路原样继续往前。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant L as 损失函数
+  participant B3 as Block 3
+  participant B2 as Block 2
+  participant B1 as Block 1
+  L->>B3: 回传梯度 g
+  B3->>B3: 分叉：g 走残差通路 + g·∂F₃ 走子层
+  B3->>B2: 传出 g + g·∂F₃
+  B2->>B2: 再次分叉，残差那份不缩放
+  B2->>B1: 传出仍含一份原始 g
+  B1->>B1: 第一层拿到的梯度里始终有一份未衰减的 g
+  Note over B1,L: 关键：无论深度多大<br/>总存在一条乘积项全为 I 的路径
+            </div>
+            <figcaption>反向传播时序：每个 Block 都把梯度分成"走捷径"和"走子层"两份，捷径那份不被雅可比缩放，因此浅层永远收得到有效信号。</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            没有残差连接时，梯度像走楼梯——每下一层都要经过一道门，门太小（雅可比矩阵压缩）就走不过去了。有了残差连接，梯度像坐电梯——不管中间楼层怎么设计，总能直达。
+          </div>
+
+          <h2>动手：20 行代码看见梯度消失</h2>
+          <p>这一节的所有说法都可以自己验证。下面的脚本搭两个结构完全一样、只差一个加号的 32 层网络，各跑一次反向传播，然后打印第 1 层权重的梯度范数。</p>
+
+          <pre><code class="language-python">import torch
+import torch.nn as nn
+
+D, L = 64, 32          # 隐藏维度、层数
+
+class Block(nn.Module):
+    def __init__(self, residual):
+        super().__init__()
+        self.residual = residual
+        self.fc = nn.Linear(D, D)
+        self.act = nn.Tanh()          # tanh 的导数最大只有 1，天然会压缩梯度
+
+    def forward(self, x):
+        out = self.act(self.fc(x))
+        return x + out if self.residual else out
+
+def grad_norm_of_first_layer(residual):
+    torch.manual_seed(0)
+    net = nn.Sequential(*[Block(residual) for _ in range(L)])
+    x = torch.randn(8, D)
+    net(x).pow(2).mean().backward()   # 随便造一个标量损失
+    return net[0].fc.weight.grad.norm().item()
+
+print("plain   :", grad_norm_of_first_layer(residual=False))
+print("residual:", grad_norm_of_first_layer(residual=True))</code></pre>
+
+          <p>运行后你会看到：<strong>plain 网络第 1 层的梯度范数比 residual 网络小好几个数量级</strong>（具体倍数取决于随机种子和维度，但差距是稳定存在的）。把 <code>L</code> 从 32 改成 8 再跑一次，差距会明显缩小——这正好印证了"深度越大，差距越悬殊"。这个实验只有几十行，却是理解残差最快的路径：与其记结论，不如亲眼看到那几个数量级的差别。</p>
+
+          <div class="callout">
+            <span class="callout-t">进一步玩法</span>
+            把 <code>nn.Tanh()</code> 换成 <code>nn.ReLU()</code>，把 <code>L</code> 拉到 100，再在每个 Block 里加一个 <code>nn.LayerNorm(D)</code> 试试。你会发现归一化能缓解一部分数值失控，但只有残差能真正保住浅层的梯度——这两件事解决的不是同一个问题，详见 <a href="normalization.html">归一化技术</a>。
+          </div>
+
+          <h2>残差在 Transformer 中的具体形态</h2>
+          <p>Transformer 的每个 Block 有两个子层，每个子层都包了一条残差连接。以 Pre-Norm 架构为例（现代大模型标配）：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathbf{x}_{out} = \mathbf{x} + \text{SubLayer}\!\left(\text{Norm}(\mathbf{x})\right)$$
+          </div>
+          <p>注意力子层和 FFN 子层各做一次这样的操作。所以一个 Transformer Block 的完整前向是：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathbf{h} = \mathbf{x} + \text{Attn}\!\left(\text{Norm}_1(\mathbf{x})\right)$$
+            $$\mathbf{y} = \mathbf{h} + \text{FFN}\!\left(\text{Norm}_2(\mathbf{h})\right)$$
+          </div>
+          <p>残差连接（$\mathbf{x} + \dots$）和归一化（Norm）的配合关系决定了深层可训练性，详见 <a href="normalization.html">归一化技术</a> 一节对 Pre-Norm vs Post-Norm 的分析。关键在于：<strong>残差通路（那个直接加的 $\mathbf{x}$）上不能有归一化的除法阻断</strong>，这就是 Pre-Norm 比 Post-Norm 更适合深层的根本原因。</p>
+
+          <h3>残差流：把整个模型看成一条总线</h3>
+          <p>有一个视角能极大地简化对 Transformer 的理解——把所有残差连接串起来看，它们其实是同一条贯穿全模型的向量通道，通常叫作<strong>残差流（residual stream）</strong>。每个注意力头和每个 FFN 都不是"接在流水线上的一环"，而是<strong>从这条总线上读一份数据、算完之后再把结果加回总线</strong>。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  E["词嵌入<br/>写入初始值"] --> R1["残差流"]
+  R1 --> R2["残差流"] --> R3["残差流"] --> R4["残差流"] --> H["LM Head<br/>读出最终值"]
+  A1["Attn 层1<br/>读 → 算 → 加回"] -. 写入 .-> R2
+  R1 -. 读取 .-> A1
+  F1["FFN 层1<br/>读 → 算 → 加回"] -. 写入 .-> R3
+  R2 -. 读取 .-> F1
+  A2["Attn 层2"] -. 写入 .-> R4
+  R3 -. 读取 .-> A2
+  style R1 fill:#e6f1fb,stroke:#185fa5
+  style R2 fill:#e6f1fb,stroke:#185fa5
+  style R3 fill:#e6f1fb,stroke:#185fa5
+  style R4 fill:#e6f1fb,stroke:#185fa5
+            </div>
+            <figcaption>残差流视角：残差连接不是"每层的小捷径"，而是一条从词嵌入直达输出头的公共总线，各子层只负责往上面读写增量。</figcaption>
+          </figure>
+
+          <p>这个视角有三个直接好处。<strong>第一</strong>，它解释了为什么各层维度必须全部等于 $d_{model}$——大家读写的是同一条总线，位宽当然要一致。<strong>第二</strong>，它解释了为什么可以做<strong>层剪枝</strong>：删掉某一层只是少了一次"加法写入"，总线本身还在，模型不会崩，顶多质量下降。<strong>第三</strong>，它是可解释性研究的基础工具——研究者可以把最终 logits 拆成"每个注意力头往总线上写了多少贡献"，从而定位某个能力具体由哪几个头负责。</p>
+
+          <h2>残差连接让网络学"差量"而非"全量"</h2>
+          <p>除了稳定梯度，残差连接还有一个深层影响：它改变了网络学习的内容。</p>
+          <p>没有残差时，每层要直接学出目标表示 $\mathbf{y} = F(\mathbf{x})$——从零开始构造完整答案。有残差时，每层只需学 $\mathbf{y} - \mathbf{x} = F(\mathbf{x})$——也就是<strong>在输入基础上需要修正多少</strong>。这就像改作文：直接重写一篇（全量）比在原文上批注修改（差量）难得多。</p>
+          <p>当网络已经足够好、某层不需要做太多修正时，$F(\mathbf{x})$ 可以自然地学到接近零——这层的输出几乎等于输入，相当于"跳过"了这层。这种<strong>恒等映射的易学性</strong>让额外加的深层不会"帮倒忙"，网络深度可以放心增加。</p>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">无残差：学全量</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">每层要从头构造完整表示。深层时初始状态差，学起来难，容易越学越偏。想"什么都不做"反而需要精确学出一个单位映射，代价极高。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">有残差：学差量</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">每层只学"在输入基础上改多少"。不需要改时把权重压到接近零即可，深层网络不会"帮倒忙"，加层的边际风险接近零。</p>
+            </div>
+          </div>
+
+          <h2>工程细节：三个真实会踩的坑</h2>
+          <h3>坑一：维度不匹配与投影残差</h3>
+          <p>残差连接要求 $\mathbf{x}$ 和 $F(\mathbf{x})$ 维度相同才能相加。在大多数 Transformer Block 内部，注意力子层的输入输出维度一致，FFN 也是如此，直接相加即可。</p>
+          <p>但当<strong>维度发生变化</strong>时（比如通道数减半的过渡层），需要一条<strong>投影残差（projection shortcut）</strong>：用一个线性变换 $W_s$ 把 $\mathbf{x}$ 的维度对齐到 $F(\mathbf{x})$，即 $\mathbf{y} = W_s \mathbf{x} + F(\mathbf{x})$。在标准 Transformer 里，这通常出现在嵌入层到第一层、以及最后一层到输出头的过渡处。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">常见坑</span>
+            投影残差的初始化要小心。如果 $W_s$ 初始化得太大，残差通路上的信号会被放大，破坏梯度稳定性。实践中常用零初始化让残差分支初期接近恒等映射——让网络先"能训起来"，再慢慢学有用的变换。不少现代架构会把残差分支的最后一层权重初始化为零，确保初始时 $\mathbf{y} = \mathbf{x}$，训练从恒等映射出发。
+          </div>
+
+          <h3>坑二：残差分支的初始化缩放</h3>
+          <p>残差解决了梯度消失，但带来一个新问题：<strong>前向数值会随深度累加</strong>。每一层往残差流上加一份方差大致相当的增量，$N$ 层之后残差流的方差大致是初始值的 $N$ 倍——这会让深层的激活值越来越大，配合 Pre-Norm 时表现为"深层的子层贡献被 Norm 压得越来越小"。</p>
+          <p>常见的缓解办法是<strong>按深度缩小残差分支输出投影的初始化</strong>。GPT-2 的做法是把残差层的权重初始化按 $1/\sqrt{N}$ 缩放（$N$ 为残差层数量），让 $N$ 层累加后的方差回到 $O(1)$。DeepNet 则给出了另一条路线：给残差通路加一个与深度相关的常数系数 $\alpha$，即 $\mathbf{y} = \alpha\mathbf{x} + F(\mathbf{x})$，据此把 Transformer 稳定地堆到了 1000 层。</p>
+
+          <h3>坑三：混合精度下的残差累加</h3>
+          <p>这是训练框架层面最容易被忽略的一点。在 FP16/BF16 混合精度训练中，如果残差加法直接用低精度做，深层累加的舍入误差会不断放大——尤其 BF16 只有 8 位尾数，一个大数加一个小数时小数可能被整个吃掉。实践中框架通常把<strong>残差流保持在 FP32</strong>，只让矩阵乘法走低精度。相关细节见 <a href="../06-pretraining/mixed-precision.html">混合精度训练</a> 与 <a href="../06-pretraining/stability-optimizer.html">训练稳定性与优化器</a>。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>症状</th><th>可能原因</th><th>排查方向</th></tr></thead>
+              <tbody>
+                <tr><td>浅层参数几乎不更新，梯度范数逐层递减</td><td>残差通路被阻断（写成了 Post-Norm 或忘了加 <code>x</code>）</td><td>打印各层梯度范数，确认是否呈指数衰减</td></tr>
+                <tr><td>训练前几百步 loss 直接 NaN</td><td>残差分支初始化过大 / 未做 warmup</td><td>改用零初始化或 $1/\sqrt{N}$ 缩放，加 warmup</td></tr>
+                <tr><td>深层激活值随层数单调变大</td><td>残差累加导致方差随深度线性增长</td><td>检查是否有 Final Norm，检查初始化缩放</td></tr>
+                <tr><td>FP32 能训，BF16 就发散</td><td>残差累加在低精度下丢失有效位</td><td>把残差流强制保持 FP32</td></tr>
+                <tr><td>维度不匹配报错</td><td>子层改变了维度但没加投影残差</td><td>补 $W_s$ 线性投影并做小初始化</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>残差家族与深层稳定技术全景</h2>
+          <p>残差不是凭空出现的，它有前身，也有后续的一整套改良。理清这条线，能帮你看懂各种论文里五花八门的"某某 Norm + 某某 Init"组合到底在解决什么。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+timeline
+  title 从"堆不深"到"堆到千层"
+  2015 : Highway Networks 用门控让信息跨层直通 : ResNet 提出恒等捷径 深度突破百层
+  2016 : Identity Mappings 论证纯恒等通路最优 : 残差被解释为浅网络的隐式集成
+  2017 : Transformer 每个子层各配一条残差 : 但用 Post-Norm 需要 warmup 护航
+  2019 : GPT-2 按 1/根号N 缩放残差分支初始化
+  2020 : Pre-Norm 成为主流 深层训练不再需要精细调参
+  2022 : DeepNet 给残差通路加深度相关系数 稳定训练到 1000 层
+            </div>
+            <figcaption>残差相关技术的演进线：核心思想七年没变，变的是"如何在超深时控制残差累加的方差"。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方案</th><th>形式</th><th>解决什么</th><th>代价</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Highway Network</strong></td><td>$\mathbf{y} = T\odot F(\mathbf{x}) + (1-T)\odot \mathbf{x}$</td><td>用可学门控 $T$ 控制跨层直通比例</td><td>多一组门控参数，训练更复杂</td></tr>
+                <tr><td><strong>残差连接</strong>（ResNet）</td><td>$\mathbf{y} = \mathbf{x} + F(\mathbf{x})$</td><td>无参数的恒等捷径，梯度直通</td><td>前向方差随深度累加</td></tr>
+                <tr><td><strong>零初始化残差分支</strong></td><td>$F$ 的最后一层权重初始化为 0</td><td>训练从严格恒等映射出发，初期不炸</td><td>初期该层完全不起作用，收敛略慢</td></tr>
+                <tr><td><strong>$1/\sqrt{N}$ 初始化缩放</strong></td><td>残差分支输出投影按层数缩小</td><td>让 $N$ 层累加后方差保持 $O(1)$</td><td>需要知道总层数，改深度要重算</td></tr>
+                <tr><td><strong>DeepNet 系数</strong></td><td>$\mathbf{y} = \alpha\mathbf{x} + F(\mathbf{x})$，$\alpha$ 与深度相关</td><td>让 Post-Norm 也能堆到极深</td><td>$\alpha$ 需按公式推导，实现更复杂</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>对比项</th><th>没有残差</th><th>有残差</th></tr></thead>
+              <tbody>
+                <tr><td><strong>每层学什么</strong></td><td>完整的目标表示（全量）</td><td>相对输入的修正量（差量）</td></tr>
+                <tr><td><strong>"什么都不做"的难度</strong></td><td>要精确学出单位映射，很难</td><td>把 $F$ 压到接近零即可，很容易</td></tr>
+                <tr><td><strong>梯度回传</strong></td><td>必须穿过所有雅可比，指数衰减</td><td>存在恒为 $\mathbf{I}$ 的路径，不衰减</td></tr>
+                <tr><td><strong>加深的边际风险</strong></td><td>可能让训练误差反而变高</td><td>接近零风险，最差退化为跳过</td></tr>
+                <tr><td><strong>实际可堆深度</strong></td><td>经验上二三十层就开始退化</td><td>配合 Pre-Norm 可到上百层</td></tr>
+                <tr><td><strong>额外参数量</strong></td><td>—</td><td><strong>0</strong>（维度一致时就是一个加号）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">性价比之王</span>
+            上表最后一行值得单独强调：<strong>残差连接的额外参数量是零，额外计算量是一次逐元素加法</strong>。在深度学习所有的架构改进里，很难再找到第二个投入产出比这么极端的设计。
+          </div>
+
+          <h2>残差连接与模型容量的关系</h2>
+          <p>残差连接不只是"稳定训练"的工程技巧，它深刻改变了模型的容量结构。有研究表明，残差网络可以被理解为<strong>多个不同深度子网络的隐式集成</strong>——因为有残差捷径，信号可以选择在任何一层"跳出去"，相当于同时训练了从浅到深的多种路径。这解释了为什么深层残差网络即使参数量不大幅增加，效果也能持续提升。</p>
+          <p>在 Transformer 中，这种特性意味着一个 100 层的模型并不强制使用全部 100 层——简单模式可能只"走"几十层，复杂模式才走完全程。这种自适应深度是残差连接带来的意外礼物，也是<a href="../08-inference/index.html">早退（early exit）</a>类推理加速方法能够成立的前提。</p>
+
+          <details class="deep">
+            <summary>展开：为什么说残差网络是"$2^L$ 条路径的集成"</summary>
+            <div class="deep-body">
+              <p>把两层残差网络完全展开来看。第一层 $\mathbf{x}_1 = \mathbf{x}_0 + F_1(\mathbf{x}_0)$，第二层：</p>
+              <div style="text-align:center">$$\mathbf{x}_2 = \mathbf{x}_1 + F_2(\mathbf{x}_1) = \mathbf{x}_0 + F_1(\mathbf{x}_0) + F_2\big(\mathbf{x}_0 + F_1(\mathbf{x}_0)\big)$$</div>
+              <p>展开后一共出现了四种"路径"：什么都不过（$\mathbf{x}_0$）、只过 $F_1$、只过 $F_2$、两个都过。每增加一层，路径数就翻一倍——$L$ 层残差网络展开后共有 $2^L$ 条从输入到输出的通路。</p>
+              <p>这带来两个推论。<strong>其一</strong>，这些路径的长度分布集中在中等长度附近（服从二项分布），真正"走满全程"的路径只有 $1/2^L$ 的权重，所以有效深度远小于名义深度——这也是"残差网络表现得像浅网络集成"这一说法的来源。<strong>其二</strong>，删掉某一层只是砍掉了一半路径，剩下的一半仍然完整，所以残差网络对层删除表现出很强的鲁棒性；而普通串行网络删一层就直接断了。</p>
+              <p>需要注意，"集成"是一个解释性的类比而不是严格定义——这些路径共享参数，并不是真正独立的模型。但它对理解"为什么加层几乎无害"很有帮助。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：Pre-Norm 下梯度直通性的一行推导</summary>
+            <div class="deep-body">
+              <p>Pre-Norm 的第 $l$ 层是 $\mathbf{x}_{l} = \mathbf{x}_{l-1} + F_l(\text{Norm}(\mathbf{x}_{l-1}))$。对输入求导：</p>
+              <div style="text-align:center">$$\frac{\partial \mathbf{x}_{l}}{\partial \mathbf{x}_{l-1}} = \mathbf{I} + \frac{\partial F_l}{\partial \mathbf{x}_{l-1}}$$</div>
+              <p>从第 $L$ 层回传到第 0 层，梯度是这些项的连乘：$\prod_{l=1}^{L}\left(\mathbf{I} + \partial F_l\right)$。把它展开，其中必然包含一项是所有因子都取 $\mathbf{I}$ 的乘积，即 $\mathbf{I}$ 本身——<strong>这一项与深度无关，永远不衰减</strong>。</p>
+              <p>再看 Post-Norm：$\mathbf{x}_l = \text{Norm}(\mathbf{x}_{l-1} + F_l(\mathbf{x}_{l-1}))$。求导后每一层都多乘了一个 Norm 的雅可比 $\partial\text{Norm}$，连乘式变成 $\prod_l \partial\text{Norm}_l\left(\mathbf{I} + \partial F_l\right)$。由于 $\partial\text{Norm}$ 的范数通常小于 1（它本质上是一个除以标准差的操作），那条"纯 $\mathbf{I}$"的干净路径就被污染了，深度一大依然会衰减。</p>
+              <p>这就是 Pre-Norm 与 Post-Norm 差异的数学本质：<strong>不在于归一化算得好不好，而在于残差通路上有没有多乘东西</strong>。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：把每层输出改成 $\mathbf{x} + F(\mathbf{x})$，给信息和梯度一条绕过子层的直通通道。额外参数量为 0。</li>
+            <li><strong>解决的核心问题</strong>：深层网络的梯度消失——残差让雅可比里多出一个 $\mathbf{I}$，存在一条永不衰减的回传路径。</li>
+            <li><strong>不是过拟合问题</strong>：无残差的深层网络连训练误差都更高，说明瓶颈在优化而非容量。</li>
+            <li><strong>学习内容的变化</strong>：从学"全量表示"变成学"差量修正"，恒等映射成为易学的默认值，深层不会帮倒忙。</li>
+            <li><strong>残差流视角</strong>：所有残差串起来是一条贯穿全模型的总线，各子层只负责读取和写回增量——这也是层剪枝和可解释性分析的基础。</li>
+            <li><strong>与归一化的配合</strong>：Pre-Norm 保证残差通路上无归一化阻断，是百层以上 Transformer 的必要条件。</li>
+            <li><strong>关键数字</strong>：雅可比范数 0.9 时，100 层后梯度衰减到 $10^{-5}$ 量级；FP16 下 100 层左右就会直接下溢为零。</li>
+            <li><strong>常见坑</strong>：维度不匹配时需要投影残差；投影权重初始化过大破坏稳定性；深层要按 $1/\sqrt{N}$ 缩放残差分支初始化；混合精度下残差流应保持 FP32。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Deep Residual Learning for Image Recognition — ResNet 原始论文，提出残差连接，并用 20 层 vs 56 层的训练误差实验证明退化不是过拟合 · <a href="https://arxiv.org/abs/1512.03385" target="_blank" rel="noopener">arXiv:1512.03385</a></li>
+            <li>Identity Mappings in Deep Residual Networks — 分析残差连接中恒等映射的理论作用，论证保持残差通路"干净"的重要性 · <a href="https://arxiv.org/abs/1603.05027" target="_blank" rel="noopener">arXiv:1603.05027</a></li>
+            <li>Highway Networks — 残差连接的门控式前身，用可学门控让信息跨层直通 · <a href="https://arxiv.org/abs/1505.00387" target="_blank" rel="noopener">arXiv:1505.00387</a></li>
+            <li>Residual Networks Behave Like Ensembles of Relatively Shallow Networks — 提出"$2^L$ 条路径隐式集成"视角，解释残差网络为何对层删除鲁棒 · <a href="https://arxiv.org/abs/1605.06431" target="_blank" rel="noopener">arXiv:1605.06431</a></li>
+            <li>DeepNet: Scaling Transformers to 1,000 Layers — 给残差通路引入深度相关系数，把 Transformer 稳定训练到千层量级 · <a href="https://arxiv.org/abs/2203.00555" target="_blank" rel="noopener">arXiv:2203.00555</a></li>
+            <li>Attention Is All You Need — Transformer 原始论文，将残差连接应用于每个子层 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></li>
+            <li>Deep Residual Learning 论文 ar5iv 全文 — 本页残差块原图（Figure 2）的出处页面，可对照阅读 · <a href="https://ar5iv.labs.arxiv.org/html/1512.03385" target="_blank" rel="noopener">ar5iv 全文</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            残差连接、<a href="normalization.html">归一化技术</a> 和 <a href="ffn-activation.html">前馈网络</a> 三者一起构成了 Transformer Block 的完整图景。如果想看它们如何组装成完整的 Encoder/Decoder 架构，见 <a href="architecture.html">Transformer 完整架构</a>。如果想看深层架构的进一步演进，<a href="../04-modern-arch/moe.html">MoE</a> 和 <a href="../04-modern-arch/attention-variants.html">注意力变体</a> 是现代模型的两个关键方向。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

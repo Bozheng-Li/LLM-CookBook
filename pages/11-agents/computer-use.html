@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Computer Use 与 GUI Agent · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="11-agents" data-topic="computer-use">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>Computer Use 与 GUI Agent</h1>
+            <p class="lead">当 Agent 不再局限于「调 API」，而是直接「用你的电脑」——看屏幕、点按钮、填表单——人机交互的形态就变了。但这条路远比想象中难：OSWorld 上的成功率至今离「可靠」很远。这一页拆解屏幕理解、坐标定位与操作序列生成的技术栈，以及真实差距到底在哪。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>GUI Agent 的循环：截屏（或读取可访问性树）→ 模型理解界面 → 决定下一步操作（点哪里、输入什么）→ 执行 → 观察新状态，循环直到任务完成。与 API Agent 最大的区别是：它面对的是「人看的界面」，而不是「机器读的接口」。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  SC["屏幕截图<br/>+ a11y 树"] --> V["视觉理解<br/>识别按钮 / 表单 / 内容"]
+  V --> D{"决策"}
+  D -->|"点击"| C["坐标 (x, y)"]
+  D -->|"输入"| T["文本输入"]
+  D -->|"滚动 / 键鼠"| K["其他操作"]
+  C --> EX["执行操作"]
+  T --> EX
+  K --> EX
+  EX --> OBS["观察新屏幕"] --> V
+              </div>
+              <figcaption>GUI Agent 循环：感知界面 → 决策动作 → 执行 → 再感知</figcaption>
+            </figure>
+          </div>
+
+          <h2>一、GUI Agent 与 API Agent 的本质区别</h2>
+          <p>很多人以为 GUI Agent 只是「会截图的多模态 Agent」，实际上它和 API Agent 是两种完全不同的范式。API Agent 面对的是结构化的接口：参数明确、返回值确定、错误可捕获。GUI Agent 面对的是「为人类设计的界面」：像素、坐标、布局、视觉层级——这些信息天然是模糊的、高噪声的。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph API["API Agent（结构化）"]
+    A1["调用 API<br/>参数明确"]
+    A2["返回值确定"]
+    A3["错误可捕获"]
+    A4["可靠 · 但受接口限制"]
+  end
+  subgraph GUI["GUI Agent（非结构化）"]
+    G1["看屏幕<br/>像素 + 坐标"]
+    G2["界面语义模糊<br/>按钮/表单识别"]
+    G3["操作结果不确定<br/>可能弹窗 / 加载慢"]
+    G4["通用 · 但成功率低"]
+  end
+  API --> Q{"要哪种?"}
+  GUI --> Q
+  Q --> Ans["有 API → 用 API<br/>无 API / 遗留系统 → GUI"]
+            </div>
+            <figcaption>API Agent 与 GUI Agent 的范式对比：结构化 vs 非结构化，可靠 vs 通用</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>API Agent</th><th>GUI Agent</th></tr></thead>
+              <tbody>
+                <tr><td>交互对象</td><td>结构化接口</td><td>人类界面（像素）</td></tr>
+                <tr><td>反馈信号</td><td>明确返回值</td><td>屏幕变化（模糊）</td></tr>
+                <tr><td>错误处理</td><td>异常捕获</td><td>视觉状态判断</td></tr>
+                <tr><td>成功率</td><td>高</td><td>低（OSWorld ~20-40%）</td></tr>
+                <tr><td>通用性</td><td>受接口覆盖限制</td><td>任意应用可用</td></tr>
+                <tr><td>典型场景</td><td>云服务、数据库、工具调用</td><td>遗留系统、桌面应用、浏览器自动化</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            API Agent 是「机器对机器」，GUI Agent 是「机器假装成人」——假装会看、会点、会判断界面状态。后者要处理的信息噪声大得多，这也是成功率差距的根本来源。
+          </div>
+
+          <p>这个「假装成人」的比喻值得再展开一层，因为它揭示了 GUI Agent 的核心矛盾：<strong>人类界面的一切设计都是为「人的感知和动作」优化的，而不是为「机器的感知和动作」优化的</strong>。按钮要做成多大，取决于人的手指和鼠标能不能点中；界面布局要清晰，取决于人的注意力；操作反馈要直观，取决于人能不能一眼看出发生了什么。而机器面对的是一堆像素——没有「语义层级」，没有「焦点概念」，连「这个按钮现在能不能点」都只能从灰度和状态推断。这就是为什么一个人类三秒钟就能完成的操作，GUI Agent 往往需要好几步外加出错重试。</p>
+
+          <p>「用人类的方式操作手机 App」这个方向，有一篇被广泛引用的论文可以当第一手教材——AppAgent。它展示了 LLM 驱动的多模态 Agent 如何在<strong>完全不接入系统后端</strong>的情况下，靠「看屏幕 + 点/滑」操作真实的手机应用。看它的论文原图：</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/2312.13771/assets/x1.png" alt="论文原图：AppAgent 在多个手机 App 上的操作示例——通过简化的点击/滑动动作空间操作 Gmail、X、图片编辑等应用" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：AppAgent 的多应用操作示例——同一个框架靠「GUI 层交互」（点击、滑动）操作邮件、社交、地图、购物、图像编辑等 10 个应用，覆盖 50 个任务</span>
+              <span class="pf-src">论文原图 · Zhang et al. (Tencent), <em>AppAgent: Multimodal Agents as Smartphone Users</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2312.13771" target="_blank" rel="noopener">arXiv:2312.13771</a></span>
+            </figcaption>
+          </figure>
+
+          <p>手把手读这张图。图是若干个小分镜拼成的「多应用巡礼」——每个分镜里是一个真实的手机界面截图，配上 Agent 的动作标注（点击哪、滑向哪）。要抓住的不是「它认识很多 App」，而是每个分镜里的<strong>动作形态</strong>：全部是 <code>tap</code>（点）和 <code>swipe</code>（滑）这类极简动作。这正是 AppAgent 的核心设计——把动作空间压缩成「人怎么用手操作」的少数几种，模型不需要输出精确到像素的坐标，只需要在「界面元素编号」或「网格」上选择目标。对比你会在本页后面看到的「直接输出 (x,y) 坐标」方案，这种「元素级动作」牺牲了一点通用性，换来了可验证性和成功率。</p>
+
+          <p>另一个值得注意的细节：AppAgent 不是「上来就点」，而是先有一个<strong>探索阶段</strong>——Agent 先在 App 里自主乱点、观察每个界面长什么样，把「这个 App 有哪些页面、每个按钮做什么」记成一份文档；到了部署阶段，它查这份文档再决定怎么操作。这其实就是本页「页面状态跟踪」和「屏幕记忆」两个概念的雏形：<strong>把「每帧屏幕」升级成「对界面结构的持续理解」</strong>。这篇论文在 50 个任务上验证了可行性——但请注意，这些任务大多是单个 App 内的操作，和 OSWorld 那种跨应用长任务的成功率（20-40%）不在一个难度量级。读到这篇论文时，把它当成「GUI 交互可行性的证明」，而不是「GUI Agent 已经可靠」的证据。</p>
+
+          <p>另一个常被低估的差异是<strong>「接口的稳定性」</strong>。API 的字段名和格式由文档定义，版本之间有明确契约；而 GUI 的布局、文案、控件在每个版本里都可能变——按钮从一个位置挪到另一个位置，弹窗文案换了个说法，这些对人是无感的改变，对 GUI Agent 却是「界面完全变了」。这意味着 GUI Agent 需要持续的「界面漂移检测」：定期用回归任务集跑一遍，一旦成功率显著下降，就说明上游应用改版了，模型需要重新适配。这个维护成本在规划 GUI Agent 项目时就要算进去，它不像 API Agent 那样「接一次就能稳定跑很久」。</p>
+
+          <h2>二、感知：截图、可访问性树，还是两者混合</h2>
+          <p>GUI Agent 感知界面的方式直接决定能力上限，三种方案各有取舍：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>感知方式</th><th>原理</th><th>优点</th><th>局限</th></tr></thead>
+              <tbody>
+                <tr><td>纯截图 + 视觉模型</td><td>多模态模型直接看图</td><td>通用、不看实现细节</td><td>坐标定位精度差、token 贵、小元素看不清</td></tr>
+                <tr><td>可访问性树</td><td>读 DOM / a11y 结构</td><td>精确、便宜、元素语义全</td><td>依赖应用暴露结构，游戏/视频等场景拿不到</td></tr>
+                <tr><td>混合</td><td>截图给视觉 + 树给语义</td><td>取长补短，当前主流</td><td>两路要对齐，实现复杂度高</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Screen["纯截图路线"]
+    S1["整屏截图"]
+    S2["VLM 识别元素 + 坐标"]
+    S3["问题：小元素漏检<br/>坐标偏差 5-10px"]
+  end
+  subgraph Tree["可访问性树路线"]
+    T1["DOM / a11y 树"]
+    T2["结构化元素 + 语义"]
+    T3["问题：依赖应用暴露<br/>游戏 / 视频拿不到"]
+  end
+  subgraph Hybrid["混合路线（主流）"]
+    H1["截图（视觉上下文）"]
+    H2["a11y 树（精确元素）"]
+    H3["两路对齐<br/>用树元素引用坐标"]
+  end
+  Screen --> Hybrid
+  Tree --> Hybrid
+            </div>
+            <figcaption>三种感知方案：纯截图最通用但精度差，树最精确但覆盖窄，混合是当前主流</figcaption>
+          </figure>
+
+          <p>工程现实：浏览器内用 DOM 树最可靠；操作系统级（桌面应用）则更依赖截图 + 辅助功能接口；纯视觉方案是「最后的通用手段」，也是当前成功率最低的。</p>
+
+          <h2>三、定位与操作：从「说」到「做」的鸿沟</h2>
+          <p>即使模型「看懂了」界面，把意图变成精确操作仍是一道坎：</p>
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  V["视觉理解<br/>识别按钮 / 输入框"] --> E["元素定位<br/>引用 + 网格坐标"]
+  E --> A{"动作类型"}
+  A -->|"点击"| C["(x, y) 像素坐标"]
+  A -->|"输入"| T["文本序列"]
+  A -->|"滚动"| S["方向 + 距离"]
+  A -->|"组合键"| K["快捷键"]
+  C --> EX["执行"]
+  T --> EX
+  S --> EX
+  K --> EX
+  EX --> R["观察结果"]
+            </div>
+            <figcaption>从「看懂」到「做对」：元素定位 + 动作类型 + 坐标输出，每一步都可能引入误差</figcaption>
+          </figure>
+
+          <h3>3.1 三种定位方式</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>定位方式</th><th>做法</th><th>优点</th><th>缺点</th></tr></thead>
+              <tbody>
+                <tr><td>直接坐标</td><td>输出像素坐标 (x, y)</td><td>简单直接</td><td>分辨率敏感、偏移 5-10px 就点错</td></tr>
+                <tr><td>元素引用</td><td>给界面元素编号，输出「点 3 号」</td><td>精准、可验证</td><td>需要元素编号预处理</td></tr>
+                <tr><td>网格坐标</td><td>把屏幕切成网格，输出「第 2 行第 5 格」</td><td>粗粒度稳定</td><td>小元素跨格难定位</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>3.2 一个 GUI Agent 循环的最小实现</h3>
+          <pre><code class="language-python">import pyautogui
+from PIL import ImageGrab
+
+class GUIAgent:
+    """最小 GUI Agent：截屏 → 理解 → 操作 → 再截屏"""
+
+    def __init__(self, vlm, max_steps=20, screenshot_dir="./screens"):
+        self.vlm = vlm          # 视觉语言模型
+        self.max_steps = max_steps
+        self.screenshot_dir = screenshot_dir
+
+    def act(self, task):
+        """执行一个 GUI 任务，直到完成或达到步数上限"""
+        history = []
+        for step in range(self.max_steps):
+            # 1. 截取当前屏幕
+            img = ImageGrab.grab()  # 全屏截图
+            img.save(f"{self.screenshot_dir}/step_{step}.png")
+
+            # 2. 让 VLM 理解界面并决策
+            decision = self.vlm(
+                image=img,
+                prompt=(
+                    f"任务：{task}\n"
+                    f"历史操作：{history}\n\n"
+                    "请输出 JSON："
+                    '{"thought": "你的思考", "action": "click|type|scroll|done", '
+                    '"args": {...}}'
+                )
+            )
+
+            # 3. 解析并执行操作
+            act = decision["action"]
+            if act == "done":
+                return {"status": "success", "steps": step,
+                        "answer": decision.get("answer")}
+
+            self._execute(act, decision["args"])
+            history.append({"step": step, "action": act,
+                            "args": decision["args"]})
+
+        return {"status": "max_steps", "steps": self.max_steps}
+
+    def _execute(self, action, args):
+        """把决策变成真实操作"""
+        if action == "click":
+            x, y = args["x"], args["y"]
+            pyautogui.click(x, y)
+        elif action == "type":
+            pyautogui.typewrite(args["text"])
+        elif action == "scroll":
+            pyautogui.scroll(args.get("clicks", -3))
+        # ... 更多动作类型</code></pre>
+
+          <p>上面的实现刻意保持了最小，它缺少一个对成功率影响最大的环节——<strong>执行后的校验</strong>。生产级的 GUI Agent 循环不是「截屏→操作→再截屏」的裸循环，而是「操作 → 等待 → 验证预期变化 → 确认或修正」的闭环。把一步操作放大看，真实时序是这样的：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant V as VLM
+  participant G as GUI Agent
+  participant OS as 操作系统
+  participant S as 屏幕
+  V->>G: 决策: click (x=420, y=300)
+  G->>OS: 执行点击
+  OS->>S: 触发界面变化
+  Note over G: 等待加载(轮询或固定延迟)
+  G->>S: 截取新屏幕
+  G->>V: 校验: 期望出现弹窗/页面跳转?
+  V-->>G: 校验通过 / 未达预期
+  G->>G: 通过则进入下一步<br/>未达预期则修正或重试
+            </div>
+            <figcaption>一步 GUI 操作的完整闭环：操作 → 等待 → 截图校验 → 确认或修正。「执行后校验」是把错误从「滚雪球」变成「单点可修复」的关键</figcaption>
+          </figure>
+
+          <p>引入校验后，成功率曲线完全不同。设单步操作的错误率为 5%，20 步任务若不做校验，最终成功率约 \((0.95)^{20} \approx 36\%\)，错误全部累积；做了执行后校验，假设校验能发现并修正 80% 的错误，那么每一步的「有效错误率」降到约 1%，20 步后成功率提升到约 82%。这不是理论推演——几乎所有把 GUI Agent 成功率从个位数推到 30-50% 的工程实践，核心都落在「校验与纠错」上。</p>
+
+          <h2>四、为什么成功率上不去：OSWorld 的教训</h2>
+          <p>OSWorld 是目前最权威的 GUI Agent 基准之一：模型需要在真实的操作系统（Windows/Ubuntu/macOS）上完成 369 个真实任务（文件操作、浏览器、办公软件等），评估最终屏幕状态而非中间动作。到 2025 年，最好的模型成功率也只有 <strong>20-40%</strong>——远低于 API Agent 的 90%+。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Bottlenecks["成功率上不去的四大瓶颈"]
+    B1["视觉理解不足<br/>小元素 / 图标语义"
+    B2["坐标精度差<br/>偏移几像素就点错"]
+    B3["状态追踪弱<br/>页面变化难判断"]
+    B4["长序列误差累积<br/>20 步后错误率爆炸"]
+  end
+  subgraph Conseq["后果"]
+    C1["任务完成率 20-40%"]
+    C2["不适合关键业务"]
+    C3["需要人类监督兜底"]
+  end
+  Bottlenecks --> Conseq
+            </div>
+            <figcaption>OSWorld 揭示的四大瓶颈：视觉理解、坐标精度、状态追踪、长序列累积</figcaption>
+          </figure>
+
+          <ul>
+            <li><strong>视觉理解不足</strong>：模型能认出「大按钮」，但认不出「图标含义」「禁用状态」「hover 提示」这些精细语义；</li>
+            <li><strong>坐标精度差</strong>：VLM 输出的坐标普遍有 5-10px 偏差，小按钮直接点不中；</li>
+            <li><strong>状态追踪弱</strong>：点击后页面可能异步加载（弹窗、转圈、变灰），模型难以判断「现在是什么状态」；</li>
+            <li><strong>长序列误差累积</strong>：每一步有 5% 错误率，20 步之后成功率掉到 $(0.95)^{20} \approx 36\%$——错误像滚雪球。</li>
+          </ul>
+
+          <p>还有一个不在四大瓶颈之列、但同样致命的问题：<strong>评测基准本身偏向「简单任务」</strong>。OSWorld 的 369 个任务虽然真实，但大多是「打开文件另存为」「在浏览器里搜索并收藏」这类单个应用内的操作；跨应用协作（比如「把邮件附件里的表格填进另一个应用的表单」）的占比很小，而这恰恰是真实办公场景里最耗时的部分。所以当你看到某个模型的 OSWorld 分数时，要意识到这个数字代表的是「单应用内任务的完成率」，离「替人类完成一整天的工作」还有很大距离。</p>
+
+          <p>理解这些瓶颈的具体成因，也就能理解为什么「换一个更强的视觉模型」往往不是灵丹妙药。坐标精度差不是模型变笨了，而是「从像素到坐标」这个映射本身存在不确定性——一个 30px 宽的小按钮，5-10px 的偏差就是「点没点中」的差别；状态追踪弱也不是模型不懂界面，而是异步加载产生的「中间状态」信息密度极低，模型从一帧静态图里根本看不出来。这些问题的解法不在模型端，而在系统端：用可访问性树拿精确坐标、用状态机判定页面状态、用执行后校验拦截错误。这也印证了本页反复强调的观点——<strong>GUI Agent 的工程问题，靠的是架构设计而不是模型堆料</strong>。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">关键结论</span>
+            GUI Agent 目前适合「人工监督的半自动场景」——用户盯着它干活，出错时人工纠正。完全无人值守的 GUI 自动化，在绝大多数业务场景里还不现实。
+          </div>
+
+          <h2>五、一步操作要多久：延迟预算拆解</h2>
+          <p>GUI Agent 的另一个现实问题是<strong>慢</strong>。一个「点击几下、填个表单」的简单任务，跑起来往往要一两分钟，用户很难等得起。要理解为什么慢，就得把一步操作的耗时拆开看。一步完整操作由四个串行环节组成：截屏、模型理解、执行操作、等待界面稳定。把典型耗时列出来：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>环节</th><th>典型耗时</th><th>优化空间</th></tr></thead>
+              <tbody>
+                <tr><td>截屏（全屏 PNG）</td><td>50-200 ms</td><td>裁剪感兴趣区域、降低分辨率</td></tr>
+                <tr><td>VLM 理解 + 决策</td><td>1-4 秒</td><td>小模型路由、缓存相似界面</td></tr>
+                <tr><td>执行操作</td><td>10-100 ms</td><td>基本无优化空间</td></tr>
+                <tr><td>等待界面稳定</td><td>0.5-3 秒</td><td>轮询停止条件代替固定延迟</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>加总起来，一步操作约 2-6 秒，一个 15 步的任务就是 30-90 秒。瓶颈一目了然：<strong>VLM 决策占了大头</strong>。这解释了为什么「动作空间约束」和「执行后校验」能显著提效——它们都能减少不必要的决策轮次。比如动作白名单限制了模型只能在「点击/输入/滚动」里选，模型就不用反复纠结要不要做复杂操作；执行后校验把「一次做错、五次重来」的浪费压到「发现即修正」。还有一个立竿见影的优化是<strong>等待策略</strong>：很多实现用固定延迟（比如每次操作后固定等 2 秒），但真实界面有时 0.5 秒就稳定、有时要 5 秒。改成轮询——每 200ms 截一次图，对比界面状态变化，直到「不再变化」或超时——平均每步能省下 1 秒以上。</p>
+
+          <details class="deep">
+            <summary>展开：延迟预算的完整算例</summary>
+            <div class="deep-body">
+              <p>假设一个表单填写任务需要 12 步操作。方案 A（固定延迟 2 秒、无校验、VLM 每次全屏决策）的耗时估算：12 步 × (1.5 秒截屏决策 + 0.05 秒执行 + 2 秒固定等待) ≈ 12 × 3.55 ≈ 43 秒。</p>
+              <p>方案 B（轮询等待平均 0.8 秒、动作白名单、执行后校验，假设 20% 的步骤需要修正重做一次）的耗时估算：12 步中约 10 步一次通过、2 步需要重做，共约 14 步有效操作 × (1.0 秒裁剪决策 + 0.05 秒执行 + 0.8 秒轮询) ≈ 14 × 1.85 ≈ 26 秒。</p>
+              <p>同样是完成任务，方案 B 比方案 A 快约 40%，而且成功率更高。这个例子说明：GUI Agent 的「性能优化」和「成功率优化」经常是同一种手段的两面——减少决策轮次、缩短无效等待、尽早发现错误，对延迟和成功率同时有益。</p>
+              <p style="margin-bottom:0">以上数字是工程经验参考值，不同模型和界面差异较大，建议在自己的环境里实测「一步决策耗时」和「界面稳定时间」两个基准数据，再代入上面的框架计算。</p>
+            </div>
+          </details>
+
+          <h2>六、提高成功率的工程手段</h2>
+          <p>尽管整体成功率不高，业界已经沉淀出一套「工程提分」的手段，把成功率从个位数推到 30-50%：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Base["GUI Agent 基础循环"] --> M1["多模态理解增强"]
+  Base --> M2["动作空间约束"]
+  Base --> M3["状态校验闭环"]
+  Base --> M4["错误恢复机制"]
+  Base --> M5["记忆与规划"]
+
+  M1 --> D1["高分辨率输入<br/>元素裁剪放大"]
+  M2 --> D2["动作白名单<br/>只允许安全操作"]
+  M3 --> D3["执行后校验<br/>期望状态匹配"]
+  M4 --> D4["超时重试<br/>回退到上一步"]
+  M5 --> D5["屏幕变化记忆<br/>子任务规划"]
+            </div>
+            <figcaption>五大提分手段：增强感知、约束动作、校验状态、恢复错误、规划记忆</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>手段</th><th>具体做法</th><th>提升效果</th></tr></thead>
+              <tbody>
+                <tr><td>高分辨率输入</td><td>裁剪目标区域放大后识别</td><td>小元素识别率 +30%</td></tr>
+                <tr><td>动作白名单</td><td>只允许点击/输入/滚动，禁止危险操作</td><td>安全性提升，失误率下降</td></tr>
+                <tr><td>执行后校验</td><td>操作后对比期望状态与屏幕</td><td>错误早发现，不累积</td></tr>
+                <tr><td>错误恢复</td><td>超时重试、回退、换方案</td><td>长任务成功率翻倍</td></tr>
+                <tr><td>屏幕记忆</td><td>记住关键状态变化</td><td>减少重复探索</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>七、页面状态跟踪：从「看一帧」到「看懂状态机」</h2>
+          <p>GUI Agent 的一大痛点不是「看不见」，而是「不知道当前处于什么状态」。网页和桌面应用大多是异步的：点击按钮后，可能出现转圈、按钮变灰、内容局部刷新、弹窗覆盖——这些状态变化在截图里都能看到，但模型很难从「上一帧 vs 这一帧」的差异里准确推断「系统正在做什么、还要不要等」。这正是「状态追踪弱」这个瓶颈的根源。</p>
+
+          <p>工程上把界面建模成<strong>状态机</strong>，比让模型每次都从头理解一帧截图可靠得多。一个典型的交互页面有四个状态：空闲、加载中、有弹窗、出错。模型每执行一个动作，就预测「应该转移到哪个状态」，然后和截图观察到的实际状态比对——对不上就说明动作没生效或者出现了预期外的情况，需要等待、重试或回退：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 空闲
+  空闲 --> 加载中 : 点击/提交动作
+  加载中 --> 空闲 : 内容刷新完成
+  加载中 --> 出错 : 超时或错误提示
+  空闲 --> 弹窗 : 触发弹窗
+  弹窗 --> 空闲 : 关闭/确认弹窗
+  出错 --> 空闲 : 重试或回退成功
+  出错 --> 失败 : 多次重试仍失败
+  加载中 --> 加载中 : 轮询等待(界面仍在变化)
+  空闲 --> 空闲 : 无副作用操作(滚动/悬停)
+  失败 --> [*]
+            </div>
+            <figcaption>页面状态机：把「界面当前处于什么状态」变成可判定的枚举，而不是让模型从像素里猜。加载中自环表示轮询等待</figcaption>
+          </figure>
+
+          <p>状态机的收益是双重的。一是<strong>等待策略更聪明</strong>：传统做法是固定延迟，状态机则让 Agent 在「加载中」状态持续轮询，直到观察到「空闲」或「出错」——界面 0.5 秒稳定就 0.5 秒继续，5 秒稳定就等 5 秒，不浪费也不过早。二是<strong>错误定位更准</strong>：当 Agent 预期「空闲」却观察到「出错」时，错误被精确定位到「上一次动作」，可以当场重试该动作或换个方式，而不是让错误悄悄滚进后续步骤。</p>
+
+          <p>实现状态机不需要复杂的框架。做法是给模型一个固定的「状态标签集合」以及「当前状态下允许的动作」约束，让模型在输出 JSON 时同时输出 <code>{"predicted_next_state": "加载中", "action": "click", ...}</code>，宿主代码负责「执行动作 → 轮询截图 → 判定实际状态 → 与预测比对」。宿主侧的判定可以是一个轻量的视觉模型或者干脆用 DOM/a11y 树的变化事件（浏览器场景），这样状态判定从「模型主观判断」变成了「代码确定性判断」，可靠性完全不同。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            新手最容易把 GUI Agent 当成「会截图的多模态 Agent」，以为核心是「让视觉模型看图更准」。实际上 GUI Agent 的成功率瓶颈大半在<strong>系统侧</strong>：坐标怎么定（元素引用 vs 裸坐标）、动作怎么约束（白名单）、界面状态怎么判（状态机 vs 猜）、错误怎么纠（执行后校验）。「换一个更强的视觉模型」通常只能提升一点识别率，而「加上执行后校验 + 状态机」能把成功率从个位数推到 30-50%。另一个常见误解是把 OSWorld 的分数当成「整体能力」——OSWorld 的 369 个任务大多单应用操作，跨应用长任务占比很小，看到某个模型 40% 的分数时，要清楚这离「替人干一整天活」还差很远。
+          </div>
+
+          <h2>八、安全与风险：GUI Agent 的放大效应</h2>
+          <p>GUI Agent 拥有「操作真实系统」的能力，这意味着它的安全风险比只输出文本的模型大一个量级——一个错误的点击可能是删除文件、购买商品、发送邮件。安全设计是上线前的必修课。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Risks["风险类型"]
+    R1["破坏性操作<br/>删除 / 覆盖文件"]
+    R2["财务风险<br/>下单 / 转账"]
+    R3["隐私泄露<br/>读取敏感信息"]
+    R4["权限滥用<br/>越权访问"]
+  end
+  subgraph Defense["防御手段"]
+    D1["动作白名单<br/>黑名单拦截"]
+    D2["危险操作确认<br/>人工二次确认"]
+    D3["沙箱隔离<br/>虚拟机 / 容器"]
+    D4["审计日志<br/>全程记录"]
+    D5["权限最小化<br/>只给所需权限"]
+  end
+  Risks --> Defense
+            </div>
+            <figcaption>GUI Agent 的安全风险与防御：破坏性操作、财务、隐私、越权四类风险，五层防御</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>防御层</th><th>做法</th><th>拦截目标</th></tr></thead>
+              <tbody>
+                <tr><td>动作白名单</td><td>只允许点击/输入/滚动</td><td>删除、格式化等危险动作</td></tr>
+                <tr><td>人工确认</td><td>破坏性操作弹窗确认</td><td>删除文件、支付等不可逆操作</td></tr>
+                <tr><td>沙箱隔离</td><td>在虚拟机/容器内运行</td><td>系统级破坏</td></tr>
+                <tr><td>审计日志</td><td>记录每一步操作</td><td>事后追溯与取证</td></tr>
+                <tr><td>权限最小化</td><td>按任务授予最小权限</td><td>越权访问</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>工程建议：<strong>未验证的 GUI Agent 只能在沙箱中运行；任何不可逆操作必须有人工确认环节；全程保留审计日志</strong>。这是 GUI Agent 从「演示」走向「生产」的硬门槛。</p>
+
+          <h2>九、2024-2026 的进展与趋势</h2>
+          <p>GUI Agent 是 2024-2026 年进展最快的 Agent 方向之一：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方向</th><th>进展</th><th>代表</th></tr></thead>
+              <tbody>
+                <tr><td>专用 GUI 模型</td><td>专为屏幕理解训练的 VLM，坐标精度大幅提升</td><td>OS-Atlas、ShowUI</td></tr>
+                <tr><td>数据合成</td><td>用可访问性树自动生成训练数据</td><td>GUI-Odyssey 等</td></tr>
+                <tr><td>浏览器优先</td><td>浏览器自动化比操作系统级更成熟</td><td>Playwright + Agent、BrowseComp</td></tr>
+                <tr><td>人类监督协同</td><td>「人盯机器干活」的半自动产品形态</td><td>各类 Computer Use 助手</td></tr>
+                <tr><td>多模态推理增强</td><td>结合 screen parsing 与链式推理</td><td>Anthropic Computer Use、OpenAI Operator</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Now["现在（2026）"]
+    N1["成功率 20-40%<br/>人机协同为主"]
+  end
+  subgraph Soon["短期（1-2 年）"]
+    S1["浏览器自动化成熟<br/>专用 GUI 模型普及"]
+  end
+  subgraph Future["长期（3-5 年）"]
+    F1["操作系统级可靠<br/>无人值守常见"]
+  end
+  Now --> Soon --> Future
+            </div>
+            <figcaption>GUI Agent 演进路线：从人机协同到无人值守，浏览器先行、系统级跟进</figcaption>
+          </figure>
+
+          <h2>十、从单步操作到完整任务：规划层是成功率的放大器</h2>
+          <p>前面讨论的校验、状态机、动作白名单，都是在「单步操作」这个尺度上做文章。但真实任务几乎都不是「点一下」——而是「把下载文件夹里的文件按类型分类整理」这种十几步的序列。当任务超过四五步，只靠「走一步看一步」的贪心策略，模型很容易在局部细节里迷失：每一步都对，但整体目标悄悄丢了。这引出了 GUI Agent 的第二个关键组件——<strong>规划层</strong>。</p>
+          <p>规划层的工作可以拆成三段：<strong>任务拆解、子任务执行、动态重规划</strong>。拆解阶段，规划器把「整理下载文件夹」拆成「列出所有文件 → 按类型分组 → 建立分类子目录 → 移动文件 → 检查残留」五个子任务；执行阶段，Agent 逐个推进，每个子任务内部仍然是「感知—决策—执行—校验」的微循环；重规划阶段最关键——当某个子任务连续失败，或环境出现预期外的变化（比如文件夹里多了一个加密压缩包），Agent 要能停下当前的拆解方案、重新拆解，而不是硬着头皮把原计划走完。很多翻车现场，问题恰恰出在「规划之后不再回头看」。</p>
+          <p>规划层带来的收益有一个直观的算例。设单步成功率为 95%、执行后校验能发现并修正 80% 的错误（即单步「有效失败率」约 1%），一个 15 步的任务直接贪心执行，最终成功率约为 86%；而如果任务被拆成 3 个子任务、每个子任务结束后做一次「结果是否符合子目标」的检查，一次检查能拦下后续所有步骤的连带错误，那么只要子任务层不跑偏，最终成功率可以压到 95% 附近。差别不在单步，而在「错误有没有机会滚雪球」——规划层的检查点相当于把 15 次相乘的失败率，压缩成 3 段相乘的失败率。</p>
+          <p>但规划层不是免费的午餐。它的代价主要是 token 与延迟：每个子任务开始前，都要把目标、进度、已观察到的环境重新打包给模型；规划器自己的输出也要花时间。粗略估算：一个 5 子任务的任务，规划层额外消耗约 1-2 次模型调用、2-4 秒；如果拆成 20 个子任务，开销就涨到 4-8 次调用、8-16 秒——对一个总时长 30-90 秒的任务来说，这已经不能忽略。所以工程上的取舍是：<strong>规划粒度要和任务复杂度匹配</strong>——简单任务给「粗计划 + 自动续完」，复杂任务才需要「细计划 + 关键节点人工确认」。常见的失败模式也源于此：拆得太细，模型在计划上反复推演、迟迟不行动；拆得太粗，规划层形同虚设。实践里比较可靠的做法是「先粗后细」的两级规划，并用「子任务完成率」这个指标动态调整粒度：连续两个子任务一次通过，就放宽粒度；连续失败，就切细。</p>
+
+          <details class="deep">
+            <summary>展开：坐标偏差 5 像素是怎么毁掉一次点击的</summary>
+            <div class="deep-body">
+              <p>很多人觉得「坐标偏移 5px 没什么大不了」——直到亲眼看到它怎么毁掉任务。以 1080p 屏幕上的一个小按钮为例：假设「保存」按钮是 30px × 20px，VLM 输出的坐标 <code>(540, 400)</code> 恰好命中中心。但 VLM 的坐标误差普遍在 5-10px 量级——如果实际落点是 <code>(548, 400)</code>，就偏出按钮右边界 8px，这一下点到了按钮旁边的空白区域，界面没有任何反应。</p>
+              <p>这还不是最糟的。如果按钮旁边正好是「删除」按钮，一次 6px 的偏移可能直接点错对象——而且 Agent 往往察觉不到，因为它「看到」屏幕发生了变化，却不知道变化不是它想要的那个。这正是本页强调「执行后校验」的原因：</p>
+              <pre><code class="language-python"># 错误恢复的简化逻辑：操作后验证预期变化
+def safe_click(x, y, expected_change):
+    pyautogui.click(x, y)
+    before = screenshot()
+    ok = wait_until(lambda: has_expected_change(before, expected_change), timeout=3)
+    if not ok:
+        # 没发生预期变化 → 认为点错了，回退或改用元素引用重试
+        revert()  # 或换成 a11y 树里的元素定位
+        return retry_with_element_reference()</code></pre>
+              <p style="margin-bottom:0">对抗坐标误差的三板斧：<strong>① 优先用元素引用（a11y 树编号）代替裸坐标</strong>；<strong>② 必要时对目标区域裁剪放大后再让 VLM 精确定位</strong>；<strong>③ 永远在操作后校验「预期变化是否发生」</strong>。前两条减少误差，第三条拦截误差——缺一不可。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：GUI Agent 让模型「假装成人」操作界面，感知像素、输出坐标、判断状态；与 API Agent 是两种范式。</li>
+            <li><strong>感知三方案</strong>：纯截图（通用但精度差）、a11y 树（精确但覆盖窄）、混合（主流）。</li>
+            <li><strong>定位三方式</strong>：直接坐标（简单易错）、元素引用（精准）、网格坐标（粗粒度稳定）。</li>
+            <li><strong>成功率瓶颈</strong>：视觉理解不足、坐标偏差 5-10px、状态追踪弱、长序列误差累积（$0.95^{20} \approx 36\%$）。</li>
+            <li><strong>提分手段</strong>：高分辨率裁剪、动作白名单、执行后校验、错误恢复、屏幕记忆。</li>
+            <li><strong>当前定位</strong>：人机协同的半自动场景，不适合无人值守关键业务。</li>
+            <li><strong>常见坑</strong>：期望 GUI Agent 达到 API Agent 的可靠性；忽略异步加载状态；不做执行后校验让错误滚雪球。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>OSWorld: Benchmarking Multimodal Agents for Open-Ended Tasks in Real Computer Environments — GUI Agent 权威基准 · <a href="https://arxiv.org/abs/2404.07972" target="_blank" rel="noopener">arXiv:2404.07972</a></li>
+            <li>ShowUI: One Vision-Language-Action Model for GUI Visual Agent — 专用 GUI 模型 · <a href="https://arxiv.org/abs/2411.17465" target="_blank" rel="noopener">arXiv:2411.17465</a></li>
+            <li>Anthropic Computer Use — 最早的商用 Computer Use 能力（官方文档）· <a href="https://docs.anthropic.com/en/docs/build-with-claude/computer-use" target="_blank" rel="noopener">docs.anthropic.com</a></li>
+            <li>GUI-Odyssey: A Comprehensive Dataset for Cross-App GUI Agents — 大规模 GUI 数据合成 · <a href="https://arxiv.org/abs/2406.10851" target="_blank" rel="noopener">arXiv:2406.10851</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            GUI Agent 是 Agent 的一种形态，Agent 的整体范式与循环机制见 <a href="agent.html">Agent 范式</a>；多 Agent 协作与 GUI 自动化的结合见 <a href="multi-agent.html">多智能体系统</a>；工具调用的底层机制见 <a href="tool-use-mcp.html">工具调用与 MCP</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

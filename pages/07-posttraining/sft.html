@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SFT 监督微调 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="07-posttraining" data-topic="sft">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>SFT 监督微调</h1>
+            <p class="lead">刚出炉的基座模型只会做一件事：接着往下写。你问它「帮我写封请假邮件」，它可能给你续上「帮我写封辞职邮件、帮我写封感谢邮件……」。SFT 要做的，就是把这个「文本续写器」调教成一个「听得懂人话、愿意回答问题」的助手。这是后训练的第一步，也是门槛最低、性价比最高的一步。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>SFT 的全部动作可以概括成一句话：<strong>把大量「人问 → 好答案」的示范对话喂给基座模型，但只在「好答案」那部分算损失</strong>。模型照抄的不是知识（知识在预训练时已经学完了），而是<strong>行为格式</strong>——遇到问题该开口回答，而不是继续列举更多问题。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  B["基座模型<br/>只会续写"] --> P["套上对话模板<br/>拼成一条训练序列"]
+  D["指令数据<br/>问题 + 优质回答"] --> P
+  P --> M["Loss Mask<br/>只对回答部分算损失"]
+  M --> T["梯度更新"]
+  T --> C["指令模型<br/>会应答"]
+  style M fill:#e6f1fb,stroke:#185fa5
+              </div>
+              <figcaption>SFT 流程：数据套模板 → 掩掉提问部分的损失 → 只学如何回答。整条链路上没有任何新的数学，全部复杂度都藏在数据和模板里。</figcaption>
+            </figure>
+          </div>
+
+          <h2>先摆正 SFT 在整条流水线上的位置</h2>
+          <p>很多初学者会把「训练一个大模型」想象成一件事，实际上它至少是三件事，各自解决完全不同的问题。用一个类比：预训练是<strong>让一个人读完整个图书馆</strong>，他因此拥有了海量知识，但他不知道自己该扮演什么角色；SFT 是<strong>教他当一名客服/助教</strong>，告诉他「有人问你就答、答完就停、按这种格式答」；偏好对齐则是<strong>告诉他哪种答法客户更满意</strong>。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  PT["预训练<br/>万亿级 token 的自监督续写"] --> BASE["基座模型<br/>有知识 无角色"]
+  BASE --> SFT["SFT 监督微调<br/>数万条示范对话"]
+  SFT --> INST["指令模型<br/>会应答 格式稳定"]
+  INST --> PREF["偏好对齐<br/>RLHF / DPO / RLVR"]
+  PREF --> CHAT["对话模型<br/>更符合人类偏好"]
+
+  BASE -.->|"知识来源"| K["知识与语言能力<br/>几乎全部来自这里"]
+  SFT -.->|"行为来源"| BH["回答格式 角色边界<br/>拒答倾向 语气风格"]
+
+  style SFT fill:#e6f1fb,stroke:#185fa5
+  style BASE fill:#f1f3f6,stroke:#d0d5de
+  style PREF fill:#faeeda,stroke:#ba7517
+            </div>
+            <figcaption>后训练三段式中 SFT 的位置。关键认知：知识几乎全部来自预训练，SFT 只塑造行为。指望用几万条 SFT 数据「教会」模型一门它预训练时没见过的知识，是最常见的期待错配。</figcaption>
+          </figure>
+
+          <p>关于 SFT 在整条流水线里的位置，与其听我讲，不如直接看当年 OpenAI 那篇把「基座模型变成听话助手」的完整流程画成图的开创性论文——InstructGPT。下面这张原图是后训练领域被引用最多的一张流程图，它把「从基座到助手」拆成了三步：先做 SFT，再训奖励模型，最后用强化学习对齐。看懂它，你就知道 SFT 为什么只配当「第一步」，也明白它的能力边界从哪来。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/07-posttraining/sft/fig2.png" alt="论文原图：InstructGPT 三步法示意——第一步 SFT 用人工示范，第二步训练奖励模型，第三步用 PPO 强化学习对齐" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：InstructGPT 三步法示意——SFT 是第一步，后面的奖励模型与强化学习都在它产出的模型上继续加工</span>
+              <span class="pf-src">论文原图 · Ouyang et al., <em>Training language models to follow instructions with human feedback</em>, 2022, Figure 2 · <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener">arXiv:2203.02155</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，分三块看。第一块是左上角的 <strong>Step 1（第 1 步）</strong>：一个「示范数据集」（demonstrations）喂给预训练好的 GPT-3，做我们这一页讲的监督微调 SFT，产出「SFT 模型」。注意这里用的词是 demonstration（示范）而不是 answer（答案）——数据里的每一行都是「有人问、有人好好答」的完整对话，SFT 学的就是这种「应答示范」。</p>
+          <p>第二块是右上角的 <strong>Step 2（第 2 步）</strong>：让 SFT 模型对同一个问题生成多个回答，人工把这些回答按「哪个更好」排序，用排序数据训练一个奖励模型（Reward Model，RM）来给「回答质量」打分。这一块就是「从示范升级到偏好」——它不再告诉你标准答案是什么，而是告诉你「哪种答法更讨人喜欢」。第三块是下方的 <strong>Step 3（第 3 步）</strong>：用强化学习（PPO）让 SFT 模型尽量拿到奖励模型的高分，同时用 KL 惩罚约束它别跑太远。这三步串起来，才是你在 ChatGPT 里见到的那个助手。</p>
+          <p>这张图对理解 SFT 最重要的启示是：<strong>SFT 只是第一步，它产出的模型质量直接决定了后面两步的天花板</strong>。奖励模型给 SFT 模型的回答排序、强化学习在 SFT 模型附近搜索更高分的答案——如果第一步的示范数据本身质量不行，后面两步再努力也只能在「烂答案」里挑相对不那么烂的。这也是本页反复强调「数据质量优先于数量」的原因。反过来，如果只看这张图不往下看，又会误以为 SFT 就是全部——别忘了后面还有偏好对齐在等着接力，详见 <a href="rlhf.html">RLHF</a> 与 <a href="dpo.html">DPO</a>。</p>
+
+          <p>这个位置决定了 SFT 的两条铁律。第一，<strong>SFT 不适合灌输新知识</strong>。如果你希望模型掌握公司内部的产品手册，用 SFT 把手册改写成问答对去训，效果通常远不如把手册放进 <a href="../10-applications/rag.html">RAG</a> 的检索库；真要走训练路线，也应该走 <a href="../06-pretraining/continual-pretrain.html">持续预训练</a> 而不是 SFT。第二，<strong>SFT 对行为的影响立竿见影</strong>。几千条样本就能显著改变模型的回答长度、Markdown 使用习惯、开场白模式——这既是它的威力，也是它的危险：你在无意中喂进去的风格，模型会一字不差地学走。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            预训练决定模型<strong>知道什么</strong>，SFT 决定模型<strong>怎么表现</strong>，偏好对齐决定模型<strong>倾向于怎么表现更好</strong>。三者的杠杆完全不同：加知识请找预训练或检索，改行为才找 SFT。
+          </div>
+
+          <h2>SFT 和预训练用的是同一个损失函数</h2>
+          <p>很多人第一次接触 SFT 会以为它是某种全新的训练方式。其实不是——SFT 的损失函数和 <a href="../06-pretraining/objectives.html">预训练目标</a> 里的 CLM 一模一样，都是 next-token prediction：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L} = -\sum_{t} m_t \cdot \log P_\theta\!\left(x_t \mid x_{&lt;t}\right)$$
+          </div>
+          <p>唯一多出来的就是那个 $m_t \in \{0, 1\}$，也就是 <strong>loss mask</strong>。真正的差别只有两处：</p>
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">数据形态变了</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">从「网页上抓来的连续文本」换成「结构化的对话样本」，每条样本有明确的角色划分和边界。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">损失范围变了</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">预训练对每个位置都算损失；SFT 只对 assistant 回复部分算，用户提问部分 $m_t = 0$。</p>
+            </div>
+          </div>
+          <p>这个「同一个损失函数」的事实有个很实用的推论：<strong>凡是预训练那一套工程设施，SFT 全部可以复用</strong>——同样的分布式并行策略、同样的混合精度、同样的梯度检查点、同样的 checkpoint 格式。你不需要为 SFT 单独搭一套训练栈，只需要换一个 dataset 和一个 collator。这也是为什么 SFT 是后训练里工程复杂度最低的一环，跟 <a href="rlhf.html">RLHF</a> 要同时驻留四个模型完全不是一个量级。</p>
+
+          <h3>Loss mask：新手第一个坑</h3>
+          <p>为什么提问部分不算损失？因为你想让模型学会的是「给定问题，如何生成好回答」这个<strong>条件分布</strong>，而不是「如何生成一个问题」。如果对 prompt 部分也算损失，模型会把一部分容量花在拟合用户的提问风格上——而这些提问是数据集作者写的，不是真实用户会问的，学它纯属浪费，还会让模型在推理时倾向于自问自答。</p>
+          <p>实现上就是把 prompt 部分的 label 置为 <code>-100</code>（PyTorch 交叉熵的默认忽略值）：</p>
+          <pre><code class="language-python">prompt_ids = tok.apply_chat_template(msgs[:-1], add_generation_prompt=True)
+full_ids   = tok.apply_chat_template(msgs, add_generation_prompt=False)
+
+input_ids = full_ids
+labels    = list(full_ids)
+# 把 prompt 覆盖的位置全部屏蔽掉,只留回答部分参与损失
+for i in range(len(prompt_ids)):
+    labels[i] = -100</code></pre>
+          <p>这段代码看起来平淡无奇，但它隐含了一个必须成立的前提：<code>prompt_ids</code> 必须是 <code>full_ids</code> 的<strong>严格前缀</strong>。绝大多数 tokenizer 满足这一点，但少数场景会翻车——比如某些 tokenizer 在词尾会做合并，把「回答的第一个字」和「模板的最后一个符号」合成同一个 token；再比如 <code>add_generation_prompt=True</code> 会追加一段引导文本，而在完整序列里这段文本可能被写成另一种形式。一旦前缀关系不成立，你的 mask 就会整体错位一到两个 token，训练照样能跑，loss 也会下降，但模型学到的东西是歪的。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">务必做这个自检</span>
+            写完 collator 后，取一条样本，把 <code>labels != -100</code> 的位置 decode 出来打印。<strong>你应该只看到 assistant 的回复内容加上结束符</strong>，一个字都不多、一个字都不少。这三行调试代码能省掉你后面几天的困惑——绝大多数「SFT 训了但没效果」的案例，根源都在这里。
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            「多轮对话只需要对最后一轮的回答算损失。」——不一定。多轮样本里<strong>每一轮 assistant 的回复都可以算损失</strong>，这样一条样本能产出更多训练信号，也不用把同一段历史重复喂好几遍。要不要这么做取决于中间轮回复的质量是否同样可靠。
+          </div>
+
+          <details class="deep">
+            <summary>展开：多轮对话的两种展开方式与 packing 的坑</summary>
+            <div class="deep-body">
+              <p>一条 5 轮的对话样本，有两种做法：</p>
+              <p><strong>做法一：切成 5 条独立样本。</strong>第 k 条包含前 k-1 轮历史 + 第 k 轮问答，只对第 k 轮回答算损失。优点是每轮独立可控（可以按质量单独筛掉某一轮）；缺点是同一段历史被重复编码 5 次，算力浪费严重，长对话尤其夸张——一条 20 轮对话会膨胀成 20 条样本，总 token 数是原来的十倍量级。</p>
+              <p><strong>做法二：保留成 1 条样本，5 段 mask。</strong>整条序列只前向一次，把 5 段 assistant 回复的位置全部置为可算损失。算力效率高得多，是目前主流框架的默认做法。代价是你没法对单轮做细粒度筛选，只能整条要或整条不要。</p>
+              <p style="margin-bottom:0"><strong>再说 packing 的坑。</strong>为了不浪费算力，训练时常把多条短样本首尾相接填满上下文窗口（sequence packing）。这里必须做一件事：<strong>屏蔽跨样本的注意力</strong>。如果不屏蔽，第二条样本的 token 就能「看到」第一条样本的内容，等于给模型喂了一堆莫名其妙的上下文；更糟的是推理时没有这种拼接，训练和推理的分布对不上。现代框架一般提供 <code>position_ids</code> 重置 + 块对角注意力掩码来解决，但如果你自己手写 collator，这是必须自己处理的一环。另一个小坑是 packing 之后每个 batch 里的有效 token 数变了，如果损失是按 batch 内 token 求平均，样本之间的实际权重会被隐式改变。</p>
+            </div>
+          </details>
+
+          <h2>对话模板：效果断崖的头号来源</h2>
+          <p>基座模型眼里只有 token 序列，它不知道什么叫「用户」和「助手」。这些角色信息是靠<strong>对话模板</strong>硬编码进文本里的——一组特殊标记，把多轮对话拍平成一条线性序列。一个 ChatML 风格的模板长这样：</p>
+          <pre><code class="language-text">&lt;|im_start|&gt;system
+你是一个乐于助人的助手。&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+帮我写封请假邮件&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+好的,请告诉我请假的时间和事由……&lt;|im_end|&gt;</code></pre>
+          <p>模板要负责三件事：<strong>标记角色边界</strong>（谁在说话）、<strong>标记回合结束</strong>（生成到哪里该停）、<strong>约定生成起点</strong>（推理时喂到 <code>assistant</code> 这一行为止，让模型接着往下写）。其中「回合结束标记」尤其关键：它同时被设置为 EOS，模型学会在合适的地方输出它，推理引擎看到它就停止解码。如果训练数据里漏掉了这个结束标记，模型就会<strong>停不下来，一直续写到 max_tokens</strong>——这是最典型的模板故障现象。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模板要素</th><th>它解决什么</th><th>缺失时的症状</th></tr></thead>
+              <tbody>
+                <tr><td><strong>角色起始标记</strong><br><span style="color:var(--text-3);font-size:12.5px">如 <code>&lt;|im_start|&gt;user</code></span></td><td>让模型分清这段话是谁说的</td><td>模型分不清指令和内容，容易被用户输入里的伪指令带偏</td></tr>
+                <tr><td><strong>回合结束标记 / EOS</strong><br><span style="color:var(--text-3);font-size:12.5px">如 <code>&lt;|im_end|&gt;</code></span></td><td>告诉模型「这轮说完了」</td><td><strong>停不下来</strong>，一路续写到 max_tokens，或者自己伪造下一轮用户提问</td></tr>
+                <tr><td><strong>生成起点约定</strong><br><span style="color:var(--text-3);font-size:12.5px">推理时以 assistant 头结尾</span></td><td>让模型明确「现在轮到我说」</td><td>模型继续补全用户的话，而不是回答</td></tr>
+                <tr><td><strong>system 位</strong></td><td>承载全局人设与规则</td><td>无法通过系统提示统一控制风格与安全策略</td></tr>
+                <tr><td><strong>特殊 token 是否入词表</strong></td><td>决定标记被切成 1 个还是多个 token</td><td>被切碎成普通字符，模型学不稳边界，还可能被用户在输入里注入伪造</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">真实的坑</span>
+            <strong>训练时用的模板和推理时用的模板必须逐字节一致</strong>，包括换行符和空格。差一个换行，模型看到的就是分布外输入，表现会断崖式下跌——不是「略微变差」，而是可能开始胡言乱语或忽略指令。合并多个开源数据集时尤其容易踩：不同数据集自带不同模板，混在一起训，模型会学得精神分裂。
+          </div>
+          <p>实践建议：<strong>不要自己手写拼接字符串</strong>。用 tokenizer 自带的 <code>chat_template</code>（定义在 <code>tokenizer_config.json</code> 里）统一生成，训练脚本和推理服务共用同一份，这样至少保证两端不会漂移。做持续微调时，也应沿用基座模型原有的模板，除非你有充分理由重新定义并准备好足量数据把它训透。</p>
+          <p>还有一个容易忽略的细节：<strong>特殊标记必须真的在词表里</strong>。如果 <code>&lt;|im_end|&gt;</code> 没有被注册为一个独立 token，它会被 BPE 切成 <code>&lt;</code>、<code>|</code>、<code>im</code>、<code>_end</code>…… 一串碎片。模型当然也能学会输出这串碎片，但边界学得远不如单 token 稳，而且用户可以在自己的输入里原样打出这串字符来伪造角色切换——这是提示注入的一条经典路径（进一步的防护见 <a href="../12-llmops/guardrails.html">护栏与输出校验</a>）。检查方法很简单：把模板 encode 一遍，看这些标记是不是各占一个 id。</p>
+
+          <h2>数据质量优先于数量</h2>
+          <p>这是 SFT 领域被反复验证的一条经验规律：<strong>几千条精心打磨的示范，效果常常胜过几十万条爬来的噪声数据</strong>。LIMA 那篇论文把这个观察推到了一个极端——用一千条人工精选样本做 SFT，就能得到相当可用的对话模型，并由此提出「表层对齐假说」：对齐主要是在<strong>激活</strong>预训练已有的能力，而不是注入新能力。原因并不神秘——预训练阶段模型已经把知识和语言能力装进权重了，SFT 只是在激活并规范化已有能力，需要的是清晰、一致、高质量的行为示范，而不是海量重复的模式。</p>
+          <p>更麻烦的是，低质量数据不是「没帮助」，而是<strong>有害</strong>：一条事实错误的回答会直接教模型编造；一条格式混乱的回答会污染输出风格；一条「我不知道」用在模型其实知道的问题上，会让它变得畏首畏尾。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>质量维度</th><th>看什么</th><th>不合格的典型表现</th></tr></thead>
+              <tbody>
+                <tr><td><strong>正确性</strong></td><td>回答本身对不对</td><td>事实错误、代码跑不通、数学算错</td></tr>
+                <tr><td><strong>格式一致</strong></td><td>同类问题的回答结构是否统一</td><td>有的用 Markdown 有的纯文本，标题层级混乱</td></tr>
+                <tr><td><strong>指令贴合</strong></td><td>有没有真正回应用户要求</td><td>答非所问、忽略「限 100 字」这类约束</td></tr>
+                <tr><td><strong>多样性</strong></td><td>任务类型、领域、长度是否分散</td><td>八成样本都是同一类改写任务</td></tr>
+                <tr><td><strong>无泄漏</strong></td><td>是否混入评测集内容</td><td>刷分虚高，线上表现对不上</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>数据配比：决定哪些能力被保住</h3>
+          <p>还有一个容易被忽视的维度：<strong>数据配比</strong>。SFT 会按数据分布重塑模型的行为倾向——如果你的数据里 90% 是闲聊、10% 是代码，模型的代码能力大概率会退化。这不是因为它「忘了」怎么写代码，而是因为在给定问题时，它输出闲聊风格回答的概率被系统性抬高了。想保住哪项能力，就得在配比里给它留位置。</p>
+          <p>下面这张表给的不是标准答案（不同产品定位差别很大），而是一个<strong>思考配比时该盯的维度</strong>清单。真正的配比要靠评测集反推：先定义你在乎的几项能力，各准备一个小评测集，然后调配比、跑评测、看哪项掉了就补哪项。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>数据类别</th><th>它保住什么能力</th><th>配比过低的症状</th><th>配比过高的症状</th></tr></thead>
+              <tbody>
+                <tr><td><strong>通用问答 / 闲聊</strong></td><td>自然对话感、语气</td><td>回答生硬、像在填表</td><td>什么问题都答得又长又空</td></tr>
+                <tr><td><strong>代码</strong></td><td>代码生成与解释</td><td>代码能力明显退化，格式混乱</td><td>非代码问题也倾向输出代码块</td></tr>
+                <tr><td><strong>数学 / 推理</strong></td><td>分步推理习惯</td><td>不会分步，直接给答案且常错</td><td>简单问题也强行写一长串推理</td></tr>
+                <tr><td><strong>长文写作</strong></td><td>长输出的组织能力</td><td>写长文时结构散、写着写着跑题</td><td>短问题也被答成小作文</td></tr>
+                <tr><td><strong>安全 / 拒答</strong></td><td>该拒时会拒</td><td>有害请求照答不误</td><td><strong>过度拒答</strong>，正常问题也说「我无法回答」</td></tr>
+                <tr><td><strong>多语言</strong></td><td>目标语言的表达质量</td><td>回答夹带训练数据主语言</td><td>挤占其他类别，通用能力下滑</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>最后一行值得单独说一句：安全数据配比过高导致的过度拒答，是 SFT 阶段最容易被忽视、上线后又最伤体验的问题。它的完整机理和校准方法见 <a href="safety-alignment.html">对齐税与安全对齐</a>。</p>
+
+          <div class="callout">
+            <span class="callout-t">边界说明</span>
+            这些指令数据具体<strong>怎么造出来</strong>——self-instruct 自举、evol-instruct 演化、拒绝采样筛优、教师模型蒸馏——是另一个完整的话题，见 <a href="../06-pretraining/synthetic-data.html">合成数据与数据飞轮</a>。本页只讲拿到数据之后怎么用。
+          </div>
+
+          <h3>清洗流水线：拿到一批数据先做这五件事</h3>
+          <p>不管数据是自己标的、开源下的还是模型生成的，进训练之前都建议过一遍下面这条流水线。顺序很重要——先做便宜的过滤，再做贵的。</p>
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  RAW["原始样本池"] --> F1["① 结构校验<br/>角色齐全 无空回答<br/>长度在合理区间"]
+  F1 --> F2["② 规则过滤<br/>去乱码 去截断<br/>去掉带 URL 广告的样本"]
+  F2 --> F3["③ 去重<br/>精确去重 + 近似去重<br/>MinHash 或 embedding 聚类"]
+  F3 --> F4["④ 去污染<br/>与评测集做 n-gram 重叠比对"]
+  F4 --> F5["⑤ 质量打分<br/>模型评分或人工抽检<br/>按分位数截断"]
+  F5 --> MIX["配比混合<br/>按能力类别采样"]
+  MIX --> TRAIN["训练集"]
+
+  F3 -.->|"典型丢弃率最高的一环"| NOTE["近似重复往往占开源<br/>指令集相当大的比例"]
+
+  style F3 fill:#faeeda,stroke:#ba7517
+  style F4 fill:#fcebeb,stroke:#a32d2d
+  style TRAIN fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>SFT 数据清洗流水线。②③是性价比最高的两步，几乎不花钱就能显著提质；④是最容易被跳过、后果最严重的一步——评测集污染会让你对模型能力产生系统性误判。</figcaption>
+          </figure>
+          <p>第 ④ 步值得多说两句。<strong>去污染不是可选项</strong>。开源指令数据集里混进评测题目是极常见的事——有些是数据作者直接拿基准题做种子，有些是教师模型在生成时「回忆」出了训练时见过的题面。一旦污染，你会看到评测分数漂亮地上涨，而真实用户体验纹丝不动，团队还会基于这个虚高的数字做出错误的决策。最低成本的做法是：对每个评测集，把题面切成 n-gram，跟训练样本做重叠检测，命中就丢。更系统的讨论见 <a href="../13-evaluation/contamination.html">数据污染与评估可信度</a>。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            很多人以为「SFT 就是把模型在问答数据上再训练一遍，等于复习知识」。实际上 SFT 更新的是<strong>输出的行为风格</strong>，不是知识本身。同一个模型，用「详细版示范」训完回答变长，用「简短版示范」训完回答变短，知识几乎不变——这就是为什么换个数据配方，模型「气质」立刻不同。想验证这个直觉，最直接的办法是拿同一个 SFT checkpoint 分别喂两种风格的数据各训一遍，观察同一批问题在两种模板下的回答长度差异。它清楚地展示了：<strong>你喂进去的不是「答案」，而是「怎么答」的示范</strong>。
+          </div>
+
+          <h2>一次 SFT 到底发生了什么：把训练循环拆开看</h2>
+          <p>前面讲的都是「准备什么」，这一节讲「跑起来之后每一步在干嘛」。SFT 的训练循环极其标准，理解它有助于你在出问题时知道该往哪看。</p>
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant DL as 数据加载器
+  participant CL as Collator
+  participant MD as 模型
+  participant OP as 优化器
+  participant EV as 评估钩子
+
+  DL->>CL: 取出一批原始对话样本
+  CL->>CL: 套 chat_template 编码
+  CL->>CL: 生成 labels 并把 prompt 位置置 -100
+  CL->>CL: padding 或 packing 对齐长度
+  CL->>MD: input_ids / attention_mask / labels
+  MD->>MD: 前向计算 logits
+  MD->>MD: 只在 labels 有效位置算交叉熵
+  MD->>OP: 反向传播得到梯度
+  OP->>OP: 梯度裁剪
+  OP->>MD: AdamW 更新参数
+  Note over OP,MD: warmup 阶段学习率线性上升<br/>之后按 cosine 衰减
+  MD->>EV: 每 N 步跑一次验证
+  EV->>EV: 记录验证 loss
+  EV->>EV: 生成若干固定 prompt 的回答供人工看
+  Note over EV: 只看 loss 会误判<br/>必须配合生成抽检
+            </div>
+            <figcaption>SFT 训练循环的一次迭代。注意第 3 步（loss mask）和最后两步（生成抽检）——前者是正确性的关键，后者是判断「训好没有」的关键，两者都最容易被省略。</figcaption>
+          </figure>
+
+          <details class="deep">
+            <summary>展开：一个最小可读的 SFT 训练骨架（PyTorch 风格）</summary>
+            <div class="deep-body">
+              <p>下面这段代码不追求可以直接复制上生产，而是把「一次 SFT 需要哪些部件」摊开给你看。真实项目建议直接用成熟框架的 SFT 训练器，参数名以官方文档为准。</p>
+              <pre><code class="language-python">import torch
+from torch.utils.data import DataLoader
+
+IGNORE = -100
+
+def build_example(tok, messages, max_len=2048):
+    """把一条多轮对话编码成 input_ids / labels,并对每一轮回答开放损失。"""
+    input_ids, labels = [], []
+    for i, msg in enumerate(messages):
+        # 逐轮增量编码:先编到本轮为止的前缀,再编到含本轮内容
+        prefix = tok.apply_chat_template(
+            messages[:i], add_generation_prompt=(msg["role"] == "assistant")
+        )
+        whole = tok.apply_chat_template(messages[:i + 1])
+        seg = whole[len(prefix):]              # 本轮新增的 token
+        input_ids = whole
+        # 前缀部分沿用已有 labels,新增段落按角色决定是否算损失
+        if msg["role"] == "assistant":
+            labels = labels + [IGNORE] * (len(prefix) - len(labels)) + list(seg)
+        else:
+            labels = labels + [IGNORE] * (len(whole) - len(labels))
+    return input_ids[:max_len], labels[:max_len]
+
+
+def collate(batch, pad_id):
+    n = max(len(x["input_ids"]) for x in batch)
+    ids  = torch.full((len(batch), n), pad_id, dtype=torch.long)
+    lab  = torch.full((len(batch), n), IGNORE, dtype=torch.long)
+    attn = torch.zeros((len(batch), n), dtype=torch.long)
+    for i, x in enumerate(batch):
+        L = len(x["input_ids"])
+        ids[i, :L]  = torch.tensor(x["input_ids"])
+        lab[i, :L]  = torch.tensor(x["labels"])
+        attn[i, :L] = 1
+    return {"input_ids": ids, "labels": lab, "attention_mask": attn}
+
+
+def train(model, dataset, tok, epochs=2, lr=2e-5, accum=8, clip=1.0):
+    dl = DataLoader(dataset, batch_size=4, shuffle=True,
+                    collate_fn=lambda b: collate(b, tok.pad_token_id))
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
+    total = len(dl) * epochs // accum
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt, max_lr=lr, total_steps=total, pct_start=0.03, anneal_strategy="cos"
+    )
+    model.train()
+    step = 0
+    for _ in range(epochs):
+        for i, batch in enumerate(dl):
+            batch = {k: v.cuda() for k, v in batch.items()}
+            # HF 风格模型内部已按 labels 做位移并忽略 -100
+            loss = model(**batch).loss / accum
+            loss.backward()
+            if (i + 1) % accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+                opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+                step += 1
+                if step % 50 == 0:
+                    print(f"step {step} loss {loss.item() * accum:.4f}")</code></pre>
+              <p>三个值得注意的地方：</p>
+              <ul>
+                <li><strong>梯度累积</strong>（<code>accum</code>）是显存不够时凑大 batch 的标准手段。SFT 的有效 batch 一般不宜太小，否则梯度噪声大、训练不稳。</li>
+                <li><strong>weight_decay 常设为 0 或很小</strong>。SFT 步数少，权重衰减带来的正则收益有限，反而可能把预训练学到的表示拉偏。</li>
+                <li><strong>padding token 必须被 mask 掉</strong>，既在 <code>attention_mask</code> 里，也在 <code>labels</code> 里。这段代码用 <code>IGNORE</code> 初始化 <code>lab</code> 天然满足后者。</li>
+              </ul>
+              <p style="margin-bottom:0">如果显存不够跑全参，把 <code>model</code> 换成挂了 LoRA 适配器的版本，其余代码一行不用改——这正是 <a href="peft-lora.html">参数高效微调</a> 的优雅之处。</p>
+            </div>
+          </details>
+
+          <h2>训练配方与过拟合判断</h2>
+          <p>SFT 的超参空间不大，几个量级记住就够用了：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>项目</th><th>经验取值</th><th>为什么</th></tr></thead>
+              <tbody>
+                <tr><td>学习率（全参微调）</td><td>比预训练低 1-2 个数量级，$10^{-5}$ 量级起步</td><td>只是微调行为，不是重学知识；太大会把预训练能力冲掉</td></tr>
+                <tr><td>学习率（LoRA）</td><td>可比全参高约一个数量级，$10^{-4}$ 量级</td><td>可训练参数少得多，需要更大步长才动得起来</td></tr>
+                <tr><td>Epoch 数</td><td>通常 2-3 轮，很少超过</td><td>SFT 数据量小，多跑几轮极易背下答案</td></tr>
+                <tr><td>调度器</td><td>warmup + cosine 衰减</td><td>开头稳住，结尾收敛得干净</td></tr>
+                <tr><td>序列打包</td><td>短样本拼接填满上下文</td><td>提升算力利用率；注意跨样本要屏蔽注意力</td></tr>
+                <tr><td>梯度裁剪</td><td>全局范数裁到 1.0 附近</td><td>SFT 数据里偶有超长或异常样本，裁剪防止单个 batch 打飞权重</td></tr>
+                <tr><td>weight decay</td><td>0 或很小</td><td>步数少，正则收益有限，还可能拉偏预训练表示</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>怎么判断过拟合？验证集 loss 上翘是最直接的信号，但 SFT 有个特殊现象：<strong>验证 loss 还在降，模型却已经变差了</strong>。因为 loss 衡量的是「多像训练数据」，而你真正想要的是泛化的应答能力。所以务必配合<strong>人工抽检</strong>，重点看这几个征兆：</p>
+          <ul>
+            <li><strong>回答变得模板化</strong>：不管问什么都是「首先……其次……最后……」三段式。</li>
+            <li><strong>开头千篇一律</strong>：每条回复都以同样的客套话起头。</li>
+            <li><strong>多样性塌陷</strong>：把 temperature 调高，输出几乎不变。</li>
+            <li><strong>原有能力退化</strong>：数学、代码这类没在 SFT 数据里出现的能力明显变弱。</li>
+          </ul>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  direction LR
+  state "第 0 步 · 基座" as S0
+  state "格式初现" as S1
+  state "甜点区" as S2
+  state "开始复读" as S3
+  state "严重过拟合" as S4
+
+  [*] --> S0
+  S0 --> S1: 训练开始 数百步
+  S1 --> S2: 回答稳定 能力保持
+  S2 --> S3: 继续训 风格开始收窄
+  S3 --> S4: 再训 背下训练答案
+  S3 --> S2: 早停 或 降低学习率
+  S4 --> [*]: 只能回滚 checkpoint
+
+  note right of S0
+    只会续写
+    不会停
+  end note
+  note right of S2
+    验证 loss 仍在降
+    人工抽检最佳
+    应在此处存 checkpoint
+  end note
+  note right of S4
+    验证 loss 可能还在降
+    但多样性已塌陷
+  end note
+            </div>
+            <figcaption>SFT 训练进程的状态机。核心信息是：<strong>「甜点区」的出口没有 loss 信号提示</strong>，从 S2 滑到 S3 时验证 loss 往往还在正常下降。所以必须定期存 checkpoint 并做生成抽检，才有回滚的余地。</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">省事的做法</span>
+            数据量不大（比如几千到几万条）或显存吃紧时，先用 <a href="peft-lora.html">LoRA</a> 跑通全流程再说。它训得快、改动可回滚、多个版本能热切换，非常适合快速迭代数据配方；确定配方之后再考虑要不要上全参微调。
+          </div>
+
+          <h3>全参、LoRA、还是只训部分层</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方案</th><th>显存量级（7B）</th><th>迭代速度</th><th>能力上限</th><th>什么时候选它</th></tr></thead>
+              <tbody>
+                <tr><td><strong>全参微调</strong></td><td>百 GB 量级</td><td>慢</td><td>最高</td><td>数据量大（十万条以上）、要改变模型的底层行为倾向、有多卡资源</td></tr>
+                <tr><td><strong>LoRA / QLoRA</strong></td><td>十几到二十几 GB</td><td>快</td><td>多数任务够用</td><td><strong>默认起点</strong>。快速验证数据配方、单卡环境、需要多版本热切换</td></tr>
+                <tr><td><strong>只训最后若干层</strong></td><td>介于两者之间</td><td>中</td><td>受限</td><td>只想改输出风格、不想动深层表示；实践中已较少单独使用</td></tr>
+                <tr><td><strong>只训嵌入 / 输出头</strong></td><td>小</td><td>快</td><td>很低</td><td>扩词表后让新 token 学到合理表示，一般作为其他方案的前置步骤</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>一条务实的路线：<strong>先 LoRA 把数据配方调对，再决定要不要用同一批数据跑一次全参</strong>。因为 SFT 阶段的大部分收益来自数据而不是可训练参数量，先用便宜的方式把数据问题解决掉，性价比最高。</p>
+
+          <h2>常见故障速查</h2>
+          <p>下面这张表把 SFT 里最高频的翻车现象和它们的根因对上。遇到问题时先对照这里，能省下大量瞎猜的时间。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>现象</th><th>最可能的根因</th><th>怎么确认</th><th>怎么修</th></tr></thead>
+              <tbody>
+                <tr><td><strong>模型停不下来</strong>，一路写到 max_tokens</td><td>训练数据末尾没有 EOS / 回合结束标记</td><td>decode 一条训练样本，看结尾有没有结束 token</td><td>在 collator 里确保结束符被编码且参与损失</td></tr>
+                <tr><td><strong>模型自问自答</strong>，自己伪造下一轮 user</td><td>结束符没学会，或对 prompt 部分也算了损失</td><td>打印 <code>labels != -100</code> 的解码结果</td><td>修 loss mask；检查多轮拼接逻辑</td></tr>
+                <tr><td><strong>loss 一直很低但输出很差</strong></td><td>mask 错位，模型主要在学复制 prompt</td><td>同上；另看 loss 是否低得不合常理</td><td>修正前缀对齐，确保 prompt 是完整前缀</td></tr>
+                <tr><td><strong>训练正常但上线效果崩</strong></td><td>推理端模板与训练端不一致</td><td>把两端最终喂给模型的字符串逐字节 diff</td><td>两端共用同一份 <code>chat_template</code></td></tr>
+                <tr><td><strong>数学/代码能力明显退化</strong></td><td>数据配比里缺这类样本</td><td>跑对应小评测集对比训练前后</td><td>回补该类别数据；降低学习率或 epoch</td></tr>
+                <tr><td><strong>什么都不敢答</strong></td><td>安全/拒答样本占比过高</td><td>统计拒答率，与人类判定的应拒率比</td><td>见 <a href="safety-alignment.html">拒答校准</a></td></tr>
+                <tr><td><strong>评测分很高、用户吐槽</strong></td><td>训练数据污染了评测集</td><td>做 n-gram 重叠检测</td><td>去污染后重训；换私有评测集</td></tr>
+                <tr><td><strong>loss 突然飙升成 NaN</strong></td><td>学习率过大、异常长样本、混合精度溢出</td><td>看飙升那一步的 batch 内容</td><td>降学习率、加梯度裁剪、过滤异常样本</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>SFT 的能力上限在哪里</h2>
+          <p>SFT 本质上是<strong>行为克隆</strong>：给一堆示范，让模型模仿。这决定了它有三层天花板。</p>
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">无法超越示范者</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">模型学到的上限就是标注者的水平。示范里没有的解题思路，SFT 教不会。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">不知道「更好」是什么</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">数据只给了一个正确答案，没告诉模型另外三个回答哪个更好、差在哪里。偏好排序这种信息，SFT 的损失函数根本表达不了。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">只有正例，没有负例</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">SFT 只会说「照这样答」，从不说「别那样答」。想压制某类不良输出，得靠别的机制。</p>
+            </div>
+          </div>
+          <p>还有一个更微妙的问题：如果示范数据里包含模型<strong>其实并不知道</strong>的知识，SFT 等于在教它「用自信的语气说出自己不确定的内容」——这会加剧幻觉。反过来，如果大量示范都在说「我不确定」，模型又会变得过度保守。这两种失衡都不是靠加数据能解决的，因为问题出在「模仿」这个范式本身。</p>
+          <p>把这几条天花板画成一张知识地图，也顺便给你一张 SFT 的复习清单：</p>
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("SFT"))
+    数据
+      质量优先于数量
+      配比决定保住哪些能力
+      去重与去污染
+      来源见合成数据一节
+    模板
+      角色标记
+      回合结束符即 EOS
+      训练推理逐字节一致
+      特殊 token 要入词表
+    训练
+      损失同 CLM 只多一个 mask
+      学习率 1e-5 量级
+      2 到 3 个 epoch
+      梯度裁剪与打包注意力屏蔽
+    评估
+      验证 loss 会骗人
+      固定 prompt 生成抽检
+      多样性与能力回归测试
+    上限
+      无法超越示范者
+      表达不了偏好排序
+      只有正例没有负例
+      需要偏好对齐接力
+            </div>
+            <figcaption>SFT 知识地图。四个可操作维度（数据、模板、训练、评估）加一个必须认清的边界（上限）。把这张图记住，基本就掌握了 SFT 的全部要点。</figcaption>
+          </figure>
+          <p>要突破这些上限，需要换一种监督信号：不再给「标准答案」，而是给<strong>比较</strong>——告诉模型 A 比 B 好。这正是 RLHF 登场的地方。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：损失函数与预训练的 CLM 完全相同，差别只在数据形态 + loss mask。全部工程设施可复用预训练那一套。</li>
+            <li><strong>定位</strong>：知识来自预训练，SFT 只塑造行为。想灌知识请找检索或持续预训练，别指望 SFT。</li>
+            <li><strong>Loss mask</strong>：prompt 部分 label 置 <code>-100</code>，只对 assistant 回复算损失。写完必须 decode 验证一次。</li>
+            <li><strong>对话模板</strong>：训练与推理必须逐字节一致；统一走 tokenizer 的 <code>chat_template</code>，不要手拼字符串；特殊标记要真的在词表里。</li>
+            <li><strong>结束标记</strong>：漏掉回合结束符 → 模型停不下来，一直续写或自问自答。</li>
+            <li><strong>数据</strong>：质量优先于数量，噪声数据是负收益；配比决定哪些能力被保住；去重和去污染是性价比最高的两步。</li>
+            <li><strong>配方</strong>：学习率 $10^{-5}$ 量级（LoRA 可高一个数量级），2-3 个 epoch，梯度裁剪 1.0，weight decay 接近 0。</li>
+            <li><strong>过拟合判断</strong>：验证 loss 会骗人——从「甜点区」滑向复读时 loss 往往还在降。必须靠固定 prompt 的生成抽检 + 定期 checkpoint。</li>
+            <li><strong>方案选择</strong>：默认从 LoRA 起步调数据配方，配方定了再考虑全参。SFT 的收益主要来自数据而非可训练参数量。</li>
+            <li><strong>上限</strong>：行为克隆无法超越示范者，也学不到「哪个回答更好」；示范里有模型不知道的知识会加剧幻觉。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Training language models to follow instructions with human feedback（InstructGPT）— 第一次把 SFT + 奖励模型 + PPO 串成完整后训练流程的系统性工作，SFT 这一步的做法基本成为后续标准 · <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener">arXiv:2203.02155</a></li>
+            <li>LIMA: Less Is More for Alignment — 用一千条精选样本做 SFT 即可获得可用对话模型，提出「表层对齐假说」，是「质量优先于数量」最有力的实证 · <a href="https://arxiv.org/abs/2305.11206" target="_blank" rel="noopener">arXiv:2305.11206</a></li>
+            <li>Finetuned Language Models Are Zero-Shot Learners（FLAN）— 多任务指令微调带来零样本泛化，指令微调这条路线的起点之一 · <a href="https://arxiv.org/abs/2109.01652" target="_blank" rel="noopener">arXiv:2109.01652</a></li>
+            <li>Scaling Instruction-Finetuned Language Models — 系统研究指令微调在任务数量、模型规模、思维链数据三个维度上的扩展效应 · <a href="https://arxiv.org/abs/2210.11416" target="_blank" rel="noopener">arXiv:2210.11416</a></li>
+            <li>Self-Instruct: Aligning Language Models with Self-Generated Instructions — 指令数据自举生成的开创性工作，理解 SFT 数据从哪来的必读 · <a href="https://arxiv.org/abs/2212.10560" target="_blank" rel="noopener">arXiv:2212.10560</a></li>
+            <li>Hugging Face Transformers 的 chat template 文档 — 对话模板的规范写法、<code>add_generation_prompt</code> 的语义与常见陷阱，具体参数以官方文档为准 · <a href="https://huggingface.co/docs/transformers/chat_templating" target="_blank" rel="noopener">官方文档</a></li>
+            <li>Hugging Face TRL 文档 — 开源的 SFT 训练器实现，可以对照阅读 collator、packing 与 loss mask 的工程写法 · <a href="https://huggingface.co/docs/trl" target="_blank" rel="noopener">官方文档</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            SFT 教会模型「怎么说话」，但教不会它「什么才算说得好」。下一步用人类的成对偏好来训练奖励信号，让模型跨过示范数据的天花板——见 <a href="rlhf.html">RLHF</a>；如果想先解决显存和迭代速度的问题，见 <a href="peft-lora.html">参数高效微调</a>；想跟着做一遍完整流程，见 <a href="../15-practice/finetune-practice.html">实战：LoRA 微调全流程</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

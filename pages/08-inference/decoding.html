@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>解码策略 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="08-inference" data-topic="decoding">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>解码策略</h1>
+            <p class="lead">模型每一步真正吐出来的，是词表上几万个 token 的一整张概率分布。从这张分布里挑出一个词，才是你看到的那个字。挑法不同，同一个模型可以严谨得像法条，也可以放飞得像散文——而这一步全靠你在 API 里设的那几个参数决定。这一节把这几个参数从数学、工程、调参三个角度讲透，并给出可以直接抄的场景对照表。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>解码就是<strong>「模型给了一张选票统计，你按什么规则宣布当选者」</strong>。温度决定这张选票是「一家独大」还是「势均力敌」，Top-k / Top-p 决定谁有资格进入候选名单，最后才是唱票——要么直接选票王（贪心），要么按得票比例抽签（采样）。整条流水线不改一个模型参数，却能让同一个模型呈现出完全不同的「性格」。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  H["最后一层隐状态"] --> L["logits<br/>词表上每个 token 一个分数"]
+  L --> R["重复惩罚<br/>压低已出现过的 token"]
+  R --> T["温度缩放<br/>logit 除以 T"]
+  T --> SM["Softmax<br/>转成概率分布"]
+  SM --> C["候选裁剪<br/>Top-k / Top-p / min-p"]
+  C --> N["重新归一化"]
+  N --> D{"选一个"}
+  D -->|取最大值| G["贪心 / 束搜索"]
+  D -->|按概率抽签| S["随机采样"]
+  style T fill:#faeeda,stroke:#ba7517
+  style C fill:#e6f1fb,stroke:#185fa5
+              </div>
+              <figcaption>一步解码的完整流水线：惩罚 → 温度 → 归一 → 裁剪 → 选词。注意这条流水线每生成一个 token 就完整跑一遍，一段 500 token 的回答就要跑 500 次。</figcaption>
+            </figure>
+          </div>
+
+          <h2>解码到底在做什么</h2>
+          <p>自回归模型每前进一步，做的事情永远只有一件：根据已经写出的内容，给词表里<strong>每一个</strong> token 打一个分数（logit）。以一个 15 万词表的模型为例，每步产生的就是一个长度 15 万的向量。</p>
+          <p>Softmax 把这些分数转成概率：</p>
+          <div class="figure" style="text-align:center">
+            $$p_i = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}}$$
+          </div>
+          <p>解码策略要回答的问题只有一句：<strong>拿到这张概率分布之后，选哪个 token？</strong> 注意这一步<em>完全在模型之外</em>——它不改一个参数、不多跑一次前向，纯粹是后处理。这也意味着两件事：换解码参数是零成本的，而且同一个模型在不同参数下的表现差异，可能比换一个模型还大。</p>
+
+          <h3>把一步拆开看</h3>
+          <p>假设模型已经写了「今天天气真」，现在要选下一个词。它内部大致会给出这样一组 logit（数字为示意，用来说明机制）：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>候选 token</th><th>logit</th><th>T=1 概率</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><strong>好</strong></td><td>3.0</td><td>61.2%</td><td>最自然的续写</td></tr>
+                <tr><td><strong>不错</strong></td><td>2.0</td><td>22.5%</td><td>也很合理</td></tr>
+                <tr><td><strong>糟糕</strong></td><td>1.0</td><td>8.3%</td><td>语义上说得通，只是不常见</td></tr>
+                <tr><td><strong>冷</strong></td><td>0.5</td><td>5.0%</td><td>可以接受</td></tr>
+                <tr><td><strong>紫色</strong></td><td>0.0</td><td>3.0%</td><td>基本是噪声</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>剩下的 14 万多个 token 分数都远低于 0，概率加起来也不到千分之一——但它们仍然存在。这就是解码策略要处理的第一件事：<strong>词表的绝大部分是垃圾，但它们的概率不是零</strong>。生成 500 个 token，每步都有那么一点点概率踩到长尾，累积起来就变成了「明明前面写得好好的，突然冒出一个莫名其妙的词」。</p>
+          <p>第二件事是：这张表每一步都在变。上一步选了「好」，下一步的分布就完全不同；如果上一步选了「糟糕」，后面整段话的走向都会跟着变。<strong>解码是一个逐步、不可回退的过程</strong>，一步的偏差会被后续所有步骤继承。这正是解码策略之所以重要的原因——它不是在做一次决策，而是在做几百次串行的决策。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as 客户端
+  participant S as 推理服务
+  participant M as 模型前向
+  participant D as 采样器
+  U->>S: 请求 加上 temperature/top_p 等参数
+  S->>M: 送入 prompt 做 prefill
+  M-->>S: 首个 logits 向量
+  loop 每生成一个 token
+    S->>D: 交给采样器 惩罚 温度 裁剪
+    D-->>S: 返回选中的 token id
+    S-->>U: 流式推送这个 token
+    S->>M: 把新 token 追加进 KV Cache 再前向一步
+    M-->>S: 下一步 logits
+  end
+  S-->>U: 命中 EOS 或 max_tokens 后结束
+            </div>
+            <figcaption>一次流式生成中的调用顺序：模型只负责产出 logits，采样器是独立的一环。换解码参数只影响「采样器」这个方框，模型和 KV Cache 都不用动——这就是为什么调参是零成本的。</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            模型负责「给出所有可能性的概率」，解码负责「在可能性里做决断」。前者是能力，后者是性格。你换不了模型的能力，但可以随时换它的性格。
+          </div>
+
+          <h2>确定性路线：贪心与束搜索</h2>
+
+          <h3>贪心解码 Greedy</h3>
+          <p>最简单的规则：每一步都取概率最大的那个 token，即 $x_t = \arg\max_i p_i$。</p>
+          <p>它的好处很实在——输出可复现、延迟最低、不会冒出莫名其妙的词。抽取式任务（从文本里摘出金额、日期、实体）、分类打标、SQL 生成这类「有标准答案」的场景，贪心几乎总是首选。做单元测试和回归测试时，贪心也是唯一能让断言写得下去的选择。</p>
+          <p>但贪心有两个绕不开的毛病：</p>
+          <ul>
+            <li><strong>每步最优 ≠ 整句最优</strong>。第 1 步选了概率 0.51 的词，可能把自己带进一条后续处处别扭的路；而第 1 步选概率 0.49 的词，整句的联合概率反而更高。贪心没有回头路。用走迷宫打比方：每个路口都挑「看起来最宽」的那条走，最后未必能走出去。</li>
+            <li><strong>容易掉进重复循环</strong>。一旦生成了「这个问题很重要，因为它很重要」这样的片段，重复本身会抬高继续重复的概率，模型就此卡死在一个循环里。开放式长文本用贪心，跑着跑着开始复读是常见现象。</li>
+          </ul>
+
+          <p>第二个问题值得再展开一点，因为它是一个<strong>正反馈</strong>：模型在训练时见过大量「前文出现过的短语在后文再次出现」的样本（人写文章确实会重复关键词），所以「已出现过」这个特征本身就会抬高概率；贪心又总是取最大值，于是一旦踏进重复区，它就再也出不来。下面这张状态图描述了这个陷阱：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  direction LR
+  state "正常生成" as Normal
+  state "复述前文" as Echo
+  state "复读锁死" as Loop
+  state "自然结束" as Done
+
+  [*] --> Normal
+  Normal --> Echo : 恰好采到一个前文出现过的短语
+  Echo --> Normal : 采样带来的扰动把它拉回来
+  Echo --> Loop : 贪心总取最大值 重复概率被自我强化
+  Loop --> Loop : 循环持续 直到撞上 max_tokens
+  Normal --> Done : 生成 EOS
+  Loop --> Done : 靠重复惩罚或 stop 词强制脱出
+
+  note right of Loop
+    贪心没有随机扰动
+    进入这个状态几乎无法自行退出
+  end note
+            </div>
+            <figcaption>贪心解码的复读陷阱状态机。采样之所以比贪心更不容易复读，是因为「随机扰动」提供了从 Echo 状态退回 Normal 的路径；而贪心一旦进入 Loop 就只能靠外部机制（重复惩罚、stop 词、max_tokens）打断。</figcaption>
+          </figure>
+
+          <h3>束搜索 Beam Search</h3>
+          <p>束搜索是对「每步最优不等于整句最优」的直接补救：同时保留 $k$ 条候选路径（beam），每步把每条路径都往后扩展一格，再从所有扩展结果里按<strong>累积对数概率</strong>留下最好的 $k$ 条。因为长序列的对数概率天然更小，实践中还要做长度归一化，否则模型会偏爱短句。</p>
+          <p>直观地说，贪心是「一个人走迷宫」，束搜索是「派 $k$ 个人分头走，每到一个路口就集合一次，淘汰掉走得最差的几个」。$k=1$ 时束搜索退化成贪心；$k$ 越大搜索越充分，代价是每步都要维护 $k$ 份 KV Cache、跑 $k$ 倍的前向。</p>
+          <p>它在机器翻译、语音识别、摘要这类<strong>封闭式任务</strong>里是标准配置——这些任务的输出长度大致由输入决定，而且确实存在「更好的译法」这种客观优劣。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">为什么开放式生成反而不用束搜索</span>
+            束搜索优化的目标是「整句概率最高」，可是<strong>人类写的自然语言恰恰不是概率最高的语言</strong>。真实文本里信息密度是起伏的，会有转折、有出人意料的用词；而概率最高的续写永远是最安全、最套话、最平庸的那句。研究者观察到一个反直觉的现象：在开放式生成里把 beam 数调大，输出质量反而下降——搜索得越充分，越是把模型推向「正确的废话」。<strong>Top-p 采样就是为了摆脱这个陷阱而提出的。</strong>
+          </div>
+
+          <p>还有两个工程上的理由让束搜索基本退出了聊天类 LLM 服务：<strong>算力放大 $k$ 倍</strong>，以及<strong>无法真正流式输出</strong>——在所有 beam 收敛到同一前缀之前，你不知道该把哪条路径的 token 推给用户。想象一下：$k=4$ 条路径分别写着「今天天气」「今天的天」「今日气温」「今天气候」，你要往用户屏幕上推哪一个？只能等它们收敛，可这一等，流式的意义就没了。这就是为什么主流对话 API 干脆不提供这个选项。</p>
+
+          <h2>随机性路线：温度、Top-k、Top-p</h2>
+
+          <h3>温度 Temperature</h3>
+          <p>温度作用在 Softmax <em>之前</em>：把每个 logit 都除以 $T$，再归一化。这一步不改变任何 token 的相对排名，只改变分布的<strong>形状</strong>。</p>
+          <ul>
+            <li>$T &lt; 1$：分数差被放大，分布变尖，强者恒强 → 更保守、更确定。</li>
+            <li>$T = 1$：原始分布，不做任何改变。</li>
+            <li>$T &gt; 1$：分数差被压缩，分布变平，长尾词有了出头机会 → 更发散、更容易胡说。</li>
+            <li>$T \to 0$：分布退化成一个 one-hot，等价于贪心。这也是为什么绝大多数 API 把 <code>temperature=0</code> 直接实现为 argmax——真除以 0 会溢出。</li>
+          </ul>
+          <p>「温度」这个名字来自统计物理里的玻尔兹曼分布：高温时粒子在各能级上分布得更均匀，低温时全都挤在最低能级。语言模型借用了同一套数学形式，直觉也是一致的——<strong>温度高＝系统更活跃＝更不可预测</strong>。</p>
+          <p>下图是同一组 logits <code>[3.0, 2.0, 1.0, 0.5, 0.0]</code> 在三个温度下的概率分布，可以直观看到「尖」和「平」的差别：</p>
+
+          <figure class="figure">
+            <div class="chart-box"><canvas id="tempChart"></canvas></div>
+            <figcaption>同一组 logits 在 T=0.5 / 1.0 / 1.5 下的概率分布（%）。T=0.5 时首选词吃掉 86% 的概率；T=1.5 时降到 47.6%，末位词从 0.2% 升到 6.4%</figcaption>
+          </figure>
+
+          <p>注意末位那个词：温度从 0.5 升到 1.5，它的中签概率涨了 30 多倍。<strong>创造力和胡言乱语是同一个旋钮拧出来的</strong>，因为分布尾部既藏着新奇的比喻，也藏着错误的事实。这不是模型没调好，而是这个旋钮的物理本质决定的——你无法只把「好的意外」放进来而把「坏的意外」挡在外面。</p>
+          <p>还要提醒一点：上表只列了 5 个候选，真实词表有十几万个。$T=1.5$ 时，那 14 万个「几乎不可能」的 token 每一个都从 $10^{-8}$ 量级涨到了 $10^{-6}$ 量级，<strong>它们加起来的总概率质量可能达到百分之几</strong>。这就是高温下模型偶尔蹦出乱码或外语词的来源。Top-k / Top-p 的价值就在于把这条长尾整体切掉。</p>
+
+          <details class="deep">
+            <summary>展开：温度怎么改变分布——把前面那张图手算一遍</summary>
+            <div class="deep-body">
+              <p>上一节那张柱状图的数字不是随便画的，它们就是 softmax 手算的结果。就拿页首那张表的 logits <code>[3.0, 2.0, 1.0, 0.5, 0.0]</code> 来算。softmax 的公式是 $p_i = \frac{e^{z_i/T}}{\sum_j e^{z_j/T}}$，温度 $T$ 出现在指数里。</p>
+              <p><strong>当 $T = 0.5$：</strong>先把每个 logit 除以 0.5，得到 <code>[6, 4, 2, 1, 0]</code>，再算 $e$ 的幂：$e^6 \approx 403.4$，$e^4 \approx 54.6$，$e^2 \approx 7.39$，$e^1 \approx 2.72$，$e^0 = 1$。分母（归一化常数）是这些数之和约 469。于是第一个词的概率是 $403.4/469 \approx 86\%$，第二名约 11.6%，第三名 1.6%，最后两名只剩 0.6% 和 0.2%。——这就是「分布变尖」：第一名几乎吃掉了全部概率。</p>
+              <p><strong>当 $T = 1.5$：</strong>把每个 logit 除以 1.5，得到 <code>[2, 1.33, 0.67, 0.33, 0]</code>，对应 $e$ 的幂约为 <code>[7.39, 3.79, 1.95, 1.40, 1]</code>，分母约 15.5。于是第一名概率降到 $7.39/15.5 \approx 47.6\%$，第二名涨到约 24.4%，最后一名也有约 6.4%。——这就是「分布变平」：长尾词一个个抬起头来。</p>
+              <p>对比这两组数，你会看到温度并不是「均匀地重排概率」，而是<strong>改变第一名和其他所有候选之间的比值</strong>。$T$ 越大，比值越接近 1，就越接近「随机挑一个」；$T$ 越小，比值差被放大，就越接近「永远选第一」。这也解释了为什么对「有标准答案」的任务要把 $T$ 调到接近 0——你不想让第二名（往往是错误选项）有任何翻盘的机会。</p>
+              <p style="margin-bottom:0">一个常见的直觉误区：<strong>温度 0.5 是不是「比温度 1.0 更聪明」？</strong>不是。低温只是让模型更专一地选它本来就认为最顺的那个词。如果模型最顺的那个词本身就是错的（知识问题），低温会把这个错误选得更加坚决。温度改变的只是「冒险程度」，不是「判断力」。</p>
+            </div>
+          </details>
+
+          <h3>Top-k 采样</h3>
+          <p>只保留概率最高的 $k$ 个 token，其余全部置为 $-\infty$，在这 $k$ 个里重新归一化后抽样。它砍掉了长尾里那些明显荒谬的选项，比纯采样稳得多。</p>
+          <p>问题出在 $k$ 是个<strong>固定值</strong>，而分布形状每一步都在变：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>此刻的分布</th><th>典型场景</th><th>固定 k 的后果</th></tr></thead>
+              <tbody>
+                <tr><td><strong>非常尖锐</strong>，第一名 0.95</td><td>「中华人民共和国成立于 1949 __」几乎只有一个合理答案</td><td>k=50 会把 49 个概率极低的错误选项拉进候选池，白白引入风险</td></tr>
+                <tr><td><strong>非常平坦</strong>，前 200 名都在 0.005 上下</td><td>「他推开门，看见 __」下文可以是任何东西</td><td>k=50 强行砍掉了大量同样合理的续写，输出变得单调</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>换句话说，$k$ 是个「一刀切」的阈值，而语言生成本身是「时而确定、时而开放」的。同一句话里，写到专有名词时分布极尖，写到形容词时分布极平——用同一个 $k$ 显然不合适。</p>
+
+          <h3>Top-p / 核采样 Nucleus Sampling</h3>
+          <p>Top-p 换了个思路：不固定候选<strong>个数</strong>，而是固定候选的<strong>概率质量</strong>。按概率从高到低累加，取「累积概率刚刚超过 $p$」的最小集合，这个集合就叫核（nucleus）。</p>
+          <p>还用上面那组数字（$T=1$ 时概率依次为 61.2%、22.5%、8.3%、5.0%、3.0%）：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>排名</th><th>概率</th><th>累积</th><th>top_p = 0.9 是否入选</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td>61.2%</td><td>61.2%</td><td>✅</td></tr>
+                <tr><td>2</td><td>22.5%</td><td>83.7%</td><td>✅</td></tr>
+                <tr><td>3</td><td>8.3%</td><td>91.9%</td><td>✅ 累积首次越过 0.9，到此为止</td></tr>
+                <tr><td>4</td><td>5.0%</td><td>97.0%</td><td>❌</td></tr>
+                <tr><td>5</td><td>3.0%</td><td>100%</td><td>❌</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>妙处在于候选集<strong>自动随分布形状伸缩</strong>：分布尖锐时可能只留 1～2 个词（该确定的地方就确定），分布平坦时可能留几百个词（该发散的地方就发散）。这正是 Top-p 取代 Top-k 成为默认策略的原因，也是今天几乎所有厂商 API 都提供 <code>top_p</code> 的原因。</p>
+          <p>提出 Top-p 的那篇论文（Holtzman 等人的《The Curious Case of Neural Text Degeneration》）给出了一个很有说服力的观察：人类真实文本的 token 概率是<strong>上下起伏</strong>的，有大量「低概率但合理」的用词；而束搜索生成的文本，概率曲线是一条几乎贴着顶的平线。这从量化角度说明了「概率最高 ≠ 最像人写的」。这个观察的原始证据就在下面这张论文原图里，值得花一分钟把它读懂。</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/1904.09751/assets/x2.png" alt="论文原图：同一上下文下，人类文本与束搜索生成文本的 token 概率对比——人类文本概率起伏大，束搜索文本几乎恒为最高概率" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：Top-p 论文的经典证据——左边人类写的词概率明显上下起伏，右边 Beam Search 生成的词概率几乎贴着顶、毫无起伏</span>
+              <span class="pf-src">论文原图 · Holtzman et al., <em>The Curious Case of Neural Text Degeneration</em>, 2019, Figure 2 · <a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noopener">arXiv:1904.09751</a></span>
+            </figcaption>
+          </figure>
+
+          <p>这张图的横轴是「按生成顺序排列的每一个 token」，纵轴是「模型给这个 token 的概率」。图里两条轨迹分别是人类写作和束搜索生成。新手读这张图只需要抓一个现象：<strong>人类的曲线忽高忽低，束搜索的曲线几乎是一条贴着顶的平线</strong>。为什么？因为人类写作会在「顺畅处用高概率词」，也会在「转折、换气、加修饰」时故意选不那么高概率的词——概率低但信息量高；而束搜索每一步都挑概率最高的 token，于是它永远不会主动去选那些「低概率但精彩」的词，整段话就变成了一条毫无起伏的「正确废话」平线。Top-p 存在的全部理由，就是让采样有机会选中这条平线下方那些「低概率但合理」的候选。</p>
+
+          <h3>min-p：一个更新的选项</h3>
+          <p>Top-p 也不是完美的。它按累积概率切，在极平坦的分布上仍可能保留几百个质量参差的候选；而 min-p 换了个基准：<strong>只保留概率不低于「最高概率 × min_p」的 token</strong>。比如 <code>min_p=0.1</code>、最高概率是 0.6 时，阈值就是 0.06，低于它的全砍掉；最高概率只有 0.05 时，阈值降到 0.005，候选集自动放宽。</p>
+          <p>它的直觉是「跟第一名比，差得太远的就没资格参赛」。因为阈值是相对的，分布尖锐时候选集自动收紧、平坦时自动放宽，在高温下比 top-p 更不容易崩。部分开源推理引擎已经支持这个参数，具体是否可用以你所用引擎的官方文档为准。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            三个采样参数经常被误当成「三个独立的功能」，其实它们作用在<strong>同一个环节、同一个分布</strong>上，改任何一个都会牵动其他两个的实际效果。最常见的误解有三个：一是「温度越高模型越聪明」——不是，温度只改分布形状，不改知识量，高温只会让错误答案也有机会被选中；二是「top_p 设小一点就是让输出更短」——不是，top_p 管的是<strong>候选范围</strong>，不直接管长度；三是「min-p 和 top-p 可以同时开，双保险」——可以开，但它们都是候选裁剪，同时开等于双重裁切，结果通常偏保守，多数场景选一个就够。<strong>记住一句话：先想清楚你要的是「更确定」还是「更发散」，再决定动哪个旋钮。</strong>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("解码参数家族"))
+    分布整形
+      温度 temperature
+        小于 1 变尖
+        大于 1 变平
+        等于 0 退化为贪心
+    候选裁剪
+      top_k 固定个数
+      top_p 固定概率质量
+      min_p 相对阈值
+    重复抑制
+      presence_penalty 只看有没有出现
+      frequency_penalty 按次数递增
+      repetition_penalty 乘性缩放
+      no_repeat_ngram 硬性禁止
+    停止与长度
+      max_tokens 上限
+      stop 停止字符串
+      EOS 结束符
+    确定性控制
+      seed 随机种子
+      n 一次返回几条
+      logprobs 返回概率明细
+    强制干预
+      logit_bias 手动加减分
+      约束解码 语法掩码
+            </div>
+            <figcaption>解码参数的完整家族图谱。真正影响「文风」的只有前三组，后三组影响的是长度、可复现性和格式约束——排查问题时先分清自己动的是哪一组。</figcaption>
+          </figure>
+
+          <details class="deep">
+            <summary>展开：一次采样的最小实现</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">import torch
+
+def sample_next_token(logits, temperature=1.0, top_k=0, top_p=1.0):
+    """logits: 形状 (vocab_size,) 的最后一步原始分数"""
+    if temperature &lt;= 0:                      # 温度 0 退化为贪心
+        return int(logits.argmax())
+
+    logits = logits / temperature             # ① 温度缩放
+
+    if top_k &gt; 0:                             # ② Top-k：只留分数最高的 k 个
+        kth = torch.topk(logits, top_k).values[-1]
+        logits[logits &lt; kth] = float("-inf")
+
+    if top_p &lt; 1.0:                           # ③ Top-p：累积概率刚过 p 的最小集合
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        cum = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        drop = cum &gt; top_p
+        drop[1:] = drop[:-1].clone()          # 右移一位，保证越界的那个词也留下
+        drop[0] = False                       # 至少保留概率最高的 token
+        logits[sorted_idx[drop]] = float("-inf")
+
+    probs = torch.softmax(logits, dim=-1)     # ④ 在候选集内重新归一化
+    return int(torch.multinomial(probs, 1))   # ⑤ 按概率抽签</code></pre>
+              <p>两个容易写错的细节：一是 <code>drop</code> 必须右移一位，否则「让累积概率越过 p 的那个词」会被误杀，当第一个词概率就大于 p 时甚至会清空候选集；二是裁剪之后<strong>必须重新归一化</strong>，否则概率和不为 1。</p>
+              <p style="margin-bottom:0">还有一个实现顺序上的坑：<strong>温度必须在裁剪之前施加</strong>。如果先按原始分布做 top-p 再调温度，候选集是按 $T=1$ 的形状切的，温度就失去了「扩大候选范围」的作用——你会发现调高温度几乎没效果。主流引擎的默认顺序都是「惩罚 → 温度 → 裁剪」，自己写采样器时别搞反。</p>
+            </div>
+          </details>
+
+          <h2>抑制重复：三种惩罚不是一回事</h2>
+          <p>即使用了采样，长文本里的车轱辘话仍然很常见。惩罚项的作用是在解码前<strong>直接修改 logits</strong>，压低已经出现过的 token。三种常见做法机制不同，别混用：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>参数</th><th>机制</th><th>与出现次数的关系</th><th>适合解决</th></tr></thead>
+              <tbody>
+                <tr><td><strong>presence_penalty</strong><br/>存在惩罚</td><td>只要出现过，就减去一个固定值</td><td><strong>无关</strong>：出现 1 次和 10 次罚得一样重</td><td>推动模型换话题、引入新概念，扩大主题覆盖面</td></tr>
+                <tr><td><strong>frequency_penalty</strong><br/>频率惩罚</td><td>按出现次数成比例扣分</td><td><strong>正比</strong>：说得越多罚得越狠</td><td>抑制同一个词、同一句话反复刷屏</td></tr>
+                <tr><td><strong>repetition_penalty</strong><br/>重复惩罚</td><td>乘性缩放：正 logit 除以系数、负 logit 乘以系数</td><td>通常只看是否出现过</td><td>开源栈里的通用抑制手段，常见取值 1.05～1.15</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>前两个是 OpenAI 风格 API 的参数，取值范围为 −2.0 到 2.0（负值等于鼓励重复）；第三个来自 Hugging Face / 开源推理引擎一脉，是乘性而非加性的，所以 1.0 才表示「不惩罚」。具体参数名与默认值以各家官方文档为准。</p>
+          <p>还有一种更硬的手段叫 <code>no_repeat_ngram_size</code>：直接禁止任何长度为 $n$ 的片段重复出现，实现上是把会造成重复的那些 token 的 logit 设为 $-\infty$。它的效果立竿见影，但副作用也最大——比如设 <code>no_repeat_ngram_size=3</code>，「人工智能技术」这个词组在全文只能出现一次，第二次想写就必须换说法。写论文摘要之类需要反复提到同一个术语的文本时，这个参数几乎不能用。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">代码生成千万别开重复惩罚</span>
+            代码天然充满合法重复：缩进、<code>self.</code>、循环里反复出现的变量名、成对的括号。惩罚项无差别地压低这些 token，会导致模型写到一半突然改用别的变量名，或者干脆漏掉缩进。<strong>生成代码、JSON、表格这类结构化内容时，把三种惩罚全部关掉。</strong>同理，生成 CSV、日志、配置文件这类高度重复的格式化文本时也要关。
+          </div>
+
+          <h2>停止条件：什么时候收笔</h2>
+          <p>选词规则解决「写什么」，停止条件解决「写到哪」。这一块参数不影响文风，但线上事故里它们的出镜率一点不比温度低。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>机制</th><th>作用</th><th>典型故障</th><th>排查方向</th></tr></thead>
+              <tbody>
+                <tr><td><strong>EOS token</strong></td><td>模型自己判断「说完了」，生成结束符</td><td>模型不肯停，一直往下写</td><td>检查是否用错了 chat template，导致模型没学过在这个格式下停</td></tr>
+                <tr><td><strong>max_tokens</strong></td><td>硬上限，到了就砍断</td><td>回答被截成半句、JSON 缺右括号</td><td>调大上限；或让模型先输出结论再展开</td></tr>
+                <tr><td><strong>stop 停止串</strong></td><td>生成到指定字符串就停，且该串通常不包含在返回里</td><td>停止串出现在正文中间，回答被提前掐断</td><td>选足够独特的停止串，别用「。」这种高频字符</td></tr>
+                <tr><td><strong>min_tokens</strong></td><td>在达到下限前屏蔽 EOS</td><td>模型被迫凑字数，说废话</td><td>一般不需要设；除非模型总是敷衍地只回一句</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>特别提醒 <code>max_tokens</code> 与结构化输出的组合：模型在写一个长 JSON，写到第 900 个 token 时撞上上限，返回给你的就是一段<strong>语法不合法的半截 JSON</strong>。解析必然失败，而错误信息只会告诉你「意外的输入结束」，很难让人第一时间联想到是长度上限的问题。养成习惯：解析失败时先看返回体里的 <code>finish_reason</code>，如果是 <code>length</code> 而不是 <code>stop</code>，那就是被截断了，跟提示词无关。</p>
+
+          <h2>还有几个不改文风但很关键的旋钮</h2>
+          <ul>
+            <li><strong><code>logit_bias</code></strong>：对指定 token 手动加分或减分。典型用法是做一个只能回答「是/否」的分类器——把这两个 token 加很高的分，其余全压低，模型就只能在两者间选。也可以用它来屏蔽特定词汇。缺点是要按 token id 指定，而 token 切分方式随 tokenizer 而变，换模型就得重做映射。</li>
+            <li><strong><code>seed</code></strong>：固定随机数种子。在采样场景下，同样的 seed + 同样的输入应该给出同样的输出。注意这只是「尽力而为」——下面「坑二」会讲为什么它也不能保证严格复现。</li>
+            <li><strong><code>n</code></strong>：一次请求返回多个候选。它比调用 $n$ 次便宜，因为 prompt 的 prefill 只需要算一次，KV Cache 可以共享。做 <a href="inference-scaling.html">Self-Consistency</a> 或 Best-of-N 时应当优先用这个参数而不是循环调用。</li>
+            <li><strong><code>logprobs</code></strong>：返回每个位置被选中 token 的对数概率，通常还能返回前几名候选。这是调试解码问题最有力的工具——模型「犹豫」时，第一名和第二名的概率会很接近；模型「确信」时，第一名会遥遥领先。用它可以给回答做一个粗糙的置信度估计。</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">用 logprobs 做置信度要小心</span>
+            token 概率高只代表「模型觉得这么写很顺」，不代表「这件事是真的」。模型可以非常自信地编造一个不存在的 API 参数——因为那个参数名在语言上完全合理。logprobs 能有效检测「模型在犹豫」，但检测不了「模型在自信地胡说」。真要评估事实性，得靠 <a href="../10-applications/rag.html">检索</a> 或 <a href="verifier-prm.html">验证器</a>。
+          </div>
+
+          <h2>两个相邻但不同的东西：约束解码与投机解码</h2>
+          <p>初学者容易把这两个词跟上面的采样参数混在一起，其实它们解决的是完全不同的问题。</p>
+          <h3>约束解码：把不合法的选项直接掐掉</h3>
+          <p>如果你要求输出必须是合法 JSON，那么在写完 <code>{"name"</code> 之后，下一个 token 只能是 <code>:</code>，别的都不合法。约束解码的做法是：<strong>在采样之前，用一个状态机（通常由 JSON Schema 或正则/语法编译而来）算出「此刻哪些 token 合法」，把非法 token 的 logit 全设成 $-\infty$</strong>。这样无论温度多高、怎么采样，输出都保证符合语法。</p>
+          <p>它和 top-p 的区别在于依据不同：top-p 按概率切，约束解码按语法切。两者可以叠加——先用语法掩码保证合法，再在合法候选里按 top-p 采样。详见 <a href="../10-applications/structured-output.html">结构化输出与约束解码</a>。</p>
+          <h3>投机解码：加速但不改变分布</h3>
+          <p>投机解码（speculative decoding）用一个小模型先「猜」几个 token，再让大模型一次性并行校验：猜对的部分直接采纳，猜错的地方从那里重来。它的关键性质是<strong>数学上保证输出分布与大模型单独解码完全一致</strong>——它只改速度，不改结果。</p>
+          <p>所以它跟本页讲的所有参数是<strong>正交</strong>的：你设的温度、top_p 照样生效，只是生成得更快。这一点很容易被误解，值得记牢：<em>采样参数改变「写什么」，投机解码只改变「多快写出来」</em>。原理见 <a href="../09-efficiency/speculative-decoding.html">投机解码</a>。</p>
+
+          <h2>场景 → 参数对照</h2>
+          <p>下表是可以直接抄的起点。真实取值仍需按你的模型和任务微调，但方向不会错：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>场景</th><th>temperature</th><th>top_p</th><th>惩罚</th><th>为什么</th></tr></thead>
+              <tbody>
+                <tr><td><strong>代码生成</strong></td><td>0 ～ 0.2</td><td>1.0（不裁剪）</td><td>全关</td><td>语法几乎只有一条正确路径，随机性只会引入 bug；且必须可复现才好排查</td></tr>
+                <tr><td><strong>结构化输出 / 函数调用</strong></td><td>0</td><td>1.0</td><td>全关</td><td>格式正确率优先，配合<a href="../10-applications/structured-output.html">约束解码</a>效果更好</td></tr>
+                <tr><td><strong>事实问答 / 信息抽取</strong></td><td>0 ～ 0.3</td><td>1.0</td><td>全关</td><td>降低采到长尾错误答案的概率，直接减少<a href="../13-evaluation/hallucination.html">幻觉</a></td></tr>
+                <tr><td><strong>RAG 问答</strong></td><td>0 ～ 0.3</td><td>1.0</td><td>全关</td><td>答案应当由检索到的资料决定，而不是由随机数决定</td></tr>
+                <tr><td><strong>翻译 / 摘要</strong></td><td>0.2 ～ 0.4</td><td>0.9</td><td>轻微 frequency</td><td>需要一点措辞灵活度，但不能偏离原意</td></tr>
+                <tr><td><strong>日常对话</strong></td><td>0.6 ～ 0.8</td><td>0.9</td><td>frequency 0.2 ～ 0.5</td><td>要自然不呆板，同时防止多轮之后开始说车轱辘话</td></tr>
+                <tr><td><strong>创意写作</strong></td><td>0.8 ～ 1.0</td><td>0.9 ～ 0.95</td><td>presence 0.3 ～ 0.6</td><td>需要意外性；presence 惩罚推动它不断引入新意象</td></tr>
+                <tr><td><strong>头脑风暴 / 多样化候选</strong></td><td>0.9 ～ 1.1</td><td>0.95</td><td>presence 偏高</td><td>目标是铺开可能性，重复的点子没有价值</td></tr>
+                <tr><td><strong>Agent 工具调用</strong></td><td>0 ～ 0.2</td><td>1.0</td><td>全关</td><td>参数填错一个字段整条链路就断，<a href="../11-agents/agent.html">Agent</a> 场景要的是稳定不是文采</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">推理模型是个例外</span>
+            o 系列、R1 这类<a href="reasoning-models.html">长思维链推理模型</a>往往对采样参数有自己的推荐值，有些干脆不接受 <code>temperature</code>。它们的输出质量主要由思考过程决定，而不是由解码参数决定。用之前先看官方文档，别把通用经验直接套上去。
+          </div>
+
+          <h2>四个真实的坑</h2>
+
+          <h3>坑一：温度和 top_p 一起调，会互相打架</h3>
+          <p>这两个参数作用在同一件事上——分布的有效宽度，但方向可能相反。调高温度是为了把尾部概率抬起来增加多样性，而 top_p 又会把刚抬起来的尾部直接切掉；反过来，低温本已让分布极尖，此时 top_p 无论设多少都几乎不起作用（因为第一个词就吃掉了 90% 以上的概率质量）。</p>
+          <p>结果就是你调了半天参数，效果毫无规律，因为你在同时拧两个耦合的旋钮。<strong>正确做法：固定一个、只调另一个。</strong> 主流厂商文档也普遍建议二选一。实践中的常见约定是把 <code>top_p</code> 固定为 1.0，只用温度控制；或者把温度固定为 1.0，只用 <code>top_p</code> 控制。</p>
+
+          <h3>坑二：temperature=0 不等于「完全可复现」</h3>
+          <p>贪心解码在数学上确实是确定的，但线上服务里同样的输入仍可能得到不同输出。原因不在解码，而在底层：GPU 浮点归约的顺序不保证一致，<strong>同一个请求跟不同的请求拼在一起做批处理（batch）时，累加顺序会变，logits 末位就可能差一点点</strong>——而两个 token 分数极接近时，这一点点足以翻转 argmax，此后整句话都会分岔。MoE 模型的专家路由在批次变化时同样可能抖动。</p>
+          <p>所以「temperature=0 保证可复现」只在单请求、固定硬件、固定引擎版本的前提下近似成立。做回归测试时要有心理准备，别把断言写成逐字符相等。更实用的做法是断言「关键字段值正确」「JSON 能解析」「包含某个必需片段」这类语义级判断，而不是整段比对。</p>
+
+          <h3>坑三：把解码参数当成质量开关</h3>
+          <p>输出不对就去拧温度，是很常见的下意识动作，但它能解决的问题其实很有限。解码只决定「从模型已有的概率分布里怎么挑」，它<strong>无法凭空创造模型没有的知识和能力</strong>：</p>
+          <ul>
+            <li>模型不知道这件事 → 是知识问题，该上 <a href="../10-applications/rag.html">RAG</a>。</li>
+            <li>模型误解了你的意图 → 是<a href="../10-applications/prompt-engineering.html">提示</a>问题。</li>
+            <li>模型格式老是错 → 该上<a href="../10-applications/structured-output.html">约束解码</a>。</li>
+            <li>模型确实答不对这类题 → 是能力问题，换模型或微调。</li>
+          </ul>
+          <p>能靠解码参数解决的，基本只有三类：输出太发散/太死板、复读、以及需要可复现。</p>
+
+          <h3>坑四：拿单条样本判断参数好坏</h3>
+          <p>采样本身就是随机的。同一组参数跑两次，一次很惊艳、一次很平庸，是完全正常的。如果你「改了温度，感觉变好了」，很可能只是这一次抽签运气好。</p>
+          <p>正确的评估方式是：<strong>固定一组测试样例（至少 20～50 条），每组参数各跑 3～5 次，看聚合指标</strong>——格式正确率、事实错误率、人工评分均值，而不是盯着某一条输出。这套流程可以固化成 CI，见 <a href="../12-llmops/prompt-eval-ci.html">提示评测与 CI</a>。</p>
+
+          <h2>动手：给你的任务扫一遍参数</h2>
+          <p>与其凭感觉调，不如花十分钟跑一次网格扫描。下面这段脚本对同一批测试用例遍历若干组参数，统计「格式合法率」和「答案一致率」两个可自动计算的指标。它不依赖具体厂商 SDK，把 <code>call_model</code> 换成你自己的调用即可：</p>
+
+          <pre><code class="language-python">import json, itertools, collections
+
+TEMPS = [0.0, 0.3, 0.7, 1.0]
+TOP_PS = [1.0, 0.9]
+REPEATS = 3          # 每组参数重复几次，抵消采样随机性
+
+def call_model(prompt, temperature, top_p):
+    """替换成你自己的调用；返回字符串"""
+    raise NotImplementedError
+
+def is_valid_json(text):
+    try:
+        json.loads(text)
+        return True
+    except Exception:
+        return False
+
+def scan(cases):
+    """cases: [{"prompt": ..., "gold": ...}, ...]"""
+    report = []
+    for temp, top_p in itertools.product(TEMPS, TOP_PS):
+        ok_format, ok_answer, total = 0, 0, 0
+        # 记录同一条用例多次采样的答案，衡量稳定性
+        stability = []
+        for case in cases:
+            answers = []
+            for _ in range(REPEATS):
+                out = call_model(case["prompt"], temp, top_p)
+                total += 1
+                if is_valid_json(out):
+                    ok_format += 1
+                    if json.loads(out).get("answer") == case["gold"]:
+                        ok_answer += 1
+                answers.append(out)
+            # 多次采样中出现频次最高的那个占比 = 稳定性
+            top_cnt = collections.Counter(answers).most_common(1)[0][1]
+            stability.append(top_cnt / REPEATS)
+
+        report.append({
+            "temperature": temp,
+            "top_p": top_p,
+            "format_ok": round(ok_format / total, 3),
+            "answer_ok": round(ok_answer / total, 3),
+            "stability": round(sum(stability) / len(stability), 3),
+        })
+
+    # 先按正确率排，正确率接近时优先选更稳定的
+    report.sort(key=lambda r: (-r["answer_ok"], -r["stability"]))
+    for r in report:
+        print(r)
+    return report</code></pre>
+
+          <p>跑完之后你通常会看到三种典型形态，据此就能判断该往哪个方向调：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>扫描结果的形态</th><th>说明什么</th><th>下一步该做什么</th></tr></thead>
+              <tbody>
+                <tr><td>温度越低正确率越高，且低温下稳定性接近 1.0</td><td>这是一个有标准答案的任务</td><td>直接锁 <code>temperature=0</code>，别再纠结采样参数</td></tr>
+                <tr><td>各组正确率都差不多，只有稳定性有差异</td><td>解码参数不是瓶颈</td><td>去改提示词、加检索、或者换模型，调参没用</td></tr>
+                <tr><td>格式合法率在高温下明显掉</td><td>模型对格式的掌握不牢，高温把它推出了安全区</td><td>上<a href="../10-applications/structured-output.html">约束解码</a>，而不是靠低温硬扛</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：解码策略的演进脉络，以及为什么会这样发展</summary>
+            <div class="deep-body">
+              <p>解码策略的每一次变化，几乎都是被「上一代方法暴露出的具体失败」逼出来的：</p>
+              <div class="mermaid">
+timeline
+  title 解码策略的演进
+  神经机器翻译时期 : 束搜索成为封闭式任务的默认解法 : 优化整句概率在有标准译文时确实有效
+  开放式生成登场 : 束搜索被发现产出乏味重复的文本 : Top-k 采样被提出用来引入受控随机性
+  分布形状问题暴露 : 固定 k 无法适应尖锐与平坦分布 : 核采样 Top-p 用累积概率质量替代固定个数
+  大模型服务化 : 重复惩罚 停止串 logit_bias 等工程参数进入 API : 解码从研究话题变成产品旋钮
+  推理与效率并重 : 约束解码保证格式 投机解码保证速度 : 采样参数之外出现了正交的新维度
+  高温需求增加 : Top-p 在极平分布上仍显粗糙 : min-p 等相对阈值方法出现
+              </div>
+              <p>这条脉络里有一个反复出现的模式：<strong>每当一种方法被用到它设计意图之外的场景，就会暴露新问题，进而催生下一代方法</strong>。束搜索本是为翻译设计的，被拿去写故事就露怯；Top-k 本是为「砍长尾」设计的，遇到分布形状剧烈变化就露怯；Top-p 本是为「自适应候选集」设计的，在极端高温下又显得不够。</p>
+              <p style="margin-bottom:0">对使用者的启示是：<strong>不存在「最好的解码策略」，只存在「跟你的任务分布匹配的解码策略」</strong>。判断标准不是它有多新，而是你的任务是偏封闭（有标准答案）还是偏开放（要多样性）。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：模型输出的是词表上的概率分布，解码是「从分布里选一个 token」的后处理规则，不改模型、不加算力。</li>
+            <li><strong>贪心</strong>：每步取 argmax。可复现、延迟低，适合抽取和代码；缺点是易复读、每步最优不等于整句最优。</li>
+            <li><strong>束搜索</strong>：保留 $k$ 条路径优化整句概率。翻译摘要有效；开放式生成反而更平庸，且无法流式输出，主流对话 API 已不提供。</li>
+            <li><strong>温度</strong>：Softmax 前除以 $T$，只改分布形状不改排名。$T&lt;1$ 变尖、$T&gt;1$ 变平、$T\to 0$ 等于贪心。顺序上必须在裁剪之前施加。</li>
+            <li><strong>Top-k vs Top-p vs min-p</strong>：分别是固定个数、固定累积概率、相对阈值。Top-p 因为候选集自动伸缩而成为默认。</li>
+            <li><strong>三种惩罚</strong>：presence 只问出没出现过、frequency 按次数递增、repetition 是乘性的。<strong>生成代码和 JSON 时全部关掉。</strong></li>
+            <li><strong>停止条件</strong>：EOS、max_tokens、stop 串。解析失败先看 <code>finish_reason</code>，是 <code>length</code> 就说明被截断了。</li>
+            <li><strong>正交维度</strong>：约束解码按语法掩码（改合法性），投机解码只加速（分布不变），都跟采样参数叠加使用。</li>
+            <li><strong>头号坑</strong>：温度和 top_p 同调会互相干扰，固定一个只调另一个。</li>
+            <li><strong>次号坑</strong>：temperature=0 在批处理和 MoE 路由下也不保证逐字节可复现。</li>
+            <li><strong>调参方法</strong>：固定 20～50 条用例、每组重复 3～5 次、看聚合指标，别用单条样本下结论。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：温度、Top-k、Top-p 分别控制什么？</h3>
+              <p><span class="answer-label">标准回答：</span>温度先缩放 logits，控制分布尖锐程度；Top-k 保留固定数量的最高概率 token；Top-p 保留累计概率达到阈值的最小候选集合。温度影响整体随机性，Top-k/Top-p 直接裁剪候选空间。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：为什么贪心解码不一定得到最好文本？</h3>
+              <p><span class="answer-label">标准回答：</span>贪心每一步只选当前最大概率 token，没有考虑后续序列的联合概率和任务目标，容易重复、保守或陷入局部最优。开放式写作常用温度加 Top-p；需要约束和确定性时才优先贪心。</p>
+              <details class="deep">
+                <summary>追问：为什么 Beam Search 在开放式生成中常常变差？</summary>
+                <div class="deep-body">
+                  <p>Beam Search 倾向于最大化模型概率，语言模型的高概率序列可能更安全、更短、更重复；它在机器翻译等条件生成任务中更有价值，但不是所有开放式对话的默认最优解。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：重复惩罚为什么可能伤害代码或结构化输出？</h3>
+              <p><span class="answer-label">标准回答：</span>它会压低已经出现过的 token 概率，而代码中的括号、缩进标记、字段名和 JSON 语法本来就需要重复。对结构化输出应优先使用约束解码或 schema 校验，不能盲目提高 repetition penalty。</p>
+              <pre class="mini-code"><code>logits = logits / temperature
+# 再按 top_k 或 top_p 裁剪候选</code></pre>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>The Curious Case of Neural Text Degeneration — Top-p / 核采样的原始论文，用「人类文本的概率曲线是起伏的」这一观察说明了为什么最大化概率会产出乏味文本 · <a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noopener">arXiv:1904.09751</a></li>
+            <li>Hierarchical Neural Story Generation — 提出 Top-k 采样并用于故事生成，是采样类解码的早期代表工作 · <a href="https://arxiv.org/abs/1805.04833" target="_blank" rel="noopener">arXiv:1805.04833</a></li>
+            <li>Fast Inference from Transformers via Speculative Decoding — 投机解码的代表性工作，证明了可以在保持输出分布不变的前提下加速生成 · <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">arXiv:2211.17192</a></li>
+            <li>OpenAI Chat Completions API 参考 — temperature / top_p / presence_penalty / frequency_penalty / logit_bias / seed 等参数的权威定义，取值范围与默认值以此为准 · <a href="https://platform.openai.com/docs/api-reference/chat" target="_blank" rel="noopener">链接</a></li>
+            <li>Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs — min-p 采样的原始论文，提出以「最高概率的相对比例」作为裁剪阈值，在高温场景下比 top-p 更稳 · <a href="https://arxiv.org/abs/2407.01082" target="_blank" rel="noopener">arXiv:2407.01082</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            解码是「一次生成」内部的选择规则。如果允许多花算力反复生成再挑最好的，就进入了
+            <a href="inference-scaling.html">推理时扩展</a> 的领域——Self-Consistency 本质上就是「用高温采样多条路径再投票」，而挑选环节要靠 <a href="verifier-prm.html">验证器与过程奖励模型</a>。
+            如果你想让输出必须符合某个格式，那么裁剪 logits 这一步可以做得更狠，见
+            <a href="../10-applications/structured-output.html">结构化输出与约束解码</a>。
+            想知道这条流水线在真实服务里是怎么被批处理和调度的，见 <a href="../09-efficiency/inference-engines.html">推理引擎</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+  (function () {
+    var el = document.getElementById('tempChart');
+    if (!el || typeof Chart === 'undefined') return;
+    var C = window.CB_COLORS || {};
+    var chart = new Chart(el, {
+      type: 'bar',
+      data: {
+        labels: ['第 1 名', '第 2 名', '第 3 名', '第 4 名', '第 5 名'],
+        datasets: [
+          { label: 'T = 0.5（尖锐）', data: [86.0, 11.6, 1.6, 0.6, 0.2], backgroundColor: C.blue },
+          { label: 'T = 1.0（原始）', data: [61.2, 22.5, 8.3, 5.0, 3.0], backgroundColor: C.amber },
+          { label: 'T = 1.5（平坦）', data: [47.6, 24.4, 12.5, 9.0, 6.4], backgroundColor: C.green }
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { position: 'top' } },
+        scales: {
+          y: { beginAtZero: true, max: 90, title: { display: true, text: '被选中的概率 (%)' } },
+          x: { title: { display: true, text: '按 logit 排序的候选 token' } }
+        }
+      }
+    });
+    (window.CB_CHARTS = window.CB_CHARTS || []).push(chart);
+  })();
+  </script>
+</body>
+</html>

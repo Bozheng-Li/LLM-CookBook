@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>混合推理与思考预算 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="08-inference" data-topic="hybrid-reasoning">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+              <span class="tag-frontier">2026 前沿</span>
+            </div>
+            <h1>混合推理与思考预算</h1>
+            <p class="lead">推理模型对每个问题都"想很久"，但"法国首都是哪"这种问题不需要想。混合推理的目标是让模型自己判断：这个问题该快回答还是慢思考？该想 100 token 还是 10000 token？这就是思考预算（thinking budget）——推理算力的旋钮。问题在于，OpenAI、Anthropic、Google、Qwen 四家都做了这个旋钮，但接口设计互不兼容，参数名、控制粒度、行为语义全不一样。应用层要同时支持四家，就得做统一封装——而封装的复杂度本身就是一笔持续的技术债。</p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">前置知识</span>
+            本页假定你已理解推理模型的行为特征和训练范式，见 <a href="reasoning-models.html">推理模型</a>；并了解推理时扩展的基本概念，见 <a href="inference-scaling.html">推理时扩展</a>。如果你还不清楚 <code>temperature</code> 这类参数在推理模型上为什么常常无效，先看 <a href="decoding.html">解码策略</a>。
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>混合推理的核心是<strong>快慢思考路由</strong>：简单问题走快通道（不思考或最少思考），困难问题走慢通道（长思维链）。思考预算控制慢通道"想多久"。理想状态下模型自主路由，但现实中用户/应用也需要能通过 API 参数手动控制。四家厂商的接口互不兼容是最大的工程痛点——同一个"调低思考量"的意图，在四家 API 上要写四套完全不同的参数。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  Q["用户问题"] --> R{"难度路由"}
+  R -->|"简单<br/>事实/翻译/闲聊"| F["快通道<br/>不思考或最少思考"]
+  R -->|"困难<br/>数学/代码/推理"| S["慢通道<br/>长思维链"]
+  R -->|"中等"| M["中等思考<br/>有限步推理"]
+  F --> F1["低延迟<br/>低成本"]
+  S --> S1["高精度<br/>高成本"]
+  M --> M1["平衡"]
+  S1 --> B{"思考预算控制"}
+  B -->|"控制思维链长度"| S
+  style R fill:#e6f1fb,stroke:#185fa5
+  style B fill:#fff8e1,stroke:#f39c12
+              </div>
+              <figcaption>混合推理：根据问题难度路由到不同思考深度，思考预算控制慢通道的算力</figcaption>
+            </figure>
+          </div>
+
+          <h2>先说清楚这一页在解决什么问题</h2>
+          <p>推理模型带来的能力提升是真实的，但它有一个所有人在上生产之前都会低估的副作用：<strong>成本和延迟不再由输出长度决定，而是由「模型自己决定想多久」决定</strong>。</p>
+          <p>传统模型的成本模型很好算：输入 token 数 × 单价 + 输出 token 数 × 单价，输出长度还可以用 <code>max_tokens</code> 卡死。推理模型不一样——思维链也是要计费的 token，而且这部分长度<strong>由模型自己决定</strong>。同一个 API 调用，有时候思维链 200 token，有时候 8000 token，成本差 40 倍。对一个日请求量百万级的服务来说，这个方差是不可接受的：你没法给财务一个可靠的预算数字，也没法给用户一个可靠的延迟承诺。</p>
+          <p>混合推理就是为了把这个方差重新拿回控制之下。它包含两件事：</p>
+          <ul>
+            <li><strong>路由</strong>：判断这个问题该不该思考，该走哪条通道。</li>
+            <li><strong>预算</strong>：如果要思考，允许它想多久。</li>
+          </ul>
+          <p>这两件事在概念上很简单，但在工程上非常麻烦——麻烦不在算法，而在四家厂商把同一个概念做成了四套互不兼容的接口。本页的一半篇幅是在处理这个「接口税」。</p>
+
+          <h2>Overthinking：想太多反而是问题</h2>
+          <p>推理模型有一个违反直觉的失效模式：<strong>想太多反而答错</strong>。这叫 overthinking——模型对简单问题生成了不必要的冗长思维链，在过度推理中引入了错误。</p>
+          <p>要理解 overthinking 为什么是「训练出来的」，看一张论文原图最直观。下图是 DeepSeek-R1-Zero 在纯 RL 训练过程中，在 AIME 2024 数学竞赛题上的准确率曲线——它一路向上，最终超过 70%。这证明「答对」这个奖励确实被模型吃透并强化了。</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/2501.12948/assets/figures/plot_aime_with_maj.png" alt="论文原图：DeepSeek-R1-Zero 在强化学习训练过程中 AIME 2024 数学竞赛准确率持续上升" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：R1-Zero 训练中 AIME 准确率稳步爬升——奖励函数把「答对」强化得很好，但从未奖励「别想太久」</span>
+              <span class="pf-src">论文原图 · DeepSeek-AI, <em>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning</em>, 2025, Figure 2 · <a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener">arXiv:2501.12948</a></span>
+            </figcaption>
+          </figure>
+
+          <p>把这张图和 overthinking 放在一起读，你会看到问题的根源：<strong>训练的奖励函数只有「答案对不对」这一项</strong>，没有「答得快」「别多想」「预算内完成」这些维度。于是 RL 发现「想得越久、答对的概率越高」这条捷径之后，就沿着它一路走下去——准确率曲线爬升的同时，思维链长度也在同步膨胀（这正是上一页 <a href="reasoning-models.html">推理模型</a> 里那张长度曲线展示的）。训练数据以竞赛级难题为主时，模型甚至完全没见过「简单题」，根本无从学会「简单题要快速收手」。overthinking 不是模型故意偷懒或犯傻，它是<strong>奖励函数设计缺失的必然产物</strong>——而思考预算，就是应用层在奖励函数之外补上的那个「别想太久」的旋钮。</p>
+
+          <p>Overthinking 的几种典型表现：</p>
+          <ul>
+            <li><strong>简单问题复杂化</strong>："2+3=?"模型想了 2000 token，中间怀疑自己是不是理解对了题意，最后反而算错了。研究表明，在简单算术上，推理模型的错误率有时随思维链长度增加而上升。</li>
+            <li><strong>过度自我怀疑</strong>：模型已经得出了正确答案，但思维链继续"让我再检查一下"，在检查过程中把正确的改成了错误的。</li>
+            <li><strong>成本浪费</strong>：即使最终答案是对的，用 5000 token 思维链回答一个 50 token 就能搞定的问题，是纯粹的算力浪费。</li>
+          </ul>
+          <p>Overthinking 的根源在于推理模型的训练信号：RLVR 奖励的是"答对"，不惩罚"想太久"。模型在训练中学会的是"多想更容易对"，但没有学会"什么时候该停"。这个偏差在训练数据全是困难问题（数学竞赛、代码竞赛）时尤其严重——模型从来没见过简单问题，不知道简单问题不需要多想。</p>
+
+          <h3>怎么在日志里识别 overthinking</h3>
+          <p>Overthinking 不会主动报错，它表现为「服务变慢变贵，但没人说得清哪里出了问题」。要把它抓出来，需要在观测层面盯几个信号：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>观测信号</th><th>怎么算</th><th>说明什么</th><th>处理方向</th></tr></thead>
+              <tbody>
+                <tr><td><strong>思考/回答长度比</strong></td><td>思考 token 数 ÷ 最终回答 token 数</td><td>比值超过 10 且答案本身很短，大概率在过度推理</td><td>给这类请求降档或直接走非推理模型</td></tr>
+                <tr><td><strong>思考长度的长尾</strong></td><td>P50 与 P99 的比值</td><td>P99 是 P50 的几十倍，说明有一批请求陷入了发散推理</td><td>设预算上限，把长尾截断</td></tr>
+                <tr><td><strong>翻转率</strong></td><td>对同一批题分别用低预算和高预算跑，统计「低预算对、高预算错」的比例</td><td>翻转率高说明多想反而在破坏答案</td><td>这类题型直接锁低预算</td></tr>
+                <tr><td><strong>预算命中率</strong></td><td>思考 token 达到预算上限的请求占比</td><td>命中率过高说明预算给紧了，模型经常被强行打断</td><td>调高预算，或换更强的模型减少思考需求</td></tr>
+                <tr><td><strong>反悔关键词频次</strong></td><td>思维链中「等等」「让我重新」「不对」一类片段的出现次数</td><td>频次异常高往往对应自我怀疑循环</td><td>作为路由降档的辅助特征</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这五个信号里最有实操价值的是<strong>翻转率</strong>。它是唯一能直接回答「多想到底有没有用」的指标，而且计算成本可控——只需要在一批离线样本上跑两遍。很多团队直到跑了这个实验才意识到：自己业务里有相当一部分题目，思考预算给多了反而掉点。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            "推理模型一定比普通模型好"——不对。在简单任务上，推理模型因为 overthinking 可能更慢、更贵、甚至更不准确。推理模型的价值在困难推理任务上，把它用在所有场景是典型的"用大炮打蚊子"。更麻烦的是，这种浪费在小流量测试时几乎看不出来，等到放量才会集中爆发成账单问题。另一个与之配套的误解是「预算给得越大越稳」——<strong>预算是上限不是目标值</strong>，给 32000 token 不代表模型会用满，但一旦遇到发散型题目，它就会实打实地烧满这 32000 token 再给你一个可能并不更准的答案。
+          </div>
+
+          <h2>思考预算：推理算力的旋钮</h2>
+          <p>思考预算（thinking budget）是控制推理模型"想多久"的参数。它的物理含义是限制思维链的 token 数量——预算越大，模型可以想得越久，精度越高但延迟和成本也越高；预算越小，模型快速给出答案，成本低但可能精度不够。</p>
+          <p>理想情况下，思考预算应该由模型<strong>自主决定</strong>——模型自己判断问题难度，分配适当的思考量。实际上，推理模型在推理时确实有一定的自主判断能力（RLVR 训练让它学会了"难问题多想"）。但自主判断不完美——它会 overthinking 简单问题，也会在困难问题上偶尔过早收敛。所以厂商都提供了<strong>外部控制接口</strong>，让用户/应用可以覆盖模型的自主判断。</p>
+          <p>思考预算的设计有一个根本性的权衡：<strong>自主 vs 可控</strong>。</p>
+          <ul>
+            <li>完全自主（不给用户控制接口）：简单，但无法应对模型 overthinking 或 underthinking 的场景。</li>
+            <li>完全可控（用户精确指定 token 数）：可控，但把难度判断的负担转嫁给了用户——用户怎么知道这个问题该想 500 还是 5000 token？</li>
+          </ul>
+          <p>四家厂商在这条权衡线上选择了不同的位置，导致接口设计互不兼容。</p>
+
+          <h3>预算是上限，不是配额</h3>
+          <p>一个容易搞错的语义细节：思考预算通常是<strong>上限（cap）</strong>而不是<strong>目标值（target）</strong>。给 8192 的预算，不代表模型会想满 8192 token；简单问题它可能想 300 token 就收手了。预算的作用是「封顶」，防止发散。</p>
+          <p>这个语义差别在成本估算时非常关键。如果你按「预算 × 请求数」估算账单，几乎一定会大幅高估；实际成本取决于<strong>思考长度的真实分布</strong>，而这个分布通常是重尾的——大部分请求想得很短，少数请求顶到上限。所以正确的做法是：<strong>用 P50 估平均成本，用 P99 和预算上限估最坏延迟</strong>，两个数分开看。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  direction LR
+  state "接收请求" as Recv
+  state "难度路由" as Route
+  state "快通道 直接作答" as Fast
+  state "慢通道 思考中" as Think
+  state "预算耗尽 强制收敛" as Cap
+  state "输出答案" as Answer
+  state "降级重试" as Retry
+
+  [*] --> Recv
+  Recv --> Route
+  Route --> Fast : 判为简单
+  Route --> Think : 判为中等或困难
+  Fast --> Answer
+  Think --> Answer : 思考自然结束 生成 EOS
+  Think --> Cap : 思考 token 达到预算上限
+  Cap --> Answer : 模型被要求立即给出结论
+  Cap --> Retry : 输出为空或明显残缺
+  Retry --> Think : 提高预算再来一次
+  Answer --> [*]
+
+  note right of Cap
+    这是最危险的状态
+    有的实现会返回空答案
+    必须显式处理
+  end note
+            </div>
+            <figcaption>一次混合推理请求的状态流转。真正的工程难点集中在「预算耗尽」这个状态——不同厂商在这里的行为不一致，有的会强制收敛给出简短答案，有的可能返回一个只有思考没有答案的响应。</figcaption>
+          </figure>
+
+          <h3>预算耗尽时会发生什么</h3>
+          <p>这是文档里往往一笔带过、线上却经常踩到的地方。当思考 token 撞上预算上限，理论上有四种可能的行为：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>行为</th><th>表现</th><th>对调用方的影响</th><th>应对</th></tr></thead>
+              <tbody>
+                <tr><td><strong>强制收敛</strong></td><td>停止思考，立刻基于当前进展给出答案</td><td>答案质量下降但结构完整</td><td>可接受；记录该请求「顶到上限」用于后续调参</td></tr>
+                <tr><td><strong>返回空答案</strong></td><td>预算全部消耗在思考上，正文部分为空</td><td>下游解析直接崩溃</td><td><strong>必须在客户端判空并重试</strong>，且重试时提高预算</td></tr>
+                <tr><td><strong>报错</strong></td><td>返回一个明确的超限错误</td><td>相对友好，至少不会静默出错</td><td>按错误码分支处理</td></tr>
+                <tr><td><strong>截断在思考中</strong></td><td>返回的内容里能看到半截思维链</td><td>可能把内部推理泄露给终端用户</td><td>输出前必须剥离思考段，见下文可见性一节</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>具体是哪一种，取决于厂商实现和模型版本，<strong>务必以各家官方文档和实测为准</strong>，不要假设。写封装层时最稳妥的姿势是：把这四种情况全部当成可能发生的，统一在一个地方判空、判错、判残缺，然后决定是降级返回还是提预算重试。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">别让重试变成成本炸弹</span>
+            「预算不够就提高预算重试」听起来很自然，但如果没有次数上限，一个持续失败的请求可能触发指数级的算力消耗——第一次 2048、第二次 8192、第三次 32000，加起来是原计划的 20 倍。<strong>重试必须设最大次数（通常 1 次就够）和总预算上限</strong>，超过就降级到非推理模型或直接返回失败。
+          </div>
+
+          <h2>四套接口对比：同一个意图，四种写法</h2>
+          <p>这是 2026 年应用层最大的工程痛点之一。你想实现"这个问题少想一点"的意图，在四家 API 上要写四套完全不同的代码。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>OpenAI（o1/o3）</th><th>Anthropic（Claude）</th><th>Google（Gemini）</th><th>Qwen（Qwen3）</th></tr></thead>
+              <tbody>
+                <tr><td><strong>参数名</strong></td><td><code>reasoning_effort</code></td><td><code>thinking.budget_tokens</code></td><td><code>thinkingConfig.thinkingBudget</code></td><td><code>enable_thinking</code></td></tr>
+                <tr><td><strong>控制粒度</strong></td><td>离散档位</td><td>token 级连续</td><td>token 级连续</td><td>布尔开关</td></tr>
+                <tr><td><strong>可选值</strong></td><td>low / medium / high</td><td>整数（如 1024-32000）</td><td>整数（0 可关闭）</td><td>true / false</td></tr>
+                <tr><td><strong>能否关闭思考</strong></td><td>不能（最低 low）</td><td>不能（需给最低预算）</td><td>能（设为 0）</td><td>能（设 false）</td></tr>
+                <tr><td><strong>思维链可见性</strong></td><td>部分可见（摘要）</td><td>完整可见</td><td>完整可见</td><td>完整可见</td></tr>
+                <tr><td><strong>单位语义</strong></td><td>抽象等级</td><td>思考 token 上限</td><td>思考 token 上限</td><td>开/关</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">这张表会过时</span>
+            四家的 API 都在快速演进：参数可能改名、取值范围可能调整、新档位可能加入。上表反映的是设计取向而非当前快照，<strong>具体参数名、取值区间和默认值请以各家官方文档为准</strong>。本页真正想传达的是「四家的设计哲学不同，因此不可能有无损的统一抽象」这个结构性判断，这一点不会随版本变化。
+          </div>
+
+          <p>来逐一拆解四套接口的设计逻辑和差异来源。</p>
+
+          <h3>OpenAI：离散档位，抽象等级</h3>
+          <p>OpenAI 的 o1/o3 系列用 <code>reasoning_effort</code> 参数，取值为 <code>low</code>、<code>medium</code>、<code>high</code>。用户不需要指定 token 数，只需要选一个"努力程度"等级，模型内部决定具体想多久。思维链不完整公开——用户只能看到摘要（reasoning summary），看不到完整推理过程。</p>
+          <p>这个设计的取向是<strong>最抽象、最用户友好</strong>：用户不需要理解"思考 token"是什么，只需要选"多想想"还是"少想想"。代价是控制粒度最粗——只有三档，无法精确控制成本。而且不能完全关闭思考（最低是 low），对简单问题场景不友好。</p>
+          <p>思维链不公开这件事，官方给出的理由通常包含两方面：一是安全与对齐考虑，未经润饰的原始思维链可能包含不适合直接展示的内容；二是竞争考虑，完整思维链是极高质量的蒸馏数据。<strong>对应用层的直接影响是：任何依赖读取完整思维链的功能（推理过程审计、把中间步骤展示给用户、用思维链做二次判断）在这条路线上都做不了。</strong></p>
+
+          <h3>Anthropic：token 级连续预算</h3>
+          <p>Anthropic 的 Claude 系列用 <code>thinking</code> 参数，需要指定 <code>type: "enabled"</code> 和 <code>budget_tokens</code>（一个整数，表示思考的 token 上限）。思维链完整公开，在响应中以独立的 thinking block 返回。</p>
+          <p>这个设计的取向是<strong>最精确、最透明</strong>：用户可以精确控制思考 token 数，可以审计完整的思维链。代价是用户需要理解"token 数"的含义——一个不熟悉 LLM 的用户很难判断"这个问题该给 1024 还是 8192 token 的预算"。而且同样不能完全关闭思考（必须给一个最低预算值）。</p>
+          <p>「独立 thinking block」这个返回结构是个不小的便利：思考内容和最终答案在数据结构层面就是分开的，客户端不需要自己解析分隔符去切。相比之下，一些开源模型把思考包在特殊标记里混在正文流中，客户端就得自己做状态机来剥离——一旦标记没配对（比如被 max_tokens 截断），剥离逻辑就会出错，把内部推理直接漏给用户。</p>
+
+          <h3>Google Gemini：连续预算 + 可关闭</h3>
+          <p>Google 的 Gemini 2.5 系列用 <code>thinkingConfig.thinkingBudget</code>，同样是一个整数 token 上限。但 Gemini 的独特之处是<strong>可以设为 0 完全关闭思考</strong>——这是四家中唯一允许在 API 层面彻底关闭思考的。Gemini 也支持 <code>thinkingLevel</code>（none/low/medium/high）作为更高层的抽象，但两种模式的行为细节可能不同。</p>
+          <p>Gemini 的设计在灵活性上最强——既能精确控制（token 数），又能完全关闭，还有高层抽象（level）。但灵活性也意味着复杂性：同一参数的不同取值范围行为差异大，文档需要仔细读。特别要注意的是，「同时提供两套控制方式」本身就是一个隐患——当 <code>thinkingBudget</code> 和 <code>thinkingLevel</code> 同时被设置时的优先级规则，是封装层最容易写错的地方之一。</p>
+
+          <h3>Qwen3：布尔开关</h3>
+          <p>Qwen3 系列用 <code>enable_thinking</code> 布尔参数——要么开要么关，没有中间档。这是四家中<strong>最简单</strong>的接口，但也是最粗粒度的。部分 Qwen3 模型后续也加入了 <code>thinking_budget</code> 参数做更细粒度控制，但核心控制仍然是布尔开关。</p>
+          <p>开源模型还有一个闭源模型没有的变量：<strong>同一个权重在不同推理引擎下的参数名可能不一样</strong>。同样是关闭思考，在 vLLM、SGLang、Ollama、以及厂商自己的云服务上，暴露的字段名和传参位置都可能不同（有的在请求体顶层，有的在 <code>chat_template_kwargs</code> 里）。自建部署时这一层要单独测，不能照抄云 API 的写法。</p>
+          <p>Qwen3 的简单设计与其"先合后拆"的挫折直接相关——下一节详述。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  subgraph Control["控制粒度谱"]
+    direction LR
+    Q["Qwen3<br/>布尔开/关"] --> O["OpenAI<br/>三档离散"]
+    O --> A["Anthropic<br/>token 连续"]
+    A --> G["Gemini<br/>连续+可关闭+层级"]
+  end
+  Q -->|"最简单<br/>最不灵活"| Note1["适合快速集成"]
+  G -->|"最灵活<br/>最复杂"| Note2["需要仔细封装"]
+  style Q fill:#e8f8e8,stroke:#27ae60
+  style G fill:#fce8e8,stroke:#c0392b
+            </div>
+            <figcaption>四家思考控制接口的控制粒度谱：从布尔开关到连续预算</figcaption>
+          </figure>
+
+          <h2>思考 token 的计费与上下文占用</h2>
+          <p>比参数名更容易被忽略的，是思考 token 在<strong>计费</strong>和<strong>上下文窗口</strong>两个维度上的行为。这两件事直接决定了你的账单和你的多轮对话能撑多久。</p>
+          <ul>
+            <li><strong>计费</strong>：思考 token 一般按输出 token 计价，也就是说它们和最终答案一样贵。一次「思考 6000 token、答案 200 token」的调用，成本几乎全在思考上。所以看账单时不能只看用户可见的输出长度，必须把思考 token 单独统计成一个指标。</li>
+            <li><strong>上下文占用</strong>：思考内容是否会留在后续轮次的上下文里，各家处理不同。如果留着，多轮对话的上下文会以极快的速度膨胀；如果不留，模型在下一轮就「忘了」自己上一轮是怎么想的。两种设计各有代价，需要按你的场景确认。</li>
+            <li><strong>是否计入 max_tokens</strong>：思考 token 和答案 token 是否共享同一个输出上限，也是各家不一致的地方。共享时，一个大预算会挤占答案的空间，导致答案被截断。</li>
+          </ul>
+          <p>这三点的具体行为<strong>都以各家官方文档为准</strong>，但无论哪家，落地时都要做同一件事：<strong>在观测系统里把「思考 token」和「答案 token」拆成两个独立指标</strong>。合在一起看，你永远搞不清成本涨了是因为回答变长了还是因为模型想多了，也就无从优化。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一个便宜的止损开关</span>
+            在正式接推理模型之前，先在网关层加一条硬规则：<strong>单请求思考 token 超过某个阈值就记一条告警日志</strong>。这条规则几乎零成本，却能在放量当天就把「哪些场景在过度思考」暴露出来，比事后翻账单快得多。
+          </div>
+
+          <details class="deep">
+            <summary>展开：思考预算到底值多少钱——手算一张日账单</summary>
+            <div class="deep-body">
+              <p>光说「思考 token 很贵」太抽象，拿一个真实的量级算一遍。假设你的服务日请求量 100 万次，普通模型的平均输出是 300 token。</p>
+              <p><strong>第一步：全量切到推理模型，不做任何控制。</strong>推理模型平均「思考 3000 token + 回答 300 token」，单次 3300 token。日输出量 = 100 万 × 3300 = 33 亿 token，是普通模型的 11 倍。账单直接爆炸——这是很多团队第一次接推理模型后的真实经历。</p>
+              <p><strong>第二步：加思考预算上限 4096，并利用「预算是上限不是目标值」的性质。</strong>大量简单题在想 300～500 token 时就自己收手了，平均思考量从 3000 压到约 800。日输出 = 100 万 × 1100 = 11 亿 token，降到约 3.7 倍。这一步几乎零工程成本，收益主要来自「让模型自己知道什么时候该停」。</p>
+              <p><strong>第三步：加难度路由。</strong>假设 60% 的请求是简单题，路由到普通模型（300 token），40% 走推理模型（1100 token）。日输出 = 60 万 × 300 + 40 万 × 1100 = 1.8 亿 + 4.4 亿 = 6.2 亿 token，约是普通模型的 2 倍。这一步的收益来自「别让推理模型碰简单题」。</p>
+              <p style="margin-bottom:0">三步合计：从 11 倍压到 2 倍，质量指标基本不动。这个例子里的数字是示意量级，真实数值取决于你的题型分布，但「先加预算上限、再做难度路由」的优化顺序是普适的——<strong>预算上限的收益零成本且立竿见影，路由的收益更大但需要准确率作为前提</strong>。</p>
+            </div>
+          </details>
+
+          <h2>Qwen3 的"先合后拆"挫折：统一模型为什么退回分开</h2>
+          <p>Qwen3 在设计之初做了一个雄心勃勃的决策：<strong>把思考模式和非思考模式合并到一个模型里</strong>。理想状态下，一个模型既能做推理（开思考），也能做快速问答（关思考），通过 <code>enable_thinking</code> 参数切换。这比维护两个独立模型（一个推理版一个通用版）更简洁，也避免了模型选择的路由逻辑。</p>
+          <p>但实践证明这个"合"带来了意想不到的问题：</p>
+          <ul>
+            <li><strong>模式串扰</strong>：关闭思考时，模型仍然偶尔输出思维链内容；开启思考时，模型对简单问题过度推理。两种模式在同一个权重空间里互相干扰——你无法在同一组权重上同时最优化"会想"和"不会想"两种行为。</li>
+            <li><strong>训练信号冲突</strong>：推理 RLVR 鼓励"多想再答"，通用 SFT 鼓励"直接回答"。在一个模型里同时优化这两个目标，梯度方向是冲突的——强化推理能力的同时，快速回答的能力在退化。</li>
+            <li><strong>评测困难</strong>：同一个模型在思考开/关两种模式下的能力曲线不一致，难以建立稳定的评测基准——一个 mode 切换 bug 可能导致评测结果大幅波动。</li>
+          </ul>
+          <p>最终 Qwen3 团队不得不在后续版本中部分"拆"回去——为不同用途提供不同的模型变体或更明确的模式分离机制，而不是纯粹依赖一个布尔参数在同一个权重上切换。这个挫折揭示了一个深刻的教训：<strong>推理能力和快速回答能力在权重层面是竞争关系</strong>，不是一个旋钮能调和的。</p>
+          <p>值得注意的是，这个教训并不否定「一个模型两种模式」这个方向本身，只是说明它比想象中难得多。从系统设计的角度看，「合」的收益（少维护一套权重、少一层路由）是确定的，「合」的代价（两种能力互相拉扯）是随训练强度增长的。当推理能力被推得越强，非推理模式受到的挤压就越大——这是一个此消彼长的关系，而不是一个可以靠调参消除的 bug。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            想让一个人既是百米冲刺冠军又是马拉松冠军，不是靠"切换模式"就能做到的——两件事练的肌肉不一样。推理模型也一样，"快思考"和"慢思考"竞争同一组权重，合并比分开难得多。
+          </div>
+
+          <h2>统一封装策略：应用层怎么应对四套接口</h2>
+          <p>应用层要同时支持四家厂商的推理模型，就必须做一个<strong>统一封装层</strong>，把四套不同的参数映射到一套内部接口上。这不是一次性的工作——厂商的接口在持续演进，封装层需要跟着更新。</p>
+          <p>封装的核心是设计一个<strong>内部抽象</strong>，能覆盖四家的能力交集：</p>
+          <pre><code class="language-python"># 统一思考预算接口的设计
+class ThinkingConfig:
+    """统一的思考预算控制，映射到各家 API。"""
+    OFF = "off"        # 完全关闭思考
+    LOW = "low"        # 最少思考
+    MEDIUM = "medium"  # 适中思考
+    HIGH = "high"      # 最大思考
+
+    def to_openai(self):
+        # OpenAI 不支持 OFF，最低是 LOW
+        mapping = {
+            self.OFF: "low",      # 降级处理
+            self.LOW: "low",
+            self.MEDIUM: "medium",
+            self.HIGH: "high",
+        }
+        return {"reasoning_effort": mapping[self.value]}
+
+    def to_anthropic(self):
+        # Anthropic 不支持 OFF，需给最低预算
+        budget_map = {
+            self.OFF: 1024,       # 最低允许值
+            self.LOW: 2048,
+            self.MEDIUM: 8192,
+            self.HIGH: 32000,
+        }
+        return {"thinking": {"type": "enabled",
+                             "budget_tokens": budget_map[self.value]}}
+
+    def to_gemini(self):
+        # Gemini 支持 OFF（设为 0）
+        budget_map = {
+            self.OFF: 0,
+            self.LOW: 1024,
+            self.MEDIUM: 8192,
+            self.HIGH: 24576,
+        }
+        return {"thinking_config": {"thinking_budget": budget_map[self.value]}}
+
+    def to_qwen(self):
+        # Qwen3 只有布尔开关
+        return {"enable_thinking": self.value != self.OFF}</code></pre>
+          <p>这个封装暴露了四个关键的设计决策：</p>
+          <ul>
+            <li><strong>抽象层级选择</strong>：用离散档位（OFF/LOW/MEDIUM/HIGH）而不是连续 token 数，因为四家的交集是离散的——OpenAI 只有三档，Qwen 只有开/关，用连续值做统一接口无法覆盖这两家。</li>
+            <li><strong>降级处理</strong>：OpenAI 和 Anthropic 不支持完全关闭思考，当用户请求 OFF 时只能降级到最低档。封装层必须记录这个降级行为，否则用户会误以为思考被完全关闭了。</li>
+            <li><strong>token 预算映射</strong>：同一个"MEDIUM"档位在 Anthropic 上是 8192 token，在 Gemini 上可能也是 8192——但两家的 token 定义不同（tokenizer 不同），实际"思考量"并不对等。封装层只能做近似映射，不能保证语义完全一致。</li>
+            <li><strong>思维链可见性差异</strong>：OpenAI 只给摘要，其他三家给完整思维链。如果应用逻辑依赖检查完整思维链（如审计或调试），在 OpenAI 上会失败。封装层需要标注这个能力差异。</li>
+          </ul>
+
+          <h3>把「能力差异」显式化，而不是藏起来</h3>
+          <p>上面的封装还缺一样最重要的东西：<strong>告诉调用方「你要的东西我没能完全给你」</strong>。一个只会把参数翻译过去的封装层，会把降级、截断、能力缺失全部静默吞掉，最后变成线上难以定位的诡异行为。</p>
+          <p>更稳妥的做法是让封装层返回一个包含「实际生效配置」和「能力标志」的结果对象：</p>
+
+          <pre><code class="language-python">from dataclasses import dataclass, field
+
+@dataclass
+class ThinkingResult:
+    """统一封装的返回结果，显式暴露降级与能力差异。"""
+    answer: str
+    thinking_text: str | None      # 完整思维链，拿不到时为 None
+    thinking_tokens: int | None    # 思考 token 数，拿不到时为 None
+    requested_level: str           # 调用方要的档位
+    effective_level: str           # 实际生效的档位
+    hit_budget_cap: bool = False   # 是否顶到了预算上限
+    warnings: list = field(default_factory=list)
+
+    @property
+    def degraded(self) -&gt; bool:
+        return self.requested_level != self.effective_level
+
+
+def call_with_thinking(provider, prompt, level, max_retry=1):
+    """带降级记录与一次性重试的统一调用。"""
+    result = provider.invoke(prompt, level)
+
+    if result.degraded:
+        result.warnings.append(
+            f"请求 {result.requested_level} 但实际为 {result.effective_level}"
+        )
+
+    # 关键防御：预算耗尽导致答案为空时，提一档重试一次
+    if not result.answer.strip() and max_retry &gt; 0:
+        higher = {"off": "low", "low": "medium", "medium": "high"}.get(level)
+        if higher:
+            result.warnings.append(f"答案为空，提档到 {higher} 重试")
+            return call_with_thinking(provider, prompt, higher, max_retry - 1)
+
+    # 观测：思考与答案 token 必须分开上报，否则无法归因成本
+    emit_metric("thinking_tokens", result.thinking_tokens or 0,
+                tags={"provider": provider.name, "level": level})
+    emit_metric("hit_budget_cap", int(result.hit_budget_cap),
+                tags={"provider": provider.name, "level": level})
+    return result</code></pre>
+
+          <p>这段代码的重点不在语法，而在三条原则：<strong>降级要留痕、空答案要兜底、思考 token 要单独上报</strong>。这三条在真实项目里的价值，远高于把四家参数名映射对。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">工程提醒</span>
+            统一封装的最大风险不是初始实现，而是<strong>持续维护</strong>。四家厂商的 API 在持续演进——参数名可能变（Gemini 从 thinkingBudget 到 thinkingLevel）、取值范围可能变（Anthropic 的最低预算可能调整）、新功能可能加（OpenAI 可能增加更多档位）。封装层的测试必须覆盖各家 API 的版本差异，否则一次厂商 API 更新就会导致线上故障。建议为每家各留一组「金丝雀用例」，定时跑，参数语义一变就能立刻发现。
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("控制思考量的手段"))
+    模型侧
+      模型自主判断
+        RLVR 训练出的难度感知
+        不可控但零成本
+      选择不同模型
+        推理模型
+        非推理模型
+        蒸馏小模型
+    API 参数侧
+      离散档位 reasoning_effort
+      连续预算 budget_tokens
+      布尔开关 enable_thinking
+      完全关闭 budget 为 0
+    提示词侧
+      要求简洁作答
+      给出解题格式约束
+      少样本示例控制篇幅
+      效果弱且不稳定
+    系统侧
+      前置难度分类器
+      缓存高频问题答案
+      预算分档配置化
+      超时与降级策略
+    观测侧
+      思考与答案 token 分开统计
+      预算命中率
+      低高预算翻转率
+            </div>
+            <figcaption>控制思考量的手段全景。注意提示词侧的效果最弱——推理模型的思考长度主要由训练塑造，靠一句「请简短思考」很难可靠压下来，真正有效的杠杆在 API 参数侧和系统侧。</figcaption>
+          </figure>
+
+          <h2>模型路由：更根本的解决方案</h2>
+          <p>思考预算控制的是"同一个模型想多久"，模型路由（model routing）解决的是"不同问题用不同模型"。这是比思考预算更根本的方案——与其让一个推理模型对简单问题"少想"，不如直接把简单问题路由到一个快速的非推理模型。</p>
+          <p>一个典型的路由策略：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>问题类型</th><th>路由目标</th><th>典型延迟</th><th>成本</th></tr></thead>
+              <tbody>
+                <tr><td>事实性问答、翻译、格式转换</td><td>小模型（非推理）</td><td>&lt; 1s</td><td>最低</td></tr>
+                <tr><td>中等推理、代码补全、摘要</td><td>大模型（非推理）或推理模型低预算</td><td>1-3s</td><td>中</td></tr>
+                <tr><td>数学证明、复杂代码、多步推理</td><td>推理模型（高预算）</td><td>5-30s</td><td>最高</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>路由可以由一个轻量分类器实现（对小模型做一次快速推理判断难度），也可以用规则（如问题长度、是否包含数学符号）。路由的准确率直接决定了成本效率——路由错误把困难问题分给了快速模型，会牺牲精度；把简单问题分给了推理模型，会浪费成本。</p>
+
+          <h3>两类路由错误的代价并不对称</h3>
+          <p>这是设计路由阈值时最重要的一个认知：<strong>把困难问题路由到快通道，和把简单问题路由到慢通道，代价完全不同</strong>。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>错误类型</th><th>直接后果</th><th>用户感知</th><th>可挽回性</th><th>量级</th></tr></thead>
+              <tbody>
+                <tr><td><strong>难题走快通道</strong><br/>（漏判）</td><td>答案错误或明显敷衍</td><td><strong>强</strong>——用户会认为「这个产品不行」</td><td>差，错误答案已经发出去了</td><td>损失的是<strong>信任</strong>，难以用钱衡量</td></tr>
+                <tr><td><strong>简单题走慢通道</strong><br/>（误判）</td><td>多花几秒、多花几分钱</td><td>弱——用户大多不会察觉</td><td>好，答案通常还是对的</td><td>损失的是<strong>成本</strong>，可精确计算</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>结论很直接：<strong>路由阈值应当偏保守</strong>，也就是把边界情况推给慢通道。这与很多人的第一直觉相反——大家往往先想着省钱，把阈值卡得很紧，结果是省下了一点算力却掉了一批答对率，而答对率的损失是用户能感知的。正确的顺序是：先用保守阈值把质量守住，再基于线上数据逐步收紧。</p>
+          <p>另外还有一个常被忽略的成本项：<strong>路由本身也要花钱</strong>。如果你用一个 LLM 来判断难度，这次判断的延迟和成本要计入总账。当路由器本身接近被路由模型的成本时，整套方案就不划算了。所以生产里的路由器通常是极轻量的——小分类模型、甚至纯规则加关键词，追求的是「便宜且召回高」而不是「准确」。</p>
+
+          <p>模型路由和思考预算是互补的：路由决定"用什么模型"，思考预算决定"这个模型想多久"。生产系统通常两者结合——先路由到合适的模型类别，再在该模型内部调思考预算。这也是为什么 Qwen3 的"先合后拆"教训重要：它说明"用一个模型覆盖所有场景"的路线走不通，模型路由作为独立环节是必要的。</p>
+
+          <details class="deep">
+            <summary>展开：怎么给自己的业务定预算档位（一个可操作的流程）</summary>
+            <div class="deep-body">
+              <p>「MEDIUM 该给多少 token」不能拍脑袋，也不能照抄别人的数字——它取决于你的题型分布。下面是一个可以在一两天内跑完的流程：</p>
+              <ol>
+                <li><strong>抽样</strong>：从线上日志里抽 200～500 条真实请求，按业务类型分层抽样（别只抽最常见的那类，长尾题型往往才是预算敏感的）。</li>
+                <li><strong>建立参考答案</strong>：能自动判对错的（数学、结构化抽取、代码单测）优先；不能自动判的，用人工标注一个小集合，或者用一个明显更强的模型加高预算跑出的结果作为参考。</li>
+                <li><strong>扫描预算</strong>：对每条样本，分别用若干个预算档（例如关闭 / 1k / 4k / 16k）各跑 3 次，记录正确率、实际思考 token、端到端延迟。</li>
+                <li><strong>画曲线</strong>：横轴是实际消耗的思考 token 中位数，纵轴是正确率。你几乎一定会看到一条先陡后平的曲线。</li>
+                <li><strong>找拐点</strong>：曲线由陡变平的位置，就是这类题型的合理预算。<strong>拐点之后每多花一倍算力换来的正确率提升通常不到一个百分点</strong>，不值得。</li>
+                <li><strong>分层落库</strong>：不同业务类型的拐点不同，把它们写进配置而不是硬编码，方便后续按线上数据调整。</li>
+              </ol>
+              <p>这个流程有两个容易做错的地方。第一，<strong>每档必须重复多次</strong>——推理模型的思考过程是采样出来的，单次结果的方差很大，跑一次就下结论几乎必然误判。第二，<strong>横轴要用实际消耗而不是预算设置值</strong>，因为预算是上限不是消耗量，用设置值画出来的曲线会严重失真。</p>
+              <p style="margin-bottom:0">跑完之后你通常会得到一个让人意外的结论：<strong>大部分业务类型的拐点比直觉低得多</strong>。很多团队原本按「越多越好」给到几万 token 的预算，实测发现四千就已经到平台期了——直接省下大半成本，而质量指标一点没动。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：思维链可见性——一个安全与产品的交叉问题</summary>
+            <div class="deep-body">
+              <p>「能不能看到模型在想什么」不只是一个 API 能力差异，它牵扯三方面的真实问题：</p>
+              <p><strong>1. 产品体验。</strong> 把思考过程展示给用户是一把双刃剑。好处是等待期有东西可看、显得「在认真工作」、也便于用户自己判断答案可不可信；坏处是思维链里充满自我怀疑、走岔路、推翻重来，普通用户看到「等等，我刚才算错了」会降低对产品的信任。折中做法是只展示一个精简摘要或进度条，完整思维链放在「查看推理过程」的折叠区里。</p>
+              <p><strong>2. 内容安全。</strong> 思维链没有经过和最终答案同等强度的安全对齐——模型在思考时可能把不该说的中间假设写出来。<strong>如果你要把思维链透传给终端用户，必须对它单独过一遍内容审核，不能只审最终答案。</strong>更保险的默认策略是：思维链只进日志、不进 UI。</p>
+              <p><strong>3. 忠实度。</strong> 一个更根本的问题：写出来的思维链未必是模型内部真正的计算过程，它可能是事后编出来的合理化说辞。这意味着<strong>「思维链看起来很严谨」不能作为「答案可信」的证据</strong>，把它当成审计凭证是危险的。这一点在 <a href="reasoning-models.html">推理模型</a> 里有更完整的讨论。</p>
+              <p style="margin-bottom:0">综合这三点，一个稳妥的默认姿势是：<strong>后端完整记录、前端最多给摘要、审计不依赖它、安全审核单独做</strong>。</p>
+            </div>
+          </details>
+
+          <h2>落地检查清单</h2>
+          <p>把这一页的内容收成一张上线前逐项过的清单：</p>
+          <ul>
+            <li>是否把<strong>思考 token 和答案 token 拆成了两个观测指标</strong>？合在一起看等于放弃了成本归因。</li>
+            <li>是否处理了<strong>答案为空</strong>的情况？预算耗尽在思考上是真实会发生的。</li>
+            <li>重试是否有<strong>次数上限和总预算上限</strong>？没有的话它会变成成本放大器。</li>
+            <li>是否有<strong>降级留痕</strong>？调用方要 OFF 但实际是 LOW，这件事必须能在日志里查到。</li>
+            <li>思维链是否<strong>确定不会漏给终端用户</strong>？包括被截断导致标记不配对的情况。</li>
+            <li>预算档位是否<strong>写在配置里</strong>而不是硬编码？厂商调整取值范围时你要能热改。</li>
+            <li>是否为每家厂商留了<strong>金丝雀用例</strong>？API 语义变化要能第一时间发现。</li>
+            <li>路由阈值是否<strong>偏保守</strong>？漏判难题的代价远高于误判简单题。</li>
+            <li>是否跑过<strong>低预算 vs 高预算的翻转率实验</strong>？这是判断「多想有没有用」的唯一直接证据。</li>
+          </ul>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>Overthinking</strong>：推理模型对简单问题过度推理，不仅浪费算力还可能把对的改成错的。根源是 RLVR 只奖励答对不惩罚想太多。</li>
+            <li><strong>识别信号</strong>：思考/回答长度比、思考长度 P99/P50、低高预算翻转率、预算命中率。其中翻转率最直接。</li>
+            <li><strong>思考预算</strong>：控制思维链长度的旋钮，语义上是<strong>上限而非目标值</strong>。自主 vs 可控是根本权衡——四家厂商在这条线上选了不同位置。</li>
+            <li><strong>四套接口不兼容</strong>：OpenAI 用 reasoning_effort（三档离散）、Anthropic 用 budget_tokens（连续）、Gemini 用 thinkingBudget（连续+可关闭）、Qwen 用 enable_thinking（布尔）。具体取值以官方文档为准。</li>
+            <li><strong>预算耗尽的行为不统一</strong>：可能强制收敛、返回空答案、报错或截断在思考中。封装层必须全部当成可能发生的来防御。</li>
+            <li><strong>计费与上下文</strong>：思考 token 一般按输出计价，是否占用后续上下文、是否计入 max_tokens 各家不同，必须实测确认。</li>
+            <li><strong>Qwen3 先合后拆</strong>：把思考/非思考合并到一个模型的尝试遇挫——两种模式在权重上竞争，训练信号冲突。教训：快思考和慢思考不是一组权重能兼顾的。</li>
+            <li><strong>统一封装</strong>：用离散档位做交集抽象，降级要留痕、空答案要兜底、思考 token 要单独上报。最大风险是持续维护而非初始实现。</li>
+            <li><strong>模型路由</strong>：比思考预算更根本——不同问题用不同模型。两类路由错误代价不对称，阈值应偏保守。路由器本身的成本也要计入总账。</li>
+            <li><strong>定档方法</strong>：抽样 → 建参考答案 → 扫预算 → 画「实际思考 token vs 正确率」曲线 → 取拐点。拐点通常比直觉低得多。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>OpenAI o1/o3 API 文档 — reasoning_effort 参数的官方说明 · <a href="https://platform.openai.com/docs/guides/reasoning" target="_blank" rel="noopener">链接</a></li>
+            <li>Anthropic Extended Thinking 文档 — Claude thinking budget_tokens 的官方说明 · <a href="https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking" target="_blank" rel="noopener">链接</a></li>
+            <li>Google Gemini API thinking_config 文档 — Gemini thinkingBudget 参数说明 · <a href="https://ai.google.dev/gemini-api/docs/thinking" target="_blank" rel="noopener">链接</a></li>
+            <li>Qwen3 技术报告 — Qwen3 的 enable_thinking 设计与"先合后拆"的经验教训 · <a href="https://arxiv.org/abs/2505.09388" target="_blank" rel="noopener">arXiv:2505.09388</a></li>
+            <li>Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters — 系统分析推理算力应该怎么分配，是「预算该给多少」这个问题的理论背景 · <a href="https://arxiv.org/abs/2408.03314" target="_blank" rel="noopener">arXiv:2408.03314</a></li>
+            <li>Overthinking the Thinking: Investigating Efficiency-Reasoning Trade-offs — 分析推理模型 overthinking 现象与效率-精度权衡 · 搜索获取</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            混合推理的前提是理解推理模型本身——训练范式、行为特征和 CoT 忠实度问题，见 <a href="reasoning-models.html">推理模型</a>。推理时扩展的完整路线图（CoT、Self-Consistency、Best-of-N、树搜索），见 <a href="inference-scaling.html">推理时扩展</a>。如果你的目标是把「多想」变成「想得对」而不是单纯加预算，看 <a href="verifier-prm.html">验证器与过程奖励模型</a>。成本侧的系统性方法见 <a href="../12-llmops/cost-engineering.html">成本工程</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

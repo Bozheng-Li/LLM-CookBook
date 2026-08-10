@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>长上下文技术 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="04-modern-arch" data-topic="long-context">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>长上下文技术</h1>
+            <p class="lead">模型在 4K 上下文上训练，怎么让它推理时能处理 128K 甚至 1M 的输入？这不是"把位置编码拉长"那么简单——位置编码外推、KV Cache 膨胀、注意力计算爆炸、长文本训练数据匮乏，每一关都是硬骨头。这一节梳理从位置插值到大海捞针评测的完整技术链路。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>长上下文技术的核心挑战一句话：<strong>模型在短上下文上训练的位置编码，推理时拉到超长距离就"失真"了</strong>。解决办法分三步走——先靠位置插值让模型"假装"见过长距离，再用长文本继续训练让它"真的适应"长距离，最后用大海捞针评测验证它"真的能看到"远处的信息。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  A["短上下文训练<br/>4K-8K"] --> B{"推理时需要<br/>更长上下文?"}
+  B -->|"是"| C["位置插值<br/>PI / NTK-aware"]
+  C --> D["长文本继续训练<br/>微调适配"]
+  D --> E["大海捞针评测<br/>验证长距离检索"]
+  E --> F["上线服务<br/>128K-1M"]
+  style C fill:#fff3e0,stroke:#e65100
+  style D fill:#e3f2fd,stroke:#1565c0
+  style E fill:#e8f5e9,stroke:#2e7d32
+              </div>
+              <figcaption>长上下文的三步走：位置插值 → 长文本训练 → 大海捞针验证</figcaption>
+            </figure>
+          </div>
+
+          <h2>为什么长上下文难：三个瓶颈</h2>
+          <p>把上下文窗口从 4K 扩到 128K，不只是"把 max_seq_len 改大"那么简单。三个瓶颈层层叠加：</p>
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">位置编码外推</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">模型在 4K 位置上训练的 RoPE 频率，推理时放到 128K 位置，旋转角度超出训练范围，模型"看不懂"这些位置。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">KV Cache 膨胀</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">KV Cache 随序列长度线性增长。128K 上下文的 KV Cache 可能比模型权重还大几倍，显存放不下。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">注意力计算爆炸</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">标准注意力是 $O(n^2)$。128K 序列的分数矩阵是 4K 的 $(128/4)^2 = 1024$ 倍，计算量暴增。</p>
+            </div>
+          </div>
+
+          <p>第三个瓶颈——注意力计算爆炸——主要由 <a href="attention-variants.html">注意力变体</a>（GQA/MLA/SWA）和 <a href="../05-systems/flash-attention.html">FlashAttention</a> 解决。本节聚焦前两个：位置编码外推和 KV Cache 管理。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root((长上下文技术))
+    位置编码外推
+      PI 统一压缩
+      NTK-aware 分频率
+      YaRN 分段缩放
+    长文本训练
+      渐进扩展
+      跨距离检索数据
+      数据混合防遗忘
+    评测
+      大海捞针
+      多针推理
+      注意力稀释
+    显存管理
+      GQA/MLA
+      量化与卸载
+      前缀缓存
+            </div>
+            <figcaption>长上下文技术地图：从位置编码外推、长文本训练，到评测与显存管理，是一条完整链路</figcaption>
+          </figure>
+
+          <h2>位置编码外推：RoPE 的长度边界</h2>
+          <p>当前主流大模型（LLaMA、Qwen、DeepSeek 等）几乎都使用 <strong>RoPE（旋转位置编码）</strong>。RoPE 的核心是：对 Q 和 K 的每一对维度施加一个与位置相关的旋转，使得两个位置的注意力分数只取决于它们的<strong>相对距离</strong>。</p>
+          <p>RoPE 对第 $m$ 个位置的旋转角度是 $\theta_i = m \cdot \omega_i$，其中 $\omega_i = 10000^{-2i/d}$ 是频率。问题在于：模型在 0–4096 位置上训练时，只见过 $\theta_i$ 在某个范围内的旋转。推理时位置 $m$ 拉到 131072，$\theta_i$ 超出训练范围——模型对这种"没见过的旋转角度"的行为是不可预测的，通常表现为注意力分数紊乱、长距离信息丢失。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">关键认知</span>
+            RoPE 不是"不能"用于训练范围外的位置，而是"没有学过"——模型在训练中从未见过这些位置编码对应的旋转角度，泛化行为不可保证。不同频率的维度受影响程度不同：高频维度（小 $i$）旋转快，外推时最先"卷绕"回训练范围；低频维度（大 $i$）旋转慢，外推相对安全。
+          </div>
+
+          <h2>位置插值（PI）：压缩而非外推</h2>
+          <p><strong>Position Interpolation（PI）</strong> 是最直接的解法：与其让位置编码超出训练范围（外推），不如把长序列的位置<strong>压缩</strong>到训练范围内（内插）。</p>
+          <p>具体做法是把推理时的位置 $m$ 缩放为 $m / s$（$s$ 是扩展倍数），让缩放后的位置落在训练范围内。比如训练时最大位置是 4096，要扩展到 16384（4 倍），就令 $s = 4$，实际位置 $m$ 用 $m/4$ 去查 RoPE。相当于把 16384 个位置"挤"进 4096 的范围内。</p>
+          <div class="figure" style="text-align:center">
+            $$\text{RoPE}_{\text{PI}}(q, m) = q \cdot e^{i m \omega / s}, \quad s = \frac{L_{\text{target}}}{L_{\text{train}}}$$
+          </div>
+          <p>PI 的优点是简单——改一行代码，不需要重新训练就能扩展上下文。但缺点也明显：压缩后相邻 token 之间的位置差异变小，模型对"谁在谁前面"的分辨率下降，短距离精度有损。通常 PI 之后需要做少量长文本微调来恢复精度。</p>
+
+          <h2>NTK-aware：按频率分治</h2>
+          <p><strong>NTK-aware Scaling</strong> 是对 PI 的改进。PI 对所有频率维度统一缩放 $1/s$，但不同频率的维度对外推的敏感度不同——高频维度最怕外推，低频维度相对安全。NTK 的思路是：<strong>对高频维度少缩放、对低频维度多缩放</strong>，让高频维度尽量留在训练范围（保分辨率），低频维度允许外推（它们不怕）。</p>
+          <p>NTK-aware 修改 RoPE 的基频：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{base}_{\text{new}} = \text{base}_{\text{old}} \cdot s^{d/(d-2)}, \quad \omega_i = \text{base}_{\text{new}}^{-2i/d}$$
+          </div>
+          <p>把这两步写成代码，能看清 NTK-aware 和 PI 的差别其实只在"怎么处理 base"：PI 不动 base、只缩放位置 $m$；NTK-aware 改 base、位置仍按原值查表。</p>
+          <pre><code class="language-python">import torch
+
+def ntk_rope_base(old_base=10000.0, scale=4.0, dim=128):
+    # NTK-aware：把扩展倍数摊进 base，而非缩放位置
+    return old_base * (scale ** (dim / (dim - 2)))
+
+def build_rope(seq_len, base, dim, scale=1.0):
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2) / dim))   # [dim/2]
+    t = torch.arange(seq_len) / scale                           # PI 用 scale>1 缩放位置
+    return torch.outer(t, inv_freq)                             # [seq_len, dim/2] 旋转角</code></pre>
+          <p>这基于 NTK（Neural Tangent Kernel）理论——不同频率的维度在训练中学习速度不同，外推时也应该区别对待。实践中 NTK-aware 比 PI 更好地保持了短距离精度，同时扩展了长距离能力。YaRN（Yet another RoPE extensioN）进一步改进了 NTK-aware，对不同频率段做更精细的分段缩放，是目前效果较好的 RoPE 扩展方法之一。</p>
+
+          <details class="deep">
+            <summary>展开：为什么"改 base"比"缩放位置"更聪明</summary>
+            <div class="deep-body">
+              <p>RoPE 把位置编码成一个旋转矩阵，每个维度对对应一个频率 $\omega_i$。训练时模型只见过位置 $m\in[0, L_{train})$ 对应的旋转角 $m\omega_i$。</p>
+              <p><strong>PI</strong> 直接把位置读成 $m/s$，等于把所有维度的旋转角整体压小 $1/s$ 倍——高频维度（大 $\omega_i$）本来在训练范围内转得慢、外推时最先"卷绕"，PI 一压反而让它的相对分辨率下降，于是短距离精度受损。</p>
+              <p><strong>NTK-aware</strong> 改的是 base：$\text{base}_{new} = \text{base}_{old}\cdot s^{d/(d-2)}$，等价于把每个频率 $\omega_i$ 乘上 $s^{-d/(d-2)}\cdot s^{2i/d}$——结果是一个<strong>频率相关的缩放</strong>：高频维度几乎不动（留在训练范围、保分辨率），低频维度大幅缩放（允许外推，它们旋转慢不怕）。NTK 理论告诉我们，低频维度在训练中"学得慢、泛化好"，所以让它承担外推的代价最小。这就是"按频率分治"的本质。</p>
+              <p style="margin-bottom:0">YaRN 进一步把维度分成若干频段，对每段用不同的缩放系数（并引入注意力缩放因子补偿 Softmax 温度），是目前开源模型（如 Llama 系列的长上下文版本）最常用的方案。</p>
+            </div>
+          </details>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方法</th><th>思路</th><th>短距离精度</th><th>长距离能力</th><th>需要微调</th></tr></thead>
+              <tbody>
+                <tr><td><strong>直接外推</strong></td><td>不做任何处理，超出训练范围直接用</td><td>不变</td><td>差（位置未见过）</td><td>需要大量</td></tr>
+                <tr><td><strong>PI</strong></td><td>统一压缩所有频率</td><td>有损（分辨率下降）</td><td>较好</td><td>少量微调</td></tr>
+                <tr><td><strong>NTK-aware</strong></td><td>高频少缩、低频多缩</td><td>保持好</td><td>好</td><td>少量或免微调</td></tr>
+                <tr><td><strong>YaRN</strong></td><td>分段精细缩放</td><td>保持好</td><td>最好</td><td>最少</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  subgraph PI_Scaling["PI：统一缩放"]
+    P1["高频维度"] -->|"1/s 缩放"| P2["分辨率下降"]
+    P3["低频维度"] -->|"1/s 缩放"| P4["安全压缩"]
+  end
+  subgraph NTK_Scaling["NTK-aware：分频率缩放"]
+    N1["高频维度"] -->|"几乎不缩"| N2["分辨率保持"]
+    N3["低频维度"] -->|"大幅缩放"| N4["允许外推"]
+  end
+  style P2 fill:#ffebee,stroke:#c62828
+  style N2 fill:#e8f5e9,stroke:#2e7d32
+            </div>
+            <figcaption>PI 统一缩放导致高频维度分辨率下降；NTK-aware 分频率处理，高频保精度、低频保外推</figcaption>
+          </figure>
+
+          <h2>算例：外推与插值的角度账</h2>
+          <p>上面的公式都比较抽象，我们用一个小模型把数字代进去算一遍。设 $d = 4$，即只有两对频率。按 $\omega_i = \text{base}^{-2i/d}$ 计算：$i = 0$ 对应 $\omega_0 = 1$（高频），$i = 1$ 对应 $\omega_1 = 10000^{-1/2} = 0.01$（低频）。训练窗口 $L = 4096$，目标扩展到 $131072$，倍数 $s = 32$。下表是各方法在目标端点位置上的实际旋转角度（弧度）：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方法</th><th>高频 $\omega_0=1$ 在 m=131072 的角度</th><th>低频 $\omega_1=0.01$ 在 m=131072 的角度</th><th>训练见过的最大角度</th></tr></thead>
+              <tbody>
+                <tr><td><strong>直接外推</strong></td><td>131072（远超 4096）</td><td>1310.72（远超 40.96）</td><td>高频 4096 / 低频 40.96</td></tr>
+                <tr><td><strong>PI（缩放位置）</strong></td><td>4096（压回上限）</td><td>40.96（压回上限）</td><td>—</td></tr>
+                <tr><td><strong>NTK-aware（改 base）</strong></td><td>131072（保持原样）</td><td>40.96（压回上限）</td><td>—</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>核对一下 NTK-aware 那行的数字：$d = 4$ 时指数 $d/(d-2) = 2$，新 base 为 $10000 \times 32^2 = 10240000$，于是新频率 $\omega'_1 = 10240000^{-1/2} = 1/3200 = 0.01 / 32$。也就是说，<strong>低频维度的频率被除以 32，恰好把 131072 位置的角度压回训练上限 40.96；高频维度 $\omega'_0 = 1$ 完全没动，131072 位置的角度仍是 131072</strong>。这正是「高频少缩、低频多缩」的具体数字形态。</p>
+          <p>再看相邻位置的「分辨率」。扩展后窗口里，位置 $m = 65536$ 与 $m = 65537$ 只差一个 token：</p>
+          <ul>
+            <li><strong>PI</strong>：两个位置的角度差是 $\omega / s$。低频 $\omega_1 = 0.01$ 时只有 $0.01 / 32 = 3.1 \times 10^{-4}$ 弧度——两个位置的旋转向量几乎重合，模型在长距离的中间段难以区分相邻 token。</li>
+            <li><strong>NTK-aware</strong>：低频同样被压到 $3.1 \times 10^{-4}$，但高频 $\omega_0 = 1$ 保持原样，角度差是 $1/32 = 0.031$ 弧度——虽然也比训练时小，但高频维度本来就是「短距离标尺」，它保住了，相邻 token 的可区分性就还在。</li>
+          </ul>
+          <p>这套账解释了 NTK-aware 为什么比 PI 更常见：<strong>高频维度负责分辨近距离，低频维度负责覆盖远距离</strong>。PI 把两把尺子一起按 1/32 缩短；NTK-aware 只把「远距离那把尺子」缩短到训练范围里，而把「近距离那把尺子」原样留着。至于为什么高频维度敢留到超范围：它在 4096 的训练范围里已经转了约 652 圈（$4096 / 2\pi \approx 652$），所有相位都见过几百遍，外推到 131072 只是把见过的相位再多用一次；低频维度训练时只转了约 6.5 圈，相位没见过的区域很大，所以必须压回来。短距离精度保住，长距离又能装下——这就是它「几乎免微调就能扩展」的原因。</p>
+          <p>最后补一句关于「免训练扩展」的边界：NTK-aware 这类方法改的只是编码方式，模型内部的注意力模式和表示还是短文本训练出来的。经验上，免训练扩展能撑住的上下文上限远低于训练时的长度，且在真正需要跨距离检索的任务上往往失败。所以它的定位是「应急」和「配合微调的第一步」，而不是长上下文能力的替代品——真正的长距离能力，还得靠后面的长文本继续训练。</p>
+
+          <h2>长文本继续训练：让模型"真的"适应长距离</h2>
+          <p>位置插值解决了"位置编码超范围"的问题，但模型只是在"假装"见过长距离——注意力模式和内部表示还是短文本训练出来的。要让模型真正利用长上下文，通常需要<strong>长文本继续训练</strong>。</p>
+          <p>典型做法是：在原始短上下文训练的基础上，用长文本数据（序列长度 32K–128K）继续训练几千步。关键细节包括：</p>
+
+          <p>不同"上下文扩展"路线在成本与质量上的取舍不同，下面这张表把它们放一起对比：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方案</th><th>是否重训</th><th>数据需求</th><th>成本</th><th>长距离质量</th><th>典型适用</th></tr></thead>
+              <tbody>
+                <tr><td><strong>免训练扩展（NTK 极端版）</strong></td><td>否</td><td>无</td><td>几乎为零</td><td>弱（多败于检索）</td><td>临时应急、短距离</td></tr>
+                <tr><td><strong>PI + 少量微调</strong></td><td>是（几百~几千步）</td><td>少量长文本</td><td>低</td><td>较好</td><td>最经济的常规方案</td></tr>
+                <tr><td><strong>长文本 SFT</strong></td><td>是（数千~数万步）</td><td>高质量长文本 + 检索任务</td><td>中</td><td>好</td><td>产品级长上下文</td></tr>
+                <tr><td><strong>从头长上下文预训练</strong></td><td>是（完整预训练）</td><td>海量长文档</td><td>极高</td><td>最好</td><td>新架构 / 超长窗口</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <ul>
+            <li><strong>数据构成</strong>：长文本数据不能只有"长文档"——还需要包含<strong>需要跨距离检索</strong>的任务数据（如"在文章开头放一个事实，在结尾问关于它的问题"），否则模型只是"读了长文本"但没学会"用长距离信息"。</li>
+            <li><strong>训练效率</strong>：长序列训练的显存和计算量远大于短序列。通常用序列并行（Sequence Parallelism）和 <a href="../05-systems/flash-attention.html">FlashAttention</a> 来控制单步训练成本。</li>
+            <li><strong>渐进扩展</strong>：不少模型采用渐进策略——先在 32K 上训一段，再扩到 64K、128K。这比直接跳到 128K 更稳定。</li>
+            <li><strong>数据混合</strong>：长文本训练数据里混入一定比例的短文本数据，防止模型"忘记"短文本上的能力。</li>
+          </ul>
+
+          <div class="callout tip">
+            <span class="callout-t">实践经验</span>
+            位置插值 + 少量长文本微调（几百步到几千步）是最经济的长上下文扩展方案。完全不做微调的"免训练扩展"（如 NTK-aware 的极端版本）在短距离上效果尚可，但在真正需要长距离检索的任务上往往会失败——这正是大海捞针评测要检验的。
+          </div>
+
+          <h2>大海捞针评测：长上下文的试金石</h2>
+          <p>怎么验证一个模型真的"能用"128K 上下文，而不是只是"能塞进"128K token？<strong>大海捞针（Needle in a Haystack）</strong>是当前最广泛使用的评测方法。</p>
+          <p>评测流程很直观：</p>
+          <ol>
+            <li>准备一段长文本（如把若干篇文档拼到 128K 长度），作为"干草堆"。</li>
+            <li>在长文本的某个位置插入一句特定的事实陈述（如"在芝加哥赏花的最佳季节是夏天"），作为"针"。</li>
+            <li>在长文本末尾提问"赏花的最佳季节是什么？"，看模型能否正确回答"夏天"。</li>
+            <li>把"针"放在不同深度（0%、25%、50%、75%、100%），在不同上下文长度（4K、8K、32K、64K、128K）下重复测试，画成热力图。</li>
+          </ol>
+          <p>把单轮"插针—提问"的流程画成时序图，能看清评测是怎么构造的：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant E as 评测脚本
+  participant H as 长文本(干草堆)
+  participant N as 插入的事实(针)
+  participant M as 被测模型
+  E->>H: 拼接到目标上下文长度
+  E->>N: 在深度 d% 处插入特定事实
+  E->>M: 喂入长文本 + 末尾提问
+  M->>M: 在上下文里检索相关信息
+  M-->>E: 返回答案
+  E->>E: 比对答案，记录热力图格子
+            </div>
+            <figcaption>大海捞针单轮流程：插入事实 → 提问 → 比对。在多个深度/长度组合上重复，得到热力图</figcaption>
+          </figure>
+          <p>一个真正具备长上下文能力的模型，热力图应该是几乎全绿——不管针放在哪里、上下文有多长，都能正确找到。如果只在针放在开头或结尾时正确（"边缘效应"），说明模型实际上只看了一头，中间的信息丢了。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">大海捞针的局限</span>
+            大海捞针只测"单针单跳检索"——找一个简单事实。它不测"多针推理"（需要综合多处信息才能回答）和"长文档理解"（需要全局把握结构）。因此大海捞针全绿不代表长上下文能力全面达标，但大海捞针不绿则一定有问题。它是必要条件，不是充分条件。更全面的评测还需要多针检索、长文档问答、长代码理解等任务。
+          </div>
+
+          <h2>从单针到多针：大海捞针不够用</h2>
+          <p>大海捞针测的是「能不能找到一个事实」，但真实的长上下文任务往往要求「综合多处信息得出结论」。用一个小例子说明两者的差距。假设文档开头写着：</p>
+          <blockquote>「小明把钥匙放在了厨房的抽屉里。」……（中间是一大段无关内容）……「晚上回家后，小明把钥匙从抽屉里拿出来，放进了卧室的保险柜。」</blockquote>
+          <p>单针测试会问「钥匙在哪」，只要模型能找到其中一句（通常它会找最近的「保险柜」句），就能答对——哪怕它完全没理解两句话的关系。但真正的推理问题是「钥匙现在在哪」，正确答案是保险柜，因为第二句话改写了第一句话。这要求模型：第一，找到两处相关位置；第二，理解它们之间的时间先后和覆盖关系；第三，把「后发生的事实」优先于「先发生的事实」。</p>
+          <p>这就是「多针推理」（multi-needle）和「推理型」长上下文任务测的东西。业界观测到的典型现象是：模型在上下文长度变长时，中间部分的信息丢失最严重（所谓「迷失在中间」，Lost in the Middle）——两端的针容易找，中间的针常常被遗忘。因此评估长上下文能力时，<strong>至少要看三件事：单针检索、多针综合、位置敏感性（针放中间是否还能找到）</strong>。只看大海捞针全绿，很容易被「边缘效应」骗过。</p>
+          <p>这也解释了一个工程上的共识：与其一味拉长窗口，不如把上下文工程做好——把关键信息放在开头或结尾、显式要求模型「先搜索再回答」、必要时让模型先列出所有相关证据再下结论。长窗口给了「能装下」的容量，但「用得动」还需要评测和提示词的配合。</p>
+
+          <h2>KV Cache 管理：长上下文的显存战场</h2>
+          <p>即使注意力计算用 FlashAttention 优化了，KV Cache 的显存占用仍是长上下文推理的核心瓶颈。128K 上下文下，单条请求的 KV Cache 可以轻松超过模型权重的显存占用。应对手段包括：</p>
+          <ul>
+            <li><strong>注意力变体</strong>：GQA / MLA 从源头减少 KV 存储量，详见 <a href="attention-variants.html">注意力变体全景</a>。</li>
+            <li><strong>KV Cache 量化</strong>：把 KV Cache 从 FP16 压到 INT8 甚至 INT4，直接减半或减至 1/4 显存。</li>
+            <li><strong>KV 卸载</strong>：把不常用的 KV Cache 换到 CPU 内存或 SSD，用时再换回 GPU。详见 <a href="../09-efficiency/kv-offload.html">KV 分级存储与卸载</a>。</li>
+            <li><strong>前缀缓存</strong>：多个请求共享相同的前缀（如系统提示），只存一份 KV。详见 <a href="kv-cache.html">KV Cache</a>。</li>
+          </ul>
+
+          <p>把这几种显存手段的节省量级放在一张表里，便于选型：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>手段</th><th>作用对象</th><th>典型节省</th><th>精度影响</th></tr></thead>
+              <tbody>
+                <tr><td><strong>GQA / MQA</strong></td><td>KV 头数</td><td>KV 头数等比下降（如 1/4~1/8）</td><td>轻微</td></tr>
+                <tr><td><strong>MLA</strong></td><td>KV 压缩维度</td><td>可达 1/32</td><td>几乎无损</td></tr>
+                <tr><td><strong>KV 量化</strong></td><td>每元素字节数</td><td>FP16→INT8 减半，→INT4 减至 1/4</td><td>低比特略损</td></tr>
+                <tr><td><strong>KV 卸载</strong></td><td>驻留 GPU 的 KV</td><td>显存上限大幅放开</td><td>换取带宽延迟</td></tr>
+                <tr><td><strong>前缀缓存</strong></td><td>重复前缀存储</td><td>共享前缀省一份/每并发</td><td>无损</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>注意力汇聚点（Attention Sink）：为什么开头的 token 不能丢</h2>
+          <p>KV Cache 的显存压力催生了一个看似很自然的问题：能不能只保留「最近的窗口」内的 KV，把更早的历史全部丢掉？直观上，对话里最近的内容最有用，早期 token 该丢就丢。但实验却给出了反直觉的结果——<strong>一旦把序列开头的几个 token 的 KV 也丢掉，生成质量会急剧崩溃</strong>。这就是 <strong>注意力汇聚点（attention sink）</strong> 现象，也是 StreamingLLM 论文的核心发现。</p>
+          <p>为什么会这样？研究者发现，Softmax 注意力需要把整行分数归一化成和为 1，而模型在训练时学到的行为是：把一部分「固定占比」的注意力倾泻到早期 token 上，即使这些 token 语义上毫无意义（比如一个 BOS 标记）。这些早期 token 就像一个「排水口」，承接了多余的概率质量。一旦把排水口拆掉，注意力分布失去出口，数值上会出现剧烈畸变，后续 token 的表示就被污染了。</p>
+
+          <p>StreamingLLM 论文的 Figure 1 把四种「在长文本上生成」的策略放在一起对比，是理解这件事最直观的图。四格从左到右分别是：<strong>稠密注意力</strong>（每次对所有历史算注意力，缓存无限增长）、<strong>窗口注意力</strong>（只留最近窗口，一旦把开头 token 的 KV 逐出就崩溃）、<strong>滑窗+重算</strong>（每个新 token 都从最近的窗口重建 KV，效果好但慢）、以及 <strong>StreamingLLM</strong>（保留开头几个 token 的 KV 作为汇聚点 + 最近窗口，又快又稳）。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/04-modern-arch/long-context/fig1.png" alt="论文原图：StreamingLLM 论文 Figure 1——四种长文本生成策略对比：稠密注意力、窗口注意力、滑窗重算、StreamingLLM" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：StreamingLLM 的 Figure 1——四种策略的对比。窗口注意力在开头 token 的 KV 被逐出后性能骤降；StreamingLLM 靠「保留注意力汇聚点 + 最近窗口」保持稳定</span>
+              <span class="pf-src">论文原图 · Xiao et al., <em>Efficient Streaming Language Models with Attention Sinks</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></span>
+            </figcaption>
+          </figure>
+
+          <p>逐块读这张图：横轴是文本位置（模型在长度 L 上训练，现在要预测第 T 个 token，T 远大于 L），纵轴是困惑度（越低越好）。<strong>第一格 Dense Attention</strong> 在超过训练长度后困惑度开始恶化（因为位置编码外推），而且时间和缓存都随 T 平方/线性增长；<strong>第二格 Window Attention</strong> 在窗口没滚动到时表现不错，一旦开头的 KV 被窗口「挤出」，困惑度曲线骤然跳升——这就是 attention sink 失效的现场；<strong>第三格 Sliding Window + Re-computation</strong> 每个新 token 都从最近的 L 个 token 重建 KV，效果最好但复杂度是 O(TL²)，慢得不可用；<strong>第四格 StreamingLLM</strong> 保留「开头的 sink token + 最近窗口」，在长文本上保持和重算相当的质量，同时维持固定大小的缓存。这张图就是「为什么开头几个 token 不能丢」的完整证据链。</p>
+
+          <p>图里还有一个细节值得留意：注意力汇聚点不需要是「有意义」的 token。StreamingLLM 论文甚至发现，在预训练时就刻意加一个占位 token（比如 BOS）专门充当汇聚点，效果更好——因为它给了模型一个明确的「排水口」，不用把注意力浪费在真正的文本上。这个设计后来被不少长上下文模型采纳。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/04-modern-arch/long-context/fig4.png" alt="论文原图：StreamingLLM 论文 Figure 4——StreamingLLM 的 KV Cache 结构：固定保留若干初始 token 的 KV（注意力汇聚点）加上滚动窗口内最近 token 的 KV" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：StreamingLLM 的 KV Cache 结构——图里清晰画出「固定的汇聚点 KV」和「滑动的窗口 KV」两部分，两者之和就是固定大小的缓存</span>
+              <span class="pf-src">论文原图 · Xiao et al., <em>Efficient Streaming Language Models with Attention Sinks</em>, 2023, Figure 4 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></span>
+            </figcaption>
+          </figure>
+
+          <p>Figure 4 则是 StreamingLLM 的「缓存形态图」。看这张图的核心是理解它的<strong>两段式缓存</strong>：一段是<strong>固定的汇聚点缓存</strong>（开头的几个 token），一段是<strong>滚动的窗口缓存</strong>（最近 W 个 token）。窗口随生成不断前移，旧 token 的 KV 被逐出、新 token 的 KV 被写入，但汇聚点缓存永远不动。整个缓存的显存占用是「sink 数 + W」的常数，和文本总长度无关——这就是它能支持无限长流式生成的原因。这张图也和 <a href="kv-cache.html">KV Cache</a> 页的分页管理天然衔接：StreamingLLM 决定了「留哪些 KV」，PagedAttention 决定「这些 KV 怎么存放」，两者正交。</p>
+
+          <details class="deep">
+            <summary>展开：手算一遍——注意力汇聚点缓存到底省了多少</summary>
+            <div class="deep-body">
+              <p>以 Llama-2-7B 为例：32 层、32 头、$d_{head}=128$、FP16，KV Cache 公式是「层数 × KV 头数 × 2 × 头维度 × 序列长度 × 2 字节」。传统上 KV Cache 随序列线性增长：单条请求 4K 上下文约 0.5 GB，32K 上下文约 4 GB，128K 上下文约 16 GB。</p>
+              <p>StreamingLLM 把「序列长度」这一项从「总长度 T」替换成「汇聚点个数 + 窗口大小 W」。取汇聚点 4 个、窗口 W = 2048：缓存 ≈ $32 \times 32 \times 2 \times 128 \times (4 + 2048) \times 2 \approx 0.27$ GB——比 32K 全量缓存的 4 GB 少了 15 倍左右，且这个数字在 T 增长到 400 万时<strong>依然不变</strong>（论文里验证了 400 万 token 的流式生成）。</p>
+              <p style="margin-bottom:0">代价是什么？窗口外的历史 token 的信息<strong>只存在于「残余状态」里</strong>——模型再也无法直接读到它们，只能靠窗口内 token 和汇聚点间接携带的信息。所以 StreamingLLM 适合「近因主导」的流式场景（对话、直播转录），不适合「必须精确回溯任意历史」的检索场景。</p>
+            </div>
+          </details>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            注意力汇聚点常被误解为「模型真的认为开头 token 很重要」。恰恰相反——<strong>它被大量注意力的原因恰恰是它不重要</strong>：Softmax 需要一个归一化的「排水口」，模型把多余的概率质量倾倒在这些 token 上，让真正重要的 token 获得清晰的权重分布。所以你不能反过来「既然开头 token 重要，就多放点重要内容在开头」——sink 的设计初衷是「承接垃圾概率」，位置开头的<strong>真实</strong>重要信息反而会和 sink 抢注意力。另一个相关误区：StreamingLLM「不微调就能无限长」，这不代表它「读得懂全部历史」——它只是<strong>稳定</strong>，能持续生成；要真正利用长距离信息，仍然需要长文本训练。
+          </div>
+
+          <h2>注意力稀释：长上下文的隐性代价</h2>
+          <p>即使技术上都搞定了——位置编码外推了、KV Cache 放得下了、注意力算得动了——还有一个更深层的现象：<strong>注意力稀释</strong>。</p>
+          <p>标准 Softmax 注意力会把概率分散到所有可见位置。上下文越长，注意力权重分布得越散——关键信息获得的注意力比例可能被大量无关 token 稀释。这意味着即使模型"能看到"远处的针，也可能因为注意力被稀释而"看不清"。</p>
+          <p>这正是 <a href="../10-applications/context-engineering.html">上下文工程</a> 要解决的问题——不是所有信息都值得塞进上下文，精心组织上下文结构（重要信息前置、冗余信息删除、分层检索）比单纯拉长窗口更有效。长上下文给了"能放进去"的容量，但"放什么、怎么放"依然需要工程判断。</p>
+
+          <h2>选型清单：什么时候值得追长上下文</h2>
+          <p>长上下文不是免费的。在决定要不要把窗口从 4K 扩到 128K 之前，先算清楚三笔账。</p>
+          <p><strong>第一，任务真的需要多长的上下文？</strong>对话、代码补全通常只需要局部信息，几千 token 足够；而整本小说总结、长报告分析、超大代码仓库检索，才需要上百 K。把「实际用到的上下文长度」统计一下，会发现大多数请求其实都很短——为极端需求付出全量代价并不划算。</p>
+          <p><strong>第二，显存和延迟的账。</strong>以 32 层、32 头、FP16 的 7B 模型为例，单请求 128K 上下文的 KV Cache 约 16GB，和权重相当；batch size 一上去，显存立刻爆炸。如果目标是高并发推理，优先用 GQA/MLA 压缩 KV，而不是一味拉长窗口。</p>
+          <p><strong>第三，评测的账。</strong>上完长上下文功能后，不要只跑大海捞针——要跑多针检索、长文档问答和长代码任务，并且对比不同深度、不同长度下的表现。如果热力图边缘绿、中间红，说明长上下文「形同虚设」，还得回去补长文本训练数据。</p>
+          <p>一句话总结：<strong>长上下文是一种能力，更是一种成本</strong>。先用量化手段确认需求分布，再决定投入——大多数团队最经济的选择，是「免训练扩展 + 少量微调 + 上下文工程」的组合，而不是一开始就冲 1M 窗口。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>三个瓶颈</strong>：位置编码外推、KV Cache 膨胀、注意力计算爆炸。前两个是长上下文专属，第三个由注意力变体和 FlashAttention 解决。</li>
+            <li><strong>位置插值</strong>：PI 统一缩放位置（简单但损短距离精度）；NTK-aware 分频率缩放（高频保精度、低频保外推）；YaRN 最精细。</li>
+            <li><strong>长文本训练</strong>：位置插值让模型"假装见过"长距离，长文本微调让它"真的适应"。需要包含跨距离检索任务数据。</li>
+            <li><strong>大海捞针</strong>：在长文本不同深度插入事实，测试模型能否检索到。是长上下文的必要评测，但不充分（不测多针推理）。</li>
+            <li><strong>常见坑</strong>：只做位置插值不微调，长距离检索失败；大海捞针全绿就以为长上下文"搞定"了，忽略了多针推理；KV Cache 没优化导致显存溢出。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Extending Context Window of Large Language Models via Positional Interpolation — 位置插值（PI）原始论文 · <a href="https://arxiv.org/abs/2306.15595" target="_blank" rel="noopener">arXiv:2306.15595</a></li>
+            <li>YaRN: Efficient Context Window Extension of Large Language Models — YaRN 方法论文，对 RoPE 频率分段缩放 · <a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">arXiv:2309.00071</a></li>
+            <li>Lost in the Middle: How Language Models Use Long Contexts — 分析长上下文中"中间信息丢失"现象的经典论文 · <a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener">arXiv:2307.03172</a></li>
+            <li>Efficient Streaming Language Models with Attention Sinks（StreamingLLM）— 注意力汇聚点现象的发现与固定缓存流式生成 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></li>
+            <li>No Train No Gain: Revisiting Efficient Training Algorithms For Transformer-based Language Models — 对 PI/NTK 等扩展方法的系统评测，结论是「不训练就很难真的长上下文」 · <a href="https://arxiv.org/abs/2407.06072" target="_blank" rel="noopener">arXiv:2407.06072</a></li>
+            <li>RoFormer: Enhanced Transformer with Rotary Position Embedding — RoPE 原始论文 · <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">arXiv:2104.09864</a></li>
+            <li>LongBench: A Bilingual, Multitask Benchmark for Long Context Understanding — 覆盖多种长上下文任务的评测基准 · <a href="https://arxiv.org/abs/2308.14508" target="_blank" rel="noopener">arXiv:2308.14508</a></li>
+            <li>Hugging Face 博客: 如何扩展 LLM 的上下文长度 — 关于 RoPE 扩展方法与工具的工程实践综述 · <a href="https://huggingface.co/blog/long-context" target="_blank" rel="noopener">huggingface.co/blog</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            长上下文解决"能读多长"的问题，而 <a href="kv-cache.html">KV Cache</a> 解决"推理时怎么存"的问题，<a href="attention-variants.html">注意力变体</a> 解决"算得少"的问题。三者共同决定了模型能服务的实际上下文长度。如果想看上下文工程层面的信息组织策略，见 <a href="../10-applications/context-engineering.html">上下文工程</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

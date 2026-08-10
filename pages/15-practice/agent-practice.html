@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实战：开发一个工具型 Agent · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="15-practice" data-topic="agent-practice">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>实战：开发一个工具型 Agent</h1>
+            <p class="lead">把概念变成能跑的东西，是理解 Agent 最快的方式。这一页以「代码任务」为载体，带你从零搭一个工具型 Agent：定义工具、接入 MCP、加记忆与失败重试，最后做轨迹评估——跑通「仓库级上下文组织 + 执行反馈闭环」的完整循环。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>工具型 Agent 的核心是一个「感知 → 决策 → 执行 → 反馈」的循环：模型看到任务和环境状态，决定调用哪个工具，工具返回结果，模型消化后再决定下一步，直到任务完成或放弃。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  T["任务"] --> M["模型决策<br/>选工具 + 参数"]
+  M --> EX["执行工具<br/>读文件 / 跑命令"]
+  EX --> FB{"反馈"}
+  FB -->|"成功 / 有新信息"| M
+  FB -->|"报错"| RT["失败重试<br/>解析错误再试"]
+  RT --> M
+  FB -->|"任务完成"| D["交付结果"]
+              </div>
+              <figcaption>Agent 主循环：决策 → 执行 → 反馈 → 再决策，重试兜住失败</figcaption>
+            </figure>
+          </div>
+
+          <h2>Agent 与一次性推理到底差在哪</h2>
+          <p>很多人第一次写 Agent 会困惑：这不就是把「问模型一个问题」换成「问模型调哪个工具」吗？差别远比表面大。一次性推理（zero-shot / few-shot）是「一问一答」：你给上下文，模型给答案，过程结束。Agent 是「带着目标反复行动」：模型每走一步，环境（文件、命令行、数据库）都会变化，下一步的决策依赖上一步的结果。它更像人在干活——先看看现状，决定干点什么，干完看反馈，再决定下一步，直到活儿干完。</p>
+          <p>这个差别带来两个工程后果。第一，<strong>上下文是动态的</strong>：你不能像写 prompt 那样一次性把所有信息塞进去，因为「下一步需要什么信息」只有走起来才知道。第二，<strong>错误会累积</strong>：一次性推理答错最多是一句废话，Agent 走错一步可能删错文件、烧光 token 预算。所以 Agent 工程的核心不是「让模型更聪明」，而是「搭一个能让不那么聪明的模型也不犯大错的循环」——重试、反馈、上限、放弃，这些是 Agent 真正安全的骨架。</p>
+          <p>用一个具体的任务把两者的差别说透。假设任务是"修复仓库里某个失败的测试并跑通它"。一次性推理的玩法是：把整个仓库塞进上下文，问模型"问题出在哪、怎么改"，模型给一个建议，你手工去验证。Agent 的玩法是：模型先调用 <code>search_in_files</code> 找到失败测试引用了哪个函数，再调用 <code>read_file</code> 读那个函数的实现，可能还要跑一次命令复现失败，根据报错再往下定位，改完代码后再次跑测试确认通过。整个过程步骤数不固定、每步都依赖上一步的结果、中间至少会失败几次——这正是"固定流水线做不到、必须靠 Agent 循环"的典型任务。反过来，如果任务只是"把 A 文件内容替换成 B 文件内容"，那两步就是固定的，直接写两行函数调用即可，完全不需要模型参与决策。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">判断要不要写 Agent</span>
+            一个经验法则：如果任务能拆成「固定几步、每步输入输出确定」，用普通流水线（串起几个函数）就够了，别上 Agent。只有当任务<strong>步骤数不固定、需要边做边看、可能失败需要绕路</strong>时（比如「修完这个 bug 并跑通测试」「根据报错定位并改配置」），Agent 的循环才值得。过早引入 Agent，是把简单问题复杂化。
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant U as 用户
+  participant M as 模型
+  participant C as Agent 客户端
+  participant S as MCP Server
+  participant E as 环境
+  U->>M: 任务描述
+  M->>C: 调用工具 X（参数）
+  C->>S: JSON-RPC 调用
+  S->>E: 执行（读文件/跑命令）
+  E-->>S: 结果 / 错误
+  S-->>C: 结构化返回
+  C-->>M: 反馈
+  M->>M: 决策下一步
+  M->>C: 继续 / 完成
+            </div>
+            <figcaption>一次工具调用的往返：模型决策 → 客户端转发 → server 执行 → 结构化反馈 → 模型再决策</figcaption>
+          </figure>
+
+          <h2>一、第一步：定义工具</h2>
+          <p>工具的本质是「函数 + 给模型看的说明书」。模型不会看你的源码，它只看 JSON Schema——所以<strong>描述写得好不好，直接决定工具被调用的准不准</strong>。</p>
+          <p>把工具想象成 API 文档与实现代码的关系：实现代码是给系统执行用的，文档是给人（或模型）决定"该不该调用、参数怎么传"用的。模型端做的是"根据当前任务 + 文档，从候选工具集合里挑一个并填参数"，本质上是一个受限的分类 + 生成问题。既然是分类问题，工具的数量、描述的区分度、参数约定的清晰度就直接决定了分类准确率。很多人把 Agent 调不准归咎于"模型不够聪明"，实际排查下来，八成是工具说明书写得含糊——模型根本没看清参数语义，不是它不会调。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  Tool["工具定义"] --> P1["函数实现<br/>实际逻辑"]
+  Tool --> P2["JSON Schema<br/>给模型看的说明书"]
+  P2 -->|"name / description<br/>/ parameters"| Model["模型据此决策"]
+  P1 -->|"执行"| Result["返回结果"]
+            </div>
+            <figcaption>工具的双重身份：函数实现给系统，JSON Schema 给模型</figcaption>
+          </figure>
+
+          <p>下面这个例子用 FastMCP 的装饰器定义一个 <code>read_file</code> 工具。注意两个细节：函数签名和 docstring 会被自动转成 JSON Schema 送给模型，所以 docstring 里写的是"给模型看的话"而不是"给人类看的注释"；参数带了默认值和明确的边界说明（offset 从 0 开始、limit 默认 200），这些都是减少误调用的关键。</p>
+
+          <details class="deep">
+            <summary>展开：一个工具定义示例（FastMCP 风格）</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("code-agent")
+
+@mcp.tool()
+def read_file(path: str, offset: int = 0, limit: int = 200) -> str:
+    """读取文件的指定片段。
+
+    Args:
+        path: 文件绝对路径
+        offset: 起始行号（从 0 开始）
+        limit: 最多读取的行数（默认 200）
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    return "".join(lines[offset:offset + limit])
+
+# 关键：docstring 就是给模型看的『说明书』
+# 描述越具体（绝对路径、行号语义），模型调用越准</code></pre>
+            </div>
+          </details>
+
+          <p>工具描述的最佳实践：</p>
+          <ul>
+            <li><strong>写「什么」不写「为什么」</strong>：docstring 描述功能与参数，不要写实现细节；</li>
+            <li><strong>参数语义要明确</strong>：「绝对路径」vs「相对路径」、「行号从 0 还是 1」必须说清；</li>
+            <li><strong>数量克制</strong>：暴露给模型 5-15 个工具最优，太多会让选择准确率下降；</li>
+            <li><strong>按用途分组</strong>：读/写/执行/搜索分开，避免模型混淆。</li>
+          </ul>
+          <p>这套最佳实践背后的统一原则只有一句：<strong>让模型在不读源码的情况下也能正确使用工具</strong>。评价一组工具描述写得好不好，可以做一个「蒙眼测试」——把描述给一个没看过实现的人，看他能不能按描述正确调用。如果他能，模型通常也能。</p>
+
+          <h3>工具描述：好与差的对照</h3>
+          <p>工具描述写得好不好，是 Agent 调得准不准的头号因素。下面这张检查清单把常见失误列出来，照着逐条过就能避开大部分误调用。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>差的写法</th><th>好的写法</th></tr></thead>
+              <tbody>
+                <tr><td>路径语义</td><td>"path: 文件路径"</td><td>"path: 文件绝对路径，相对路径会解析失败"</td></tr>
+                <tr><td>行号约定</td><td>"offset: 行号"</td><td>"offset: 起始行号，从 0 开始"</td></tr>
+                <tr><td>边界说明</td><td>"limit: 数量"</td><td>"limit: 最多读取行数，默认 200，防上下文爆炸"</td></tr>
+                <tr><td>副作用</td><td>不提</td><td>"该工具会修改磁盘，请确认后再调用"</td></tr>
+                <tr><td>失败含义</td><td>不提</td><td>"返回 exit code，非 0 表示失败，附 stderr"</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout warn">
+            <span class="callout-t">别让模型猜参数</span>
+            模型不会读你的源码，它只看得见 description。凡是「容易猜错」的地方——单位、起点、绝对/相对、是否幂等——都要在描述里写死。一个常见惨案：offset 写成「从 1 开始」，模型按 0 开始传，读到的永远是错行，还以为是文件内容有问题，于是在错误方向上越走越远。
+          </div>
+          <p>设计工具集时还有一个更高层的原则：<strong>按"模型天然会怎么描述这个动作"来命名和分组</strong>。模型是自然语言驱动的，它更容易想起"读文件"而不是"fetch_document_chunk_v2"。工具名要短、以动词开头、与语义强绑定；分组上把"读类"和"写类"分开，避免一个"编辑文件"的工具既做读又做写，让模型在只需要读的时候犹豫要不要动用"可能造成修改"的工具。工具数量控制在 5-15 个还有一层原因：模型做选择时，候选越多，被相似描述干扰的概率越大——两个工具描述里有八成相同的词，模型选错就是必然。</p>
+
+          <h2>二、第二步：接入 MCP 让工具可发现</h2>
+          <p>MCP（Model Context Protocol）是工具的标准接入层：把工具注册成 MCP server，客户端（Agent 框架）自动发现工具清单并调用。好处是「工具与模型解耦」——换模型不用重写工具。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Agent["Agent 客户端"]
+    A1["模型"]
+    A2["MCP Client"]
+  end
+  subgraph Server["MCP Server"]
+    S1["工具清单<br/>（自动发现）"]
+    S2["工具实现<br/>read_file / run_command"]
+  end
+  subgraph Env["环境"]
+    E1["文件系统"]
+    E2["Shell / Git"]
+  end
+  A1 <--> A2
+  A2 <-->|"JSON-RPC"| S1
+  A2 <-->|"调用"| S2
+  S2 --> E1
+  S2 --> E2
+            </div>
+            <figcaption>MCP 架构：Agent 通过 MCP 自动发现并调用工具，与模型解耦</figcaption>
+          </figure>
+
+          <p>如果没有 MCP，工具接入通常是硬编码的：在客户端代码里写死一张"工具名 → 函数"的映射表，模型要调用什么，客户端就调什么。这在工具只有两三个时没问题，但一旦工具多起来——读文件、写文件、跑命令、搜代码、查数据库、调外部 API——每个都要维护参数转换、错误处理、权限控制，硬编码的维护成本会失控。MCP 把"工具发现"也标准化了：客户端启动时向 server 要一份工具清单（名字、描述、参数 Schema），模型看到的就是这份清单。新增一个工具只需在 server 侧加一个函数，客户端零改动。</p>
+
+          <p>完整接入示例（Python + FastMCP + OpenAI 风格客户端）：</p>
+
+          <pre><code class="language-python">from mcp.server.fastmcp import FastMCP
+import subprocess
+
+mcp = FastMCP("code-agent")
+
+@mcp.tool()
+def run_command(command: str, timeout: int = 30) -> str:
+    """在沙箱 shell 中执行命令。
+
+    Args:
+        command: 要执行的 shell 命令
+        timeout: 超时秒数（默认 30）
+    """
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True,
+            text=True, timeout=timeout
+        )
+        out = result.stdout[-2000:]  # 截断防上下文爆炸
+        err = result.stderr[-500:]
+        return f"exit={result.returncode}\nstdout:\n{out}\nstderr:\n{err}"
+    except subprocess.TimeoutExpired:
+        return "ERROR: command timed out"
+
+@mcp.tool()
+def search_in_files(pattern: str, path: str = ".") -> str:
+    """在目录中搜索匹配模式的文件内容。
+
+    Args:
+        pattern: 正则表达式
+        path: 搜索目录（默认当前目录）
+    """
+    # 用 ripgrep 实现，返回文件:行号:内容
+    result = subprocess.run(
+        ["rg", "-n", pattern, path],
+        capture_output=True, text=True, timeout=15
+    )
+    return result.stdout[-3000:]
+
+# 启动 server（stdio 模式，被 Agent 客户端拉起）
+if __name__ == "__main__":
+    mcp.run(transport="stdio")</code></pre>
+
+          <p>细节：工具返回要<strong>截断长输出</strong>（否则上下文爆炸）；错误信息要<strong>结构化返回</strong>（exit code + stdout + stderr），让模型能解析并重试。详见 <a href="../11-agents/tool-use-mcp.html">工具调用与 MCP</a>。</p>
+          <p>逐段读这段 server 代码，藏着两个 Agent 工程的核心习惯。第一，所有工具返回都被截断——stdout 只留后 2000 字符、stderr 后 500 字符。上下文是有限的宝贵资源，一次命令的输出可能上万字符，全塞进去既费 token 又稀释注意力。第二，返回值是"结构化错误"而不是抛异常：exit code、stdout、stderr 分开返回，模型才能解析出"到底哪里失败了、该改什么再试"。如果直接抛异常让主循环崩溃，模型就没有第二次机会了。<code>search_in_files</code> 用 ripgrep 而不是 Python 自己遍历目录，是因为在大仓库上 rg 快几个数量级——工具的性能瓶颈往往不在模型调用，而在这些被调用的底层命令。最后，<code>mcp.run(transport="stdio")</code> 说明 server 是被 Agent 客户端按需拉起的子进程，这也让权限隔离更干净。</p>
+
+          <h2>三、第三步：记忆与上下文组织</h2>
+          <p>工具型 Agent 的上下文管理是成败关键：完整日志太占 token，压缩过度又丢失信息。工程实践分两层：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Short["短期记忆（窗口内）"]
+    S1["最近 N 轮对话 + 工具结果"]
+    S2["保留决策所需的最小上下文"]
+  end
+  subgraph Long["长期记忆（外部）"]
+    L1["对话摘要（滚动压缩）"]
+    L2["文件 / 仓库索引"]
+    L3["任务状态记录"]
+  end
+  subgraph Flow["组织策略"]
+    F1["系统提示：角色 + 工具清单"]
+    F2["历史：最近完整 + 更早摘要"]
+    F3["当前：最新工具结果"]
+  end
+  Short --> Flow
+  Long --> Flow
+  Flow --> Model["模型决策"]
+            </div>
+            <figcaption>Agent 记忆分层：短期窗口保留细节，长期外部存储压缩历史</figcaption>
+          </figure>
+
+          <p>下面是一个约 40 行的 <code>AgentMemory</code> 实现：它维护一个消息列表，超过窗口阈值就把最老的一半折叠进滚动摘要，组装 prompt 时把"摘要 + 最近窗口"发给模型。它的设计动机很直接：模型对"最新几轮"的内容理解最好，对"很久以前的细节"只有模糊记忆，所以最新的保留原样、最老的压缩成要点，正好匹配模型的注意力分布。你可以把它理解成一个"记事本 + 便签"的组合：便签上写最近发生的事，记事本里是已经归档的总结。</p>
+
+          <pre><code class="language-python">class AgentMemory:
+    """Agent 的双层记忆：窗口 + 摘要"""
+
+    def __init__(self, window_size=8, summary_model=None):
+        self.messages = []       # 完整消息列表
+        self.window_size = window_size
+        self.summary = ""        # 滚动摘要
+        self.summary_model = summary_model
+
+    def add(self, message):
+        self.messages.append(message)
+        if len(self.messages) > self.window_size * 2:
+            self._compress()
+
+    def _compress(self):
+        """滚动压缩：把最老的一半折叠进摘要"""
+        old = self.messages[:len(self.messages) // 2]
+        new = self.messages[len(self.messages) // 2:]
+        if self.summary_model:
+            self.summary = self.summary_model.compress(
+                self.summary, old)
+        else:
+            # 无摘要模型时：简单截断
+            self.summary += f"[{len(old)} 条历史已折叠]\n"
+        self.messages = new
+
+    def build_prompt(self):
+        """组装发给模型的上下文"""
+        return [
+            {"role": "system", "content": (
+                f"摘要：{self.summary}\n"
+                "可用工具见工具清单。"
+            )},
+            *self.messages
+        ]</code></pre>
+
+          <p>逐行看 <code>_compress</code>：它把消息列表从中间切开，前半段交给摘要模型压缩，后半段保留。注意摘要的更新是增量的——新的摘要由"旧摘要 + 被折叠的历史"生成，而不是每次都从头总结，这样压缩成本是 O(窗口) 而不是 O(全部历史)。<code>build_prompt</code> 把摘要放在 system 消息里，位置靠前且不随对话增长，保证无论对话多长，模型总能读到任务主线。一个容易忽略的细节是 <code>window_size=8</code>：8 轮以内不压缩，超过才压缩——这是为了避免"频繁压缩导致的信息抖动"，每次压缩都有信息损失，压缩次数越少越好。真实项目中，摘要模型通常直接用同一个 Agent 模型，让它总结"已完成什么、卡在哪、下一步计划"，比保留原始对话更有决策价值。</p>
+
+          <h3>三种记忆策略怎么选</h3>
+          <p>上面的代码展示了「窗口 + 滚动摘要」的朴素实现。实际项目里记忆策略不止一种，各有取舍。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>策略</th><th>做法</th><th>优点</th><th>缺点</th><th>适用</th></tr></thead>
+              <tbody>
+                <tr><td>全量保留</td><td>不截断，全塞进上下文</td><td>零信息丢失</td><td>token 爆炸、模型迷失</td><td>极短任务</td></tr>
+                <tr><td>滚动摘要</td><td>老历史折叠成摘要</td><td>省 token、保主线</td><td>细节可能丢</td><td>中等长度任务</td></tr>
+                <tr><td>外部检索</td><td>历史存库，按需检索</td><td>几乎无限上下文</td><td>检索可能不准</td><td>长程 / 多轮</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>一个实用的「摘要质量」细节：摘要不是简单截断，最好让模型总结「已完成什么、卡在哪、下一步计划」，而不是保留原始对话。否则摘要里全是「用户说……模型说……」，占着 token 却没提供决策信号。换句话说，<strong>压缩的是「叙事」，保留的是「状态」</strong>。对于代码 Agent，把「已读过的文件及其关键内容」单独存一份结构化索引，往往比把原始工具输出塞回上下文更管用。</p>
+          <p>上下文预算可以按"四份"来分配：系统提示（角色 + 工具清单）约占 10%，任务与摘要约占 15%，最近 N 轮对话约占 60%，最新工具结果约占 15%。这个比例不是精确公式，但它的方向是对的——把大头留给最近发生的、直接影响下一步决策的内容。一个典型的失控场景是：模型每读一个大文件就把整个文件留在上下文里，几轮之后上下文被历史占满，模型开始"忘掉"最早的约束条件（比如"只改测试不碰源码"），于是越做越偏。对策就是上面代码里的窗口裁剪，再加一条纪律：每个工具结果只保留"与当前任务相关的片段"，而不是整段塞入。</p>
+
+          <h2>四、第四步：失败重试与容错</h2>
+          <p>真实环境里工具必然出错——文件不存在、命令超时、参数错误。Agent 的容错设计决定它能不能「自己爬起来」。核心是<strong>把错误变成可解析的信号</strong>，让模型能诊断并重试。</p>
+          <p>这里有一个"自主性程度"的概念值得展开：如果错误处理全部写在执行器里（遇到超时就重试、遇到参数错就换参数），Agent 的自主性很低，但行为稳定、可预期；如果把错误原样丢给模型去处理，Agent 的自主性很高，能处理没预料到的错误，但行为不可控，可能在一个坑里反复试探。成熟的做法是分层：执行器兜住"常见、确定"的错误（超时、瞬时失败），模型处理"罕见、需要判断"的错误（逻辑性失败）。分清哪一层该负责什么，比把容错逻辑都堆在一层更重要。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  ToolCall["调用工具"] --> Result{"结果分类"}
+  Result -->|"成功"| Proceed["继续下一步"]
+  Result -->|"可重试错误<br/>超时 / 临时失败"| Retry{"重试次数<br/>< 3?"}
+  Retry -->|"是"| Backoff["指数退避重试"]
+  Retry -->|"否"| Change["换策略<br/>换工具 / 换参数"]
+  Result -->|"不可重试错误<br/>参数错误 / 不存在"| Diagnose["模型诊断错误<br/>修正参数重试"]
+  Backoff --> ToolCall
+  Change --> ToolCall
+  Diagnose --> ToolCall
+  Change -->|"多次失败"| GiveUp["放弃并报告<br/>（优于死循环）"]
+            </div>
+            <figcaption>Agent 容错流程：错误分类 → 重试/换策略/诊断，最终失败要体面放弃</figcaption>
+          </figure>
+
+          <pre><code class="language-python">import time
+import json
+
+class ToolExecutor:
+    """带容错的工具执行器"""
+
+    MAX_RETRY = 3
+
+    def __init__(self, tools):
+        self.tools = tools  # {name: function}
+
+    def call(self, name, args, history=None):
+        """执行工具调用，带重试与错误结构化返回
+
+        Args:
+            name: 工具名
+            args: 参数字典
+            history: 之前的错误记录（用于退避）
+        """
+        if name not in self.tools:
+            return {"error": f"未知工具: {name}",
+                    "known_tools": list(self.tools.keys())}
+
+        retries = 0
+        while True:
+            try:
+                result = self.tools[name](**args)
+                return {"ok": True, "result": result}
+            except TimeoutError as e:
+                retries += 1
+                if retries >= self.MAX_RETRY:
+                    return {"error": f"工具超时（已重试{retries}次）",
+                            "suggestion": "换更小的输入 / 拆任务"}
+                time.sleep(2 ** retries)  # 指数退避
+            except Exception as e:
+                # 参数类错误：让模型自己诊断修正
+                return {
+                    "error": f"{type(e).__name__}: {str(e)}",
+                    "suggestion": "检查参数类型与取值范围后重试"
+                }
+
+
+# 主循环里使用
+executor = ToolExecutor(tools)
+result = executor.call("run_command", {"command": "pytest"})
+if "error" in result:
+    print(json.dumps(result, ensure_ascii=False))  # 结构化错误给模型</code></pre>
+
+          <p>这个执行器把"失败"拆成了三个层次，每一层对应不同的应对策略。第一层，工具名不存在——这是 Agent 侧的 bug，返回已知工具列表，让模型自己纠正选择。第二层，超时——这是"可重试"错误，用指数退避（1 秒、2 秒、4 秒）重试最多 3 次，避免在瞬时故障上反复横跳。第三层，其他异常——这类参数型错误"重试多少次都会再失败"，所以不做机械重试，而是把异常类型和消息结构化返回给模型，让它诊断后换参数再调。这个分层是容错设计的关键：<strong>无脑重试不是容错，分清"重试有用"和"重试无用"才是</strong>。如果对参数错误也机械重试 3 次，只会浪费时间，并让模型看到 3 条重复的错误日志，反而干扰判断。最后，超时用 <code>while True</code> + 提前 return 的结构而不是递归，避免了重试层级加深时的栈开销，也让"何时放弃"的判定集中在一处。</p>
+
+          <h2>五、第五步：轨迹评估与迭代</h2>
+          <p>Agent 开发完不算完——要跑评估才知道它「真的能用」。轨迹评估看三件事：任务成没成、过程顺不顺、成本高不高。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  EvalTasks["评估任务集<br/>10-20 个典型任务"] --> Run["批量运行 Agent<br/>记录完整轨迹"]
+  Run --> Metrics["三维指标"]
+  Metrics --> M1["完成率<br/>目标达成比例"]
+  Metrics --> M2["平均步数<br/>轨迹质量"]
+  Metrics --> M3["平均成本<br/>token 数"]
+  M1 --> Analyze{"发现问题?"}
+  M2 --> Analyze
+  M3 --> Analyze
+  Analyze -->|"工具误调用"| Fix1["改工具描述"]
+  Analyze -->|"上下文丢失"| Fix2["改记忆策略"]
+  Analyze -->|"死循环"| Fix3["加步数上限"]
+  Fix1 --> Run
+  Fix2 --> Run
+  Fix3 --> Run
+            </div>
+            <figcaption>Agent 评估迭代闭环：跑任务 → 看三维指标 → 定位问题 → 修复 → 重跑</figcaption>
+          </figure>
+
+          <p>三维指标里，「平均成本」最容易被忽视。成本不只是钱，还包括时间：一次任务跑 30 步、每步都要等模型输出和工具执行，用户等不起。建议给每个任务设定成本上限（比如最多 40 步或 20 万 token），超了就强制停止并标记为「超预算失败」。这样评估时你会同时得到「任务成功率」和「预算满足率」两个数字：前者衡量能力，后者衡量可用性——一个成功率 90% 但平均要跑 200 步的 Agent，在真实产品里可能还不如一个成功率 70% 但 20 步内就能结束的 Agent。</p>
+
+          <p>开发过程的实用建议：</p>
+          <ul>
+            <li><strong>先手工验证</strong>：用 3-5 个任务手动调，把明显问题修完再上自动化评估；</li>
+            <li><strong>记录每次轨迹</strong>：轨迹就是调试素材，保留错误样本用于分析；</li>
+            <li><strong>加步数上限</strong>：防止死循环烧钱，超过上限强制停止并报告；</li>
+            <li><strong>逐步加任务</strong>：从简单任务到复杂任务，避免一开始就陷入难任务泥潭。</li>
+          </ul>
+          <p>再补充两个评估细节。第一，评估任务集不能只选"模型大概率会做对"的任务——那样评估结果没有区分度。要故意混入几道"中等难度、容易走错路"的任务，才能暴露工具描述、记忆策略、重试逻辑的真实短板。第二，记录轨迹时把"模型当时的决策依据"也存下来（比如它在调用某个工具前的思考字段），这样当某个任务失败时，你能看到它是"理解错了工具语义"还是"判断错了下一步"，从而对症下药。一个团队如果只有最终正确率这一个数字，几乎无法迭代 Agent 质量——轨迹才是调试素材，正确率只是验收指标。</p>
+
+          <h2>六、常见坑与进阶方向</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>坑</th><th>表现</th><th>应对</th></tr></thead>
+              <tbody>
+                <tr><td>工具描述含糊</td><td>模型频繁误调用</td><td>写清参数语义与边界</td></tr>
+                <tr><td>上下文无限膨胀</td><td>token 爆炸、模型迷失</td><td>截断 + 滚动摘要</td></tr>
+                <tr><td>错误不结构化</td><td>模型无法解析重试</td><td>返回 exit code + 建议</td></tr>
+                <tr><td>死循环</td><td>反复调用同一工具</td><td>步数上限 + 重复检测</td></tr>
+                <tr><td>工具过多</td><td>选择准确率下降</td><td>精简到 5-15 个</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>上述坑里，前三个（描述含糊、上下文膨胀、错误不结构化）属于"写了代码但没写到位"，是迭代两三轮就能修掉的问题；后两个（死循环、工具过多）是设计层面的问题，需要在架构时就规划清楚。一个实用的做法：每次迭代后把失败轨迹按上面五个坑归类统计占比。如果"工具描述含糊"占比最高，说明问题在工具层，集中改描述；如果"死循环"占比上升，说明该加更激进的上限——用数据驱动改进方向，而不是凭感觉东改一榔头西改一棒槌。</p>
+
+          <p>进阶方向：接 <a href="../11-agents/agent-memory.html">Agent 记忆</a> 做长期状态；用 <a href="../07-posttraining/agentic-rl.html">Agentic RL</a> 把「会做的」固化成「总能做的」；上 <a href="../11-agents/agent-eval.html">Agent 评估</a> 体系做回归保障。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/11-agents/agent/fig1.png" alt="论文原图：ReAct 在思考轨迹与外部行动之间交替循环" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：ReAct 推理—行动循环——模型先生成思考轨迹，再执行动作获得观察结果，随后继续推理</span>
+              <span class="pf-src">论文原图 · Yao et al., <em>ReAct: Synergizing Reasoning and Acting in Language Models</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">arXiv:2210.03629</a></span>
+            </figcaption>
+          </figure>
+          <p>读这张图时先看横向的时间顺序：左侧是模型产生的 <strong>Thought（思考）</strong>，中间是 <strong>Action（行动）</strong>，右侧是环境返回的 <strong>Observation（观察）</strong>。它不是把思考和工具调用拆成两个互不相干的模块，而是让每一次观察都成为下一轮思考的输入；因此工具结果不是日志，而是会改变计划的证据。</p>
+          <p>再看图中的循环边界：一次任务可能经历多轮 Thought→Action→Observation，直到得到答案或达到停止条件。实现时要把每轮的工具名、参数、返回值和错误写进轨迹，并设置步数、超时和权限上限。这样既能复现模型为什么选了某个工具，也能在错误时把问题定位到工具描述、参数生成还是执行环境。</p>
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            Agent 的“思考”不是执行结果，模型说“我已经修改文件”并不代表磁盘真的变化。只有工具返回成功状态、退出码和可验证的文件差异，才能把动作视为完成；展示给用户的思考文字也不能替代权限校验和审计日志。
+          </div>
+          <details class="deep">
+            <summary>展开：最小可运行版本、验证步骤与排查清单</summary>
+            <div class="deep-body">
+              <p>先只实现三个纯函数工具：<code>list_files</code>、<code>read_file</code> 和 <code>run_tests</code>，不要一开始就开放写文件或任意 shell。主循环接收一个任务，最多执行 5 步；每步把工具调用序列化成 JSON，执行后把 <code>ok</code>、<code>result</code> 或 <code>error</code> 回传给模型。验证时先用一个必然成功的“列出目录”任务，再用一个不存在的文件任务，最后用一个会失败的测试任务，确认 Agent 能分别完成、诊断和放弃。</p>
+              <p>排查顺序固定为：工具清单是否完整，参数 schema 是否准确，执行器是否返回结构化错误，循环是否真的把上一轮结果放回上下文，以及停止条件是否生效。若出现重复调用，打印最近 3 轮的工具名和参数；若输出为空，检查客户端是否把 tool result 当成 user 消息；若任务成功但报告错误，检查成功判定是否只依赖模型文本而没有检查工具返回值。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>主循环</strong>：决策 → 执行 → 反馈 → 再决策，重试兜住失败，步数上限防死循环。</li>
+            <li><strong>工具定义</strong>：函数实现 + JSON Schema 说明书；描述写清参数语义；5-15 个最优。</li>
+            <li><strong>MCP 接入</strong>：工具注册成 server，客户端自动发现；工具与模型解耦。</li>
+            <li><strong>记忆分层</strong>：短期窗口保留细节 + 长期摘要压缩历史 + 文件索引。</li>
+            <li><strong>容错</strong>：错误分类（可重试/不可重试）；指数退避重试；多次失败体面放弃。</li>
+            <li><strong>评估闭环</strong>：完成率 + 平均步数 + 平均成本三维指标，定位问题迭代修复。</li>
+            <li><strong>常见坑</strong>：工具描述含糊、上下文膨胀、错误不结构化、死循环、工具过多。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>MCP 官方文档 — Model Context Protocol 规范 · <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">modelcontextprotocol.io</a></li>
+            <li>OpenAI Function Calling 文档 — 工具调用的结构化参数机制 · <a href="https://platform.openai.com/docs/guides/function-calling" target="_blank" rel="noopener">platform.openai.com</a></li>
+            <li>Anthropic Agent 构建指南 — 官方最佳实践（Build Effective Agents）· <a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">anthropic.com</a></li>
+            <li>ReAct: Synergizing Reasoning and Acting — Agent 循环的范式论文 · <a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">arXiv:2210.03629</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            实战的根基是理论：先看 <a href="../11-agents/agent.html">Agent 范式</a> 与 <a href="../11-agents/tool-use-mcp.html">工具调用与 MCP</a>；再深入多 Agent 协作 <a href="../11-agents/multi-agent.html">多智能体系统</a>；评估体系见 <a href="../11-agents/agent-eval.html">Agent 评估</a>。
+          </div>
+
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

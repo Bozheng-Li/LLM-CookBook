@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>自注意力与多头注意力 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="03-transformer" data-topic="multi-head">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>自注意力与多头注意力</h1>
+            <p class="lead">一个注意力头只能给出一张权重表，可词与词之间的关系远不止一种：指代、语法、搭配、位置远近……多头注意力的办法很朴素——既然一张表不够，那就同时开好几张。而因果掩码则解决了另一个问题：让「预测下一个词」这件本质上串行的事，在训练时能一次算完。这一节会把张量形状一步一步走完，把参数量算到个位，把掩码的坑挨个踩一遍。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>多头注意力不是把注意力算 8 遍，而是<strong>把每个词向量的 512 维切成 8 份 64 维，每份独立做一次注意力，最后拼回 512 维再过一个输出投影</strong>。就像看一份合同，法务、财务、技术三个人各看各关心的条款，最后把三份批注汇总成一份意见——总工作量没变，但视角从一个变成了三个。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  X["输入 X<br/>n × d_model"] --> P["线性投影<br/>W_Q / W_K / W_V"]
+  P --> H1["头 1<br/>d_k = d_model/h"]
+  P --> H2["头 2"]
+  P --> Hd["……"]
+  P --> Hh["头 h"]
+  H1 --> C["Concat<br/>拼回 d_model"]
+  H2 --> C
+  Hd --> C
+  Hh --> C
+  C --> WO["输出投影 W_O"]
+  WO --> O["输出<br/>n × d_model"]
+
+  style P fill:#e6f1fb,stroke:#185fa5
+  style C fill:#eaf3de,stroke:#639922
+  style WO fill:#faeeda,stroke:#ba7517
+              </div>
+              <figcaption>多头注意力的数据流：切分 → 并行做 h 次注意力 → 拼接 → 输出投影。注意「切分」发生在投影之后，不是把投影做了 h 遍。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 0: 自注意力到底自在哪 ============ -->
+          <h2>先厘清：自注意力的「自」是什么意思</h2>
+          <p><a href="attention.html">上一节</a>讲的注意力是一个通用算子：给一组 Query、一组 Key/Value，算出加权结果。它并没有规定这三组东西从哪来。<strong>「自注意力」的意思就是：Q、K、V 全部由同一个序列投影而来</strong>。</p>
+          <p>这个约束听起来平淡，但它带来的能力是质变的。序列自己看自己，等于让句子内部每个词都能主动去问「跟我有关的词在哪」。翻译时源语言看源语言、代码补全时上文看上文、图像 patch 之间互相看——同一个算子换个输入来源就能覆盖。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>形态</th><th>Q 来自</th><th>K / V 来自</th><th>信息流方向</th><th>典型出现位置</th></tr></thead>
+              <tbody>
+                <tr><td><strong>自注意力</strong>（双向）</td><td>序列 A</td><td>序列 A</td><td>每个位置 ↔ 所有位置</td><td>BERT 的每一层、Encoder 层</td></tr>
+                <tr><td><strong>因果自注意力</strong>（单向）</td><td>序列 A</td><td>序列 A 中位置 ≤ 当前</td><td>每个位置 ← 左侧位置</td><td>GPT / Llama 的每一层</td></tr>
+                <tr><td><strong>交叉注意力</strong></td><td>序列 B（解码端）</td><td>序列 A（编码端）</td><td>B 的每个位置 ← A 的所有位置</td><td>T5 / BART 解码器第二个子层</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>三种形态用的是同一段代码，区别只在<strong>喂进去的张量和掩码</strong>。这也是为什么现代框架里只有一个 <code>scaled_dot_product_attention</code> 函数，靠参数区分场景——理解了这一点，读任何模型源码时就不会被「这里怎么又出现一个 attention」搞晕。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            自注意力 = 一个班级里所有同学互相提问；交叉注意力 = 这个班的同学去问隔壁班的同学。提问的动作完全一样，只是问的对象换了。
+          </div>
+
+          <!-- ============ Section 1: 一个头为什么不够 ============ -->
+          <h2>一个头为什么不够</h2>
+          <p>回顾上一节的结论：注意力对每个位置产出一行 Softmax 权重，这一行的和恒等于 1。<strong>「和为 1」是个很强的约束——它意味着注意力必须做取舍</strong>。</p>
+          <p>看这句话：</p>
+          <p style="padding-left:16px;border-left:3px solid var(--line);color:var(--text-2)"><em>The lawyer who reviewed the <strong>contract</strong> yesterday <strong>said</strong> <strong>it</strong> was fine.</em></p>
+          <p>当模型处理 <code>it</code> 时，至少有三件事同时需要关注：</p>
+          <ul>
+            <li><strong>指代关系</strong>：<code>it</code> 到底指 <code>contract</code> 还是 <code>lawyer</code>？这需要把权重压给 <code>contract</code>。</li>
+            <li><strong>句法角色</strong>：<code>it</code> 是 <code>said</code> 引导的宾语从句的主语，需要关注 <code>said</code>。</li>
+            <li><strong>局部搭配</strong>：<code>it was</code> 是个紧邻的固定结构，需要关注右边一个词。</li>
+          </ul>
+          <p>单头注意力只有一行权重，这三种需求要在同一个概率分布里抢份额。给 <code>contract</code> 分 0.6，给 <code>said</code> 就只剩 0.4 可分——<strong>不同性质的关系被迫在一个预算里竞争，结果是每种都被稀释成平均值</strong>。更糟的是，加权求和会把这几个词的 Value 混成一锅粥，下游没法再区分「这部分信息是从指代来的，那部分是从句法来的」。</p>
+
+          <p>换成 4 个头之后，每个头有自己独立的一行权重、自己独立的 64 维输出子空间。第 1 个头可以把 0.85 给 <code>contract</code>，第 2 个头把 0.7 给 <code>said</code>，互不影响；而且它们写入的是输出向量里<strong>不重叠的维度段</strong>，下游的 $W^O$ 有机会把它们区分开再重新组合。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>处理 <code>it</code> 时的需求</th><th>单头（1 张权重表）</th><th>4 头（4 张权重表）</th></tr></thead>
+              <tbody>
+                <tr><td>找到指代对象 contract</td><td>只能分到部分权重</td><td>头 1 独占，权重可给到很高</td></tr>
+                <tr><td>关联主句谓语 said</td><td>与指代抢预算</td><td>头 2 独立处理，不挤占头 1</td></tr>
+                <tr><td>捕捉相邻搭配 it was</td><td>基本被挤掉</td><td>头 3 专职做局部窗口</td></tr>
+                <tr><td>输出可分离性</td><td>混成一个向量，无法区分来源</td><td>写入不同维度段，$W^O$ 可再组合</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            单头是「只允许投一票的选举」，多头是「开 h 个独立投票箱」。每个箱子可以有完全不同的赢家，互不挤占。
+          </div>
+
+          <!-- ============ Section 2: 怎么切 ============ -->
+          <h2>怎么切：参数量为什么几乎没涨</h2>
+          <p>这是多头注意力最容易被误解的地方。很多人第一反应是「8 个头 = 8 套 QKV 投影 = 参数量 ×8」，<strong>这是错的</strong>。</p>
+          <p>真实做法是<strong>切分而非复制</strong>。设模型维度 $d_{model}$、头数 $h$，则每个头的维度是</p>
+          <div class="figure" style="text-align:center">
+            $$d_k = d_v = \frac{d_{model}}{h}$$
+          </div>
+          <p>投影矩阵 $W^Q$、$W^K$、$W^V$ 的形状仍然是 $d_{model} \times d_{model}$，只是投影出来的结果被<strong>在最后一维上切成 h 段</strong>，每段送给一个头。换句话说，那 8 个头的投影矩阵本来就是同一个大矩阵的 8 个列块，拼起来正好是原来的大小。</p>
+
+          <div class="figure" style="text-align:center">
+            $$\text{head}_i = \text{Attention}(QW_i^Q,\; KW_i^K,\; VW_i^V)$$
+            $$\text{MHA}(Q,K,V) = \text{Concat}(\text{head}_1, \dots, \text{head}_h)\,W^O$$
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  A["x<br/>B × n × 4096"] --> B["W_q 线性层<br/>4096 → 4096"]
+  B --> C["view<br/>B × n × 32 × 128"]
+  C --> D["transpose 1 2<br/>B × 32 × n × 128"]
+  D --> E["批量矩阵乘<br/>scores B × 32 × n × n"]
+  E --> F["softmax 后乘 V<br/>B × 32 × n × 128"]
+  F --> G["transpose 回来<br/>B × n × 32 × 128"]
+  G --> H["view 拼接<br/>B × n × 4096"]
+  H --> I["W_o 线性层<br/>4096 → 4096"]
+
+  style C fill:#e6f1fb,stroke:#185fa5
+  style G fill:#e6f1fb,stroke:#185fa5
+  style E fill:#fcebeb,stroke:#a32d2d
+            </div>
+            <figcaption>张量形状的完整旅程（以 d_model=4096、h=32、d_k=128 为例）。红色那一步是显存与算力的大头，也是 FlashAttention 要消灭的对象。两次 transpose 是实现里最容易写反的地方。</figcaption>
+          </figure>
+
+          <p>用原始 Transformer base 的配置（$d_{model}=512$，$h=8$）算一遍形状：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>张量</th><th>形状</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>输入 $X$</td><td>$n \times 512$</td><td>n 个 token，每个 512 维</td></tr>
+                <tr><td>$W^Q / W^K / W^V$</td><td>$512 \times 512$</td><td><strong>与头数无关</strong>，不随 h 变化</td></tr>
+                <tr><td>投影后 reshape</td><td>$8 \times n \times 64$</td><td>切成 8 个头，每头 64 维</td></tr>
+                <tr><td>单头分数矩阵</td><td>$n \times n$</td><td>共 8 份，并行计算</td></tr>
+                <tr><td>Concat 后</td><td>$n \times 512$</td><td>$8 \times 64 = 512$，维度回到原样</td></tr>
+                <tr><td>$W^O$</td><td>$512 \times 512$</td><td>把拼接结果混合成最终输出</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>参数量合计 $4 \times 512^2 \approx 105$ 万（不含偏置），<strong>无论 h 取 1、8 还是 16，这个数字都不变</strong>。计算量也基本一致：分数矩阵那一步，单头是 $n^2 \times 512$，八头是 $8 \times n^2 \times 64$，同样是 $n^2 \times 512$。多头真正多出来的开销只有 reshape / transpose 带来的访存，以及 h 次较小矩阵乘法对 GPU 利用率的轻微影响。</p>
+
+          <h3>把数字落到一次真实前向上</h3>
+          <p>抽象的形状不容易有体感，换成一组常见的推理配置算算看：batch $B=2$、序列长度 $n=1024$、$d_{model}=4096$、$h=32$、$d_k=128$。</p>
+          <ul>
+            <li><strong>分数矩阵元素数</strong>：$2 \times 32 \times 1024 \times 1024 = 67{,}108{,}864$ 个数。FP16 下就是 <strong>128 MiB</strong>——这还只是<strong>一层</strong>的中间结果。32 层全部保留会直接吃掉 4 GiB。</li>
+            <li><strong>这一步的乘加量</strong>：$2 \times B \times h \times n^2 \times d_k \approx 1.72 \times 10^{10}$，约 <strong>17.2 GFLOP</strong>。</li>
+            <li><strong>序列翻倍到 2048</strong>：元素数与算力都乘以 4，分数矩阵变成 512 MiB。</li>
+          </ul>
+          <p>这组数字解释了两件事：为什么 <a href="../05-systems/flash-attention.html">FlashAttention</a> 死磕「不把 $n \times n$ 写回显存」这一件事，以及为什么长上下文的成本增长让人吃不消。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            「头越多越好」是不成立的。$d_{model}$ 固定时，头数翻倍意味着每头维度减半。$d_k$ 太小（比如降到 16 以下）时，单个头的 Query-Key 匹配退化为低秩运算，表达力明显不足，反而掉点。现代模型的 $d_k$ 普遍稳定在 <strong>64 或 128</strong>，头数是由 $d_{model}$ 除出来的结果，而不是先定的超参。
+          </div>
+
+          <h3>主流模型的头配置</h3>
+          <p>把几个代表模型的配置横向摆一排，上面这条规律看得非常清楚：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模型</th><th>$d_{model}$</th><th>Query 头数</th><th>KV 头数</th><th>$d_k$</th><th>注意力形态</th></tr></thead>
+              <tbody>
+                <tr><td>Transformer base</td><td>512</td><td>8</td><td>8</td><td><strong>64</strong></td><td>MHA</td></tr>
+                <tr><td>Transformer big</td><td>1024</td><td>16</td><td>16</td><td><strong>64</strong></td><td>MHA</td></tr>
+                <tr><td>BERT-base</td><td>768</td><td>12</td><td>12</td><td><strong>64</strong></td><td>MHA（双向）</td></tr>
+                <tr><td>BERT-large</td><td>1024</td><td>16</td><td>16</td><td><strong>64</strong></td><td>MHA（双向）</td></tr>
+                <tr><td>GPT-3 175B</td><td>12288</td><td>96</td><td>96</td><td><strong>128</strong></td><td>MHA（因果）</td></tr>
+                <tr><td>Llama-2-7B</td><td>4096</td><td>32</td><td>32</td><td><strong>128</strong></td><td>MHA（因果）</td></tr>
+                <tr><td>Llama-2-70B</td><td>8192</td><td>64</td><td><strong>8</strong></td><td><strong>128</strong></td><td>GQA</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="color:var(--text-3);font-size:13px;margin-top:-8px">具体配置以各模型官方 config 为准；这里只取常被引用的主干参数用于对比。</p>
+
+          <p>$d_k$ 一路稳定在 64 或 128，从 2017 年到今天几乎没变。真正在变的是最后一列：<strong>Query 头数和 KV 头数开始解绑</strong>。这就是下面要讲的现代演进。</p>
+
+          <details class="deep">
+            <summary>展开：多头注意力最小实现（PyTorch 风格）</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.h = n_heads
+        self.d_k = d_model // n_heads
+        # 注意:这里就是三个 d_model x d_model 的大矩阵,不是 h 套小矩阵
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x, causal=True):          # x: (B, n, d_model)
+        B, n, _ = x.shape
+
+        # 投影后切头: (B, n, d_model) -> (B, h, n, d_k)
+        def split(t):
+            return t.view(B, n, self.h, self.d_k).transpose(1, 2)
+
+        q, k, v = split(self.W_q(x)), split(self.W_k(x)), split(self.W_v(x))
+
+        scores = q @ k.transpose(-2, -1) / (self.d_k ** 0.5)   # (B, h, n, n)
+
+        if causal:
+            # 上三角(不含对角线)置为 dtype 最小值,而不是 -inf
+            mask = torch.triu(torch.ones(n, n, dtype=torch.bool, device=x.device), diagonal=1)
+            scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
+
+        attn = F.softmax(scores, dim=-1)
+        out = attn @ v                                          # (B, h, n, d_k)
+
+        # 拼回来: (B, h, n, d_k) -> (B, n, d_model)
+        out = out.transpose(1, 2).contiguous().view(B, n, -1)
+        return self.W_o(out)</code></pre>
+              <p>注意 <code>transpose(1, 2)</code> 出现了两次：第一次把头维提到前面好做批量矩阵乘，第二次换回来准备拼接。这两行是多头实现里最容易写反的地方，维度对不上时先查它们。</p>
+              <p style="margin-bottom:0">还有一个静默的坑：<code>transpose</code> 之后张量不再连续，必须先 <code>.contiguous()</code> 才能 <code>.view()</code>，否则会报错或者（在某些写法下）拼出错位的结果。用 <code>.reshape()</code> 可以绕过报错，但也会掩盖真正的形状错误。</p>
+            </div>
+          </details>
+
+          <h3>动手验证：形状对不对，跑一遍就知道</h3>
+          <p>理解多头最快的办法是打印形状。下面这段可以直接贴进解释器，把每一步的张量尺寸打出来，顺便和框架内置实现对一下答案：</p>
+
+          <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+B, n, d_model, h = 2, 6, 8, 2
+d_k = d_model // h
+x = torch.randn(B, n, d_model)
+
+# 手动切头
+q = x.view(B, n, h, d_k).transpose(1, 2)      # (2, 2, 6, 4)
+print("切头后:", q.shape)
+
+scores = q @ q.transpose(-2, -1) / d_k ** 0.5  # (2, 2, 6, 6)
+print("分数矩阵:", scores.shape)
+
+# 因果掩码:上三角屏蔽
+mask = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min)
+w = F.softmax(scores, dim=-1)
+
+# 校验 1: 每一行权重之和必须是 1
+print("行和:", w.sum(-1))
+
+# 校验 2: 第 0 个位置只应该看见自己
+print("首行权重:", w[0, 0, 0])
+
+# 校验 3: 与框架内置实现对齐(数值应非常接近)
+ref = F.scaled_dot_product_attention(q, q, q, is_causal=True)
+mine = w @ q
+print("最大误差:", (ref - mine).abs().max().item())</code></pre>
+
+          <p>三条校验分别对应三个最常见的 bug：<strong>行和不为 1</strong> 说明 Softmax 的维度写错了（写成 <code>dim=-2</code> 是经典错误）；<strong>首行权重不是 one-hot</strong> 说明掩码方向反了（<code>diagonal</code> 参数取错）；<strong>与内置实现误差过大</strong> 说明缩放因子或转置顺序有问题。</p>
+
+          <!-- ============ Section 3: 头在看什么 ============ -->
+          <h2>不同的头在看什么</h2>
+          <p>训练完成后把注意力权重画出来，确实能看到一些头呈现出稳定的模式。常见的几类：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((注意力头的经验分类))
+    位置类
+      前一个词头
+      后一个词头
+      固定偏移窗口头
+    句法类
+      动词指向宾语
+      介词指向宾语
+      限定词指向中心名词
+    语义类
+      指代消解头
+      同义与共指关联
+    功能类
+      注意力汇聚头 attention sink
+      诱导头 induction head
+    现实情况
+      多数头无法命名
+      头之间高度冗余
+      同一个头换分布就变样
+            </div>
+            <figcaption>注意力头的经验分类图谱。前四支是可视化研究里反复出现的模式，最后一支是必须同时记住的限定条件——分类只是描述，不是设计。</figcaption>
+          </figure>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">位置头</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">权重几乎全压在「前一个词」或「后一个词」上，相当于学出了一个局部卷积窗口。这类头在浅层尤其多。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">句法头</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">动词关注它的宾语、介词关注它的宾语、限定词关注中心名词——权重分布与依存句法树高度吻合。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">指代头</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">代词稳定地指向它的先行词，如 <code>it → contract</code>。多出现在中间层。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">注意力汇聚头</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">大量权重堆在序列首个 token（BOS 或第一个词）上，这个现象被称为 <strong>attention sink</strong>，可以理解为「这一步没什么要看的」的默认去处。</p>
+            </div>
+          </div>
+
+          <p>attention sink 不只是个可视化趣闻，它有实际工程后果：做流式推理、滑动窗口裁剪 KV Cache 时，如果把最前面几个 token 一起丢掉，模型输出质量会明显崩坏。所以「无论窗口怎么滑，永远保留最初几个 token」成了长对话场景的一条常见工程做法。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">别把可解释性当真理</span>
+            上面这套「某某头」的说法广为流传，但它的干净程度被严重高估了。几点必须说清楚：
+            <ul style="margin:8px 0 0">
+              <li><strong>大量头没有可命名的模式</strong>。能被人类归类的只是少数，更多头的权重图看上去就是一片弥散的噪声。</li>
+              <li><strong>头之间高度冗余</strong>。多项研究发现，推理时剪掉相当比例的注意力头，任务性能只有很小的下降——说明「每个头各司其职」的图景并不准确。</li>
+              <li><strong>功能不稳定</strong>。同一个头在不同输入、不同领域上的行为可能完全不同，「指代头」往往是在特定探测集上做的事后归因，换个分布就不成立了。</li>
+              <li><strong>头不是独立的</strong>。$W^O$ 会把所有头的输出混合，真正被下游使用的是混合后的结果，单独解读一个头本身就有偏差。</li>
+            </ul>
+          </div>
+
+          <!-- ============ Section 4: 因果掩码 ============ -->
+          <h2>因果掩码：让串行任务并行训练</h2>
+          <p>自注意力默认是「全体大会」，每个位置都能看到所有位置。这在 BERT 那种理解任务里没问题，但对 GPT 这类<strong>自回归语言模型是致命的</strong>。</p>
+          <p>语言模型的训练目标是：给定前 $t-1$ 个 token，预测第 $t$ 个。如果位置 $t-1$ 的注意力能看到位置 $t$，那它就直接看到了答案。模型会飞快地学会一个恒等映射——训练损失降到接近 0，而推理时未来 token 根本不存在，输出立刻崩掉。这就是典型的<strong>标签泄漏</strong>。</p>
+          <p>解决办法是在 Softmax 之前，把「看向未来」的那些分数全部屏蔽掉。掩码矩阵是一个<strong>下三角</strong>结构：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Query \ Key</th><th>t1</th><th>t2</th><th>t3</th><th>t4</th><th>t5</th></tr></thead>
+              <tbody>
+                <tr><td><strong>t1</strong></td><td>✓</td><td>−∞</td><td>−∞</td><td>−∞</td><td>−∞</td></tr>
+                <tr><td><strong>t2</strong></td><td>✓</td><td>✓</td><td>−∞</td><td>−∞</td><td>−∞</td></tr>
+                <tr><td><strong>t3</strong></td><td>✓</td><td>✓</td><td>✓</td><td>−∞</td><td>−∞</td></tr>
+                <tr><td><strong>t4</strong></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>−∞</td></tr>
+                <tr><td><strong>t5</strong></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>第 $i$ 行表示第 $i$ 个 token 的可见范围：只能看自己和自己之前。对角线保留，因为一个词看自己是允许的。</p>
+
+          <h3>为什么是 −∞ 而不是 0</h3>
+          <p>这是个高频疑问，答案在于<strong>掩码作用的位置是 Softmax 的输入，不是输出</strong>。</p>
+          <p>如果把被屏蔽位置的分数设成 0，经过 Softmax 后得到的是 $e^0 = 1$，归一化之后它反而拿到了一个不小的权重——0 在 logits 空间里是个「中等偏上」的分数，完全没有屏蔽效果。要让 Softmax 之后的权重真正为 0，需要</p>
+          <div class="figure" style="text-align:center">
+            $$\lim_{s \to -\infty} \frac{e^{s}}{\sum_j e^{s_j}} = 0$$
+          </div>
+          <p>举个具体的数：假设一行未屏蔽位置的分数是 $[2.0,\ 1.0]$，被屏蔽位置本来是 $3.0$。把它设成 0，Softmax 后三者权重约为 $[0.63,\ 0.23,\ 0.09]$——那个「屏蔽掉」的位置还占了 9%。设成 $-10^4$ 时，$e^{-10^4}$ 在浮点下直接下溢为 0，权重才真正归零。</p>
+          <p>所以必须把分数推到负无穷。工程实现上有两个细节：</p>
+          <ul>
+            <li><strong>用 dtype 的最小值而非字面 <code>-inf</code></strong>。<code>torch.finfo(dtype).min</code> 更安全：真正的 <code>-inf</code> 在后续算子里参与乘法或加法容易产出 <code>NaN</code>，FP16 下尤其脆弱。</li>
+            <li><strong>当心整行被屏蔽</strong>。如果某一行所有位置都是 −∞（padding 与因果掩码叠加时可能出现），Softmax 分母为 0，直接得到 <code>NaN</code> 并污染整个批次。这是训练突然出现 NaN 损失的经典原因之一。</li>
+          </ul>
+          <div class="callout warn">
+            <span class="callout-t">顺序不能错</span>
+            掩码必须加在<strong>缩放之后、Softmax 之前</strong>。写成 <code>softmax(mask(scores) / sqrt(d_k))</code> 会把 −∞ 也除一遍（数值上通常仍是极小值，但配合有限的 <code>finfo.min</code> 时可能被稀释到不够小）；写成掩码加在 Softmax 之后再重新归一化，则是另一套实现，容易和缩放逻辑打架。跟着标准顺序走最省事。
+          </div>
+
+          <h3>掩码不止一种</h3>
+          <p>实际训练里，注意力掩码往往是好几层语义叠加出来的。搞清楚它们各自解决什么问题，能省掉大量调试时间：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>掩码类型</th><th>屏蔽的是什么</th><th>形状</th><th>什么时候需要</th><th>忘了会怎样</th></tr></thead>
+              <tbody>
+                <tr><td><strong>因果掩码</strong></td><td>当前位置右侧的所有 token</td><td>下三角，$n \times n$</td><td>所有自回归语言模型</td><td>标签泄漏，损失异常低、推理崩溃</td></tr>
+                <tr><td><strong>Padding 掩码</strong></td><td>为对齐长度而补的 PAD token</td><td>每个样本一行，$B \times n$</td><td>batch 内序列长度不等时</td><td>模型把 PAD 当真实内容读，短句表现变差</td></tr>
+                <tr><td><strong>文档分隔掩码</strong></td><td>同一条序列里跨文档的注意力</td><td>块对角 × 下三角</td><td>把多篇短文档打包进一条序列时</td><td>上一篇文章的内容污染下一篇的预测</td></tr>
+                <tr><td><strong>前缀掩码</strong>（Prefix-LM）</td><td>只对生成段做因果限制，前缀段双向可见</td><td>左侧矩形 + 右下三角</td><td>UL2 / GLM 这类前缀语言模型</td><td>失去前缀双向理解的优势</td></tr>
+                <tr><td><strong>滑动窗口掩码</strong></td><td>距离超过窗口 W 的历史</td><td>带状下三角</td><td>局部注意力、长上下文降本</td><td>复杂度回到 $O(n^2)$</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>合并多个掩码时最稳妥的做法是<strong>先在布尔域里做逻辑与，最后一次性转成加性分数</strong>。如果对两个已经变成 −∞ 的加性掩码直接相加，很容易叠出 $-2 \times 10^{38}$ 这种溢出值，FP16 下直接变成 <code>-inf</code>，再往下走就是 <code>NaN</code>。</p>
+
+          <h3>训练的并行性正是靠它换来的</h3>
+          <p>这才是因果掩码最值得体会的一点。没有掩码时，要训练一个自回归模型，朴素做法是把一条长度 $n$ 的样本拆成 $n$ 条：用前 1 个词预测第 2 个、用前 2 个词预测第 3 个……跑 $n$ 次前向。</p>
+          <p>有了下三角掩码，情况完全不同：<strong>一次前向，序列里每个位置的输出天然就只依赖它左边的内容</strong>。于是位置 1 的输出可以拿来预测 token 2，位置 2 的输出预测 token 3……$n$ 个训练信号在同一次前向里全部产生，损失一次性求和。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant D as 数据批次
+  participant M as Transformer
+  participant L as 损失函数
+  Note over D,L: 训练阶段 —— 一次前向拿到 n 个训练信号
+  D->>M: 整条序列 t1 到 tn 一次性送入
+  M->>M: 因果掩码屏蔽每个位置右侧
+  M->>L: n 个位置的 logits 同时产出
+  L->>L: n 个交叉熵一次求和
+  L-->>M: 单次反向传播更新全部参数
+  Note over D,L: 推理阶段 —— 每步只能拿到 1 个新 token
+  D->>M: 送入 prompt 做预填充
+  M-->>D: 产出第 1 个新 token
+  D->>M: 把新 token 追加后再前向
+  M-->>D: 产出第 2 个新 token
+  Note over D,M: 如此循环 直到 EOS 或达到长度上限
+            </div>
+            <figcaption>同一个模型在训练与推理下的时序差异。训练是一次大矩阵乘，推理是 n 次小步骤——这个不对称是所有推理优化技术的出发点。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th></th><th>训练阶段</th><th>推理阶段</th></tr></thead>
+              <tbody>
+                <tr><td>未来 token</td><td>已知（整条序列都在手上）</td><td>未知（还没生成出来）</td></tr>
+                <tr><td>是否需要掩码</td><td>需要，否则泄漏答案</td><td>不需要，未来本就不存在</td></tr>
+                <tr><td>前向次数</td><td><strong>1 次</strong>算出 n 个位置的损失</td><td><strong>n 次</strong>，每次只出 1 个 token</td></tr>
+                <tr><td>GPU 利用率</td><td>高，是大矩阵乘</td><td>低，受访存带宽限制</td></tr>
+                <tr><td>瓶颈资源</td><td>算力（compute-bound）</td><td>显存带宽（memory-bound）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> Prefill
+  Prefill : 预填充 整条 prompt 一次前向 因果掩码生效
+  Prefill --> Decode : 缓存全部 K 与 V
+  Decode : 解码 每步只送入 1 个新 token
+  Decode --> Decode : 追加新的 K 与 V 继续生成
+  Decode --> [*] : 遇到 EOS 或达到长度上限
+            </div>
+            <figcaption>推理被自然地切成两个阶段：预填充是一次大矩阵乘（算力受限），解码是逐步小运算（带宽受限）。两阶段特性差异极大，这也是后来「PD 分离」部署方案的理论依据。</figcaption>
+          </figure>
+
+          <p>「训练并行、推理串行」这个不对称，是理解后续一系列推理优化的起点：既然推理时每步都要重算前面所有 token 的 K 和 V，而它们其实一模一样，那就把它们缓存下来——这就是 <a href="../04-modern-arch/kv-cache.html">KV Cache</a> 的由来。</p>
+
+          <!-- ============ Section 5: 从 MHA 到今天 ============ -->
+          <h2>从 MHA 到今天</h2>
+          <p>标准 MHA 提出至今没有被推翻，但在两个方向上被大幅改造：</p>
+          <ul>
+            <li><strong>算得更快</strong>：朴素实现要把 $h$ 个 $n \times n$ 的分数矩阵完整写进显存，长序列下访存量惊人。<a href="../05-systems/flash-attention.html">FlashAttention</a> 通过分块和在线 Softmax 让分数矩阵永远不落显存，数学结果完全等价。今天几乎所有框架的默认路径都是它。</li>
+            <li><strong>存得更省</strong>：MHA 的每个头都有自己独立的 K 和 V，推理时缓存开销与头数成正比。<a href="../04-modern-arch/attention-variants.html">MQA / GQA / MLA</a> 让多个 Query 头共享同一组 K、V，以很小的质量代价把 KV Cache 压缩数倍，已经是现代模型的标配。</li>
+          </ul>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 多头注意力的演进主线
+  2017 : Transformer 提出 MHA : 每个头独立的 Q K V
+  2019 : MQA 所有 Query 头共享一组 K V : KV 缓存骤降 质量略有损失
+  2022 : FlashAttention 分块与在线 Softmax : 不改数学结果只改访存
+  2023 : GQA 分组共享 : 在 MHA 与 MQA 之间取折中
+  2024 : MLA 低秩压缩 KV : 缓存压缩与质量兼顾
+            </div>
+            <figcaption>「多头」这个结构一直没被推翻，被改造的始终是「每个头都要有一套完整 KV」这个假设。左侧是算法层演进，FlashAttention 属于系统层，与前后两者可以叠加。</figcaption>
+          </figure>
+
+          <p>为什么大家都盯着 KV 缓存不放？把数算出来就明白了。KV Cache 每个 token 占用的字节数是：</p>
+
+          <h3>手把手读 GQA 论文原图</h3>
+          <p>「共享 KV」到底长什么样，看一张论文原图最直观。2023 年 Google 的 Ainslie 等人在 GQA 论文里画了一张经典的对比图，把 MHA、MQA、GQA 三种注意力头结构并排摆在一起，一眼就能看出「Query 头」和「KV 头」的绑定关系是怎么一步步松开的。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/04-modern-arch/attention-variants/fig1.png" alt="论文原图：MHA、MQA 与 GQA 三种注意力结构中 Query 头与 KV 头的共享关系对比" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：从左到右依次是 MHA、MQA、GQA——KV 头从「每头一套」变为「全部共享一组」再到「按组共享」</span>
+              <span class="pf-src">论文原图 · Ainslie et al., <em>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">arXiv:2305.13245</a></span>
+            </figcaption>
+          </figure>
+
+          <p>逐块读这张图。整张图分成三列，每一列都是「上方一行 Query 头、下方一行 Key 与 Value 头」，连线表示「这个 Query 头用哪组 K、V」。第一列是 <strong>MHA（多头注意力）</strong>：每个 Query 头都连着自己独立的一组 Key 和 Value，KV 头数和 Query 头数完全相等——这就是本页前面一直在讲的标准结构，KV 缓存也因此和头数成正比。第三列是 <strong>MQA（多查询注意力）</strong>：所有 Query 头全部连向唯一的一组 Key 和 Value，KV 头数压缩到 1，缓存最小，但所有头被迫共享同一套「被检索的索引」，表达能力受限。中间一列是 <strong>GQA（分组查询注意力）</strong>：Query 头被分成若干组，<strong>组内共享一组 K、V，组与组之间各自独立</strong>——它是前两者的折中：比 MHA 省缓存，比 MQA 保表达。</p>
+          <p>对照本页前面的 KV 缓存公式读这张图，结论就出来了：<strong>KV 缓存的体积只由「KV 头数」决定，与 Query 头数无关</strong>。所以把 KV 头数从 32 降到 8，缓存直接砍到四分之一，而 Query 头还是 32 个、问法还是 32 种——这正是 Llama-2-70B 一类大模型的选择，也是 GQA 在 2023 年后成为事实标准的原因。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            两个高频误解必须纠正。第一个：「多头注意力 = 把注意力重复算 8 遍」——<strong>错</strong>。多头是「切分」而非「复制」：$W^Q$、$W^K$、$W^V$ 仍然各是一个 $d_{model}\times d_{model}$ 的大矩阵，只是投影结果被在最后一维切成 $h$ 段，每段送一个头。参数量与头数无关。第二个：「GQA 是连 Query 头也一起减少了」——<strong>也不对</strong>。GQA 只共享 KV，Query 头保持原样；Query 头一旦减少就等于直接砍掉输出向量里的独立维度段，质量损失是立竿见影的。
+          </div>
+
+          <details class="deep">
+            <summary>踩坑实录：把多头实现成 h 套独立小矩阵，参数暴涨 8 倍</summary>
+            <div class="deep-body">
+              <p>一个非常经典的手写实现错误：新手照着论文公式 $\text{head}_i = \text{Attention}(QW_i^Q, KW_i^K, VW_i^V)$ 逐字实现，用 <code>h</code> 个独立的 <code>nn.Linear(d_model, d_k)</code> 分别做投影——代码能跑、结果也「看起来对」，但一算参数量，比预期大了 8 倍，显存直接爆掉。</p>
+              <p>问题出在「切分」与「复制」的理解上。标准实现是<strong>一个大的 <code>nn.Linear(d_model, d_model)</code> 投影完，再把结果 <code>view(B, n, h, d_k)</code> 切成 h 段</strong>；而错误实现是 <code>h</code> 个独立的小 Linear，每个都是 <code>d_model × d_k</code>，总参数正好多出 $h$ 倍。两者数学上并不等价——独立小矩阵让每个头拥有完全独立的投影空间，等于把模型宽度扩大成了 $h \times d_k$，而大矩阵切块让所有头共享同一个 $d_{model}$ 维空间的不同子空间。</p>
+              <p style="margin-bottom:0">排查方法很简单：<strong>把模型的参数量打印出来，和 $4 \times d_{model}^2$（每层注意力，含 $W^O$）对一遍</strong>，对不上就先怀疑这里。顺带一提，正规框架里 <code>nn.MultiheadAttention</code> 也是用大矩阵加 <code>reshape</code> 实现的——对照官方实现最省心。</p>
+            </div>
+          </details>
+
+          <div class="figure" style="text-align:center">
+            $$\text{bytes/token} = 2 \times L_{layers} \times h_{kv} \times d_k \times \text{bytes per element}$$
+          </div>
+          <p>前面的 2 是因为 K 和 V 各存一份。代入 Llama-2-7B 的配置（32 层、32 个 KV 头、$d_k=128$、FP16）：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>配置</th><th>KV 头数</th><th>每 token 占用</th><th>4K 上下文</th><th>32K 上下文</th></tr></thead>
+              <tbody>
+                <tr><td>MHA，32 层，$d_k=128$</td><td>32</td><td><strong>512 KiB</strong></td><td>2 GiB</td><td>16 GiB</td></tr>
+                <tr><td>GQA，32 层，$d_k=128$</td><td>8</td><td><strong>128 KiB</strong></td><td>0.5 GiB</td><td>4 GiB</td></tr>
+                <tr><td>MQA，32 层，$d_k=128$</td><td>1</td><td><strong>16 KiB</strong></td><td>64 MiB</td><td>0.5 GiB</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="color:var(--text-3);font-size:13px;margin-top:-8px">按 FP16 每元素 2 字节、单条序列计算；上表的 GQA / MQA 行是在同一骨架上只改 KV 头数的对照，不代表某个具体模型的官方配置。</p>
+
+          <p>一个 7B 模型 FP16 权重约 14 GB。上表第一行告诉你：<strong>只要上下文拉到 32K，KV 缓存就能再吃掉一个模型那么多的显存</strong>。这就是 GQA 几乎变成默认选项的原因——把 KV 头从 32 降到 8，缓存直接砍到四分之一，而质量损失小到多数场景可以忽略。</p>
+
+          <p>换句话说，<strong>「多头」这个结构保留了下来，被改造的是「每个头都要有一套完整 KV」这个假设</strong>。</p>
+
+          <details class="deep">
+            <summary>展开：为什么 Query 头不能也一起共享</summary>
+            <div class="deep-body">
+              <p>既然共享 K / V 影响不大，为什么不干脆把 Query 头也砍掉几个？因为两者在计算图里的地位完全不对称。</p>
+              <p><strong>Query 头数决定「有多少种不同的问法」</strong>。每个 Query 头对应输出向量里一段独立的维度，砍掉一个 Query 头就是直接砍掉一段输出容量，等于减小了模型宽度，质量下降是线性且明显的。</p>
+              <p><strong>K / V 头数决定「被检索的索引有多少套」</strong>。多个 Query 头去查同一套索引，只是让它们的检索目标空间被迫共享，但每个头依然可以用自己的 Query 投影问出不同的问题、得到不同的权重分布。信息瓶颈存在，但远没有砍 Query 头那么直接。</p>
+              <p>另一个现实约束是：<strong>KV 需要在推理全过程被缓存，Query 不需要</strong>。Query 每步用完即弃，缓存开销为零。所以省显存的动机天然只指向 K 和 V 这一侧。</p>
+              <p style="margin-bottom:0">这也解释了 GQA 的分组设计为什么合理：把 32 个 Query 头分成 8 组、每组共享一套 KV，既保住了 32 种问法，又只付 8 套索引的缓存代价。详见 <a href="../04-modern-arch/attention-variants.html">注意力变体</a>。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>自注意力</strong>：Q / K / V 全部来自同一序列。加不加因果掩码决定它是双向还是单向；换成另一序列做 K / V 就变成交叉注意力。三者共用同一段代码。</li>
+            <li><strong>动机</strong>：单头只有一行和为 1 的权重，多种关系被迫争抢同一份预算；多头给每种关系独立的投票箱，且写入互不重叠的维度段。</li>
+            <li><strong>做法</strong>：切分而非复制。$d_k = d_{model}/h$，投影矩阵仍是 $d_{model} \times d_{model}$。</li>
+            <li><strong>参数量</strong>：$4 d_{model}^2$（$W^Q, W^K, W^V, W^O$），<strong>与头数无关</strong>；计算量同理基本持平。</li>
+            <li><strong>头数选择</strong>：实际固定的是 $d_k$（常见 64 / 128），头数由 $d_{model}$ 除出来。$d_k$ 过小会掉点。</li>
+            <li><strong>显存直觉</strong>：$B=2$、$n=1024$、$h=32$ 时，单层分数矩阵 FP16 就占 128 MiB，长度翻倍变四倍——这是 FlashAttention 存在的理由。</li>
+            <li><strong>可解释性</strong>：确有位置头 / 句法头 / 指代头 / attention sink，但冗余度高、不稳定，别当成严格的功能划分。</li>
+            <li><strong>因果掩码</strong>：下三角，屏蔽未来防止标签泄漏；用 −∞（实现上取 <code>finfo.min</code>）而非 0，因为它作用在 Softmax 输入端。</li>
+            <li><strong>掩码家族</strong>：因果 / padding / 文档分隔 / 前缀 / 滑动窗口，合并时先在布尔域做与运算，最后一次性转加性掩码。</li>
+            <li><strong>最大价值</strong>：掩码让 n 个位置的训练信号在一次前向里全部产生，这是 Transformer 训练效率的根基。</li>
+            <li><strong>常见坑</strong>：整行被掩 → Softmax 出 NaN；Softmax 维度写成 <code>dim=-2</code>；<code>transpose</code> 后忘了 <code>contiguous</code>；掩码方向写反。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Attention Is All You Need — 多头注意力的原始定义，包含 base / big 两套头配置 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></li>
+            <li>Are Sixteen Heads Really Better than One? — 系统性剪枝实验，说明大量注意力头是冗余的 · <a href="https://arxiv.org/abs/1905.10650" target="_blank" rel="noopener">arXiv:1905.10650</a></li>
+            <li>Analyzing Multi-Head Self-Attention: Specialized Heads Do the Heavy Lifting, the Rest Can Be Pruned — 对头的功能分工与可剪枝性的细致分析 · <a href="https://arxiv.org/abs/1905.09418" target="_blank" rel="noopener">arXiv:1905.09418</a></li>
+            <li>Fast Transformer Decoding: One Write-Head is All You Need — MQA 的提出，解绑 Query 头与 KV 头的起点 · <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener">arXiv:1911.02150</a></li>
+            <li>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints — 分组共享 KV，今天的事实标准 · <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">arXiv:2305.13245</a></li>
+            <li>Efficient Streaming Language Models with Attention Sinks — 解释 attention sink 现象及其对流式推理的影响 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></li>
+            <li>PyTorch <code>scaled_dot_product_attention</code> 官方文档 — 内置融合实现与 <code>is_causal</code> 参数的行为说明 · <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">pytorch.org</a></li>
+            <li>PyTorch <code>nn.MultiheadAttention</code> 官方文档 — 框架内置多头注意力的实现与参数说明，可对照本页的手写实现 · <a href="https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html" target="_blank" rel="noopener">pytorch.org</a></li>
+            <li>Llama 2 模型卡（Hugging Face）— 本页头配置对照表里 Llama-2 各型号 config 的官方来源 · <a href="https://huggingface.co/meta-llama/Llama-2-7b-hf" target="_blank" rel="noopener">huggingface.co</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            到这里注意力已经能捕捉多种关系了，但它还有个根本缺陷：<strong>打乱输入顺序，输出只会跟着换位置，模型根本不知道词序</strong>。下一节<a href="positional-encoding.html">位置编码</a>解决这个问题；想看整个 Block 怎么组装成完整模型，直接跳到 <a href="architecture.html">Transformer 完整架构</a>；想动手把这一切写成一个能跑的小模型，见 <a href="../15-practice/build-minigpt.html">实战：手写 MiniGPT</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

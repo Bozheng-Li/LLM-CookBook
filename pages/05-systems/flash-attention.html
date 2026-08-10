@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FlashAttention 与 IO 感知注意力 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="05-systems" data-topic="flash-attention">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>FlashAttention 与 IO 感知注意力</h1>
+            <p class="lead">注意力机制在数学上早已明确，但在真实硬件上，标准实现会把一个 N×N 的中间矩阵反复读写 HBM，白白浪费带宽。FlashAttention 不是改了注意力的"算法"，而是改了"怎么算"——它让 softmax 在 SRAM 里完成，把 IO 复杂度从 O(N²) 降到 O(N²d/M)。这一改，让几乎所有大模型的训练提速 2-4 倍。本文把这套"IO 感知"思想拆开讲透：分块、online softmax、重计算、复杂度账，以及最关键也最容易被忽视的——静默回退与后端验证。</p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">正交关系</span>
+            本页讲的是注意力<strong>怎么算</strong>（IO 感知的分块计算），与 <a href="../03-transformer/attention.html">注意力机制</a>（算什么、QKV 的数学）和 <a href="../04-modern-arch/attention-variants.html">注意力变体全景</a>（MHA/MQA/GQA/MLA 等改什么）是正交的。FlashAttention 可以加速任何一种注意力变体——只要后端支持。
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>标准 Attention 把 $N \times N$ 的注意力矩阵 $S = QK^\top$ 和 softmax 归一化后的 $P$ 全部写到 HBM 再读回来。FlashAttention 把 Q、K、V 分成小块（tile），每块加载到 SRAM 后直接算完 softmax 再输出——<strong>中间结果 $S$ 和 $P$ 从不落盘 HBM</strong>。代价是反向传播时需要重计算（recomputation），但这比读写 HBM 快得多。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  subgraph Standard["标准 Attention"]
+    S1["HBM → SRAM: Q, K, V 块"] --> S2["SRAM: 算 S=QK^T"]
+    S2 --> S3["HBM ← 写回 S (N×N)"]
+    S3 --> S4["HBM → SRAM: 读回 S"]
+    S4 --> S5["SRAM: softmax → P"]
+    S5 --> S6["HBM ← 写回 P (N×N)"]
+    S6 --> S7["HBM → SRAM: 读回 P, V"]
+    S7 --> S8["SRAM: O=PV"]
+    S8 --> S9["HBM ← 写回 O"]
+  end
+  subgraph Flash["FlashAttention"]
+    F1["HBM → SRAM: Q 块, K 块, V 块"] --> F2["SRAM: S=QK^T<br/>online softmax<br/>O=PV"]
+    F2 --> F3["HBM ← 只写最终 O"]
+  end
+  style S3 fill:#fde8e8,stroke:#c44
+  style S6 fill:#fde8e8,stroke:#c44
+  style S7 fill:#fde8e8,stroke:#c44
+  style F2 fill:#e8f5e9,stroke:#4a4
+              </div>
+              <figcaption>标准实现（上）反复读写 N×N 中间矩阵到 HBM；FlashAttention（下）在 SRAM 内完成全部计算，只读写最终结果</figcaption>
+            </figure>
+          </div>
+
+          <h2>问题：标准 Attention 的 IO 瓶颈</h2>
+          <p>标准注意力计算分三步：</p>
+          <div class="figure" style="text-align:center">
+            $$S = QK^\top \in \mathbb{R}^{N \times N}, \quad P = \text{softmax}(S), \quad O = PV$$
+          </div>
+          <p>数学上没问题，但看硬件执行过程：先算出 $S$（$N \times N$ 矩阵）写回 HBM，再从 HBM 读 $S$ 做 softmax 写回 $P$，再从 HBM 读 $P$ 和 $V$ 算 $O$。对于 $N = 8192$、FP16，$S$ 和 $P$ 各占 $8192 \times 8192 \times 2 = 128$ MB。一个注意力头就要读写 3-4 次 128 MB 的中间矩阵。</p>
+          <p>回到 <a href="gpu-architecture.html">GPU 显存层级</a>的知识：HBM 带宽约 3 TB/s，SRAM 带宽约 19 TB/s。中间结果放在 HBM 意味着你用最慢的存储做最频繁的读写。这个操作的算术强度极低——softmax 对 $S$ 的每个元素只做几次运算，但每个元素都要从 HBM 读出来再写回去。在 <a href="compute-budget.html">Roofline 模型</a>视角下，注意力这种低算术强度操作正好卡在"带宽墙"上，算得再快也受限于 HBM 带宽。</p>
+          <div class="callout warn">
+            <span class="callout-t">核心矛盾</span>
+            标准 Attention 的 HBM 访问量为 $\mathcal{O}(N^2 + Nd)$，其中 $N^2$ 是中间矩阵的读写，$Nd$ 是 Q/K/V/O 的读写。当 $N$ 很大时（长上下文），$N^2$ 项主导，成为瓶颈。FlashAttention 把 HBM 访问量降到 $\mathcal{O}(N^2 d / M)$，其中 $M$ 是 SRAM 大小——本质上是用分块把 $N^2$ 的读写缩小到恰好能放进 SRAM 的粒度。
+          </div>
+
+          <h2>FlashAttention 的核心：分块 + Online Softmax</h2>
+          <p>FlashAttention 的关键洞察是：<strong>softmax 可以增量计算</strong>。不需要一次性看到整行才能做归一化——可以分块处理，每处理一块就更新部分最大值和部分和，最后合并。这就是 <strong>Online Softmax</strong>。</p>
+
+          <h3>Online Softmax 推导</h3>
+          <p>标准 softmax 对一行 $x_1, \dots, x_N$ 的计算是：</p>
+          <div class="figure" style="text-align:center">
+            $$m = \max_i x_i, \quad f_i = e^{x_i - m}, \quad \ell = \sum_i f_i, \quad y_i = f_i / \ell$$
+          </div>
+          <p>如果分成两块 $[x_1, \dots, x_j]$ 和 $[x_{j+1}, \dots, x_N]$，可以先算第一块得到 $m^{(1)}, \ell^{(1)}$，再处理第二块时更新：</p>
+          <div class="figure" style="text-align:center">
+            $$m^{(2)} = \max(m^{(1)}, m_{\text{new}}), \quad \ell^{(2)} = \ell^{(1)} \cdot e^{m^{(1)} - m^{(2)}} + \ell_{\text{new}} \cdot e^{m_{\text{new}} - m^{(2)}}$$
+          </div>
+          <p>这个递推意味着：<strong>不需要把整行同时加载到内存里</strong>。可以一块一块地处理，每处理一块只需维护两个标量（$m$ 和 $\ell$），最后用合并后的 $m$ 和 $\ell$ 做归一化。直观理解：新块来了，先把旧结果"缩"到新最大值 $m^{(2)}$ 下（乘 $e^{m^{(1)}-m^{(2)}}$），再加上新块的贡献，累加得到新的 $\ell$。最终输出 $O$ 的更新同理：$O_i^{\text{new}} = O_i \cdot e^{m_i - m_i^{\text{new}}} + P_{ij} V_j$。</p>
+
+          <details class="deep">
+            <summary>展开：完整的分块 Attention 计算</summary>
+            <div class="deep-body">
+              <p>把 $Q, K, V$ 沿序列维度分成块 $Q_1, \dots, Q_{T_r}$ 和 $K_1, \dots, K_{T_c}$ / $V_1, \dots, V_{T_c}$。对每个 $Q$ 块 $Q_i$：</p>
+              <p><strong>初始化</strong>：$O_i = 0$, $\ell_i = 0$, $m_i = -\infty$</p>
+              <p><strong>遍历每个 $K, V$ 块 $j$</strong>：</p>
+              <ol>
+                <li>计算 $S_{ij} = Q_i K_j^\top$（在 SRAM 内）</li>
+                <li>算当前块的行最大值 $m_{ij} = \text{rowmax}(S_{ij})$</li>
+                <li>更新全局最大值：$m_i^{\text{new}} = \max(m_i, m_{ij})$</li>
+                <li>计算 $P_{ij} = \exp(S_{ij} - m_i^{\text{new}})$</li>
+                <li>更新归一化因子：$\ell_i^{\text{new}} = \ell_i \cdot e^{m_i - m_i^{\text{new}}} + \text{rowsum}(P_{ij})$</li>
+                <li>更新输出：$O_i^{\text{new}} = O_i \cdot e^{m_i - m_i^{\text{new}}} + P_{ij} V_j$</li>
+              </ol>
+              <p><strong>最终</strong>：$O_i = O_i / \ell_i$</p>
+              <p style="margin-bottom:0">整个过程 $S_{ij}$ 和 $P_{ij}$ 只存在于 SRAM 中，从不写回 HBM。写回 HBM 的只有最终的 $O_i$ 和 $\ell_i$（用于反向传播）。注意这里每块的 softmax 不是"对整行"的，而是"对当前已见所有块的累积"——$m_i$ 和 $\ell_i$ 这两个标量携带了之前所有块的信息，因此每个新块都能正确修正之前的输出。</p>
+            </div>
+          </details>
+
+          <h3>反向传播：重计算代替存储</h3>
+          <p>标准实现在前向时把 $P$（softmax 后的注意力矩阵）存到 HBM，反向传播时直接读 $P$ 来算梯度。FlashAttention 不存 $P$，而是在反向传播时<strong>重新计算</strong> $S$ 和 $P$——从 HBM 重新读 Q、K、V，在 SRAM 里再算一遍。</p>
+          <p>这看起来是浪费：前向 + 反向算了两遍注意力。但关键是：<strong>重计算的成本（算力）远低于读写 HBM 的成本（带宽）</strong>。在注意力这种低算术强度的操作上，省下的 HBM 访问时间远大于多算一遍的时间。这就是"重计算换存储"——也叫 Activation Recomputation 的一个特例。具体来说，标准实现省了一次重算，但要在 HBM 上多读写 $N^2$ 大小的 $P$ 矩阵（前向写、反向读）；FlashAttention 多算一遍（在 SRAM 里，几乎免费），但完全不碰 HBM 上的 $P$。当 $N^2$ 很大时，后者净赚。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant HBM as HBM
+  participant SRAM as SRAM
+  participant Compute as 计算单元
+  Note over HBM,Compute: FlashAttention 前向
+  HBM->>SRAM: 加载 Q 块, K 块, V 块
+  SRAM->>Compute: 算 Si,j = Qi × Kj^T
+  SRAM->>Compute: online softmax 更新 m, ℓ
+  SRAM->>Compute: Oi += Pij × Vj
+  SRAM->>HBM: 只写回 Oi 和 ℓi
+  Note over HBM,Compute: FlashAttention 反向
+  HBM->>SRAM: 加载 Q, K, V 块 + dO 块
+  SRAM->>Compute: 重算 S 和 P
+  SRAM->>Compute: 算 dQ, dK, dV
+  SRAM->>HBM: 写回 dQ, dK, dV
+            </div>
+            <figcaption>FlashAttention 前向与反向的数据流：中间矩阵 S 和 P 始终不离开 SRAM</figcaption>
+          </figure>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/05-systems/flash-attention/fig1.png" alt="论文原图：FlashAttention 的分块（tiling）示意——Q、K、V 切块后在 SRAM 内完成注意力计算" loading="lazy" style="max-width:480px">
+            <figcaption>
+              <span class="pf-title">图：FlashAttention 分块（tiling）——将 Q、K、V 切成小块逐块处理，中间矩阵不落 HBM</span>
+              <span class="pf-src">论文原图 · Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></span>
+            </figcaption>
+          </figure>
+
+          <h2>IO 复杂度分析</h2>
+          <p>标准 Attention 的 HBM 访问量：</p>
+          <div class="figure" style="text-align:center">
+            $$\Theta(Nd + N^2) \text{ words}$$
+          </div>
+          <p>FlashAttention 的 HBM 访问量：</p>
+          <div class="figure" style="text-align:center">
+            $$\Theta\!\left(\frac{N^2 d^2}{M}\right) \text{ words}$$
+          </div>
+          <p>其中 $M$ 是 SRAM 大小，$d$ 是 head_dim。当 $M$ 足够大时（$M \geq Nd$，即一整行能放进 SRAM），FlashAttention 的 IO 量退化为 $\Theta(Nd)$——这是理论下界，只读写 Q/K/V/O 一次。</p>
+          <p>实际中 $M \ll Nd$（SRAM 只有几百 KB，而 $Nd$ 可能几 MB），所以 FlashAttention 仍然是 $\mathcal{O}(N^2 d^2 / M)$，但常数远小于标准实现的 $\mathcal{O}(N^2)$，因为 $d/M$ 通常在 $10^{-3}$ 量级。举例：A100 每个 SM 的 SRAM 约 164 KB，$d=128$ 时 $d^2/M$ 约为 $16384 / 168000 \approx 0.098$，也就是说 FlashAttention 的 HBM 访问量约为标准实现的 $10\%$ 量级——这正是提速 2-4 倍、省显存一个数量级的来源。</p>
+
+          <details class="deep">
+            <summary>展开：8192 序列到底省了多少 IO——一笔具体账</summary>
+            <div class="deep-body">
+              <p>以 $N = 8192$、$d = 128$、batch=1、heads=8、FP16（2 字节）为例，只算注意力<strong>中间矩阵</strong>的 HBM 读写（不含 Q/K/V/O 本身）：</p>
+              <p><strong>标准实现</strong>：每个头的 $S$ 和 $P$ 各 $N^2 = 8192^2 = 67{,}108{,}864$ 个元素，FP16 下各约 128 MB。前向写 $S$、读 $S$、写 $P$、读 $P$ 共约 4 次往返 ≈ $4 \times 128 \text{ MB} = 512$ MB/头，8 个头 ≈ <strong>4 GB</strong>。这还没算 O=PV 的读写。</p>
+              <p><strong>FlashAttention</strong>：分块大小 $B_r \times B_c$ 通常取 128。共 $T_r = T_c = 8192/128 = 64$ 块。每块的 $S_{ij}$ 在 SRAM 内 $B_r \times B_c = 128 \times 128 = 16384$ 个元素。整轮前向遍历 $T_r \times T_c = 4096$ 个 (i,j) 块对，每个块对只读写一次 $S_{ij}$ 到 SRAM（不落 HBM），HBM 上只读写 Q/K/V/O 与每块的 $\ell_i$。HBM 访问量约为 $\Theta(N^2 d^2 / M)$，代入 $M \approx 168$ KB 量级，整体注意力中间态 HBM 访问从 4 GB 降到约 <strong>数百 MB</strong>，且<strong>峰值显存</strong>从 $\mathcal{O}(N^2)$（8 头共 ~2 GB 中间矩阵）降到 $\mathcal{O}(N)$（只存 $O$ 和 $\ell$，约几十 MB）。</p>
+              <p style="margin-bottom:0">结论：序列越长，标准实现的 $N^2$ 项膨胀越狠，FlashAttention 省得越多。这就是为什么长上下文（<a href="../04-modern-arch/long-context.html">长上下文技术</a>）几乎必须依赖 FlashAttention 或等价 IO 感知实现。</p>
+            </div>
+          </details>
+
+          <h3>不同序列长度下的 HBM 访问量对比</h3>
+          <p>下面的表把上面的直觉量化成具体数字（注意力中间矩阵 S/P 的 HBM 读写，FP16、d=128、8 heads、batch=1，causal mask 下 $S/P$ 约半量，仅作量级示意）。关键看增长规律：标准实现每翻倍 $N$ 访问量约 4 倍（二次），FlashAttention 约 2 倍（线性，常数更小）。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>序列长度 N</th><th>标准 Attention 中间态 HBM 访问</th><th>FlashAttention 中间态 HBM 访问</th><th>相对节省</th></tr></thead>
+              <tbody>
+                <tr><td>1024</td><td>约 64 MB</td><td>约 8 MB</td><td>~8×</td></tr>
+                <tr><td>2048</td><td>约 256 MB</td><td>约 16 MB</td><td>~16×</td></tr>
+                <tr><td>4096</td><td>约 1.0 GB</td><td>约 32 MB</td><td>~32×</td></tr>
+                <tr><td>8192</td><td>约 4.0 GB</td><td>约 64 MB</td><td>~64×</td></tr>
+                <tr><td>16384</td><td>约 16 GB</td><td>约 128 MB</td><td>~128×</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure" style="text-align:center;font-size:12.5px;color:var(--text-2)">注：上表为说明增长规律的示意量级，实际数值取决于 head_dim、块大小、是否 causal、框架实现等，请以实际 profiling 为准。但"标准二次、FlashAttention 线性"的<strong>增长阶</strong>是严格成立的。</p>
+
+          <h2>动手算一遍：A100 上块大小该怎么选</h2>
+          <p>前面说「块大小要适配 SRAM 大小 M」，但 M 到底是多少、块该取多大，值得用一组真实数字推一遍。以 A100 为例：每个 SM 的 SRAM（注意力 kernel 里可按约 192 KB 来估算其可用量）记为 M；head_dim d = 64；序列长度 N = 4096。FlashAttention 把 Q 沿行分成 B_r 块、把 K/V 沿列分成 B_c 块，每个 (i, j) 块对要同时在 SRAM 里放下 Q_i（B_r × d）、K_j 与 V_j（各 B_c × d）、当前块的 S_ij（B_r × B_c），以及在线维护的 O_i（B_r × d）和 ℓ_i（B_r，极小可忽略）。</p>
+          <p>粗略估算单块峰值 SRAM 占用：Q_i 占 B_r·d·2 字节，K_j/V_j 各 B_c·d·2 字节，S_ij 占 B_r·B_c·2 字节，O_i 占 B_r·d·2 字节，合计约 2·(2·B_r·d + 2·B_c·d + B_r·B_c) 字节。代入 d=64、取 B_r = B_c = 64：2·(2·64·64 + 2·64·64 + 64·64) = 2·(8192 + 8192 + 4096) = 2·20480 = 40960 字节 ≈ 40 KB，远小于 192 KB——所以 64×64 是非常保守、稳能放进 SRAM 的块。若想更充分利用 SRAM 把块加大到 128：2·(2·128·64 + 2·128·64 + 128·128) = 2·(16384 + 16384 + 16384) = 2·49152 = 98304 字节 ≈ 96 KB，仍在 192 KB 内，可选用。这就是 FlashAttention 默认块大小常取 64~128 的原因：它是「减少外层循环次数（省 HBM 往返）」与「单块别撑爆 SRAM」之间的平衡点——块越大，外层 (N/B_r)·(N/B_c) 的块对越少、访存往返越少，但单块 SRAM 压力越大。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>块大小 B_r×B_c</th><th>单块 SRAM 估算</th><th>占 192KB 比例</th><th>取舍</th></tr></thead>
+              <tbody>
+                <tr><td>64×64</td><td>约 40 KB</td><td>~21%</td><td>最稳，循环次数多、访存略多</td></tr>
+                <tr><td>128×128</td><td>约 96 KB</td><td>~50%</td><td>常用，循环少、SRAM 余量适中</td></tr>
+                <tr><td>256×256</td><td>约 320 KB</td><td>超出</td><td>单 SM 放不下，触发溢出或报错</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>要点：选块大小的本质是在「少做外层循环」和「单块别撑爆 SRAM」之间找平衡；192 KB 这个数字会随 GPU 代次和 kernel 实际寄存器占用浮动，所以生产实现常把块大小当可调超参、配合 autotune 实测，而不是写死。</p>
+
+          <h3>online softmax 的 rescaling 为什么数值上是安全的</h3>
+          <p>分块 softmax 最让人不放心的是「每来一块就重新缩放之前的累积结果」——这不会累积舍入误差、最后爆炸吗？答案是不会，因为它只动「指数里的平移量」。回想更新式：新最大值 m' = max(m, m_new)，归一化因子 ℓ' = ℓ·e^{m−m'} + ℓ_new·e^{m_new−m'}。注意 m−m' ≤ 0 且 m_new−m' ≤ 0，所以两个指数项 e^{·} 都落在 (0, 1] 区间——我们只是在「等比例缩小」已有的累积 ℓ，再补上当前块的贡献，没有任何放大操作。这样 ℓ 始终保持为「已见元素 e^{x−m'} 之和」，数值上稳定，不会因块数增多而膨胀或下溢。</p>
+          <p>更关键的是：每次缩放只乘一个标量 e^{m−m'}（一个常数），不需要重新扫描之前所有块的数据——这正是「在线」的含义。输出 O 的更新同理：O' = O·e^{m−m'} + P_new·V_j，把旧输出整体缩放到新最大值下再叠加新块。由于所有缩放都是 ≤1 的标量乘法，最终结果与「一次性对整行做 softmax」在数学上完全等价；差别只在 FP16/BF16 的舍入，通常 ~1e-3 量级，与标准实现无本质区别。这也是为什么 FlashAttention 的数值结果能和朴素实现对得上。</p>
+
+          <h3>反向传播为什么选重算而不是存 P</h3>
+          <p>标准实现前向把 P（softmax 后的 N×N 矩阵）写进 HBM，反向直接读 P 算梯度；FlashAttention 选择不存 P、反向时从 Q/K/V 重算 S 和 P。代价是多算一遍注意力（前向一次 + 反向一次），省下的是 P 的 HBM 存储与读写。用上面的数字说话：4096 序列、8 头、FP16 下，单头 P 矩阵约 N²·2 = 4096²·2 ≈ 32 MB，8 头共约 256 MB 的中间矩阵——这还只是前向写、反向读两次，累计 HBM 流量约 512 MB/层。FlashAttention 不存 P，反向重算的算力成本约等于「再跑一遍 SRAM 内的分块注意力」，几乎不碰 HBM 上的大矩阵，只多读一次 Q/K/V（本来反向也要读）。省下的 256 MB 峰值显存 + 数百 MB 的 HBM 流量，对比多算一遍 softmax 的毫秒级 SRAM 开销，净收益在长序列下非常可观——这就是「用便宜的算力换昂贵的带宽」的精髓。</p>
+
+          <h2>FlashAttention 1 → 2 → 3 的演进</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>版本</th><th>年份</th><th>核心改进</th><th>适用硬件</th></tr></thead>
+              <tbody>
+                <tr><td><strong>FlashAttention-1</strong></td><td>2022</td><td>分块 + online softmax + 重计算，首次实现 IO 感知注意力</td><td>A100 (Ampere)+</td></tr>
+                <tr><td><strong>FlashAttention-2</strong></td><td>2023</td><td>减少非 matmul 计算、优化并行度（沿序列维度并行）、更好的 warp 分工</td><td>A100+</td></tr>
+                <tr><td><strong>FlashAttention-3</strong></td><td>2024</td><td>利用 Hopper 异步执行（warp specialization + TMA + FP8 支持），前向 1.5-2× 于 FA2</td><td>H100 (Hopper) 专用</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>FA2 相对 FA1 的主要改进：<strong>减少 softmax 等非矩阵乘运算的占比</strong>（因为 H100 上 matmul 和非 matmul 的吞吐差距更大），以及在<strong>序列维度上并行</strong>（FA1 只在 batch 和 head 维度并行，长序列时 SM 利用率低）。FA3 则进一步利用了 Hopper 架构的异步特性：用 TMA（Tensor Memory Accelerator）异步搬数据，同时用 warp specialization 让一组 warp 专门算 GEMM、另一组算 softmax，实现<strong>计算与访存重叠</strong>。</p>
+
+          <div class="callout">
+            <span class="callout-t">不是万能的</span>
+            FlashAttention 的加速效果取决于注意力在总计算中的占比。对于短序列（$N$ 小）或大 batch 的 GEMM 密集型场景，注意力占比低，加速效果不明显。它最大价值在长上下文（$N \geq 4096$）场景——序列越长，$N^2$ 项越大，省下的 IO 越多。
+          </div>
+
+          <h3>演进时间线</h3>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+timeline
+  title FlashAttention 演进时间线
+  2022 : FlashAttention-1 分块 tiling
+         online softmax
+         重计算 首次 IO 感知
+  2023 : FlashAttention-2 减少非 matmul
+         序列维度并行 更好 warp 分工
+  2024 : FlashAttention-3 Hopper 异步
+         TMA 与 warp specialization
+         FP8 E4M3 低精度
+            </div>
+            <figcaption>三代 FlashAttention 的演进主线：从"IO 感知奠基"到"榨干 Hopper 异步与低精度"</figcaption>
+          </figure>
+
+          <h3>优化维度全景（mindmap）</h3>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root((FlashAttention))
+    分块 tiling
+      SRAM 内完成计算
+      块大小适配 M
+      避免 N 平方落盘
+    online softmax
+      增量更新 m
+      增量更新 l
+      无需整行
+    重计算
+      前向不存 P
+      反向重算 S P
+      算力换带宽
+    异步 Hopper
+      TMA 异步搬运
+      warp specialization
+      计算访存重叠
+    低精度
+      FP8 E4M3
+      误差可控
+            </div>
+            <figcaption>FlashAttention 的几条优化主线：分块、online softmax、重计算、Hopper 异步、低精度</figcaption>
+          </figure>
+
+          <h2>静默回退：什么条件下 FlashAttention 不生效</h2>
+          <p>FlashAttention 最大的工程陷阱是<strong>静默回退（silent fallback）</strong>：你以为在用 FlashAttention，实际上它默默退化成了标准实现，你却毫不知情。不同的后端（PyTorch SDPA、FlashAttention 库、xFormers）的回退条件不同，但常见的触发条件包括：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>条件</th><th>可能触发回退</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><strong>head_dim 不支持</strong></td><td>是</td><td>FA1/2 通常只支持 head_dim ∈ {32, 64, 128, 256}。非常规 head_dim（如 96、80）会回退</td></tr>
+                <tr><td><strong>dtype 不支持</strong></td><td>是</td><td>FP32 输入通常回退到标准实现。FA3 的 FP8 有额外约束（E4M3 vs E5M2）</td></tr>
+                <tr><td><strong>mask 类型</strong></td><td>部分</td><td>标准 causal mask 通常支持；自定义任意 mask 矩阵可能不支持，取决于后端</td></tr>
+                <tr><td><strong>硬件代次</strong></td><td>是</td><td>FA3 需要 Hopper (H100) 架构，在 Ampere 上自动回退到 FA2。FA2 在 Volta 上可能回退</td></tr>
+                <tr><td><strong>dropout &gt; 0 + 反向</strong></td><td>视版本</td><td>部分早期版本的 FA 在开启 dropout 时行为不同</td></tr>
+                <tr><td><strong>非 contiguous 张量</strong></td><td>是</td><td>Q/K/V 不连续时可能回退或报错</td></tr>
+                <tr><td><strong>滑动窗口 / 本地注意力</strong></td><td>视版本</td><td>较新版本的 FA 支持滑动窗口，老版本不支持</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">最坑的场景</span>
+            你在本地 A100 上跑通了 FlashAttention，部署到生产环境的 V100 集群上——静默回退了，慢了 3 倍，但没有任何报错。或者你升级 PyTorch 版本后 dtype 默认值变了——又静默回退了。<strong>没有任何 warning</strong>，只有 profiling 才能发现。
+          </div>
+
+          <h3>反向重计算的状态机</h3>
+          <p>静默回退之所以危险，是因为"回退版"走的完全是另一条代码路径。下面用状态机描述 FlashAttention 反向时"无存储、靠重算"的真实流程，以及它和标准实现"读已存 P"流程的区别：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 加载QKV: 从 HBM 读 Q K V 与 dO
+  加载QKV --> 取KV块: 沿序列维分块
+  取KV块 --> 重算S: 在 SRAM 内 S=QK^T
+  重算S --> 重算P: online softmax 得 P
+  重算P --> 算梯度: 算 dQ dK dV
+  算梯度 --> 取KV块: 还有 KV 块
+  算梯度 --> 写回梯度: 所有块处理完
+  写回梯度 --> [*]
+            </div>
+            <figcaption>FlashAttention 反向的状态机：每次都从 Q/K/V 重算 S 和 P，从不读取前向存的 P</figcaption>
+          </figure>
+
+          <h2>与推理、KV Cache 的关系</h2>
+          <p>上面讲的是训练 /  prefill 阶段（所有 token 已知）。在自回归生成（decode）阶段，情况不同：每生成一个新 token，只需要计算它对所有历史 token 的注意力，历史 K/V 已经被缓存在 <a href="../04-modern-arch/kv-cache.html">KV Cache</a> 里。这时 FlashAttention 的"分块 + 不存中间矩阵"思路依然有价值，但瓶颈从"算注意力"变成了"从 HBM 读越来越长的 KV Cache"——这才是 <a href="../09-efficiency/kv-offload.html">KV 卸载</a>、PagedAttention、GQA/MQA 等要解决的问题。</p>
+          <p>换句话说：FlashAttention 优化的是<strong>单步注意力计算的 IO</strong>；长序列推理的墙是<strong>KV Cache 的总带宽与容量</strong>。两者是正交的两道关，需要组合拳（FlashAttention 算得快 + 高效 KV Cache 管理读得省）。相关工程实现见 <a href="../09-efficiency/inference-engines.html">推理引擎</a>。</p>
+
+          <h3>后端组件关系（classDiagram）</h3>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+classDiagram
+  class SDPA {
+    + 自动选择后端
+    + sdpa_kernel 强制
+    + 默认 math flash memeff
+  }
+  class FlashAttention {
+    + 分块 tiling
+    + online softmax
+    + 反向重计算
+  }
+  class xFormers {
+    + memory efficient
+    + 自定义 mask
+  }
+  class MathAttention {
+    + 纯 PyTorch 实现
+    + 最慢但最稳
+  }
+  SDPA <|-- FlashAttention
+  SDPA <|-- xFormers
+  SDPA <|-- MathAttention
+            </div>
+            <figcaption>PyTorch SDPA 是一个调度层，底层可选 FlashAttention / xFormers / Math 等后端；不同后端对 head_dim、dtype、mask 的支持不同，这正是静默回退的来源</figcaption>
+          </figure>
+
+          <h2>什么时候不该用 FlashAttention</h2>
+          <p>前面讲了 FlashAttention 的价值，但工程选型时要对四类场景保持谨慎。第一类是短序列：当 $N \leq 512$ 时，$N^2$ 的中间矩阵只有几 MB 量级，HBM 带宽本就不紧张，FlashAttention 省下的 IO 有限，反而要额外付出分块、online softmax 和重计算的指令开销——在极端小序列下，实测往往和标准实现打平甚至更慢。第二类是注意力占比很低的模型：如果计算主体是超大 hidden size 的 MLP（GEMM 密集），注意力只占整体 FLOP 的个位数百分比，那么把注意力从 1× 优化到 2×，端到端收益不到 10%，优先优化 MLP 的收益要大得多。</p>
+          <p>第三类是对数值确定性有硬约束的场景。FlashAttention 的 online softmax 改变了同一行内元素的累加次序，在 FP16/BF16 下与"整行归一化"的朴素实现会差出 ~1e-3 量级的舍入误差。绝大多数训练任务不在意，但涉及梯度数值对比、跨框架结果对拍、或对位敏感的科学计算流水线时，这点差异可能让断言失败、让调试陷入困境。第四类是异构部署环境：当你的推理集群同时混有 Ampere、Hopper 甚至更老的 Volta 时，FA3 只在 Hopper 上可用、FA2 在 Volta 上可能回退，同一个 kernel 在不同代 GPU 上性能差异极大——此时坚持统一的算子、接受略慢的速度，往往比在每张卡上"最优"更容易维护。</p>
+          <p>一句话决策框架：序列长度 $N \geq 4096$、注意力 FLOP 占比高于 20%、且对数值确定性无硬约束——放心用；反之先做小规模 benchmark 再决定，别默认"越快越好"。比速度更重要的是<strong>一致性</strong>：训练和推理、本地和生产环境尽量锁定同一套后端配置（参考 <a href="../09-efficiency/inference-engines.html">推理引擎</a> 的做法），这样你在 CI 里做的回退检测才有意义。</p>
+
+          <h2>如何验证 FlashAttention 真的生效</h2>
+          <p>不要靠"跑得更快了"来判断——差异可能来自其他因素。以下是可靠的验证方法：</p>
+
+          <h3>方法 1：PyTorch SDPA 后端检查</h3>
+          <p>PyTorch 2.0+ 的 <code>torch.nn.functional.scaled_dot_product_attention</code>（简称 SDPA）会自动选择后端。可以用 context manager 强制后端并检查是否报错：</p>
+          <pre><code class="language-python">import torch
+import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+Q = torch.randn(1, 8, 4096, 128, device="cuda", dtype=torch.bfloat16)
+K = torch.randn(1, 8, 4096, 128, device="cuda", dtype=torch.bfloat16)
+V = torch.randn(1, 8, 4096, 128, device="cuda", dtype=torch.bfloat16)
+
+# 强制使用 FlashAttention 后端，不支持会抛异常而非静默回退
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+    print("FlashAttention backend OK")</code></pre>
+          <p>如果这段代码不报错，说明 FlashAttention 后端在此配置下可用。如果报错，说明触发了回退条件。</p>
+
+          <h3>方法 2：检查可用后端列表</h3>
+          <pre><code class="language-python">from torch.nn.attention import sdpa_kernel, SDPBackend
+import torch
+
+# 列出当前环境下哪些后端可用
+for backend in SDPBackend:
+    try:
+        with sdpa_kernel(backend):
+            Q = torch.randn(1, 8, 128, 128, device="cuda", dtype=torch.bfloat16)
+            K = torch.randn(1, 8, 128, 128, device="cuda", dtype=torch.bfloat16)
+            V = torch.randn(1, 8, 128, 128, device="cuda", dtype=torch.bfloat16)
+            F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+        print(f"{backend}: available")
+    except Exception as e:
+        print(f"{backend}: NOT available — {e}")</code></pre>
+
+          <h3>方法 3：Profiler 看 kernel 名</h3>
+          <pre><code class="language-python">from torch.profiler import profile, ProfilerActivity
+
+with profile(activities=[ProfilerActivity.CUDA]) as prof:
+    out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+    torch.cuda.synchronize()
+
+# 关键：看 CUDA kernel 名
+events = prof.key_averages()
+for ev in events:
+    if "flash" in ev.key.lower() or "attention" in ev.key.lower():
+        print(f"{ev.key}: {ev.cuda_time_total} μs")</code></pre>
+          <p>如果 kernel 名包含 <code>flash_attn</code> 或 <code>_flash_attention_forward</code>，说明 FlashAttention 生效。如果看到的是 <code>aten::_scaled_dot_product_attention</code> 的通用实现或大量 <code>aten::matmul</code> + <code>aten::softmax</code> 分开调用，说明回退了。</p>
+
+          <h3>方法 4：显存对比</h3>
+          <p>FlashAttention 的显存占用应与序列长度成<strong>线性</strong>关系（$\mathcal{O}(N)$），标准实现成<strong>二次</strong>关系（$\mathcal{O}(N^2)$）。可以用不同序列长度跑一遍，看显存增长曲线：</p>
+          <pre><code class="language-python">for N in [1024, 2048, 4096, 8192]:
+    torch.cuda.reset_peak_memory_stats()
+    Q = torch.randn(1, 8, N, 128, device="cuda", dtype=torch.bfloat16)
+    K = torch.randn(1, 8, N, 128, device="cuda", dtype=torch.bfloat16)
+    V = torch.randn(1, 8, N, 128, device="cuda", dtype=torch.bfloat16)
+    out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() / 1024**2
+    print(f"N={N}: peak memory = {peak:.1f} MB")</code></pre>
+          <p>如果显存随 $N$ 线性增长（每次翻倍 $N$，显存也约翻倍），FlashAttention 生效。如果呈二次增长（每次翻倍 $N$，显存变 4 倍），说明回退了。</p>
+
+          <h3>显存随序列长度增长：标准 vs FlashAttention</h3>
+          <p>下面这张图把"方法 4"的结果可视化——标准实现的注意力中间态显存随 $N$ 二次飙升，FlashAttention 近似线性。曲线形状（而非具体数值）才是判断回退的关键证据。</p>
+          <div class="chart-box">
+            <canvas id="chartFaMemory"></canvas>
+          </div>
+          <p class="figure" style="text-align:center;font-size:12.5px;color:var(--text-2)">示意：注意力中间态显存随序列长度 N 的增长（对数坐标）。标准实现曲线陡升（二次），FlashAttention 平缓（线性）。具体数值因实现而异，请以实际 profiling 为准。</p>
+
+          <h2>注意力耗时到底花在哪（示意）</h2>
+          <p>为什么 FlashAttention 能省这么多？下面这张饼图示意了标准注意力前向的耗时结构：最大头是"把中间矩阵 S/P 反复读写 HBM"，而不是矩阵乘本身。FlashAttention 砍掉的正好是这块最大的浪费。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+pie title 标准注意力前向耗时占比 示意
+  "HBM 读写中间矩阵 S P" : 62
+  "QK^T 矩阵乘" : 20
+  "PV 矩阵乘" : 12
+  "softmax 归一化" : 6
+            </div>
+            <figcaption>标准注意力前向耗时结构（示意）：HBM 读写中间矩阵占了最大头，FlashAttention 正是消除这一项</figcaption>
+          </figure>
+
+          <h2>实际使用建议</h2>
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">优先用 SDPA</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">PyTorch 2.0+ 的 <code>F.scaled_dot_product_attention</code> 自动选择最优后端，无需手动安装 flash-attn 包。配合 <code>torch.compile</code> 效果更好。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">检查 head_dim</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">设计模型时尽量选 head_dim ∈ {64, 128}。非标准 head_dim 是回退的常见原因，且通常没有 warning。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">长序列收益最大</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">$N \geq 4096$ 时 FlashAttention 的加速比最显著。短序列（$N \leq 512$）收益有限，因为 $N^2$ 项本就不大。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">CI 里加回退检测</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">在 CI pipeline 里跑一次方法 1 的强制后端测试，防止版本升级导致的静默回退。</p>
+            </div>
+          </div>
+
+          <h2>排查清单：FlashAttention 没生效怎么办</h2>
+          <p>生产环境里最常见的不是「算错」，而是「静默回退导致变慢却没人发现」。下面这张决策表把「现象 → 该查什么 → 怎么修」串成一条排查路径，配合前面四种验证方法使用：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>现象</th><th>优先排查</th><th>典型修复</th></tr></thead>
+              <tbody>
+                <tr><td><strong>训练/推理比预期慢 2-4 倍</strong></td><td>profiler 看 kernel 名是否含 flash；显存是否随 N 二次增长</td><td>强制 <code>sdpa_kernel(FLASH_ATTENTION)</code> 验证；CI 里加回退检测</td></tr>
+                <tr><td><strong>换卡/换 PyTorch 后变慢</strong></td><td>硬件代次与 dtype 默认值（如 FP32 输入、新版 bfloat16 行为）</td><td>确认 FA3 需 Hopper；显式指定 dtype 为 bfloat16/fp16</td></tr>
+                <tr><td><strong>非标准 head_dim 报错或回退</strong></td><td>head_dim 是否在 {32,64,128,256}</td><td>模型设计优先选 64/128；或退回 math 后端接受慢一点</td></tr>
+                <tr><td><strong>自定义 mask 不生效</strong></td><td>后端是否支持任意 mask；causal 用标准 <code>is_causal=True</code></td><td>改用标准 causal 标志；或确认后端 mask 支持范围</td></tr>
+                <tr><td><strong>显存随序列长度暴涨</strong></td><td>是否真的走了 FlashAttention（方法 4 内存对比）</td><td>检查张量是否 contiguous；检查是否误落回 math 实现</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>最后一条经验法则：<strong>把「后端可用性」当成模型配置的一部分来测，而不是当成「默认就快」的黑盒</strong>。尤其在多卡异构集群、容器镜像版本漂移、或是从训练切到推理引擎时，静默回退几乎必然发生，唯一的防线是显式验证 + 在 CI 里固化断言。</p>
+          <div class="callout warn">
+            <span class="callout-t">别用"跑得更快"当证据</span>
+            端到端变快可能来自 batch 调整、torch.compile 命中缓存、或数据 pipeline 优化——和 FlashAttention 是否生效无关。判断回退只能靠「看 kernel 名 / 看显存增长阶 / 强制后端」，这三条里有任意一条就够，但「感觉快了」永远不算。
+          </div>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：FlashAttention 不改注意力的数学，而是用分块 + online softmax 让计算在 SRAM 内完成，把 HBM 访问量从 $\mathcal{O}(N^2)$ 降到 $\mathcal{O}(N^2d^2/M)$。</li>
+            <li><strong>反向传播</strong>：不存中间矩阵 $P$，反向时重计算——用算力换带宽，在带宽墙场景下净赚。</li>
+            <li><strong>演进</strong>：FA1 奠基，FA2 减少非 matmul 计算并改进并行度，FA3 利用 Hopper 异步特性。硬件代次决定可用版本。</li>
+            <li><strong>静默回退</strong>：head_dim 非标准、dtype 不支持、mask 类型特殊、硬件代次不够、张量不连续——都可能触发，<strong>无 warning</strong>。</li>
+            <li><strong>验证方法</strong>：强制后端测试（<code>sdpa_kernel</code>）、profiler 看 kernel 名、显存随 $N$ 线性 vs 二次增长——至少用一种。</li>
+            <li><strong>与推理的关系</strong>：训练/prefill 用它算得快，长序列 decode 的墙在 <a href="../04-modern-arch/kv-cache.html">KV Cache</a> 带宽，二者正交需组合优化。</li>
+            <li><strong>正交关系</strong>：FlashAttention 是"怎么算"的优化，与"算什么"（<a href="../03-transformer/attention.html">注意力机制</a>）和"改什么"（<a href="../04-modern-arch/attention-variants.html">注意力变体</a>）正交，可组合使用。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：FlashAttention 改变了注意力公式吗？</h3>
+              <p><span class="answer-label">标准回答：</span>没有。它仍然计算精确的 Softmax 注意力，改变的是计算顺序和显存读写方式：通过 tiling、online softmax 和必要的重计算，避免把完整的 $n\times n$ 分数矩阵写回 HBM。</p>
+              <p><span class="pitfall-label">常见误区：</span>FlashAttention 不是近似注意力，也不等于 MQA/GQA；后两者改变的是 K/V 头数和数学结构。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：为什么 FlashAttention 能更快？</h3>
+              <p><span class="answer-label">标准回答：</span>标准实现频繁在 HBM 和片上 SRAM 之间搬运中间矩阵。FlashAttention 将 Q、K、V 分块加载到 SRAM，在块内完成点积与在线归一化，减少 HBM 读写；代价是部分中间结果被重算，用算力换 IO。</p>
+              <details class="deep">
+                <summary>追问：如何确认后端真的生效？</summary>
+                <div class="deep-body">
+                  <p>不要只看“调用成功”。应检查 dtype、head dimension、mask 类型和 GPU 架构，并用 profiler 或 PyTorch 后端信息确认没有静默回退到普通实现，再比较相同输入下的延迟、显存峰值和数值误差。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：FlashAttention 与注意力变体能叠加吗？</h3>
+              <p><span class="answer-label">标准回答：</span>可以。FlashAttention 优化“怎么算”，MHA/MQA/GQA/滑动窗口优化“算什么”，两者属于不同层次。实际收益取决于后端是否支持对应 mask、头数和布局。</p>
+              <pre class="mini-code"><code>Q, K, V -&gt; tiled attention -&gt; online softmax -&gt; output</code></pre>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (2022) — FlashAttention-1 原始论文，提出分块 + online softmax + 重计算 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></li>
+            <li>Dao, "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (2023) — FA2 的改进：减少非 matmul 运算、序列维度并行 · <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">arXiv:2307.08691</a></li>
+            <li>Shah et al., "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision" (2024) — FA3：Hopper 架构的 warp specialization + TMA + FP8 · <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener">arXiv:2407.08608</a></li>
+            <li>Dao et al., "Monarch Mixer" 与 FlashAttention 工程实现讨论（GitHub：Dao-AILab/flash-attention）— 实际 kernel 实现、回退条件与 benchmark 说明 · <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">GitHub 仓库</a></li>
+            <li>PyTorch 官方文档 "Scaled Dot Product Attention" — SDPA 后端选择、<code>sdpa_kernel</code> 强制后端与可用后端枚举的权威说明 · <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">PyTorch Docs</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            想亲手实现 FlashAttention kernel，跳转 <a href="triton-kernel.html">Triton Kernel 与编译优化</a>，或直接看 <a href="../15-practice/build-flashattention.html">实战：手写 FlashAttention Kernel</a>。想理解为什么大模型训练需要这么多卡，回顾 <a href="compute-budget.html">FLOP 与显存核算</a>；想了解它在长序列推理里的搭档，读 <a href="../04-modern-arch/kv-cache.html">KV Cache</a> 与 <a href="../09-efficiency/inference-engines.html">推理引擎</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+  (function () {
+    function drawFaMemory() {
+      var c = document.getElementById('chartFaMemory');
+      if (!c || typeof Chart === 'undefined') return;
+      var N = [1024, 2048, 4096, 8192, 16384];
+      // 示意量级（MB）：标准二次，FlashAttention 线性
+      var standard = N.map(function (n) { return Math.round(4 * Math.pow(n / 8192, 2) * 1024); });
+      var flash = N.map(function (n) { return Math.round(64 * (n / 8192)); });
+      var chart = new Chart(c.getContext('2d'), {
+        type: 'line',
+        data: {
+          labels: N.map(function (n) { return n; }),
+          datasets: [
+            { label: '标准 Attention（示意 MB）', data: standard, borderColor: window.CB_COLORS.red, backgroundColor: window.CB_COLORS.redSoft, tension: 0.3 },
+            { label: 'FlashAttention（示意 MB）', data: flash, borderColor: window.CB_COLORS.green, backgroundColor: window.CB_COLORS.greenSoft, tension: 0.3 }
+          ]
+        },
+        options: {
+          responsive: true,
+          scales: {
+            x: { title: { display: true, text: '序列长度 N' }, type: 'logarithmic' },
+            y: { title: { display: true, text: '中间态显存（MB，示意）' }, type: 'logarithmic' }
+          },
+          plugins: { title: { display: true, text: '注意力中间态显存：标准二次 vs FlashAttention 线性' } }
+        }
+      });
+      if (window.CB_CHARTS) window.CB_CHARTS.push(chart);
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', drawFaMemory);
+    else drawFaMemory();
+  })();
+  </script>
+</body>
+</html>

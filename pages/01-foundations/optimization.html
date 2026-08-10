@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>优化算法基础 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="01-foundations" data-topic="optimization">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>优化算法基础</h1>
+            <p class="lead">反向传播只负责把梯度算出来，怎么拿梯度去更新参数，是优化器的工作。从最朴素的 SGD，到加惯性的动量，再到自适应的 Adam，再到把权重衰减拆正的 AdamW——优化器的演进史，就是一部"怎样在百亿参数的崎岖 loss 曲面上又稳又快地走"的工程史。本节讲清四代优化器的动机，给出大模型时代的默认选择。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>四代优化器，每一代都针对上一代的硬伤做加法：<strong>SGD</strong> 走得稳但慢、易卡在鞍点；<strong>动量</strong>给它装上惯性冲出洼地；<strong>Adam</strong> 再给每个参数配自己的步长，解决各方向曲率不均；<strong>AdamW</strong> 最后把权重衰减从梯度里拆出来，避免它被自适应学习率吃掉。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  SGD["SGD<br/>固定步长 顺梯度走"] -->|卡鞍点 慢| M["动量 SGD<br/>累加历史梯度 加惯性"]
+  M -->|各方向步长仍统一| AD["Adam<br/>每参数自适应步长"]
+  AD -->|权重衰减被自适应抵消| W["AdamW<br/>权重衰减与梯度解耦"]
+  style SGD fill:#e8f5e9
+  style W fill:#fff3e0
+              </div>
+              <figcaption>四代优化器的演进链：每一代修复上一代的硬伤，AdamW 是大模型时代的事实默认</figcaption>
+            </figure>
+          </div>
+
+          <h2>梯度下降的三种吃法</h2>
+          <p>梯度下降的更新规则只有一行：</p>
+          <div class="figure" style="text-align:center">
+            $$\theta \leftarrow \theta - \eta \,\nabla_\theta L$$
+          </div>
+          <p>但"用多少数据算这个梯度"会带来三种变体，差异不小：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>变体</th><th>每次用的数据</th><th>梯度估计</th><th>特点</th></tr></thead>
+              <tbody>
+                <tr><td><strong>批量 GD</strong></td><td>全部训练集</td><td>真实梯度，无噪声</td><td>方向准，但一步要扫全量数据，且无法利用 GPU 并行的多组样本</td></tr>
+                <tr><td><strong>小批量 GD</strong></td><td>一个 batch（几十到几千）</td><td>梯度的无偏估计，带噪声</td><td>现代训练的标准做法，平衡速度与方向</td></tr>
+                <tr><td><strong>随机 GD（SGD）</strong></td><td>单个样本</td><td>方差极大、极嘈杂</td><td>理论分析常用，工程上几乎没人真用</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这里有个术语混用的坑：大家嘴里的"SGD"在工程语境下其实指的是<strong>小批量梯度下降</strong>，而不是一次一个样本。本节后文提到 SGD，都按这个约定。小批量带来的一点噪声其实是好事——它能让优化器跳出纯批量 GD 容易卡住的鞍点和浅洼。</p>
+
+          <p>工程上还有一个隐藏约束：batch 太小，GPU 的并行算力用不满，每一步的"墙钟效率"低；batch 太大，等效学习率要跟着调（见下文 linear scaling rule），而且噪声太小反而不易逃离鞍点。所以选 batch size 是"算力利用率"和"优化质量"之间的折中，常见取值从视觉任务的几十，到预训练的上百万 tokens 不等。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            小批量梯度 = 真实梯度 + 噪声。噪声是免费的"扰动"，帮优化器逃离过于平缓的鞍点，代价是收敛时会来回抖动。
+          </div>
+
+          <h2>为什么"各方向曲率不均"是核心难题</h2>
+          <p>要理解后面几代优化器在解决什么，先要明白 loss 曲面有多"畸形"。真实模型的 loss 关于参数的 Hessian 矩阵（曲率）在不同方向上可以差好几个数量级：有的方向陡得像峭壁，有的方向平得像高原。用一个二维玩具函数感受：$f(x,y)=50x^2+0.5y^2$，它在 $x$ 方向陡（$x$ 的系数 50）、在 $y$ 方向平（系数 0.5）。从 $(1,1)$ 出发、用统一学习率 $\eta=0.01$ 走梯度下降，梯度是 $(100x,\; y)$：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>步数</th><th>$x$</th><th>$y$</th><th>发生了什么</th></tr></thead>
+              <tbody>
+                <tr><td>0</td><td>1.000</td><td>1.000</td><td>起点；梯度 $(100,\;1)$，陡平差 100 倍</td></tr>
+                <tr><td>1</td><td>0.000</td><td>0.990</td><td>$x$ 一步迈过头（陡方向震荡），$y$ 只挪了 1%</td></tr>
+                <tr><td>~458</td><td>0.000</td><td>0.010</td><td>$y$ 还要约 458 步才从 1 降到 0.01</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这个玩具的"陡峭比"在数学上叫<strong>条件数</strong>（condition number）$\kappa=\lambda_{\max}/\lambda_{\min}$，这里就是 $100/1=100$。真实大模型的条件数常高达 $10^6$ 以上，困境被放大百万倍——这正说明"统一学习率"从根上不够用。好消息是：后面两代优化器恰好分别针对"卡住"和"曲率不均"这两件事。</p>
+          <p>关键困境在于：学习率必须小到不让陡方向（$x$）发散，可一旦为此把 $\eta$ 调小，平方向（$y$）就几乎不动、训练龟速。<strong>一个统一的学习率没法适配所有方向</strong>——这直接催生了"动量"（治卡住）和"自适应学习率"（治曲率不均）两代改进。下面先解决"易卡住"。</p>
+
+          <h2>SGD：最朴素的走法，以及它的硬伤</h2>
+          <p>SGD 的更新就是上面那行公式，每个参数都按同一个学习率 $\eta$ 沿负梯度走。它简单，但有两个工程硬伤：</p>
+          <ol>
+            <li><strong>各方向步长统一</strong>。loss 曲面在不同参数方向上曲率可以差几个数量级，用同一个 $\eta$ 走，在陡方向会震荡甚至发散，在缓方向则龟爬不动。学习率只能迁就最陡方向取小，于是整体很慢（上一节的玩具函数就是例子）。</li>
+            <li><strong>容易被鞍点和浅洼卡住</strong>。梯度在接近鞍点时趋于零，SGD 失去惯性，会在那里停滞不前。</li>
+          </ol>
+          <p>在百亿参数的真实模型里，这两个硬伤被剧烈放大：参数空间的"鞍点密度"随维度升高而急剧上升，纯 SGD 几乎必然在某个鞍点附近磨蹭很久；而条件数动辄百万倍，让"迁就最陡方向取小学习率"变得完全不可接受。这也解释了为什么现代大模型预训练几乎不会用裸 SGD。有人会想：那用牛顿法（直接用 Hessian 逆做二阶更新）不就好了？问题是 Hessian 有"参数数²"个元素，百亿参数下内存根本放不下，且 Hessian 可能不正定。所以工程上只能在"一阶梯度 + 各种技巧"这条路上走。</p>
+
+          <h2>动量：给优化器装上惯性</h2>
+          <p>动量（momentum）的思路来自物理：把参数位置比作小球，给它一个速度，让它积累历史梯度方向上的"动量"，从而冲过浅洼和鞍点。维护一个速度向量 $v$，把每步的梯度按比例累加进去：</p>
+          <div class="figure" style="text-align:center">
+            $$v_t = \beta\, v_{t-1} + \nabla_\theta L,\qquad \theta \leftarrow \theta - \eta\, v_t$$
+          </div>
+          <p>其中 $\beta$ 是动量系数，常取 0.9。效果是：梯度方向一致时速度持续累加、越走越快（在缓方向加速）；梯度来回震荡时正负抵消、速度被抑制（在陡方向消震）。两个硬伤的第二条被治了一半——有了惯性，更容易冲出浅洼。</p>
+          <p>接上一节的玩具：在平缓的 $y$ 方向，梯度方向始终一致，动量会把速度累积到稳态 $v \approx g/(1-\beta)=g/0.1=10g$，相当于把该方向的有效步长放大 10 倍——原本要 ~458 步，动量下大约 46 步就能到 $y\approx 0.01$。这正是"惯性在缓方向加速"的量化体现。$\beta=0.9$ 的直觉是"大约看最近 $1/(1-\beta)=10$ 步的加权平均"；$\beta$ 越大，记忆越久、惯性越强。</p>
+          <p>不过要注意：动量只治了"卡住"，并没有解决"陡平方向曲率差太大"。在上面的玩具里，$x$ 方向依旧会因为统一学习率而震荡——动量让 $y$ 变快，却没让 $x$ 变稳。真正让"每个方向各用各的步长"的是下一节的<strong>自适应学习率</strong>，它和动量叠加就成了 Adam。</p>
+          <p>动量有个变体叫 Nesterov 动量（NAG），先按速度"提前看一眼"再算梯度，理论上收敛更稳。在图像分类时代的 ResNet 训练里常用，大模型时代则被 Adam 系取代，了解即可。</p>
+
+          <h2>自适应学习率：RMSProp 与 Adam</h2>
+          <p>动量治了"易卡住"，但"各方向步长统一"的硬伤还在。自适应学习率优化器的思路是：<strong>给每个参数配一个自己的步长，按该参数历史梯度的幅度自动调节</strong>。梯度一直很大的参数，说明这方向陡，步长调小；梯度一直很小的参数，说明这方向缓，步长放大。这就正面回应了上一节"陡平方向曲率差 100 倍"的困境。</p>
+          <p>RMSProp 是最早可用的版本，用梯度平方的滑动平均来缩放步长。具体地，它维护 $v_t=\beta v_{t-1}+(1-\beta)g_t^2$，更新时把梯度按 $1/(\sqrt{v_t}+\varepsilon)$ 缩放——这相当于给每个参数做了一次"对角预条件"，陡方向（$v_t$ 大）自动变小、缓方向自动变大。Adam（Adaptive Moment estimation）则把<strong>动量（梯度一阶矩）和自适应（梯度二阶矩）合在一起</strong>，是这两个思路的集大成者：</p>
+          <div class="figure" style="text-align:center">
+            $$m_t = \beta_1 m_{t-1} + (1-\beta_1)\,g_t \quad\text{（一阶矩，动量）}$$
+            $$v_t = \beta_2 v_{t-1} + (1-\beta_2)\,g_t^2 \quad\text{（二阶矩，自适应）}$$
+            $$\theta \leftarrow \theta - \eta\,\frac{\hat{m}_t}{\sqrt{\hat{v}_t}+\varepsilon}$$
+          </div>
+          <p>其中 $\hat{m}_t, \hat{v}_t$ 是偏差修正（避免训练初期估计被 0 拖偏），$\varepsilon$ 是防止除零的小常数。Adam 的默认参数 $\beta_1=0.9, \beta_2=0.999, \varepsilon=10^{-8}$ 在绝大多数任务上都不用改。</p>
+
+          <p>「给每个参数一个独立步长」是不是真的有必要细到每个参数？2024 年的 Adam-mini 论文用一张插图把学习率的「粒度」讲得很直观：从 SGD 的一个学习率管全部，到 Adam 的每个参数一个学习率，中间其实存在一个更省的中间档——按参数块分组管理。下面这张图就是论文里的示意：</p>
+
+          <figure class="paper-figure">
+            <img src="https://arxiv.org/html/2406.16793/extracted/6228547/images/illustration.png" alt="论文原图：Adam-mini 示意图——按 Hessian 结构把参数分组，每组共享一个学习率，学习率的数量介于 SGD 与 Adam 之间" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：Adam-mini 的粒度示意——学习率的数量比 SGD 多、比 Adam 少：按 Hessian（曲率）结构把参数分块，块内共享一个学习率</span>
+              <span class="pf-src">论文原图 · Zhang et al., <em>Adam-mini: Use Fewer Learning Rates To Gain More</em>, 2024, Figure 3 · <a href="https://arxiv.org/abs/2406.16793" target="_blank" rel="noopener">arXiv:2406.16793</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，抓两个点。① <strong>横向上是「学习率的数量」从少到多</strong>：最左的 SGD 只有一个全局学习率，最右的 Adam 给每个参数单独一个学习率，Adam-mini 停在中间——它证明对大多数任务，把参数按曲率相近的块分组、每块一个学习率，效果已经足够。② <strong>分组依据是 Hessian 结构</strong>：哪些参数对同一类损失方向敏感，就归到一组，这与「给每个参数单独配步长」的动机（各方向曲率不均）同源，只是用块级粗粒度换取了状态显存的大幅下降。</p>
+          <p>为什么值得关心一个优化器的「粒度」？因为每个参数的学习率不是白来的——Adam 必须为每个参数额外存一阶矩 $m$ 和二阶矩 $v$ 两份状态，百亿参数就是两份百亿量级的 fp32 张量。Adam-mini 把「每参数一份」压缩到「每块一份」，优化器状态显存可以省下可观的量，且在许多任务上收敛效果与 AdamW 相当。这正是「自适应学习率」这条思路的工程边界：<em>不是越细越好，而是细到够用为止</em>。想继续往下看不同优化器在显存上的账，跳到本页后面的「优化器的显存账」。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+            classDiagram
+  class Optimizer {
+    +step()
+    +zero_grad()
+  }
+  class SGD {
+    +lr
+    +momentum
+  }
+  class Adam {
+    +beta1
+    +beta2
+  }
+  class AdamW {
+    +weight_decay
+  }
+  Optimizer <|-- SGD
+  Optimizer <|-- Adam
+  Adam <|-- AdamW
+            </div>
+            <figcaption>优化器的继承关系：AdamW 在 Adam 基础上把权重衰减解耦，工程框架里常这样组织</figcaption>
+          </figure>
+
+          <div class="callout">
+            <span class="callout-t">为什么 Adam 成为默认</span>
+            它同时治了两个硬伤：动量给惯性冲过洼地，自适应给每个参数自己的步长。对超参数也比 SGD 鲁棒得多，学习率稍大稍小都能跑。这份"好上手"让它长期占据主流。
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            同一个学习率数字，在 SGD 和 Adam 里的<strong>物理含义完全不同</strong>。SGD 的每步位移是「学习率 × 梯度」，梯度为 10 就挪 $10\eta$；而 Adam 用二阶矩把梯度量级归一化后，每步位移约为「学习率」，与梯度大小基本解耦。所以把 SGD 调好的 $\eta=0.01$ 直接搬给 Adam，行为会天差地别；反之亦然。<strong>学习率不能跨优化器直接迁移</strong>，这就是为什么各家训练报告都会写明「我们用的优化器 + 学习率」，缺一不可。常见的适配起点是：SGD 用 $0.01\sim0.1$ 量级，Adam/AdamW 用 $10^{-4}\sim3\times10^{-3}$ 量级，然后各自做一次学习率找范围。</div>
+
+          <div class="callout warn">
+            <span class="callout-t">真实坑：Adam 的权重衰减失效</span>
+            工程实践里常把 L2 正则（权重衰减）实现成"把权重的一小部分加进梯度"。但 Adam 会用自适应分母把这个额外项缩掉，使正则强度被严重稀释——同一组超参下，SGD+weight_decay 和 Adam+weight_decay 的实际正则强度根本不是一个量级。这是 Adam 到 AdamW 的直接导火索。
+          </div>
+
+          <h2>AdamW：权重衰减的正确姿势</h2>
+          <p>AdamW 的核心改动只有一处：<strong>把权重衰减从梯度里拆出来，直接作用在参数上，不经过自适应缩放</strong>。</p>
+          <div class="figure" style="text-align:center">
+            $$\theta \leftarrow \theta - \eta\,\frac{\hat{m}_t}{\sqrt{\hat{v}_t}+\varepsilon} \;-\; \eta\,\lambda\,\theta$$
+          </div>
+          <p>看公式右半部分：$\eta\lambda\theta$ 这一项与梯度的自适应项并列、独立，不再被 $\sqrt{v_t}$ 缩放。后果是<strong>权重衰减的强度变得可预测、可对齐</strong>——同样的 $\lambda$ 在 SGD 和 AdamW 下作用量级一致，迁移实验结论变得有意义。</p>
+          <p>这一改动看似微小，影响却极大：它让大模型训练里的正则强度可复现、可比较，正则化与自适应学习率解耦后，两者可以独立调。今天主流大模型（Llama、Qwen、DeepSeek 等）的预训练几乎清一色用 AdamW，$\lambda$ 取值通常在 $0.01 \sim 0.1$ 量级，具体以各家技术报告为准。</p>
+          <p>从等价视角看：AdamW 在 SGD 意义下把权重衰减严格当作"解耦的 L2 正则"；而旧式 Adam+L2 则把衰减项乘进了自适应分母 $\sqrt{\hat v_t}$——当某参数梯度历史很大时，它的衰减被分母吞掉，正则几乎失效。所以想让权重衰减"真的起作用"，AdamW 才是正确实现。这一点在 Transformer 上尤其明显：embedding 等层的权重范数会随训练增长，若不真正做权重衰减，模型容易把某些权重训得过大。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> SGD
+  SGD --> Momentum: 加惯性冲出洼地
+  Momentum --> Adam: 每参数自适应步长
+  Adam --> AdamW: 权重衰减解耦
+  AdamW --> [*]
+  note right of Adam
+    缺点：L2 被自适应分母稀释
+  end note
+            </div>
+            <figcaption>四代优化器的状态演进；注意 Adam 那一格的硬伤正是 AdamW 要修的</figcaption>
+          </figure>
+
+          <h2>学习率调度：warmup 与余弦衰减</h2>
+          <p>优化器定了，学习率怎么随时间变化同样关键。训练初期，参数随机、自适应统计（$m,v$）还没攒够，直接上大学习率极易发散；后期靠近谷底，又该把步长收小好"精细对准"。大模型预训练的标配是 <strong>warmup（线性升温）+ cosine decay（余弦衰减）</strong>：先从小学习率线性升到峰值，再沿余弦曲线平滑降到接近零。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>调度方式</th><th>形状</th><th>何时用</th></tr></thead>
+              <tbody>
+                <tr><td>constant</td><td>全程不变</td><td>短训练、调试脚本</td></tr>
+                <tr><td>step decay</td><td>阶梯式跳降</td><td>旧范式，如今较少用</td></tr>
+                <tr><td>cosine decay</td><td>平滑降到近 0</td><td>预训练常用</td></tr>
+                <tr><td>warmup + cosine</td><td>先升后降</td><td>大模型预训练事实标配</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>下面这张交互图给出一份典型的 warmup+cosine 曲线（峰值 $10^{-3}$、谷底 $10^{-4}$、前 100 步升温、共 1000 步）。可以直观看到：开头一段贴合斜线上升，之后是平滑的余弦下落。</p>
+          <div class="chart-box"><canvas id="cbChartLR"></canvas></div>
+          <script>
+          (function(){
+            var ctx = document.getElementById('cbChartLR');
+            if(!ctx || !window.CB_CHARTS) return;
+            var chart = new Chart(ctx, {
+              type: 'line',
+              data: {
+                labels: ['0','50','100','150','200','300','400','500','600','700','800','900','1000'],
+                datasets: [{
+                  label: '学习率（warmup 100 步 + cosine 到 1000 步）',
+                  data: [0.0,0.0005,0.001,0.000993,0.000973,0.000895,0.000775,0.000628,0.000472,0.000325,0.000205,0.000127,0.0001],
+                  borderColor: window.CB_COLORS.amber,
+                  backgroundColor: window.CB_COLORS.amberSoft,
+                  fill: true, tension: 0.3, pointRadius: 3, borderWidth: 2
+                }]
+              },
+              options: {
+                plugins: { title: { display: true, text: '学习率调度：先 warmup 升温，再 cosine 衰减' } },
+                scales: {
+                  x: { title: { display: true, text: '训练步数' } },
+                  y: { title: { display: true, text: '学习率' }, type: 'logarithmic' }
+                }
+              }
+            });
+            window.CB_CHARTS.push(chart);
+          })();
+          </script>
+
+          <h2>梯度裁剪：给更新量上保险</h2>
+          <p>大模型训练里常出现"loss spike"——某一步梯度突然爆大，把参数一把带飞，之后要花很久才恢复。梯度裁剪（gradient clipping）是标配的保险：算出全局梯度范数，若超过阈值就整体等比缩小，不让任何一步走得太远。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TD
+  G["拿到本步梯度 g"] --> N["算全局范数 ‖g‖"]
+  N --> C{"‖g‖ 大于阈值?"}
+  C -->|是| D["g = g · 阈值/‖g‖"]
+  C -->|否| K["保持 g 不变"]
+  D --> U["送去优化器更新"]
+  K --> U
+            </div>
+            <figcaption>按全局范数裁剪：只在大梯度时等比缩放，方向不变、步长封顶</figcaption>
+          </figure>
+          <p>注意裁剪按"全局范数"而非逐参数，所以它改变的是步长上限、不改变更新方向，因此不会破坏前面各优化器的收敛性质。阈值常取 1.0（全局范数），是预训练里几乎必开的稳定手段。</p>
+
+          <h2>学习率过大与过小：现象、诊断与修复</h2>
+          <p>学习率是训练里最容易被乱调、也最能直接看出效果的超参。把它设错，再好的优化器也白搭。下面把"过大"和"过小"各自的现象、判断方法和修法讲透，并给一个具体数字例子，让你下次看到 loss 曲线就能对症下药。</p>
+          <p><strong>学习率过大，典型现象是训练一开始 loss 就剧烈震荡，甚至跳上几个数量级、直接变 NaN。</strong>原因很简单：更新步长太大，一步就越过了谷底，甚至迈到损失更高的区域；在陡峭方向上，参数会在谷底两边来回横跳，像把球从坡上滚下去却刹不住车。用一个数字感受：假设某参数当前值 $\theta=1$，梯度是 10（相当陡），学习率若取 1.0，一步就是 $\theta=1-1.0\times10=-9$——参数一下翻到对面山坡上，这就是"发散"的微观过程。</p>
+          <p>诊断学习率过大，最直接的手段是看训练前几百步的 loss 曲线：如果 loss 不是平滑下降，而是剧烈锯齿甚至出现 NaN，几乎可以断定是学习率太大。修复也很标准：把学习率往小调一个量级重试（比如从 0.1 降到 0.01），或者给训练加 warmup，让前几步从很小的学习率开始，给参数和自适应统计一个缓冲期。大多数情况下，warmup 就够兜住前期的不稳定。</p>
+          <p><strong>学习率过小，现象则完全相反：loss 缓慢下降、看起来"很稳定"，但训练几万步才走完别人几千步的路。</strong>用同样的数字感受：仍取梯度 10，若学习率只有 0.0001，一步只移动 0.001——从一个随机的初始点走到谷底需要天文数字步数，训练结束时模型还停在半山腰，表现为"训了很久却离最优解很远"。这类失败比发散隐蔽，因为它不报错、曲线也平滑，容易让人误以为一切正常。</p>
+          <p>诊断学习率过小，看 loss 的下降斜率即可：如果 loss 长期贴着地板往下"磨"，说明每步都在前进但太慢。修复方向是先做"学习率找范围"实验——从很小的学习率开始，指数增大跑几百步，画 loss 曲线，找到它开始平滑下降的那一段，取该区间的中上段作为初始学习率。这个流程也叫 learning rate finder，是快速确定合理量级的标准做法。</p>
+          <p>一个实用经验是：学习率宁可先用"偏大区间做扫描"，再收敛到"稳定下降区间的中段"。真正成熟的大模型训练，会把学习率调度交给 warmup 加 cosine decay，配合梯度裁剪兜底，让这个最敏感的超参在安全范围内自动运行——但理解它过大过小各自长什么样，仍然是你在跑自定义实验时必须具备的基本功。</p>
+
+          <h2>一次训练 step 里优化器在做什么</h2>
+          <p>把优化器和前面的反向传播拼起来，一次迭代里它的职责是：接住梯度、更新内部状态、算出最终更新量。下面用时序图串一遍（以 AdamW 为例）。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant F as 前向 forward
+  participant B as 反向 backward
+  participant O as 优化器 AdamW
+  participant S as 学习率调度器
+  F->>B: 算出 loss 与梯度 g_t
+  B->>O: 交付梯度 g_t
+  O->>O: 更新一阶矩 m、二阶矩 v
+  S->>O: 给出当前学习率 lr_t
+  O->>F: θ ← θ - lr_t·(m/√v) - lr_t·λθ
+            </div>
+            <figcaption>优化器不是孤立的：它接梯度、管状态、配合学习率调度，才输出真正写回参数的更新</figcaption>
+          </figure>
+
+          <h2>实战选择：什么时候用哪个</h2>
+          <p>说了这么多代际演进，落到选型上其实有现成的经验：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>场景</th><th>推荐</th><th>理由</th></tr></thead>
+              <tbody>
+                <tr><td>大模型预训练</td><td>AdamW</td><td>正则可复现、对超参鲁棒，是事实标准</td></tr>
+                <tr><td>小模型 / 视觉微调</td><td>SGD + 动量</td><td>泛化常优于自适应方法，调好了上限高</td></tr>
+                <tr><td>快速实验、不确定超参</td><td>Adam</td><td>默认参数就能跑，最省心</td></tr>
+                <tr><td>LoRA 等 PEFT 微调</td><td>AdamW</td><td>与预训练一致，便于复用经验（见 <a href="../07-posttraining/peft-lora.html">LoRA 微调</a>）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>把几种优化器横向摆在一起看更清楚：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>优化器</th><th>动量</th><th>自适应步长</th><th>权重衰减方式</th><th>每参数额外状态</th><th>典型用途</th></tr></thead>
+              <tbody>
+                <tr><td>SGD</td><td>否</td><td>否</td><td>加进梯度</td><td>0</td><td>视觉微调</td></tr>
+                <tr><td>SGD + 动量</td><td>是</td><td>否</td><td>加进梯度</td><td>$1\times$（速度 $v$）</td><td>视觉微调</td></tr>
+                <tr><td>RMSProp</td><td>否</td><td>是</td><td>加进梯度</td><td>$1\times$（$v$ 二阶矩）</td><td>RNN / 早期</td></tr>
+                <tr><td>Adam</td><td>是</td><td>是</td><td>加进梯度（被稀释）</td><td>$2\times$（$m,v$）</td><td>通用默认</td></tr>
+                <tr><td>AdamW</td><td>是</td><td>是</td><td>直接作用参数</td><td>$2\times$（$m,v$）</td><td>大模型预训练</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>常用超参默认值速查</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>超参</th><th>SGD(+动量)</th><th>Adam / AdamW</th></tr></thead>
+              <tbody>
+                <tr><td>学习率 $\eta$</td><td>$0.01\sim 0.1$（需 warmup）</td><td>$10^{-3}\sim 3\times10^{-3}$</td></tr>
+                <tr><td>动量 $\beta$</td><td>$0.9$</td><td>$\beta_1=0.9$</td></tr>
+                <tr><td>$\beta_2$</td><td>—</td><td>$0.999$</td></tr>
+                <tr><td>$\varepsilon$</td><td>—</td><td>$10^{-8}$</td></tr>
+                <tr><td>权重衰减 $\lambda$</td><td>$10^{-4}\sim 10^{-1}$</td><td>$0.01\sim 0.1$</td></tr>
+                <tr><td>梯度裁剪（全局范数）</td><td>$1.0$</td><td>$1.0$</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>优化器的显存账</h3>
+          <p>Adam/AdamW 为每个参数额外维护一阶矩 $m$ 和二阶矩 $v$，通常存为 fp32。再加上混合精度下的一份 fp32 主权重，优化器状态就成了训练显存的大头之一。业界常粗略记：<strong>混合精度 + AdamW 训练，每参数约需 18 字节量级</strong>（fp16 参数 2 + fp16 梯度 2 + fp32 主权重 4 + fp32 $m$ 4 + fp32 $v$ 4 = 16，再加激活与碎片）。这正解释了为什么大模型训练显存紧张，以及为什么需要把优化器状态分片到多卡（见 <a href="../06-pretraining/distributed-training.html">分布式训练</a> 的 ZeRO）。</p>
+
+          <p>几个真实工程要点，避免踩坑：</p>
+          <ul>
+            <li><strong>学习率是最关键的超参</strong>，比优化器选型更重要。再好的优化器配错学习率也白搭，常见做法是先做学习率找范围（loss 曲线是否平滑下降），再细调。</li>
+            <li><strong>学习率要 warmup 再 decay</strong>。训练初期梯度噪声大、自适应统计未稳定，直接上大学习率易发散；线性升温再余弦衰减是预训练标配。</li>
+            <li><strong>梯度裁剪（gradient clipping）</strong>按全局范数裁，防 loss spike 把权重带飞，大模型训练几乎必开。</li>
+            <li><strong>Adam 不保证收敛到最优泛化解</strong>，某些任务上 SGD+动量的最终泛化更好——这也是视觉领域仍用 SGD 的原因之一。</li>
+          </ul>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root((优化算法))
+    梯度下降
+      批量/小批量/SGD
+      学习率 η
+    动量
+      速度累积
+      Nesterov
+    自适应
+      RMSProp
+      Adam 一阶矩二阶矩
+    权重衰减
+      L2 正则
+      AdamW 解耦
+    学习率调度
+      warmup
+      cosine decay
+    实战
+      梯度裁剪
+      显存账
+            </div>
+            <figcaption>本页概念落点地图：从梯度下降到学习率调度、显存账</figcaption>
+          </figure>
+
+          <h2>二阶方法与自适应之外</h2>
+          <p>Adam 这类一阶方法只用梯度（一阶信息），步长对所有方向"平均"对待。理论上，<strong>二阶方法</strong>（如牛顿法、L-BFGS）会利用"曲率"（Hessian）给每个方向单独定步长，在凸问题上收敛更快。但大模型参数是百亿级，Hessian 根本存不下，纯二阶方法不现实。</p>
+          <p>于是出现了一批"折中"优化器：它们在 Adam 的框架上，用低秩或块对角近似来引入曲率信息——例如 Shampoo、以及 2024 年后受到关注的 Muon（对矩阵参数做谱分解来定方向）。这类方法在部分任务上展现出比 AdamW 更优的"每 token 样本效率"，但工程复杂度和超参敏感度高，目前更多用于前沿研究和特定训练配方，尚未成为通用默认。具体适用范围以各方法论文与官方实现为准。</p>
+          <div class="callout">
+            <span class="callout-t">给初学者的取舍建议</span>
+            不要一上来就追新优化器。AdamW + warmup + cosine decay + 梯度裁剪，已经是覆盖绝大多数场景的稳健基线；只有当你明确卡在"训练效率"或"收敛质量"瓶颈、且已排除数据和学习率问题后，才值得去试二阶/谱方法。
+          </div>
+
+          <details class="deep">
+            <summary>展开：从零实现 SGD、动量、Adam 的更新步</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">import torch
+
+def sgd_step(p, grad, lr):
+    p.data -= lr * grad
+
+def momentum_step(p, grad, v, lr, beta=0.9):
+    v.mul_(beta).add_(grad)          # v = beta*v + grad
+    p.data -= lr * v
+
+def adam_step(p, grad, m, v, t, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+    m.mul_(beta1).add_(grad, alpha=1 - beta1)
+    v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+    m_hat = m / (1 - beta1 ** t)      # 偏差修正
+    v_hat = v / (1 - beta2 ** t)
+    p.data -= lr * m_hat / (v_hat.sqrt() + eps)</code></pre>
+              <p style="margin-bottom:0">三段代码就是三代的全部核心差异：动量多了一个速度缓存，Adam 多了二阶矩和偏差修正。框架封装得更复杂（混合精度、 fused kernel），但优化逻辑不变。理解了这三段，就能看懂任意优化器配置。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：手算一遍——Adam 怎么把「陡平方向」的步长拉齐</summary>
+            <div class="deep-body">
+              <p>假设有两个参数 $a$ 和 $b$，梯度一直稳定在 $g_a = 10$、$g_b = 0.1$——一个陡方向、一个平方向，正是前面条件数例子里那种「曲率差 100 倍」的简化版。取 $\eta=0.1$、$\beta_1=0.9$、$\beta_2=0.999$，走第一步，对比 SGD 与 Adam：</p>
+              <ul>
+                <li><strong>SGD</strong>：$a$ 位移 $0.1 \times 10 = 1.0$，$b$ 位移 $0.1 \times 0.1 = 0.01$。差 100 倍——平方向几乎原地踏步。</li>
+                <li><strong>Adam（参数 $a$）</strong>：一阶矩 $m_1 = 0.1\times10 = 1$，二阶矩 $v_1 = 0.001\times10^2 = 0.1$；偏差修正后 $\hat m_1 = 1/0.1 = 10$、$\hat v_1 = 0.1/0.001 = 100$；位移 $= 0.1 \times 10/\sqrt{100} = 0.1$。</li>
+                <li><strong>Adam（参数 $b$）</strong>：$m_1 = 0.1\times0.1 = 0.01$，$v_1 = 0.001\times0.1^2 = 0.00001$；修正后 $\hat m_1 = 0.01/0.1 = 0.1$、$\hat v_1 = 0.00001/0.001 = 0.01$；位移 $= 0.1 \times 0.1/\sqrt{0.01} = 0.1$。</li>
+              </ul>
+              <p>看到关键了：<strong>SGD 下两个方向每步位移差 100 倍，Adam 下都恰好是 0.1（≈$\eta$）</strong>。因为 Adam 的分母用「历史梯度幅度」把每个方向归一化了——陡方向被压、平方向被抬，最终每步的有效位移大致都在学习率量级。这就是「自适应」两字的精确含义：<em>它不等步长，它把不同方向的步长拉齐到同一个可比的量级</em>。</p>
+              <p>由此也能推出两个实践推论：一是 Adam 的学习率几乎就是「每步位移的绝对量级」，所以直接按 $10^{-4}\sim10^{-3}$ 起步比较安全；二是梯度恒为 0 的参数，$v=0$，分母加上 $\varepsilon$ 只是防除零，并不会让它动起来——靠梯度本身为 0 时，任何优化器都救不了。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>SGD</strong>：固定步长走负梯度，简单但慢、易卡鞍点。工程里的"SGD"通常指小批量版。</li>
+            <li><strong>核心难题</strong>：loss 各方向曲率可差百倍，统一学习率顾此失彼——这是动量与自适应的共同动机。</li>
+            <li><strong>动量</strong>：累加历史梯度加惯性，$v_t=\beta v_{t-1}+g_t$，治"易卡住"、在缓方向加速。</li>
+            <li><strong>Adam</strong>：动量 + 自适应，每参数独立步长，对超参鲁棒，但权重衰减会被吃掉。</li>
+            <li><strong>AdamW</strong>：把权重衰减从梯度里解耦直接作用参数，正则可复现，是大模型预训练事实默认。</li>
+            <li><strong>配套手段</strong>：warmup+cosine 调度、梯度裁剪防 spike、关注优化器显存账。</li>
+            <li><strong>常见坑</strong>：Adam+L2 与 AdamW 不是一回事、跨优化器迁超参不靠谱、不 warmup 直接大学习率易发散。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Kingma &amp; Ba《Adam: A Method for Stochastic Optimization》— Adam 的原始论文，定义了一阶/二阶矩估计与偏差修正 · <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener">arXiv:1412.6980</a></li>
+            <li>Loshchilov &amp; Hutter《Decoupled Weight Decay Regularization》— AdamW 的原始论文，讲清为何要把权重衰减从自适应梯度中解耦 · <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener">arXiv:1711.05101</a></li>
+            <li>Sebastian Ruder《An overview of gradient descent optimization algorithms》— 把 SGD 到 Adam 各代优化器的动机与差异梳理得最清楚的一篇综述，适合建立全局图景 · <a href="https://ruder.io/optimizing-gradient-descent/" target="_blank" rel="noopener">ruder.io</a></li>
+            <li>Goyal et al.《Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour》— 提出学习率 warmup，奠定了大模型预训练"升温再衰减"的调度范式 · <a href="https://arxiv.org/abs/1706.02677" target="_blank" rel="noopener">arXiv:1706.02677</a></li>
+            <li>Wilson et al.《The Marginal Value of Adaptive Gradient Methods》— 指出 Adam 等自适应方法在某些任务上泛化不如 SGD，解释了为何视觉领域仍偏爱 SGD+动量 · <a href="https://arxiv.org/abs/1705.08292" target="_blank" rel="noopener">arXiv:1705.08292</a></li>
+            <li>Zhang et al.《Adam-mini: Use Fewer Learning Rates To Gain More》— 本页「学习率粒度」一节的来源：按 Hessian 结构分组共享学习率，优化器状态显存大幅下降 · <a href="https://arxiv.org/abs/2406.16793" target="_blank" rel="noopener">arXiv:2406.16793</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            梯度和优化器都有了，可以拼出第一个能跑的网络了。下一节 <a href="neural-networks.html">神经网络基础</a> 把线性层、激活、损失、正则化组装成 MLP；之后到 <a href="../03-transformer/attention.html">注意力机制</a> 看 Transformer 时代的真正主角；想了解怎么在有限显存里塞下 AdamW 的状态，可见 <a href="../06-pretraining/distributed-training.html">分布式训练</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MoE 混合专家 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="04-modern-arch" data-topic="moe">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+              <span class="tag-frontier">2026 前沿</span>
+            </div>
+            <h1>MoE 混合专家</h1>
+            <p class="lead">如何让模型拥有几千亿参数的「知识容量」，却只花几百亿参数的「推理成本」？答案是稀疏激活：每个 token 只唤醒一小撮相关的「专家」。MoE 已从研究概念变成 2026 前沿模型的默认架构。这一节从路由机制讲到负载均衡，从训练稳定性讲到推理部署，配上完整代码和 DeepSeek 架构剖析。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>把 Transformer 里那个稠密的前馈网络（FFN）拆成许多个小 FFN（专家），再加一个<strong>路由器（Router）</strong>。每个 token 进来，路由器只挑选 Top-K 个最相关的专家去处理，其余专家完全不激活。于是<strong>总参数量巨大（能力强），但单次实际计算量很小（成本低）</strong>。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  T["输入 Token"] --> R{{"路由器 Router<br/>算亲和度打分"}}
+  R -->|Top-2 选中| E1["专家 1"]
+  R -->|Top-2 选中| E3["专家 3"]
+  R -.未激活.-> E2["专家 2"]
+  R -.未激活.-> E4["专家 4"]
+  E1 --> S["加权求和"]
+  E3 --> S
+  S --> O["输出"]
+  style E1 fill:#e6f1fb,stroke:#185fa5
+  style E3 fill:#e6f1fb,stroke:#185fa5
+  style E2 fill:#f1f3f6,stroke:#d0d5de
+  style E4 fill:#f1f3f6,stroke:#d0d5de
+              </div>
+              <figcaption>MoE 前向：路由器为每个 token 选 Top-K 专家，只激活选中的那几个。未被选中的专家不参与计算——但它们的权重仍然占显存。              </figcaption>
+            </figure>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+mindmap
+  root((MoE 混合专家))
+    容量解耦
+      总参数决定知识容量
+      激活参数决定推理成本
+    路由策略
+      Top-K 选择
+      Expert-Choice
+      Fine-Grained 细粒度
+      Shared 共享专家
+    训练难题
+      负载均衡(马太效应)
+      路由崩塌
+    部署挑战
+      专家并行
+      All-to-All 通信
+      量化与显存
+              </div>
+              <figcaption>MoE 知识地图：把"容量解耦"作为总纲，路由策略、训练难题、部署挑战三条支线各自展开</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 1: 稠密 vs 稀疏 ============ -->
+          <h2>稠密 vs 稀疏：核心区别</h2>
+          <p>理解 MoE，先分清两个关键的参数概念。这两个概念的解耦是 MoE 的全部价值所在：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Dense["稠密模型 Dense"]
+    direction TB
+    D1["总参数 = 激活参数<br/>例: 70B"]
+    D1 --> D2["每个 token<br/>经过全部参数"]
+    D2 --> D3["知识容量受限于<br/>激活参数量"]
+  end
+  subgraph Sparse["稀疏模型 MoE"]
+    direction TB
+    S1["总参数 ≠ 激活参数<br/>例: 671B 总 / 37B 激活"]
+    S1 --> S2["每个 token<br/>只经过 Top-K 专家"]
+    S2 --> S3["知识容量由总参数决定<br/>推理成本由激活参数决定"]
+  end
+
+  style Dense fill:#f5f5f5,stroke:#999
+  style Sparse fill:#e8f5e9,stroke:#4a7
+            </div>
+            <figcaption>稠密 vs 稀疏：稠密模型的总参数 = 激活参数，知识容量和推理成本绑在一起。MoE 把两者解耦——容量靠总参数，成本靠激活参数。</figcaption>
+          </figure>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">总参数量 Total Params</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">模型拥有的全部参数，决定<strong>知识容量的上限</strong>。MoE 可以做到极大（如 DeepSeek-V3 达 671B）。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">激活参数量 Active Params</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">处理单个 token 实际参与计算的参数，决定<strong>推理成本与速度</strong>。DeepSeek-V3 每次仅激活 37B。</p>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>稠密模型 Dense</th><th>稀疏模型 MoE</th></tr></thead>
+              <tbody>
+                <tr><td>每个 token 激活的参数</td><td>全部参数</td><td>仅 Top-K 专家（一小部分）</td></tr>
+                <tr><td>相同算力下的容量</td><td>较小</td><td>可大数倍到数十倍</td></tr>
+                <tr><td>显存占用</td><td>较低</td><td>高（所有专家都要驻留显存）</td></tr>
+                <tr><td>训练稳定性</td><td>成熟稳定</td><td>需处理负载均衡等难题</td></tr>
+                <tr><td>代表模型</td><td>Llama 3 稠密版</td><td>DeepSeek-V3、Qwen3-MoE、gpt-oss</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            MoE 用「显存换算力」——参数都存着（占显存），但每次只算一部分（省算力），换来「大模型能力、小模型成本」。代价是显存需求暴增：671B 参数的模型即使量化后也需要多卡才能装载。
+          </div>
+
+          <h3>算一笔账：Mixtral 8×7B 的参数从哪来</h3>
+          <p>"8×7B 却只有 46.7B 而不是 56B"是很多人第一次看到 Mixtral 时的疑惑。把参数拆开数一遍，MoE 的账就彻底清楚了。Mixtral 8×7B 的配置是 $d_{model} = 4096$、FFN 中间维度 $d_{ff} = 14336$、32 层、8 个专家、每 token 选 2 个。它用的是 SwiGLU，一个 FFN 里有三个大矩阵（gate、up、down），所以：</p>
+
+          <div class="figure" style="text-align:center">
+            $$\text{单个专家参数} = 3 \times d_{model} \times d_{ff} = 3 \times 4096 \times 14336 \approx 1.76\times10^8$$
+          </div>
+
+          <p>也就是每个专家约 1.76 亿参数。一层有 8 个专家，32 层共 $8 \times 1.76\text{亿} \times 32 \approx 451$ 亿。再加上注意力层、词嵌入和输出头约 16 亿，总计约 <strong>467 亿（46.7B）</strong>——和官方数字对上了。之所以不是 $8 \times 7 = 56$B，是因为<strong>注意力层和词表在 8 个"7B"之间是共享的，没有复制 8 份</strong>，重复计算了才会得出 56B。</p>
+
+          <p>激活参数同理：每个 token 只走 2 个专家，$2 \times 1.76\text{亿} \times 32 \approx 113$ 亿，加上共享的注意力和嵌入约 16 亿，得到约 <strong>129 亿（12.9B）</strong>。于是这个模型的性格就出来了：<strong>推理时的算力开销接近一个 13B 稠密模型，但知识容量对标 47B 级别；显存却要按 47B 准备。</strong></p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模型</th><th>总参数</th><th>激活参数</th><th>稀疏比</th><th>BF16 权重显存</th><th>推理算力约等于</th></tr></thead>
+              <tbody>
+                <tr><td>Llama-3-8B（稠密对照）</td><td>8B</td><td>8B</td><td>1.0</td><td>≈ 16 GB</td><td>8B 稠密</td></tr>
+                <tr><td><strong>Mixtral 8×7B</strong></td><td>46.7B</td><td>12.9B</td><td>≈ 3.6×</td><td>≈ 93 GB</td><td>13B 稠密</td></tr>
+                <tr><td><strong>Mixtral 8×22B</strong></td><td>≈ 141B</td><td>≈ 39B</td><td>≈ 3.6×</td><td>≈ 282 GB</td><td>39B 稠密</td></tr>
+                <tr><td><strong>DeepSeek-V3</strong></td><td>671B</td><td>37B</td><td>≈ 18×</td><td>≈ 1342 GB</td><td>37B 稠密</td></tr>
+                <tr><td><strong>Qwen3-235B-A22B</strong></td><td>235B</td><td>22B</td><td>≈ 10.7×</td><td>≈ 470 GB</td><td>22B 稠密</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>"稀疏比"这一列是 MoE 设计里最有信息量的指标。早期 MoE（Mixtral 一代）只有 3.6×，因为专家数少（8 个）、每次选得多（2 个）。DeepSeek-V3 把稀疏比推到 18×，靠的是<strong>专家切得更细（256 个）而每次仍只选 8 个</strong>。稀疏比越高，"用小算力买大容量"的杠杆就越大——但显存代价和路由难度也同步上升。DeepSeek-V3 的 1342 GB BF16 权重意味着最少要 17 张 80 GB 卡才装得下，这不是普通团队能承担的部署。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">MoE 的经济学：省的是算力，花的是显存和带宽</span>
+            如果你的瓶颈是<strong>训练/推理算力</strong>（有卡但每张卡算不快，或者按 FLOPs 计费），MoE 极其划算。如果你的瓶颈是<strong>显存容量</strong>（比如只有一两张卡、要做端侧部署），MoE 是纯粹的负担——同样 16 GB 显存，稠密模型能跑 8B，MoE 只能跑一个激活参数 2B 左右的小模型。选型前先想清楚自己卡在哪一头。
+          </div>
+
+          <!-- ============ Section 2: 路由机制 ============ -->
+          <h2>路由机制：怎么选专家</h2>
+          <p>路由器是 MoE 的大脑，通常就是一个小小的线性层。它为每个 token 计算对所有专家的亲和度分数，再选出得分最高的 K 个：</p>
+
+          <p>MoE 的路由机制最早被画进论文，是从 Switch Transformer 那张著名的「编码器块」示意图开始的。它也是理解「MoE 到底改了什么」的最直观一页：在普通 Transformer 编码器里，前馈网络（FFN）是一整个稠密模块；Switch Transformer 把它替换成一个「路由器 + 多个小 FFN 专家」的稀疏结构。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/04-modern-arch/moe/fig1.png" alt="论文原图：Switch Transformer 编码器块——路由器把每个 token 独立路由到 4 个 FFN 专家之一，稀疏开关层替换稠密 FFN" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：Switch Transformer 的编码器块——中间的稠密 FFN 被替换成「路由器 + 稀疏 Switch FFN」，每个 token 独立被路由到其中一个专家，输出按门控权重缩放</span>
+              <span class="pf-src">论文原图 · Fedus, Zoph &amp; Shazeer, <em>Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity</em>, 2021, Figure 2 · <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">arXiv:2101.03961</a></span>
+            </figcaption>
+          </figure>
+
+          <p>这张图是 MoE 新手的第一张地图，逐块看有四件事：<strong>① 大块的蓝色区域是「稀疏 Switch FFN 层」</strong>，它整体替换了原来的稠密 FFN——层数、输入输出维度都不变，接缝处无需改动；<strong>② 图里画了两个 token（x₁="More"、x₂="Parameters"）</strong>，用实线表示它们被路由器分别派往不同的专家——注意每个 token 是「独立」路由的，这正是稀疏激活与稠密 FFN「所有 token 过所有参数」的分水岭；<strong>③ 路由器的输出不是硬开关</strong>——专家输出还要乘以一个门控权重（图上虚线表示的 gate value），这个权重让路由器可微、能训练；<strong>④ 图里只画了 4 个专家、每个 token 去 1 个</strong>——对应 Switch 的 Top-1 简化，而 GShard / Mixtral 的 Top-2 只是「选 2 个专家再加权」的推广。</p>
+          <p>需要特别指出：Switch Transformer 论文里用的是 <strong>Top-1 路由</strong>（每个 token 只去一个专家），这是它比 GShard 更「激进」的简化——训练更快、通信更少，但路由决策也更脆弱。今天的 MoE 模型大多回到 Top-2 或细粒度 Top-8，但「路由器打分 → 门控加权 → 只算选中专家」这个骨架，全部源自这张图。</p>
+          <div class="figure" style="text-align:center">
+            $$g = \text{Softmax}(x \cdot W_g), \qquad y = \sum_{i \in \text{Top-}K(g)} g_i \cdot E_i(x)$$
+          </div>
+          <p>其中 $W_g$ 是路由器权重，$g_i$ 是第 $i$ 个专家的门控权重，$E_i(x)$ 是第 $i$ 个专家的输出。只有进入 Top-K 的专家才会被计算和加权。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  X["输入 x<br/>(d维向量)"] --> Gate["路由器<br/>W_g: d x N"]
+  Gate --> Scores["亲和度分数<br/>g = softmax(x · W_g)<br/>N个分数"]
+  Scores --> TopK["Top-K 选择<br/>选最高分的K个"]
+  TopK --> Selected["选中: 专家3, 专家7"]
+  TopK -.-> Dropped["未选中: 其他N-K个<br/>不计算"]
+  Selected --> E3["专家3: E3(x)"]
+  Selected --> E7["专家7: E7(x)"]
+  E3 --> Weighted["加权求和<br/>y = g3·E3(x) + g7·E7(x)"]
+  E7 --> Weighted
+  Weighted --> Output["输出 y"]
+
+  style Gate fill:#fef3c7,stroke:#d97706
+  style Selected fill:#e6f1fb,stroke:#185fa5
+  style Dropped fill:#f1f3f6,stroke:#d0d5de
+  style Output fill:#e8f5e9,stroke:#4a7
+            </div>
+            <figcaption>路由机制详解：输入 → 路由器打分 → Top-K 选择 → 只计算选中专家 → 加权求和。整个过程的计算量只有「全部专家都算」的 K/N。</figcaption>
+          </figure>
+
+          <h3>一个容易踩的实现细节：Softmax 在 Top-K 之前还是之后</h3>
+          <p>上面的公式写的是"先 softmax 再取 Top-K"，但工程实现里有两种常见写法，结果并不等价：</p>
+          <ul>
+            <li><strong>先 Softmax 后 Top-K</strong>：在全部 $N$ 个专家上做归一化，再挑出最大的 $K$ 个，保留它们各自的概率值。此时被选中的 $K$ 个权重<strong>加起来不等于 1</strong>（剩下的概率质量被丢掉了）。好处是权重的绝对大小反映了"路由器有多确信"——如果 Top-1 只拿到 0.15，说明模型很犹豫，这个信号会传递到输出的幅度上。</li>
+            <li><strong>先 Top-K 后 Softmax</strong>：先按原始 logits 选出 $K$ 个，再只在这 $K$ 个上做归一化。权重<strong>严格加和为 1</strong>，输出幅度稳定，训练更平滑。Mixtral 用的就是这种。</li>
+          </ul>
+          <p>这个选择会实打实影响训练稳定性。前者在路由器不确定时输出幅度会缩水，相当于给残差流注入了一个随机缩放，早期训练容易震荡；后者则丢失了"确信度"信息，但换来了稳定。<strong>绝大多数现代实现选后者</strong>，因为幅度稳定对深层网络太重要了。上一节代码里的 <code>weights = F.softmax(weights, dim=-1)</code> 正是在 <code>topk</code> 之后做的，就是这个道理。</p>
+
+          <h3>Top-K 里的 K 该取几</h3>
+          <p>$K=1$（Switch Transformer 的做法）是最省算力的极端：每个 token 只过一个专家，通信量和计算量都减半。但它有一个理论上的麻烦——<strong>路由决策是离散的，$K=1$ 时门控权重 $g_i$ 是唯一一个能给路由器传梯度的通道</strong>。如果某个专家从来没被选中，它的路由权重就永远收不到梯度，只能靠辅助损失硬推。</p>
+          <p>$K=2$ 是长期以来的默认值（GShard、Mixtral 都是），因为它提供了"比较"：两个专家的输出被加权混合，路由器能通过调整权重比例学到"谁更合适"，梯度信号明显更好。代价是算力和通信翻倍。</p>
+          <p>$K \geq 8$ 只在<strong>细粒度专家</strong>的设定下才合理。DeepSeek 的思路是：既然要激活 8 个，那就把每个专家做小 8 倍，总激活算力不变，但"从 256 个里选 8 个"的组合数（约 $4\times10^{14}$）远远大于"从 8 个里选 2 个"（28 种）。<strong>组合空间的爆炸式增长，就是细粒度专家带来表达力提升的根本原因。</strong></p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>配置</th><th>专家数 $N$</th><th>选中数 $K$</th><th>组合数</th><th>典型代表</th></tr></thead>
+              <tbody>
+                <tr><td>粗粒度 Top-1</td><td>64–2048</td><td>1</td><td>$N$</td><td>Switch Transformer</td></tr>
+                <tr><td>粗粒度 Top-2</td><td>8–64</td><td>2</td><td>$\binom{8}{2}=28$（$N=8$）</td><td>GShard、Mixtral</td></tr>
+                <tr><td><strong>细粒度 Top-8 + 共享</strong></td><td>256 + 1 共享</td><td>8 + 1</td><td>$\binom{256}{8}\approx 4\times10^{14}$</td><td>DeepSeek-V3</td></tr>
+                <tr><td>细粒度 Top-8</td><td>128</td><td>8</td><td>$\binom{128}{8}\approx 1.4\times10^{12}$</td><td>Qwen3-MoE</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>主流路由策略对比</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>策略</th><th>机制</th><th>优势</th><th>劣势</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Top-K 选择</strong></td><td>token 选得分最高的 K 个专家</td><td>简单高效，最常用</td><td>易导致专家负载不均</td></tr>
+                <tr><td><strong>Expert-Choice</strong></td><td>反过来，由专家挑选 token</td><td>天然负载均衡</td><td>路由决策更复杂</td></tr>
+                <tr><td><strong>Fine-Grained</strong></td><td>切更多更小的专家，细粒度路由</td><td>组合更灵活、精度高</td><td>通信与调度开销大</td></tr>
+                <tr><td><strong>Shared Experts</strong></td><td>共享专家 + 路由专家协同</td><td>兼顾通用与专用知识</td><td>架构更复杂</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：DeepSeek 的细粒度 + 共享专家设计</summary>
+            <div class="deep-body">
+              <p>DeepSeek-V3 采用了两项关键设计，成为 2025-2026 MoE 的标杆：</p>
+              <figure class="figure">
+                <div class="mermaid">
+flowchart TB
+  Input["输入 Token"] --> Shared["共享专家<br/>(始终激活)<br/>处理通用知识"]
+  Input --> Router["路由器"]
+  Router -->|"Top-8"| Routed["256个路由专家中<br/>选8个激活"]
+  Shared --> Combine["合并输出"]
+  Routed --> Combine
+  Combine --> Output["最终输出"]
+
+  style Shared fill:#eaf3de,stroke:#639922
+  style Routed fill:#e6f1fb,stroke:#185fa5
+                </div>
+                <figcaption>DeepSeek 的「1 共享 + 256 路由、每次激活 8 个」设计。共享专家始终激活，处理所有 token 都需要的通用知识；路由专家专注于差异化的专业知识。</figcaption>
+              </figure>
+              <ul>
+                <li><strong>细粒度专家（Fine-Grained）</strong>：把专家切得更小更多（如 256 个路由专家），每次激活 8 个。更细的粒度让专家能学到更专精的知识，组合空间也更大。</li>
+                <li><strong>共享专家（Shared Expert）</strong>：设置 1 个始终激活的共享专家，负责处理所有 token 都需要的通用知识，让路由专家能专注于差异化的专业知识，避免知识冗余。</li>
+              </ul>
+              <p style="margin-bottom:0">这套「1 共享 + 256 路由、每次激活 8 个」的配置，是 DeepSeek 实现 671B 总参数 / 37B 激活的关键。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section 3: 负载均衡 ============ -->
+          <h2>负载均衡：MoE 的头号难题</h2>
+          <p>如果放任路由器自由学习，它会倾向于把大多数 token 都发给少数几个「明星专家」——这些专家越练越强、越强越被选中，形成<strong>马太效应</strong>。结果是大部分专家闲置，模型容量白白浪费，还可能训练崩溃。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Without["无均衡约束"]
+    direction LR
+    W1["路由器自由选择"] --> W2["明星专家被反复选中"]
+    W2 --> W3["明星专家越来越强"]
+    W3 --> W4["其他专家闲置<br/>容量浪费"]
+    W4 --> W5["马太效应加剧<br/>训练可能崩溃"]
+  end
+  subgraph With["有均衡约束"]
+    direction LR
+    G1["辅助损失/偏置调节"] --> G2["强制均匀分配"]
+    G2 --> G3["所有专家都被训练"]
+    G3 --> G4["容量充分利用"]
+  end
+
+  Without -->|"加入均衡机制"| With
+
+  style W5 fill:#fde8e8,stroke:#c44
+  style G4 fill:#e8f5e9,stroke:#4a7
+            </div>
+            <figcaption>负载均衡问题的形成与解决：无约束时马太效应导致专家负载严重不均，加入均衡机制后趋于均匀。这不仅是效率问题，更是训练稳定性的问题。</figcaption>
+          </figure>
+
+          <figure class="figure">
+            <div class="chart-box"><canvas id="loadChart"></canvas></div>
+            <figcaption>无均衡约束时负载严重倾斜；加入辅助损失后趋于均匀</figcaption>
+          </figure>
+
+          <p>常见的解决方案：</p>
+          <ul>
+            <li><strong>辅助负载均衡损失（Auxiliary Loss）</strong>：在训练目标里加一项惩罚，鼓励 token 均匀分配到各专家。</li>
+            <li><strong>无辅助损失均衡（Aux-Loss-Free）</strong>：DeepSeek-V3 采用为每个专家维护一个可动态调整的偏置项，避免辅助损失干扰主任务的梯度。</li>
+            <li><strong>专家容量（Capacity Factor）</strong>：给每个专家设一个 token 处理上限，超出的 token 被丢弃或转发。</li>
+          </ul>
+
+          <h3>容量因子与丢 token：一个必须算清楚的数</h3>
+          <p>"专家容量"这个概念之所以存在，是因为 GPU 上的专家计算必须写成<strong>固定形状的张量运算</strong>。你不能让专家 3 这一步处理 1800 个 token、下一步处理 200 个——那样每一步都要重新分配缓冲区、核函数无法预编译，效率崩溃。所以工程实现要求：<strong>每个专家的输入缓冲区大小是提前固定好的</strong>，装不下的 token 只能溢出。</p>
+
+          <p>容量的计算公式很简单：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{capacity} = \left\lceil \text{CF} \times \frac{T \times K}{N} \right\rceil$$
+          </div>
+          <p>其中 $T$ 是这一批的 token 总数，$K$ 是每 token 选中的专家数，$N$ 是专家数，$\text{CF}$ 是<strong>容量因子（capacity factor）</strong>。分式部分 $T\cdot K/N$ 是"完全均匀分配时每个专家该拿多少"，CF 是留出的余量。</p>
+
+          <p>代入具体数字：一批 $T = 4096$ 个 token，$N = 8$ 个专家，$K = 2$。均匀情况下每个专家该拿 $4096 \times 2 / 8 = 1024$ 个。取 CF = 1.25，容量就是 1280。现在假设路由器学偏了，某个热门专家被分到 1800 个 token——<strong>超出容量的 520 个 token 会被丢弃</strong>，占该专家 token 的 29%，占整批的约 6%。这些 token 在这一层什么都没算，直接靠残差连接穿过去（这就是所谓的"残差转发"，token 至少不会变成零向量），但它们在这一层确确实实没有获得任何 FFN 变换。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>容量因子 CF</th><th>每专家容量（$T$=4096, $N$=8, $K$=2）</th><th>典型丢弃率</th><th>额外显存/算力开销</th><th>适用阶段</th></tr></thead>
+              <tbody>
+                <tr><td>1.0</td><td>1024</td><td>较高，训练早期可达 10%+</td><td>0</td><td>负载已经很均衡时</td></tr>
+                <tr><td><strong>1.25（常用默认）</strong></td><td>1280</td><td>均衡良好时 &lt; 1%</td><td>+25%</td><td>训练主流配置</td></tr>
+                <tr><td>2.0</td><td>2048</td><td>接近 0</td><td>+100%</td><td>训练极早期或路由不稳时</td></tr>
+                <tr><td>无上限（dropless）</td><td>动态</td><td>0</td><td>需要变长核函数（如分组 GEMM）</td><td>推理，或用 MegaBlocks 类实现的训练</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这里有一个反直觉但很重要的现象：<strong>丢 token 在训练时反而有一点"正则化"作用</strong>——它逼着路由器不要过度集中，因为集中的代价是自己选的 token 被扔掉。但在<strong>推理时丢 token 是不可接受的</strong>，因为它会造成输出的不确定性：同一句话，因为和它同批的其他请求不同，被丢弃的 token 也不同，结果就不可复现了。所以生产推理引擎普遍采用 <strong>dropless</strong> 方案——用分组 GEMM（grouped GEMM）或稀疏矩阵核函数支持变长的专家输入，代价是核函数实现复杂得多。MegaBlocks 就是把 MoE 计算改写成块稀疏矩阵乘来实现无丢弃训练的代表工作。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">调试线索</span>
+            如果你训练 MoE 时发现 loss 曲线有规律的锯齿、或者验证集指标显著低于训练集，先查<strong>丢弃率</strong>。很多框架会输出每层的 <code>tokens_dropped</code> 或 <code>capacity_overflow</code> 指标。丢弃率长期高于 5% 基本可以断定负载均衡出了问题，先把 CF 临时提到 2.0 观察，再回头调均衡机制。
+          </div>
+
+          <p><strong>无辅助损失均衡</strong>是 2025 年最被推崇的做法。它不在损失函数里加惩罚项（那会损害主任务），而是给路由分数额外加一个<strong>可学习的偏置 $b_e$</strong>：过载的专家偏置自动下降、少被选中，闲置的专家偏置上升、多被选中。这个偏置按"本步各专家实际负载"在线更新，不进入反向传播的主梯度。下面这段伪代码展示了它的更新逻辑：</p>
+          <pre><code class="language-python"># 无辅助损失均衡：为每个专家维护可更新的偏置 b_e
+# 路由分数 = softmax(x · W_g + b)，偏置 b 按负载在线调整，不进主梯度
+def update_bias(bias, expert_counts, target, lr=1e-3):
+    # bias: [num_experts]；expert_counts: 本步各专家被选中的 token 数
+    imbalance = expert_counts - target        # > 0 表示该专家过载
+    return bias - lr * imbalance               # 过载专家偏置下降，少被选中</code></pre>
+
+          <div class="callout warn">
+            <span class="callout-t">负载不均不只是效率问题</span>
+            如果 80% 的 token 都去 2 个专家，这 2 个专家成为训练瓶颈（梯度更新集中在它们身上），而其他专家几乎不被训练——等于你花了几百亿参数的钱，实际只用了几十亿参数的能力。更严重的是，未被充分训练的专家在推理时可能产生不可预测的输出。
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            很多新手把「总参数 671B」和「显存 671B」混为一谈，或者反过来以为「只激活 37B 就不用装下 671B」。正确的账是这样：<strong>MoE 省的是算力（FLOPs），一分钱都没省显存</strong>。所有专家权重必须全部驻留在显存里（哪怕这次推理只用到其中 8 个），因为下一次推理可能用到任何一个。所以 MoE 的部署账本永远是「按总参数算显存、按激活参数算速度」——这也是为什么 MoE 模型几乎必然配量化、多卡和张量并行，纯靠单卡根本装不下。还有个常见误区：路由器的 Top-K 不是「投票后取众数」，而是<strong>所有被选中专家的输出按门控权重加权求和</strong>——是「混合」，不是「挑选一个」。
+          </div>
+
+          <!-- ============ Section 4: 专家并行 ============ -->
+          <h2>专家并行：MoE 的分布式训练与推理</h2>
+          <p>MoE 的一个核心工程挑战是：所有专家都要驻留显存，但 671B 参数的模型单卡装不下。解决方案是<strong>专家并行（Expert Parallelism）</strong>——把不同的专家放到不同的 GPU 上。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph GPU0["GPU 0"]
+    direction LR
+    G0A["注意力层"] --> G0R["路由器"] --> G0E["专家 1-64"]
+  end
+  subgraph GPU1["GPU 1"]
+    direction LR
+    G1A["注意力层"] --> G1R["路由器"] --> G1E["专家 65-128"]
+  end
+  subgraph GPU2["GPU 2"]
+    direction LR
+    G2A["注意力层"] --> G2R["路由器"] --> G2E["专家 129-192"]
+  end
+  subgraph GPU3["GPU 3"]
+    direction LR
+    G3A["注意力层"] --> G3R["路由器"] --> G3E["专家 193-256"]
+  end
+
+  G0R -.->|"token 需要专家 100"| G1E
+  G1R -.->|"token 需要专家 200"| G3E
+
+  style G0E fill:#e6f1fb,stroke:#185fa5
+  style G1E fill:#e6f1fb,stroke:#185fa5
+  style G2E fill:#e6f1fb,stroke:#185fa5
+  style G3E fill:#e6f1fb,stroke:#185fa5
+            </div>
+            <figcaption>专家并行：256 个专家分布到 4 张 GPU 上。当某张 GPU 上的 token 需要其他 GPU 上的专家时，通过 All-to-All 通信把 token 发送过去——这就是 MoE 训练中通信开销大的原因。</figcaption>
+          </figure>
+
+          <p>专家并行引入了一个新的通信模式：<strong>All-to-All</strong>——每张 GPU 都可能需要把 token 发送到其他 GPU 上的专家，也要接收其他 GPU 发来的 token。这个通信量比普通数据并行的 All-Reduce 大得多，是 MoE 训练效率的主要瓶颈。</p>
+
+          <p>把一个 token 从出生到拿到专家输出的"跨卡旅程"画成时序图，能看清 All-to-All 到底发生了几次：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant T as Token（在 GPU0）
+  participant R as 路由器
+  participant D as Dispatch/Combine
+  participant E as 目标专家（在 GPU2）
+  T->>R: 计算亲和度，选出 Top-K（含专家 200）
+  R->>D: 需要专家 200，它在 GPU2
+  D->>E: All-to-All 把该 token 发往 GPU2
+  E->>E: 在 GPU2 上计算专家 200 的输出
+  E->>D: 返回专家输出
+  D->>T: All-to-All 把结果发回 GPU0
+  T->>T: 对所有 Top-K 专家输出做加权求和
+            </div>
+            <figcaption>一次 MoE 跨卡调度：token 先被路由，再经 All-to-All 发往持有目标专家的 GPU，算完再发回。每个被选中的"远端专家"都会触发一轮 All-to-All。</figcaption>
+          </figure>
+          <p>正因为每次跨卡都要两轮 All-to-All（发出去、收回来），MoE 训练对网络带宽极度敏感。这也是为什么 DeepSeek 这类超大 MoE 通常部署在 IB（InfiniBand）网络、甚至采用"专家并行 + 通信计算重叠"来隐藏延迟。</p>
+
+          <h3>通信量估个数量级</h3>
+          <p>抽象地讲，一次 MoE 层的 All-to-All 通信量大约是：每张卡上有 $T$ 个 token，每个 token 要发往 $K$ 个专家，每份数据是 $d_{model}$ 维的隐状态。所以<strong>单卡发出的字节数约为 $T \times K \times d_{model} \times \text{dtype\_bytes}$</strong>，收回来的结果同样大小，一层共两轮。</p>
+          <p>代入 $T = 4096$、$K = 8$、$d_{model} = 7168$、BF16：单卡单层单向约 $4096 \times 8 \times 7168 \times 2 \approx 470$ MB。一个有 58 个 MoE 层的模型，一次前向就要搬 $58 \times 470\text{MB} \times 2 \approx 54$ GB。反向传播还要再来一遍。<strong>这就是为什么 MoE 训练必须上 InfiniBand 或 NVLink——普通以太网的带宽会让 GPU 大部分时间在等网络。</strong></p>
+          <p>缓解手段有三类，工程上通常叠加使用：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>手段</th><th>做法</th><th>效果</th><th>限制</th></tr></thead>
+              <tbody>
+                <tr><td><strong>通信-计算重叠</strong></td><td>把一批 token 切成若干微批，第 $i$ 批在通信时第 $i+1$ 批在算注意力</td><td>理想情况能把通信时间几乎完全藏起来</td><td>需要精细的流水线编排，微批太小会让 GEMM 效率下降</td></tr>
+                <tr><td><strong>限制跨节点路由</strong></td><td>约束每个 token 最多只能路由到有限个节点（如 DeepSeek 的节点受限路由）</td><td>把昂贵的跨节点通信压到可控范围</td><td>轻微限制了路由自由度，需要与均衡机制配合</td></tr>
+                <tr><td><strong>降低通信精度</strong></td><td>All-to-All 传输时用 FP8 甚至更低精度</td><td>通信量直接减半</td><td>需要硬件支持与数值验证</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>还有一个容易忽略的点：<strong>All-to-All 的耗时由最慢的那张卡决定</strong>。如果负载不均，某张卡上的专家收到了两倍的 token，其他所有卡都要等它算完才能进入下一步。所以在分布式场景下，<strong>负载均衡不只是"容量利用率"的问题，它直接决定了整个集群的墙钟时间</strong>。这两个原本看起来独立的话题——路由均衡与通信效率——在超大规模训练里是同一个问题的两面。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">推理时的挑战</span>
+            推理时所有专家都要驻留显存——即使每次只激活 37B 参数，671B 参数的模型权重仍然需要全部加载。这意味着 MoE 模型的推理<strong>显存需求远大于同等激活参数的稠密模型</strong>。这也是为什么 MoE 模型的量化（见 <a href="../09-efficiency/quantization.html">量化</a>）和 KV 缓存管理（见 <a href="kv-cache.html">KV 缓存</a>）格外重要。
+          </div>
+
+          <!-- ============ Section 5: 训练稳定性 ============ -->
+          <h2>训练稳定性：MoE 特有的坑</h2>
+          <p>MoE 训练比稠密模型更容易出问题，因为路由器的引入带来了新的不稳定性来源：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  Start["MoE 训练"] --> Issues{"常见稳定性问题"}
+  Issues --> I1["路由崩塌<br/>所有 token 只去少数专家"]
+  Issues --> I2["专家利用率低<br/>部分专家从未被选中"]
+  Issues --> I3["梯度噪声<br/>路由决策不可微"]
+  Issues --> I4["通信瓶颈<br/>All-to-All 开销"]
+
+  I1 --> F1["修复: 辅助损失<br/>+ 偏置调节"]
+  I2 --> F2["修复: 专家容量限制<br/>+ 初始化策略"]
+  I3 --> F3["修复: 直通估计器<br/>+ 软路由"]
+  I4 --> F4["修复: 专家并行优化<br/>+ 通信压缩"]
+
+  style I1 fill:#fde8e8,stroke:#c44
+  style I2 fill:#fde8e8,stroke:#c44
+  style I3 fill:#fef3c7,stroke:#d97706
+  style I4 fill:#fef3c7,stroke:#d97706
+  style F1 fill:#e8f5e9,stroke:#4a7
+  style F2 fill:#e8f5e9,stroke:#4a7
+  style F3 fill:#e8f5e9,stroke:#4a7
+  style F4 fill:#e8f5e9,stroke:#4a7
+            </div>
+            <figcaption>MoE 训练的四大稳定性问题与修复方案。路由崩塌是最严重的——一旦发生，模型基本等于退化成了一个小模型。</figcaption>
+          </figure>
+
+          <h3>路由崩塌：最危险的失败模式</h3>
+          <p>训练初期，路由器还没学好，可能把所有 token 都路由到同一个专家。这个专家被反复训练，越来越强；其他专家从未被激活，权重停留在初始化。一旦发生，模型等于退化成了一个只用了 1/N 容量的小模型——而且很难自我恢复。</p>
+          <p>防御方法：(1) 训练初期用较大的辅助损失权重强制均衡；(2) 路由器初始化时加入噪声打破对称性；(3) 监控专家利用率，如果发现崩塌趋势及时介入。</p>
+
+          <h3>怎么判断路由是否健康</h3>
+          <p>路由崩塌不是突然发生的，它有清晰的前兆。训练 MoE 时应该把下面几个指标和 loss 一起打到监控面板上，任何一个越界都值得停下来看：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>怎么算</th><th>健康区间</th><th>越界意味着</th></tr></thead>
+              <tbody>
+                <tr><td><strong>负载变异系数 CV</strong></td><td>各专家 token 数的标准差 ÷ 均值</td><td>&lt; 0.3</td><td>持续 &gt; 1.0 说明少数专家在吃掉大部分流量</td></tr>
+                <tr><td><strong>零激活专家数</strong></td><td>整个 epoch 内一次都没被选中的专家个数</td><td>0</td><td>&gt; 0 就是实打实的容量浪费，这部分参数白存了</td></tr>
+                <tr><td><strong>token 丢弃率</strong></td><td>溢出容量的 token ÷ 总 token</td><td>&lt; 1%</td><td>&gt; 5% 说明容量因子或均衡机制需要调整</td></tr>
+                <tr><td><strong>路由熵</strong></td><td>门控分布的平均信息熵</td><td>接近但低于 $\ln N$</td><td>骤降表示路由器变得过度确信，是崩塌的早期信号</td></tr>
+                <tr><td><strong>Top-1 权重均值</strong></td><td>最高分专家的门控权重的批平均</td><td>0.4–0.8</td><td>持续接近 1.0 说明退化为硬路由，梯度信号变差</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>其中<strong>路由熵</strong>是最灵敏的先行指标。健康的路由器应该保持一定的"犹豫"——熵接近均匀分布的上界 $\ln N$，说明它还在探索不同专家的组合。一旦熵在几百步内快速下降，往往意味着路由器找到了一条"偷懒捷径"：把所有 token 都塞给同几个专家，短期内 loss 也能降，但长期看整个模型的容量就被锁死了。这时候把辅助损失权重临时调大、或者给路由 logits 加一点高斯噪声，通常能把它拽回来。</p>
+          <p>另一个实践经验是<strong>不要在训练中途大幅改变专家数或 Top-K</strong>。路由器的权重是针对特定专家数训练出来的，改变 $N$ 相当于把它的输出维度换掉，需要重新学习整个路由空间。如果确实要扩容，业界的做法是"专家复制 + 加噪"：把已有专家复制一份、加上小扰动作为新专家，让路由器在此基础上继续分化，比随机初始化收敛快得多。</p>
+
+          <!-- ============ Section 6: 2026 现状 ============ -->
+          <h2>2026 现状：MoE 成为默认架构</h2>
+          <p>2025-2026 年，MoE 已经从研究概念变成主流前沿模型的默认架构。新发布的大模型中，约七成采用某种形式的 MoE：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模型</th><th>总参数</th><th>激活参数</th><th>专家数</th><th>每次激活</th><th>特色</th></tr></thead>
+              <tbody>
+                <tr><td>DeepSeek-V3</td><td>671B</td><td>37B</td><td>256+1 共享</td><td>8+1</td><td>细粒度 + 共享专家 + 无辅助损失均衡</td></tr>
+                <tr><td>Qwen3-MoE</td><td>235B</td><td>22B</td><td>128</td><td>8</td><td>细粒度专家</td></tr>
+                <tr><td>gpt-oss</td><td>-</td><td>-</td><td>-</td><td>-</td><td>开源 MoE 架构</td></tr>
+                <tr><td>Llama 4 (部分版本)</td><td>-</td><td>-</td><td>-</td><td>-</td><td>Meta 的 MoE 尝试</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">为什么稠密模型不会消失</span>
+            MoE 的显存需求远大于同等能力的稠密模型。对于显存受限的部署场景（端侧、单卡推理），稠密模型仍然是更好的选择。7B-14B 的稠密模型在端侧和中小规模部署中仍然有不可替代的地位——见 <a href="../09-efficiency/on-device-slm.html">端侧小模型</a>。
+          </div>
+
+          <!-- ============ 代码实现 ============ -->
+          <details class="deep">
+            <summary>展开：MoE 层最小实现（PyTorch 风格）</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MoELayer(nn.Module):
+    def __init__(self, d_model, num_experts=8, top_k=2):
+        super().__init__()
+        self.top_k = top_k
+        self.gate = nn.Linear(d_model, num_experts)          # 路由器
+        self.experts = nn.ModuleList([
+            nn.Sequential(nn.Linear(d_model, 4 * d_model),
+                          nn.GELU(),
+                          nn.Linear(4 * d_model, d_model))
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, x):                                    # x: (tokens, d_model)
+        logits = self.gate(x)                                # (tokens, num_experts)
+        weights, idx = torch.topk(logits, self.top_k, dim=-1)
+        weights = F.softmax(weights, dim=-1)                 # 只对选中的专家归一化
+
+        out = torch.zeros_like(x)
+        for k in range(self.top_k):
+            for e in range(len(self.experts)):
+                mask = (idx[:, k] == e)                      # 选中专家 e 的 token
+                if mask.any():
+                    out[mask] += weights[mask, k:k+1] * self.experts[e](x[mask])
+        return out</code></pre>
+              <p style="margin-bottom:0">真实实现会用更高效的分组 gather/scatter 和专家并行（Expert Parallelism）来跨 GPU 分布专家，但核心逻辑就是「路由 → 选 Top-K → 加权求和」。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：把稠密 FFN 拆成多个专家 + 路由器，每 token 只激活 Top-K 个。总参数（容量）与激活参数（成本）解耦。</li>
+            <li><strong>收益</strong>：「大能力、小开销」——671B 参数的模型只花 37B 的推理成本。</li>
+            <li><strong>代价</strong>：所有专家占显存（显存需求暴增）；训练需解决负载均衡；All-to-All 通信开销大。</li>
+            <li><strong>路由公式</strong>：$g = \text{Softmax}(x \cdot W_g)$，选 Top-K，加权求和 $y = \sum g_i \cdot E_i(x)$。</li>
+            <li><strong>负载均衡</strong>：辅助损失 / 无辅助损失偏置调节（DeepSeek 路线）/ 专家容量限制。不解决会马太效应→路由崩塌。</li>
+            <li><strong>路由崩塌</strong>：最危险的失败模式——所有 token 只去少数专家，模型退化成小模型。防御：初期大辅助损失 + 噪声初始化 + 利用率监控。</li>
+            <li><strong>专家并行</strong>：不同专家放不同 GPU，All-to-All 通信是主要开销。</li>
+            <li><strong>前沿配置</strong>：细粒度专家 + 共享专家 + 无辅助损失均衡（DeepSeek 路线）。</li>
+            <li><strong>2026 现状</strong>：新架构中约七成采用 MoE，稠密模型在端侧仍有不可替代的地位。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：MoE 节省的是算力还是显存？</h3>
+              <p><span class="answer-label">标准回答：</span>MoE 主要节省每个 token 的激活计算量，不直接节省总权重显存。总参数量决定模型容量，激活参数量决定单 token 的 FLOPs；部署时通常仍要让全部专家权重可访问，还要承担路由和通信开销。</p>
+              <p><span class="pitfall-label">常见误区：</span>“37B 激活参数”不等于“只需要加载 37B 参数”。如果专家权重没有卸载或按专家分片，显存仍接近总参数量。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：Top-K 路由为什么会导致专家负载不均？</h3>
+              <p><span class="answer-label">标准回答：</span>路由器会根据 token 表示选择专家，早期稍占优势的专家可能获得更多 token，训练后形成“越忙越被选”的反馈，导致其他专家闲置、热门专家溢出，甚至出现路由崩塌。</p>
+              <details class="deep">
+                <summary>追问：如何监控和缓解？</summary>
+                <div class="deep-body">
+                  <p>训练中应记录每个专家的 token 占比、容量溢出率、丢 token 数量和路由熵。缓解方法包括辅助负载均衡损失、容量因子、路由噪声、专家偏置调节、Expert-Choice，以及 DeepSeek 风格的无辅助损失均衡。不能只看总 loss，因为总 loss 下降并不代表专家使用健康。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：为什么 MoE 会引入 All-to-All 通信？</h3>
+              <p><span class="answer-label">标准回答：</span>在 Expert Parallelism 中，不同 GPU 放置不同专家。一个 batch 的 token 先在本地生成路由结果，然后需要把 token 发送到承载目标专家的 GPU，专家计算后再把结果发送回原设备，这两次跨卡重排通常就是 All-to-All 通信。</p>
+              <p><span class="follow-label">工程取舍：</span>增加专家并行度可以装下更大的总参数，但会放大通信和负载不均问题；实际系统要结合互联拓扑、micro-batch、容量因子和专家放置共同设计。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q4：Fine-Grained Experts 和 Shared Experts 解决什么问题？</h3>
+              <p><span class="answer-label">标准回答：</span>细粒度专家把 FFN 切得更细，让 Top-K 组合具有更灵活的容量分配；共享专家则为所有 token 提供一条稳定的公共知识路径，避免所有信息都依赖动态路由。两者可以在保持稀疏激活的同时改善专家专门化和训练稳定性。</p>
+              <p><span class="pitfall-label">常见误区：</span>专家数量越多不一定越好。专家切得越细，路由选择空间、通信调度和负载均衡难度也会增加，必须用实际吞吐和质量评测验证收益。</p>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>DeepSeek-V3 Technical Report (DeepSeek-AI, 2024) — 当前 MoE 架构的工程标杆。细粒度专家 + 共享专家 + 无辅助损失均衡的完整实现细节，是理解 2026 年 MoE 最佳实践的必读文档 · <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arXiv:2412.19437</a></li>
+            <li>Mixtral of Experts (Mistral AI, 2024, arXiv:2401.04088) — 把 MoE 带入开源主流的论文。8×7B 的配置证明了 MoE 在中等规模也能有效，不再只是超大模型的专利 · <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">arXiv:2401.04088</a></li>
+            <li>Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer (Shazeer et al., 2017, arXiv:1701.06538) — MoE 的奠基论文，首次在 LSTM 上实现了稀疏路由。虽然架构已过时，但负载均衡的思想至今仍在使用 · <a href="https://arxiv.org/abs/1701.06538" target="_blank" rel="noopener">arXiv:1701.06538</a></li>
+            <li>Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity (Fedus et al., 2021) — 把路由简化到 Top-1，系统讨论了容量因子、丢 token 与训练稳定性的工程细节 · <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">arXiv:2101.03961</a></li>
+            <li>GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding (Lepikhin et al., 2020) — Top-2 路由与专家并行分片的奠基工作 · <a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener">arXiv:2006.16668</a></li>
+            <li>DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models — 细粒度专家 + 共享专家设计的原始论文 · <a href="https://arxiv.org/abs/2401.06066" target="_blank" rel="noopener">arXiv:2401.06066</a></li>
+            <li>MegaBlocks: Efficient Sparse Training with Mixture-of-Experts — 用块稀疏矩阵乘实现无丢弃（dropless）MoE 训练 · <a href="https://arxiv.org/abs/2211.15841" target="_blank" rel="noopener">arXiv:2211.15841</a></li>
+            <li>Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts — 无辅助损失均衡的偏置调节方法 · <a href="https://arxiv.org/abs/2408.15664" target="_blank" rel="noopener">arXiv:2408.15664</a></li>
+            <li>Mixture-of-Experts with Expert Choice Routing — Expert-Choice 路由，由专家反向挑选 token，天然负载均衡 · <a href="https://arxiv.org/abs/2202.09368" target="_blank" rel="noopener">arXiv:2202.09368</a></li>
+            <li>Hugging Face MoE 文档 — 关于专家数量、Top-K、容量因子等超参数的工程说明 · <a href="https://huggingface.co/docs/transformers/architecture_moe" target="_blank" rel="noopener">huggingface.co/docs/transformers</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            MoE 常与 <a href="attention-variants.html">MLA 注意力</a>、<a href="../06-pretraining/distributed-training.html">专家并行</a> 搭配使用；推理部署时还要面对多专家的 <a href="kv-cache.html">显存与调度</a> 挑战。如果你想了解 MoE 模型的量化部署，看 <a href="../09-efficiency/quantization.html">量化</a>；想了解端侧场景为什么仍然用稠密模型，看 <a href="../09-efficiency/on-device-slm.html">端侧小模型</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+    window.addEventListener('load', function () {
+      if (typeof Chart === 'undefined') return;
+      var c = window.CB_COLORS || { red: '#e24b4a', blue: '#378add' };
+      var ch = new Chart(document.getElementById('loadChart'), {
+        type: 'bar',
+        data: {
+          labels: ['专家1','专家2','专家3','专家4','专家5','专家6','专家7','专家8'],
+          datasets: [
+            { label: '无均衡约束', data: [38, 22, 15, 9, 6, 5, 3, 2], backgroundColor: c.red },
+            { label: '加入均衡后', data: [14, 13, 12, 13, 12, 12, 12, 12], backgroundColor: c.blue }
+          ]
+        },
+        options: {
+          scales: { y: { title: { display: true, text: 'token 占比 (%)' }, beginAtZero: true } },
+          plugins: { legend: { position: 'top' } }
+        }
+      });
+      (window.CB_CHARTS = window.CB_CHARTS || []).push(ch);
+    });
+  </script>
+</body>
+</html>

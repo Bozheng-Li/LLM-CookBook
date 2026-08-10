@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>服务化与推理经济学 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="09-efficiency" data-topic="serving-cost">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>服务化与推理经济学</h1>
+            <p class="lead">把模型从「能跑」变成「能服务」要跨越一道巨大的工程鸿沟。同一个 7B 模型，单卡裸跑和千卡集群服务的吞吐可以差三个数量级——差距不在模型，在部署形态、SLO 设计和调度策略。本节聚焦纯技术侧：怎么部署、怎么设 SLO、怎么在吞吐-延迟-成本三角中找到你的最优点。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>服务化的核心矛盾是一个<strong>三角约束</strong>：吞吐（每秒处理多少 token）、延迟（用户等多久）、成本（每 token 花多少钱）三者互相牵制——提高吞吐就要增大 batch，但 batch 大了延迟就高；降延迟就要减小 batch，但小 batch 的单位成本更贵。没有银弹，只有在你业务约束下的最优权衡。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  T["吞吐 Throughput<br/>token/s"] ---|增大 batch| L["延迟 Latency<br/>p50 / p99 ms"]
+  L ---|减小 batch<br/>增加实例| C["成本 Cost<br/>每百万 token"]
+  C ---|降成本 → 大 batch| T
+  T ---|高吞吐 → 大 batch| L
+  style T fill:#e8f0fe,stroke:#185fa5
+  style L fill:#fce4ec,stroke:#c62828
+  style C fill:#fff3e0,stroke:#e65100
+              </div>
+              <figcaption>吞吐-延迟-成本三角：三者互相牵制，服务化设计的本质是在三角中找最优点</figcaption>
+            </figure>
+          </div>
+
+          <h2>部署形态：从单卡到千卡集群</h2>
+          <p>LLM 服务的部署形态直接决定了能承载多少并发、延迟水平和成本结构。选择哪种形态，取决于你的流量模式和 SLO 要求。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>部署形态</th><th>典型配置</th><th>适用场景</th><th>并发能力</th></tr></thead>
+              <tbody>
+                <tr><td>单机单卡</td><td>1×A100/H100</td><td>开发调试、小规模内部服务</td><td>10-50 并发</td></tr>
+                <tr><td>单机多卡（TP）</td><td>4-8×A100，张量并行</td><td>70B 级模型单实例部署</td><td>50-200 并发</td></tr>
+                <tr><td>多机多卡（TP+PP）</td><td>多节点，张量+流水线并行</td><td>超大模型（400B+）单实例</td><td>100-500 并发</td></tr>
+                <tr><td>多实例负载均衡</td><td>N 个独立实例 + LB</td><td>生产高可用、水平扩展</td><td>N × 单实例并发</td></tr>
+                <tr><td>PD 分离</td><td>Prefill 节点 + Decode 节点</td><td>大规模高并发服务</td><td>1000+ 并发</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>从单机到多实例的关键变化是<strong>从「一台机器跑模型」到「一个集群服务流量」</strong>。前者的核心问题是模型怎么跑得快（推理引擎的事），后者的核心问题是流量怎么调度得合理（服务架构的事）。</p>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">单实例阶段</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">一个 vLLM/SGLang 实例处理所有请求。瓶颈在单实例的 max_concurrency。适合日请求量万级以下、延迟要求不严苛的场景。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">多实例阶段</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">前置负载均衡器（Nginx/Envoy/专用网关）把流量分发到多个实例。关键设计：会话亲和性（同一会话路由到同一实例以利用 KV Cache）、优雅缩放、健康检查。</p>
+            </div>
+          </div>
+
+          <h2>SLO 设计：用什么指标衡量「够好」</h2>
+          <p>SLO（Service Level Objective）是服务化的契约——你向用户承诺的服务质量水平。LLM 服务的 SLO 和传统 Web 服务有本质区别：传统服务的延迟主要来自计算和 IO，LLM 服务的延迟还取决于生成长度（生成 1000 token 天然比 100 token 慢）。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>定义</th><th>为什么重要</th></tr></thead>
+              <tbody>
+                <tr><td>TTFT（首 Token 延迟）</td><td>从请求到达到第一个 token 返回的时间</td><td>用户感知的「响应速度」，决定体验</td></tr>
+                <tr><td>TPOT（每 Token 延迟）</td><td>生成阶段平均每个 token 的间隔时间</td><td>流式输出的流畅度，&gt;100ms 用户会感觉卡</td></tr>
+                <tr><td>端到端延迟</td><td>从请求到达到完整响应的时间</td><td>非流式场景的核心指标</td></tr>
+                <tr><td>吞吐量</td><td>单位时间处理的 token 或请求数</td><td>系统容量上限，决定成本效率</td></tr>
+                <tr><td>错误率</td><td>请求失败 / 超时 / 截断的比例</td><td>可用性底线</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>设 SLO 的关键原则：<strong>区分 Prefill 延迟和 Decode 延迟</strong>。TTFT 主要受 Prefill 计算和队列等待影响，TPOT 主要受 batch size 和显存带宽影响。把两者混在一起设一个「p99 延迟 &lt; X」是常见错误——一个生成 2000 token 的请求和一个生成 50 token 的请求放在一起统计 p99 没有意义。</p>
+
+          <p>「为什么不把 Prefill 和 Decode 分开设 SLO」这个问题，可以用一张论文原图来解释。它来自 PD 分离奠基论文 DistServe（OSDI 2024），用同一张卡上的实测延迟回答了「混合部署到底付出了什么代价」。</p>
+
+          <figure class="paper-figure">
+            <img src="https://arxiv.org/html/2401.09670v2/x1.png" alt="论文原图：13B 模型在 A100 上、输入 512 token 输出 64 token 的合成负载下的延迟——上方为 TTFT p90 对比，下方为 TPOT p90 对比，展示混合部署（共置）与分离部署的差距" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：共置（Colocation）vs 分离（Separation）的延迟对比——上半 TTFT、下半 TPOT，共置系统在两个指标上同时劣化</span>
+              <span class="pf-src">论文原图 · Zhong et al., <em>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</em>, 2024, Figure 1 · <a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener">arXiv:2401.09670</a></span>
+            </figcaption>
+          </figure>
+
+          <p>读这张图先看它的<strong>上下两个半图</strong>。上半图是 TTFT（首 token 延迟）的 p90 对比，下半图是 TPOT（每 token 延迟）的 p90 对比。每一半里都有一组「现有系统」的柱子和一根「仅 Prefill / 仅 Decode 系统」的基线。注意上下半图的结论是一致的：<strong>把 Prefill 和 Decode 混在同一批 GPU 上时，两个指标同时变差</strong>——用户既等得更久才看到第一个字（TTFT 高），又看到后续每个字都慢吞吞（TPOT 高）。</p>
+          <p>第二，理解<strong>为什么会这样</strong>：图里的负载是「输入 512、输出 64」的合成流量。当 Decode 请求占着显存带宽逐 token 生成时，一个长 prompt 的 Prefill 突然插进来，会把 GPU 算力瞬间吃满——正在 Decode 的请求每一步都要等这个「庞然大物」先算完，TPOT 飙升；反过来，Decode 请求长期占据带宽，新请求的 Prefill 又挤不进去，TTFT 被拉长。这两个方向上的「互踩」，就是图上两根柱子同时变高的原因。</p>
+          <p>第三，从<strong>SLO 工程</strong>的角度读这张图，结论是：如果你在混合部署下要同时满足「TTFT p99 &lt; 1s 且 TPOT p99 &lt; 100ms」，唯一办法是<strong>过度配置</strong>——买更多的卡、把 batch 压小，让两个阶段互相干扰的概率降到足够低。而 DistServe 的测法告诉你，分离部署可以用同样的 GPU 数量在两项指标上都达标。这就是「SLO 是有价格的」最直观的证据：<em>同样一个 SLO，用不同的部署形态实现，成本可以差出数倍</em>。这也是本页后面「吞吐-延迟-成本三角」以及 <a href="pd-disaggregation.html">PD 分离</a> 一节的出发点。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">实践经验</span>
+            典型的 LLM 服务 SLO：TTFT p99 &lt; 1-2s（Prefill 阶段），TPOT p99 &lt; 50-100ms（Decode 阶段），端到端 p99 则按生成长度分档设定。SLO 不是越高越好——p99 TTFT 从 1s 降到 500ms 可能需要 3 倍的 GPU，但用户感知的提升微乎其微。
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            新手最容易把「SLO」和「SLI」混为一谈，也最容易把「延迟」和「响应时间」划等号。<strong>SLO 是你承诺的目标（如 TTFT p99 &lt; 1s），SLI 是实际测出来的指标值（如今天 TTFT p99 = 830ms）</strong>，两者是「目标 vs 事实」的关系，SLO 靠 SLI 来验证。更隐蔽的坑是：对 LLM 服务，「响应时间」不是单一数字——它是 TTFT 和 TPOT 的组合。一个端到端 30 秒的响应可能是「首字 200ms + 每秒 35 token 匀速流出」，体验并不差；而一个「首字 8 秒 + 之后瞬间吐完」的响应，虽然端到端可能更快，体验却糟透了。所以衡量 LLM 服务必须拆开看，任何只报「平均延迟」的数字都有误导性。
+          </div>
+
+          <h2>吞吐-延迟-成本三角</h2>
+          <p>这三个指标的权衡是服务化设计的核心。理解它们的关系，关键是理解 batch size 的作用：</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  subgraph SMALL["小 Batch（低并发）"]
+    S1["GPU 利用率低<br/>~20-40%"] --> S2["延迟低<br/>无需排队"]
+    S2 --> S3["单 token 成本高<br/>算力浪费"]
+  end
+  subgraph LARGE["大 Batch（高并发）"]
+    L1["GPU 利用率高<br/>~80-95%"] --> L2["延迟高<br/>排队 + KV Cache 增大"]
+    L2 --> L3["单 token 成本低<br/>算力摊薄"]
+  end
+  subgraph OPT["最优区间"]
+    O1["Batch 适中<br/>GPU 70-85% 利用"] --> O2["延迟可接受<br/>SLO 达标"]
+    O2 --> O3["成本合理<br/>不过度配置"]
+  end
+  style SMALL fill:#e3f2fd,stroke:#1565c0
+  style LARGE fill:#fce4ec,stroke:#c62828
+  style OPT fill:#e8f5e9,stroke:#2e7d32
+            </div>
+            <figcaption>batch size 是三角的枢纽：太小则浪费算力（贵），太大则排队严重（慢）</figcaption>
+          </figure>
+
+          <p>具体来说，吞吐和成本的关系是<strong>非线性</strong>的：batch 从 1 增到 10，吞吐可能提升 8 倍（接近线性），成本降 8 倍；但从 10 增到 100，吞吐可能只提升 2-3 倍（因为显存带宽瓶颈开始显现），而延迟却线性增长。最优 batch size 通常在 GPU 利用率达到 70-85% 的拐点附近。</p>
+
+          <h3>三种典型部署策略</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>策略</th><th>特点</th><th>适用场景</th></tr></thead>
+              <tbody>
+                <tr><td>延迟优先</td><td>小 batch、多实例、快速响应</td><td>实时对话、搜索补全</td></tr>
+                <tr><td>吞吐优先</td><td>大 batch、少实例、高利用率</td><td>批处理、后台任务、数据标注</td></tr>
+                <tr><td>混合策略</td><td>按优先级路由到不同实例组</td><td>同时服务在线和离线流量</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>自动扩缩容：什么时候加机器</h2>
+          <p>生产服务的流量通常有明显的波峰波谷——白天高峰、深夜低谷。固定实例数要么白天不够用（SLO 违约），要么晚上浪费（GPU 闲置）。自动扩缩容（Autoscaling）是解决这个问题的关键。</p>
+          <p>传统 Web 服务的 autoscaling 通常基于 CPU 利用率或 QPS，但 LLM 服务的关键指标不同：</p>
+          <ul>
+            <li><strong>KV Cache 利用率</strong>：当 KV Cache 使用率持续 &gt; 80% 时，新请求会被排队等待，此时应该扩容。</li>
+            <li><strong>队列深度</strong>：等待 Prefill 的请求数持续超过阈值时，说明 Prefill 算力不足。</li>
+            <li><strong>TTFT p99</strong>：当 TTFT 持续高于 SLO 时扩容，低于阈值时缩容。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            LLM 模型加载慢——一个 70B 模型加载到 GPU 可能需要 30-60 秒，这意味着扩容不是「秒级生效」的。Autoscaling 的触发阈值要设得比传统 Web 服务更早（比如 KV Cache 利用率 70% 而非 90%），给模型加载留出时间。冷启动延迟是 LLM 服务化与传统微服务最大的运维差异。
+          </div>
+
+          <p>把扩容决策写成一个最小逻辑（示意，生产要结合多指标和冷却时间）：</p>
+          <pre><code class="language-python">class LLMAutoscaler:
+    """基于 KV Cache 利用率与队列深度的扩缩容决策（示意）"""
+
+    def decide(self, kv_util, queue_depth, ttft_p99_ms,
+               slo_ttft_ms=2000, target=0.70):
+        # 1. 提前扩容：给模型加载留缓冲，不在 90% 才动
+        if kv_util &gt; target or queue_depth &gt; 32:
+            return "scale_out"
+        # 2. 已违约：立刻扩容，不再等
+        if ttft_p99_ms &gt; slo_ttft_ms:
+            return "scale_out_urgent"
+        # 3. 长期空闲：缩容省钱
+        if kv_util &lt; 0.30 and queue_depth == 0:
+            return "scale_in"
+        return "hold"
+
+    def cooldown(self, last_action_ts, now, min_gap_sec=120):
+        # 避免抖动：两次扩缩容之间至少间隔 min_gap
+        return (now - last_action_ts) &gt;= min_gap_sec</code></pre>
+
+          <h2>流量调度：会话亲和与前缀路由</h2>
+          <p>多实例部署时，请求路由策略直接影响 KV Cache 命中率和成本：</p>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">轮询路由（Round Robin）</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">请求均匀分配到各实例。简单公平，但每个实例的 KV Cache 都从零开始，前缀缓存命中率低。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">会话亲和路由（Session Affinity）</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">同一会话的请求路由到同一实例，复用已有 KV Cache。多轮对话场景下 TPOT 可降 30-50%。</p>
+            </div>
+          </div>
+
+          <p>更进阶的做法是<strong>前缀感知路由</strong>：根据请求的前缀（系统提示、RAG 上下文）选择已有该前缀 KV Cache 的实例。SGLang 的 RadixAttention 天然支持这种模式，vLLM 也通过前缀缓存实现类似效果。在大规模 RAG 服务中，前缀感知路由可以显著降低 Prefill 计算量。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant U as 用户
+  participant LB as 负载均衡
+  participant I as 实例 A
+  participant KV as KV 缓存池
+  U->>LB: 请求（带 session_id）
+  LB->>I: 会话亲和路由到持有 KV 的实例
+  I->>KV: 查共享前缀 KV
+  alt 前缀命中
+    KV-->>I: 复用前缀 KV（跳过部分 Prefill）
+  else 未命中
+    I->>KV: 计算并写入前缀 KV
+  end
+  I-->>U: 流式输出 token
+            </div>
+            <figcaption>一次请求在集群中的旅程：负载均衡按会话/前缀路由，实例复用或写入 KV 缓存，再流式返回</figcaption>
+          </figure>
+
+          <h2>高可用与容灾</h2>
+          <p>LLM 服务的单点故障比传统服务更棘手——一个 70B 模型实例崩溃后，重启需要重新加载模型，恢复时间可能长达分钟级。高可用设计需要考虑：</p>
+          <ul>
+            <li><strong>多实例冗余</strong>：至少 N+1 实例，单实例故障不中断服务。</li>
+            <li><strong>优雅降级</strong>：高峰期流量超过容量时，按优先级拒绝低优先级请求（而非全部超时）。</li>
+            <li><strong>模型预加载</strong>：备用实例预先加载模型，故障切换时秒级生效而非分钟级。</li>
+            <li><strong>请求超时与重试</strong>：设合理的请求超时，超时后重试到其他实例。注意重试会放大流量——N 次重试 = N 倍负载，需配合断路器。</li>
+          </ul>
+
+          <details class="deep">
+            <summary>展开：推理成本的量级估算</summary>
+            <div class="deep-body">
+              <p>虽然具体价格随时间波动，但推理成本的<strong>技术结构</strong>是稳定的。一个 7B 模型在单张 A100 上的粗略估算：</p>
+              <ul>
+                <li>A100 80GB 的理论峰值吞吐约 2000-3000 token/s（batch 较大时）</li>
+                <li>一天 = 86400 秒，理论最大约 1.7-2.6 亿 token/天</li>
+                <li>实际利用率 50-70%（排队、长短请求混杂、波谷），有效约 1-1.8 亿 token/天</li>
+                <li>GPU 小时成本（云厂商按需价格量级）分摊到每百万 token，大致在亚美分级别</li>
+              </ul>
+              <p style="margin-bottom:0">这个估算只覆盖了 GPU 算力成本，实际服务成本还包括网络、存储、运维、多地域部署等。完整的成本归因（按工作流/租户/版本四维拆分）属于成本工程范畴，见 <a href="../12-llmops/cost-engineering.html">推理成本工程</a>。</p>
+            </div>
+          </details>
+
+          <h2>服务化能力地图</h2>
+          <p>把前面所有决策点收进一张图，服务化要操心的就是这五个板块——它们彼此牵制，调一个往往要回头看其他的：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((LLM 服务化))
+    部署形态
+      单机单卡
+      多实例 LB
+      PD 分离
+    SLO
+      TTFT
+      TPOT
+      错误率
+    调度
+      轮询
+      会话亲和
+      前缀路由
+    弹性
+      自动扩缩容
+      高可用容灾
+    成本
+      吞吐量
+      每 token 单价
+            </div>
+            <figcaption>服务化能力地图：部署形态、SLO、调度、弹性、成本五块互相牵制，服务化设计是它们的联合优化</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">先定 SLO，再谈优化</span>
+            很多团队一上来就调批处理、上 PD 分离，却没先写清楚 SLO。正确的顺序是：先用真实的延迟/吞吐/成本目标倒推需要哪种部署形态，再决定要不要 PD 分离、要不要前缀路由。没有 SLO 的「优化」很容易陷入「为了快而快」，最后 GPU 成本翻倍但用户无感。SLO 的设定本身也是权衡——p99 TTFT 从 1s 降到 500ms 可能要多花 3 倍算力。
+          </div>
+
+          <h2>单卡并发度与 TCO 的换算算例</h2>
+          <p>服务化成本的所有讨论，最后都要落到一个核心问题：一张 GPU 到底能服务多少用户，以及每多服务一个用户边际成本是多少。这里用一组可验证的量级估算，把「并发度 ↔ 成本」的换算关系走一遍。数字以量级示意为准，不同模型和硬件会偏移，但结构不变。</p>
+          <p>以 7B 模型、单张 A100 80GB 为例。权重 FP16 约 14 GB，剩下约 66 GB 给 KV Cache 和激活。假设量化到 INT8 权重约 7 GB，剩下 73 GB。KV 每 token 约 1.25 MB（7B 模型、INT8 KV），一条 4096 token 的请求约占 5 GB。算上激活和缓冲，单卡大概能同时驻留 10-15 条这样的请求——这就是单实例的「并发上限」。再乘上平均生成速度（batch=12 时单卡吞吐约 1500-2500 token/s），一个 7B 服务一天能产出的 token 量级在 1-2 亿之间。</p>
+          <p>现在做成本换算。假设一张 A100 按需价格约每小时 3-4 美元（云厂商量级），一天约 80 美元，分摊到 1.5 亿 token，每百万 token 的成本约 0.5 美元。这个数字就是推理经济的「锚」：如果你的业务每百万 token 只能赚 0.2 美元，那这张卡是亏的；如果能赚 1 美元，毛利 50%。而任何优化——连续批处理把并发从 10 提到 20、量化把权重砍半、投机解码把有效吞吐提高 2 倍——都直接改变「每百万 token 成本」这个数。理解了这个换算链，就能理解为什么「优化吞吐」本质就是「优化毛利」。</p>
+          <p>这个算例还揭示一个反直觉结论：<strong>并发度不是越高越好</strong>。把 batch 从 12 拉到 24，吞吐可能只涨 30%，但单请求 TPOT 翻倍、SLO 违约率上升。当系统逼近「带宽墙」时，加并发换来的吞吐增量越来越小，延迟代价却线性增长。所以「最经济并发度」不在最大吞吐点，而在「边际吞吐收益 ≈ 边际延迟代价」的平衡点——这个点通常比硬件极限低 30-50%，也就是前文说的 GPU 利用率 70-85% 拐点。</p>
+
+          <h2>SLO 的代价曲线：过度配置的隐性成本</h2>
+          <p>SLO 不是免费的，每收紧一个百分点的延迟承诺，背后都是实打实的算力。理解这条「代价曲线」，才能避免最常见的浪费——为了一个用户根本感知不到的延迟提升，多花一倍的 GPU。</p>
+          <p>延迟指标有一个重要特性：<strong>p99 的改善是「边际递减」的</strong>。把 TTFT p99 从 3 秒压到 1 秒，通常需要明显加大 batch 余量或增加实例，用户从「明显等待」到「顺畅」的体验提升非常大；但从 1 秒压到 0.5 秒，可能需要再加 50% 的算力去对付尾延迟（长 prompt 突发、GC 抖动、网络波动），而用户在 1 秒和 0.5 秒之间的感知差异微乎其微。这条曲线的形状是：前半段斜率陡（划算）、后半段斜率平（浪费）。</p>
+          <p>过度配置的隐性成本还不只 GPU 本身。更宽松的 SLO 意味着可以接受更小的 batch 余量、更少的预留实例、更晚的扩容触发——这些都是在「降低每 token 成本」和「降低延迟违约率」之间做位移。一个务实的做法是给 SLO 分级：核心功能（登录、支付相关）承诺 p99 < 1s，非核心功能（推荐语、润色）承诺 p95 < 3s，让有限的算力优先保障用户真正在等的路径。全站一视同仁地追求「p99 < 500ms」，往往是成本失控的开始。</p>
+          <p>另一个常被忽略的成本是「SLO 与流量峰值的关系」。如果 SLO 要求「任何时刻 p99 < 1s」，容量规划就必须按<strong>峰值流量</strong>来配 GPU——而峰值可能只是均值的好几倍，这意味着大部分时间 GPU 闲置。如果改成「p99 < 1s 允许在 95% 的时间窗口内满足」，就可以用均值 + 少量弹性补齐峰值，GPU 利用率显著提升。SLO 的措辞（是「绝对满足」还是「按时间窗口满足」）直接决定 TCO，值得在服务设计之初就想清楚。</p>
+
+          <details class="deep">
+            <summary>展开：从 SLO 反推 GPU 数量的一整套手算</summary>
+            <div class="deep-body">
+              <p>把「SLO → 并发 → GPU 数」这条链完整走一遍，看看每个数字是怎么来的。以 7B 模型、单卡 A100 80GB、FP16 权重（约 14GB）为例。</p>
+              <p><strong>第 1 步，定单卡并发。</strong>前面算过，剩约 56 GB 给 KV。若平均请求 2048 token、每 token KV 约 0.5 MB，单条请求约 1 GB，单卡约 56 并发。但这是「显存上限」，不是「SLO 上限」——56 条并发时 TPOT 会因 batch 太大而飙升，必须打折。</p>
+              <p><strong>第 2 步，从 SLO 反推 batch 上限。</strong>假设 TPOT SLO 是 p99 &lt; 80ms。经验上 batch=16 时单卡 TPOT 大约 40-60ms，batch=32 时可能到 100-150ms。所以为了守住 80ms，实际可用的并发得压在 16-24，而不是 56。这就是「SLO 把显存并发打了对折」——<strong>显存让你能放得下，SLO 才决定你真正敢放多少</strong>。</p>
+              <p><strong>第 3 步，乘上流量需求。</strong>假设目标高峰并发 200 条（在线用户 × 同时使用率估算），200 ÷ 20 ≈ 10 张卡。再按「按峰值 + 冗余 20%」预留，约 12 张卡。如果 SLO 放宽到 TPOT p99 &lt; 150ms，batch 能提到 32，同样的流量只要 7 张卡——<strong>SLO 每放松一点，GPU 需求就掉一截</strong>，这就是前文「SLO 的代价曲线」的量化版本。</p>
+              <p style="margin-bottom:0">这套手算里的数字都是量级估计，真实值要以你的模型、硬件和流量回放实测为准。但推导顺序（显存上限 → SLO 上限 → 流量需求 → 冗余）是通用的，缺了任何一步，容量规划都会失真——尤其是第二步，几乎所有团队都会在这里少算。</p>
+            </div>
+          </details>
+
+          <h2>负载混合与成本归因：把「贵」算清楚</h2>
+          <p>多业务共用一个推理集群时，最大的管理问题是成本归因：同一批 GPU 上跑着搜索、对话、批处理三种负载，月底账单出来了，怎么分摊？分摊不公平，业务方就没有优化自己负载的动力。</p>
+          <p>成本归因的最小可行单位是<strong>「每 token 成本」</strong>：把 GPU 总成本除以总产出的 token 数，得到平均单价，再按每个业务的 token 消耗量分摊。但直接用「平均单价 × token 数」有偏差——长上下文请求的 KV 占用大、batch 里摊薄效果差，单位成本远高于短请求。更公平的做法是<strong>按「占用的 GPU 时间」而非「产出的 token 数」</strong>归因：一个请求的 GPU 时间 = prefill 计算时间 + decode 计算时间 + 它占用的 KV 显存时间。前者由算力决定，后者由显存占用 × 驻留时长决定。把这四个分量分别计量，长请求和短请求的成本差异就显现出来了——很多「看起来便宜」的请求实际是昂贵的长尾。</p>
+          <p>归因粒度再细一层，就是<strong>按租户/产品/模型版本拆</strong>：同一产品的新旧模型版本跑在同一集群，新版更快但 KV 更贵，成本怎么分？实践中通常用「每请求的 token 数 × 每 token 基准价 + 长度溢价」的计价模型，让每个业务方看到的成本与它消耗的真实资源挂钩。只有成本归因清晰，业务方才会主动优化 prompt 长度、缓存复用率、请求并发策略——而这些恰恰是推理成本里最可控的部分。</p>
+          <p>最后提醒：成本归因本身也有成本。计量日志要写、存储要占、报表要生成，如果业务量小到「省下的钱还不够做归因的服务器钱」，退回到简单的「按 token 均摊」更划算。归因的精细度应该和集群规模匹配——单机几块卡，按 token 均摊足够；千卡集群，才值得上完整的四维归因体系。</p>
+
+          <h2>从延迟看成本：在线与离线负载的分池策略</h2>
+          <p>一个集群里同时跑在线（对话、搜索）和离线（批处理、评测、数据标注）负载，是最常见的生产形态。两种负载对延迟的诉求几乎相反，强行混在一个池子里，要么在线请求被离线长任务拖垮，要么离线任务被在线请求「饿死」。</p>
+          <p>在线负载的特征是<strong>延迟敏感、到达随机、每请求短小</strong>。它的成本优化空间在于：不能无限堆 batch（SLO 约束），因此单卡吞吐有硬上限；真正省钱的手段是提高缓存命中率（前缀复用）、压缩 KV、以及尽量压低「空闲等待」——一个在线实例在低峰时段可能只有 30% 利用率，这部分就是纯浪费。</p>
+          <p>离线负载的特征是<strong>延迟无感、批量大、可排队</strong>。它的成本优化空间恰恰相反：可以把 batch 推到接近硬件极限（延迟无所谓）、可以接受很长的队列（任务本身就要跑几十分钟）、可以放在低峰时段执行以利用闲时算力。离线任务的「最经济 batch」通常比在线任务大得多，因为它不背着 SLO 的枷锁。</p>
+          <p>因此分池的核心不是「物理上分开」，而是<strong>让两类负载各自取到适合自己的运行形态</strong>：在线池追求「低延迟 × 高命中」，离线池追求「大 batch × 高利用率」。具体做法有三条。一是时间分池：在线负载在白天高峰独占，离线任务调度到夜间和周末低峰，利用闲时算力跑批处理——这比买两台机器便宜得多。二是空间分池：高峰时段在线与离线确实要抢 GPU 时，用配额和优先级保证在线请求优先，离线任务降级到剩余算力。三是弹性分池：离线任务可以「随时被抢占、断了重跑」（checkpoint 续跑），所以它在低峰时吃满、高峰时让路，成为在线集群的「弹性缓冲」。</p>
+          <p>这三条里最容易被忽略的是第三条。离线任务如果能容忍抢占和断点续跑，它本质上就是集群里的「可压缩负载」——在线流量高时被压缩掉，在线流量低时撑满算力。这比单纯的时间分池灵活得多，能让 GPU 的平均利用率从 40% 提到 70% 以上。代价是实现成本：任务要支持 checkpoint、断点续跑、以及「随时让路」的调度协议。要不要做，取决于你的离线任务占比——离线任务越多，这个投入越值。</p>
+          <p>最后用一句话总结分池策略：<strong>让延迟敏感的和延迟无关的负载不要互相污染，让可压缩的负载给不可压缩的负载让路</strong>。在线池为 SLO 服务，离线池为利用率服务，两者通过调度和配额松耦合，而不是挤在同一个 batch 里互相将就。</p>
+          <p>还有一个容易踩的坑是「分池不等于分硬件」：很多团队分完池就各自买机器，导致在线池低峰闲置、离线池高峰排队。更经济的方式是让两个池共享同一批物理 GPU，通过调度层按时间片或配额动态划分——在线时段在线优先，低峰时段离线吃满。只要离线任务支持抢占续跑，物理共享几乎总能比物理隔离更省。判断标准很简单：把两个池各自 GPU 的利用率曲线画出来，如果峰值和低谷正好错开，就该合并物理资源、只在调度层分池。这条经验在千卡集群和单卡创业公司同样适用，区别只在于实现的复杂程度。简单场景用「低峰时段手动切批处理」就够了，复杂场景才需要引入完整的优先级调度器，两者之间的投入回报需要结合团队实际情况衡量。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：服务化设计的核心是在吞吐-延迟-成本三角中找到业务约束下的最优权衡，batch size 是三角的枢纽。</li>
+            <li><strong>SLO 指标</strong>：TTFT（首 token 延迟）和 TPOT（每 token 延迟）要分开设，不要混成一个 p99 延迟——Prefill 和 Decode 的瓶颈完全不同。</li>
+            <li><strong>部署形态</strong>：从单机单卡到多实例负载均衡再到 PD 分离，选择取决于流量规模和 SLO 要求。</li>
+            <li><strong>自动扩缩容</strong>：基于 KV Cache 利用率和队列深度而非 CPU；模型加载慢，扩容阈值要提前设。</li>
+            <li><strong>会话亲和</strong>：多轮对话场景下同一会话路由到同一实例，TPOT 可降 30-50%。</li>
+            <li><strong>高可用</strong>：N+1 冗余 + 模型预加载 + 优雅降级，LLM 实例恢复慢是最大的运维差异。</li>
+            <li><strong>与成本工程的边界</strong>：本页讲怎么部署和调度让系统又快又稳，每 token 花多少钱的归因和优化见 <a href="../12-llmops/cost-engineering.html">推理成本工程</a>。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Orca: A Distributed Serving System for Transformer-Based Generative Models — 连续批处理与调度器设计 · <a href="https://www.usenix.org/conference/osdi22/presentation/yu" target="_blank" rel="noopener">OSDI 2022</a></li>
+            <li>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving — PD 分离的 SLO 优化，本页论文原图来源 · <a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener">arXiv:2401.09670</a></li>
+            <li>Splitwise: Efficient Generative LLM Inference Using Phase Splitting — Prefill/Decode 分离部署的成本收益 · <a href="https://arxiv.org/abs/2311.18677" target="_blank" rel="noopener">arXiv:2311.18677</a></li>
+            <li>Google SRE Book — SLO 与 SLI 的设计方法论 · <a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener">Google SRE Book</a></li>
+            <li>vLLM 官方文档 — 在线服务配置、批处理与 KV 缓存参数 · <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">docs.vllm.ai</a></li>
+            <li>SGLang 官方文档 — RadixAttention 与前缀感知路由 · <a href="https://docs.sglang.ai/" target="_blank" rel="noopener">docs.sglang.ai</a></li>
+            <li>Anyscale: The Cost of Intelligence — 关于推理成本随模型规模与技术演进的分析报告 · <a href="https://www.anyscale.com/blog/the-cost-of-intelligence" target="_blank" rel="noopener">Anyscale 报告</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            推理引擎的内部机制（连续批处理、PagedAttention）见 <a href="inference-engines.html">推理引擎</a>。大规模部署的 PD 分离和专家并行见 <a href="pd-disaggregation.html">PD 分离与大规模专家并行部署</a>。每 token 成本的精细化归因和优化（按工作流/租户/版本拆分）见 <a href="../12-llmops/cost-engineering.html">推理成本工程</a>——效率篇讲怎么让它快，运维篇讲怎么让它不烧钱。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

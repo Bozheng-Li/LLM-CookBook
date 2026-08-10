@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>概率与信息论 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="01-foundations" data-topic="probability-info">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>概率与信息论</h1>
+            <p class="lead">语言模型本质上不输出文字，而是输出「下一个词的概率分布」。熵、交叉熵、KL 散度和困惑度，就是用来衡量这种概率分布「有多确定」「有多准」「和真实差多远」的四把尺子。不懂这套尺子，就看不懂训练 loss 为什么长那样，也说不清 temperature 到底在调什么、为什么两个模型的 PPL 不能直接比。这一节全部用能手算的小数字把它们坐实。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>一句话串起来：<strong>熵</strong>量「真实分布本身有多不确定」，<strong>交叉熵</strong>量「用我的预测分布去编码真实分布要付多少代价」，<strong>KL 散度</strong>量「我的预测和真实差多远」，<strong>困惑度</strong>是交叉熵的指数化，直觉是「模型相当于在多少个候选里纠结」。四者之间只有一条恒等式：交叉熵 = 熵 + KL 散度。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  P["真实分布 p<br/>数据里真实发生的概率"] --> H["熵 H p<br/>p 自身的不确定性<br/>模型改不了的下限"]
+  P --> CE["交叉熵 H p q<br/>用 q 编码 p 的平均代价<br/>这就是训练 loss"]
+  Q["预测分布 q<br/>模型 softmax 的输出"] --> CE
+  CE --> KL["KL 散度<br/>= 交叉熵 减 熵<br/>模型多付的那部分"]
+  CE --> PPL["困惑度 PPL<br/>= exp 交叉熵<br/>换成人能读的单位"]
+
+  style H fill:#e6f1fb,stroke:#185fa5
+  style CE fill:#faeeda,stroke:#ba7517
+  style KL fill:#fcebeb,stroke:#a32d2d
+  style PPL fill:#eaf3de,stroke:#639922
+              </div>
+              <figcaption>四个量的关系：交叉熵 = 熵 + KL 散度，困惑度 = 交叉熵的指数。训练能优化的只有 KL 那一段，熵是数据本身的下限，再好的模型也压不下去。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section 1: 概率分布 ============ -->
+          <h2>概率分布：模型如何表达「不确定」</h2>
+          <p>大模型每生成一个 token 前，其实是在词表上给每个候选 token 打了一个分数（logits），经 softmax 归一成一组和为 1 的概率。这组数就是模型对「下一个词」的概率分布。</p>
+          <p>为什么是概率而不是确定的答案？因为自然语言天生有不确定性——「今天天气真好，我们去____吧」，填「公园」「爬山」「看电影」都合理。模型没法也没必要给出唯一答案，合理的做法是<strong>给不同可能性分配不同概率</strong>。所谓训练，就是让这组概率尽量逼近真实数据的分布。</p>
+
+          <h3>softmax：从打分到概率，手算一遍</h3>
+          <p>softmax 的定义是 $q_i = \dfrac{e^{z_i}}{\sum_j e^{z_j}}$。取一个只有三个候选的玩具词表，模型输出 logits 为 $z = (2.0,\, 1.0,\, 0.1)$：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>候选</th><th>logit $z_i$</th><th>$e^{z_i}$</th><th>概率 $q_i$</th></tr></thead>
+              <tbody>
+                <tr><td>token A</td><td>$2.0$</td><td>$7.389$</td><td><strong>$0.659$</strong></td></tr>
+                <tr><td>token B</td><td>$1.0$</td><td>$2.718$</td><td>$0.242$</td></tr>
+                <tr><td>token C</td><td>$0.1$</td><td>$1.105$</td><td>$0.099$</td></tr>
+                <tr><td colspan="2"><strong>合计</strong></td><td>$11.213$</td><td>$1.000$</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <figure class="figure">
+            <div class="mermaid">
+pie showData
+  title softmax 输出的概率占比 单位百分比
+  "token A" : 65.9
+  "token B" : 24.2
+  "token C" : 9.9
+            </div>
+            <figcaption>同一组 logits 经 softmax 后的概率占比。注意 logit 只差 1.0（A 与 B），概率就差了 2.7 倍——softmax 里的指数会把 logit 的小差距放大成概率的大差距。</figcaption>
+          </figure>
+          <p>这里有个值得记住的性质：<strong>softmax 只关心 logits 之间的差，不关心绝对值</strong>。给所有 logit 同时加 100，结果一模一样（分子分母同乘 $e^{100}$ 约掉）。框架实现里正是利用这一点，先减去最大值再取指数，避免 $e^{z}$ 溢出——这就是「数值稳定版 softmax」。</p>
+
+          <h3>温度：同一组 logits 能有几副面孔</h3>
+          <p>解码时的 temperature 参数 $T$，做的事就是在 softmax 前把 logits 除以 $T$：$q_i \propto e^{z_i / T}$。还用上面那组 logits：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>温度 $T$</th><th>token A</th><th>token B</th><th>token C</th><th>分布的熵（bits）</th><th>直观效果</th></tr></thead>
+              <tbody>
+                <tr><td>$T=0.5$</td><td><strong>$0.864$</strong></td><td>$0.117$</td><td>$0.019$</td><td>$\approx 0.65$</td><td>更尖锐，几乎只出 A，保守稳定</td></tr>
+                <tr><td>$T=1.0$</td><td>$0.659$</td><td>$0.242$</td><td>$0.099$</td><td>$\approx 1.22$</td><td>原始分布</td></tr>
+                <tr><td>$T=2.0$</td><td>$0.502$</td><td>$0.304$</td><td>$0.194$</td><td>$\approx 1.48$</td><td>更平坦，多样性高但容易跑偏</td></tr>
+                <tr><td>$T \to 0$</td><td>$\to 1$</td><td>$\to 0$</td><td>$\to 0$</td><td>$\to 0$</td><td>退化为贪心解码</td></tr>
+                <tr><td>$T \to \infty$</td><td>$\to 0.333$</td><td>$\to 0.333$</td><td>$\to 0.333$</td><td>$\to \log_2 3 \approx 1.585$</td><td>退化为在词表上纯随机</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>看最后一列的熵：温度调的其实就是<strong>输出分布的熵</strong>。这解释了为什么「调高温度增加创造性」和「调高温度容易胡说」是同一件事的两面——熵高了，低概率的候选也有机会被采到，其中既有惊喜也有错误。更多解码细节见 <a href="../08-inference/decoding.html">解码策略</a>。</p>
+
+          <h3>链式法则：一整句话的概率怎么来</h3>
+          <p>语言模型建模的是一整个句子的概率 $P(x_1, x_2, \dots, x_n)$。这个联合概率没法直接建模（组合数爆炸），但概率的链式法则给了一条出路：</p>
+          <div class="figure" style="text-align:center">
+            $$P(x_1, \dots, x_n) = \prod_{t=1}^{n} P(x_t \mid x_{&lt;t})$$
+          </div>
+          <p>把「一句话的概率」拆成「每一步给定前文、预测下一个词的条件概率」的连乘。<strong>这一个等式就是自回归语言模型的全部合法性来源</strong>——它说明「一个个往下预测 token」不是权宜之计，而是在精确地建模整句话的联合分布。</p>
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  S["句子: 我 爱 大 模型"] --> C1["P 我"]
+  S --> C2["P 爱 给定 我"]
+  S --> C3["P 大 给定 我爱"]
+  S --> C4["P 模型 给定 我爱大"]
+  C1 --> MUL["四项连乘<br/>= 整句话的概率"]
+  C2 --> MUL
+  C3 --> MUL
+  C4 --> MUL
+  MUL --> LOG["取对数变连加<br/>避免连乘下溢<br/>这就是 log likelihood"]
+
+  style MUL fill:#e6f1fb,stroke:#185fa5
+  style LOG fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>链式法则把联合概率拆成条件概率连乘。实际计算时一定取对数把连乘变连加——上千个小于 1 的数连乘会直接下溢成 0，这是训练里 <code>log_softmax</code> 无处不在的原因。</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            概率分布是模型对世界的「打分表」，softmax 是把任意打分变成合法打分表的标准手续，temperature 是这张表的「锐化/柔化」旋钮。训练就是让这张表越来越接近真实世界那张。
+          </div>
+
+          <!-- ============ Section 2: 熵 ============ -->
+          <h2>熵：不确定性到底有多大</h2>
+          <p>熵是信息论的奠基概念，由香农（Shannon）在 1948 年提出，用来度量一个分布「本身有多不确定」。对一个离散分布 $p$，熵的定义是：</p>
+          <div class="figure" style="text-align:center">
+            $$H(p) = -\sum_{i} p_i \log p_i$$
+          </div>
+          <p>这个公式为什么长这样？关键在于 $\log p_i$。一个事件越罕见（$p_i$ 越小），它一旦发生带来的「信息量」$-\log p_i$ 就越大——这是信息论的核心假设：<strong>罕见即意外，意外即信息</strong>。熵就是所有事件的「意外程度」按其发生概率加权平均，可以理解为「在这个分布下，平均每发生一次要用多少比特来记录」。</p>
+
+          <h3>四个分布，四个熵值</h3>
+          <p>都取 4 个候选，用 $\log_2$ 算（单位 bits）：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>分布</th><th>熵（bits）</th><th>解读</th></tr></thead>
+              <tbody>
+                <tr><td>$(1, 0, 0, 0)$ 完全确定</td><td>$0$</td><td>结果早已知道，一个比特都不用传</td></tr>
+                <tr><td>$(0.97, 0.01, 0.01, 0.01)$ 极端偏斜</td><td>$\approx 0.242$</td><td>几乎总是同一个结果，偶尔有意外</td></tr>
+                <tr><td>$(0.7, 0.1, 0.1, 0.1)$ 有偏好</td><td>$\approx 1.357$</td><td>有主流选项，但不确定性明显</td></tr>
+                <tr><td><strong>$(0.25, 0.25, 0.25, 0.25)$ 完全均匀</strong></td><td>$\log_2 4 = 2$</td><td><strong>最大值</strong>，最摸不着头脑</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>规律很清楚：<strong>越接近均匀，熵越大；越集中在少数几个选项，熵越小</strong>。$N$ 个候选的熵上界是 $\log N$，这是熵的一个硬边界。</p>
+
+          <h3>为什么偏偏是对数</h3>
+          <p>很多人第一次看到熵的公式都会问：衡量「意外程度」的函数那么多，为什么非得是 $-\log p$？答案是对数几乎是唯一同时满足下面三条朴素要求的函数：</p>
+          <ul>
+            <li><strong>越罕见越意外</strong>：$p$ 越小，$-\log p$ 越大，且概率为 1 的必然事件信息量恰好为 0。</li>
+            <li><strong>独立事件的信息量可以相加</strong>：两个独立事件同时发生的概率是 $p_1 p_2$，而 $-\log(p_1p_2) = -\log p_1 - \log p_2$。这条「乘法变加法」的性质是对数独有的，也正是它让「一句话的信息量 = 每个词的信息量之和」成立。</li>
+            <li><strong>连续变化</strong>：概率微小变化时信息量也微小变化，不会跳变，这样才能求导、才能拿来当 loss。</li>
+          </ul>
+          <p>第二条尤其关键。回头看上一小节的链式法则：整句话的概率是各步条件概率的连乘，取对数后就变成了各步 loss 的连加。<strong>「一句话的总 loss = 每个 token 的 loss 之和」这件在代码里天经地义的事，根子就在对数的这条性质上</strong>。</p>
+
+          <p>「概率越小，信息量越大」「信息量可以相加」——这两条听起来像课本教条，但它们有一条非常具体的工程化身：<strong>算术编码</strong>（arithmetic coding）。下面这张论文原图来自 DeepMind 2023 年的《Language Modeling Is Compression》，画的正是「一个概率模型如何把字符串 'AIXI' 变成二进制代码」：</p>
+
+          <figure class="paper-figure">
+            <img src="https://arxiv.org/html/2309.10668/x1.png" alt="论文原图：用概率模型 P 对字符串 'AIXI' 做算术编码，得到一个二进制码——概率模型与无损压缩之间的直接对应" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：算术编码示例——一个概率模型 P 把字符串 'AIXI' 逐步编码成二进制码。代码长度完全由模型对每个字符的概率决定：概率越高，占的码长越短</span>
+              <span class="pf-src">论文原图 · Delétang et al. (DeepMind), <em>Language Modeling Is Compression</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.10668" target="_blank" rel="noopener">arXiv:2309.10668</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，只需要看懂一个动作：<strong>把区间 $[0,1)$ 当作一根刻度尺，每来一个字符，就按它的概率把当前子区间再切一刀，指针所在位置最后转成二进制码</strong>。蓝色是模型给每个字符的概率，绿色是切完之后分配到的码段。核心规律就一条：出现概率越大的字符，分到的区间越宽、最终码长越短；整段字符串越「被模型猜中」，总码长就越短。</p>
+          <p>这和图上的 $- \log p$ 是同一件事：一段文本所需的平均码长，正好等于它的平均信息量（即交叉熵）；交叉熵越小，压缩率越高。这篇论文用「语言模型能不能当压缩器用」把这条等式做到了极致——它证明了在无损压缩比赛里，一个训练好的 70B 语言模型能赢过 gzip 这类通用压缩器。反过来想：<strong>「会压缩」和「会预测下一个 token」是同一件事的两面</strong>。这也是为什么「压缩即智能」会被当作一个大模型研究纲领——你现在理解的熵，就是这件事的计量单位。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">单位坑：nats 还是 bits</span>
+            $\log$ 取自然对数 $\ln$ 时单位是 <strong>nats</strong>，取 $\log_2$ 时是 <strong>bits</strong>。换算关系 $1 \text{ nat} = 1/\ln 2 \approx 1.4427 \text{ bits}$。深度学习框架（PyTorch 的 <code>cross_entropy</code>）默认用自然对数，输出是 nats；而信息论教材和很多评测报告用 bits。<strong>看到一个「交叉熵 2.0」先问清单位</strong>，否则困惑度会算差一大截：$e^{2.0} \approx 7.39$，而 $2^{2.0} = 4$。
+          </div>
+
+          <p>语言为什么难预测？因为它的熵远高于 0——同一个上下文，下一个词往往有好几种合理选择。这也是为什么语言建模能成为一个有意义的任务：如果熵是 0，意味着语言可被完美预测，模型也就没存在的必要了。反过来，如果熵等于 $\log(\text{词表大小})$，说明语言完全随机、无规律可学，模型同样没意义。<strong>语言的熵不高不低，正好落在「有规律但不确定」的甜区</strong>，这是整个领域成立的前提。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            「熵小」不等于「模型好」。熵 $H(p)$ 衡量的是<strong>真实数据分布本身</strong>的不确定性，它是数据固有属性，与模型无关；模型能改变的是交叉熵 $H(p,q)$，而且无论模型多强，交叉熵都降不到数据熵以下——因为 $H(p,q) = H(p) + D_{\mathrm{KL}}(p\|q) \ge H(p)$。所以看到「这个数据集熵很低」就下结论说「模型很准」，是把两把不同的尺子混用了。正确的说法是：<strong>模型好不好，看交叉熵逼近数据熵的距离（KL 那一段）</strong>，而不是看交叉熵的绝对值。同一个模型在中文小说和英文代码上的交叉熵差很多，不是因为模型偏心，而是两种数据的固有熵本就不同。</div>
+
+          <!-- ============ Section 3: 交叉熵 ============ -->
+          <h2>交叉熵：编码代价，也是训练 loss 的真身</h2>
+          <p>现在模型给出预测分布 $q$，真实数据的分布是 $p$。我们想知道：用 $q$ 去「编码」真实事件 $p$，平均要付多大代价？这就是交叉熵：</p>
+          <div class="figure" style="text-align:center">
+            $$H(p, q) = -\sum_{i} p_i \log q_i$$
+          </div>
+          <p>注意它的结构：权重用的是真实概率 $p_i$（因为事件确实按真实分布发生），但「意外程度」用的是模型的预测 $-\log q_i$。如果模型对真实发生的事件给的概率高（$q_i$ 大），$-\log q_i$ 就小，代价就低；反之模型把概率压错了地方，代价就暴涨。</p>
+
+          <h3>训练里的交叉熵，其实只剩一项</h3>
+          <p>训练数据给的是一个确定的「正确 token」，所以真实分布 $p$ 是 one-hot：正确那一项为 1，其余全 0。代入上式，求和里除了正确项以外全被 0 乘没了：</p>
+          <div class="figure" style="text-align:center">
+            $$H(p, q) = -\log q_{\text{正确 token}}$$
+          </div>
+          <p>还用前面那组 softmax 结果 $q = (0.659, 0.242, 0.099)$：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>真实答案</th><th>模型给它的概率</th><th>loss = $-\ln q$（nats）</th><th>评价</th></tr></thead>
+              <tbody>
+                <tr><td>token A</td><td>$0.659$</td><td>$0.417$</td><td>预测对了，loss 小</td></tr>
+                <tr><td>token B</td><td>$0.242$</td><td>$1.419$</td><td>没押中主流选项，loss 明显变大</td></tr>
+                <tr><td>token C</td><td>$0.099$</td><td><strong>$2.313$</strong></td><td>押错得很离谱，loss 是第一行的 5.5 倍</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>把这个关系画成完整曲线，就能看清交叉熵的性格：</p>
+          <div class="chart-box"><canvas id="chart-ce-curve"></canvas></div>
+          <p style="font-size:13px;color:var(--text-3);margin-top:-6px">横轴是模型给正确答案的概率，纵轴是对应的交叉熵 loss（nats）。曲线在右侧几乎贴地、在左侧陡然拉起——<strong>模型「对得差不多」时几乎没有惩罚，「错得离谱」时惩罚趋于无穷</strong>。这正是我们想要的性格：优先把灾难性错误改掉。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            交叉熵 loss 是 $-\log q_{\text{正确 token}}$，看起来只惩罚「正确那一个 token 的预测概率」，并不直接管其他错误 token。但因为 softmax 的分母是全词表求和，<strong>抬高正确项必然连带压低其他项</strong>——梯度会同时作用在所有 logits 上。这个「间接」的机制很容易被忽略，也是下面深入块里那条漂亮梯度公式的来源。
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">工程细节：标签平滑</span>
+            把 one-hot 的 1 改成 $1-\varepsilon$、把 0 改成 $\varepsilon/(V-1)$，就是标签平滑（label smoothing）。它让真实分布不再是绝对确定，从而<strong>阻止模型把正确 token 的 logit 推到无穷大</strong>，缓解过度自信。代价是模型输出的概率不再是良好校准的置信度。大模型预训练现在多数不开标签平滑，但在分类微调和一些机器翻译任务里仍常见，具体以各家训练配置为准。
+          </div>
+
+          <!-- ============ Section 4: KL ============ -->
+          <h2>KL 散度：两个分布差多远</h2>
+          <p>交叉熵里其实混了两个东西：一部分是真实分布本身的熵 $H(p)$（无法改变），另一部分是模型预测偏离真实多出来的「额外代价」。把这部分单独拎出来，就是 KL 散度（Kullback-Leibler divergence）：</p>
+          <div class="figure" style="text-align:center">
+            $$D_{\mathrm{KL}}(p \| q) = \sum_{i} p_i \log \frac{p_i}{q_i} = H(p, q) - H(p)$$
+          </div>
+          <p>它度量「用 $q$ 近似 $p$」额外付出的代价。最重要的性质有三条：</p>
+          <ul>
+            <li><strong>非负</strong>：$D_{\mathrm{KL}}(p \| q) \geq 0$，当且仅当 $p=q$ 时为 0。这就是吉布斯不等式。</li>
+            <li><strong>不对称</strong>：$D_{\mathrm{KL}}(p \| q) \neq D_{\mathrm{KL}}(q \| p)$。它不是真正意义上的「距离」，而是「方向性散度」。</li>
+            <li><strong>恒等关系</strong>：$H(p,q) = H(p) + D_{\mathrm{KL}}(p \| q)$。这就是概览图里那条线的数学来源。</li>
+          </ul>
+
+          <h3>用两个数字把「不对称」坐实</h3>
+          <p>取 $p = (0.5,\, 0.5)$（一枚公平硬币），$q = (0.9,\, 0.1)$（模型以为它严重偏向正面）。用自然对数算：</p>
+          <div class="figure" style="text-align:center">
+            $$D_{\mathrm{KL}}(p \| q) = 0.5\ln\frac{0.5}{0.9} + 0.5\ln\frac{0.5}{0.1} \approx -0.294 + 0.805 = \mathbf{0.511}\ \text{nats}$$
+            $$D_{\mathrm{KL}}(q \| p) = 0.9\ln\frac{0.9}{0.5} + 0.1\ln\frac{0.1}{0.5} \approx 0.529 - 0.161 = \mathbf{0.368}\ \text{nats}$$
+          </div>
+          <p>同样两个分布，换个方向差了近 40%。为什么？因为 KL 的加权系数是<strong>第一个参数</strong>的概率。$D_{\mathrm{KL}}(p\|q)$ 在 $p$ 有质量而 $q$ 接近 0 的地方会被 $\log(p/q)$ 拉爆——它<strong>不允许模型漏掉真实分布覆盖到的区域</strong>；反过来 $D_{\mathrm{KL}}(q\|p)$ 只在 $q$ 有质量的地方计较，模型可以只盯住一个峰、忽略其余。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方向</th><th>俗称</th><th>行为</th><th>典型用途</th></tr></thead>
+              <tbody>
+                <tr><td>$D_{\mathrm{KL}}(p \| q)$</td><td>前向 KL / mode-covering</td><td>逼模型覆盖真实分布的所有峰，宁可摊平也不漏</td><td>最大似然训练、<a href="../07-posttraining/distillation.html">知识蒸馏</a> 里让学生对齐教师全分布</td></tr>
+                <tr><td>$D_{\mathrm{KL}}(q \| p)$</td><td>反向 KL / mode-seeking</td><td>允许模型只锁定一个主峰，产出更聚焦</td><td>变分推断；部分对齐方法里做「别漂太远」的正则</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>因为训练时 $H(p)$ 是固定的（真实数据不变），所以<strong>最小化交叉熵等价于最小化 KL 散度</strong>，都等于「让模型预测分布尽量逼近真实分布」。这是交叉熵 loss 在数学上站得住脚的根本原因。</p>
+          <p>KL 散度在大模型里还有个高频用途：<a href="../07-posttraining/rlhf.html">RLHF</a> 和 <a href="rl-basics.html">强化学习</a> 里，为了防止微调后的策略跑得太远，常常加一个 KL 惩罚项，让新策略不要偏离参考策略太多。这个「不要漂太远」的约束，背后就是 $D_{\mathrm{KL}}$。同样的思路也出现在 <a href="../07-posttraining/dpo.html">DPO</a> 的目标函数推导里。</p>
+
+          <!-- ============ Section 5: 困惑度 ============ -->
+          <h2>困惑度：把 loss 换成人能读的单位</h2>
+          <p>交叉熵的单位是 nats 或 bits，数值不太直观。把它指数化就得到困惑度：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathrm{PPL} = \exp\!\left(H(p, q)\right) = \exp\!\left(-\frac{1}{N}\sum_{t=1}^{N} \log q(x_t \mid x_{&lt;t})\right)$$
+          </div>
+          <p>困惑度的直觉是：<strong>模型相当于在多少个等概率候选之间犹豫</strong>。PPL=1 表示完全确定，PPL=100 表示模型每次像在 100 个候选里随机猜。数值越低越好。对照表：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>平均交叉熵（nats）</th><th>困惑度 $e^{H}$</th><th>直觉</th></tr></thead>
+              <tbody>
+                <tr><td>$0.5$</td><td>$\approx 1.65$</td><td>几乎已经确定下一个词</td></tr>
+                <tr><td>$1.0$</td><td>$\approx 2.72$</td><td>在两三个候选里挑</td></tr>
+                <tr><td>$2.0$</td><td>$\approx 7.39$</td><td>在七八个候选里挑</td></tr>
+                <tr><td>$3.0$</td><td>$\approx 20.1$</td><td>相当不确定</td></tr>
+                <tr><td>$5.0$</td><td>$\approx 148$</td><td>模型基本在瞎猜</td></tr>
+                <tr><td>$\ln V$（$V$ = 词表大小）</td><td>$= V$</td><td>纯随机的理论上界</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>最后一行是个有用的坐标：一个词表 $V = 32000$ 的模型，如果 PPL 接近 32000，说明它完全没学到东西。真实训练里 loss 曲线从 $\ln 32000 \approx 10.4$ 附近起步一路下降，就是这个道理——<strong>训练刚开始时模型的输出确实是均匀分布</strong>。</p>
+
+          <h3>三条使用纪律</h3>
+          <ul>
+            <li><strong>不能跨分词器比</strong>。困惑度是「每 token」的量。同一段文本，分词器 A 切成 100 个 token、分词器 B 切成 130 个 token，每 token 的平均难度就不同，PPL 天然不可比。要跨模型比，得换成与分词无关的指标，比如 <strong>bits per byte（BPB）</strong> 或 bits per character。</li>
+            <li><strong>不能跨语料比</strong>。在维基百科上测的 PPL 和在代码库上测的 PPL 不是一回事，代码的重复模式多、PPL 天然更低。</li>
+            <li><strong>它不等于生成质量</strong>。PPL 低的模型也可能生成无聊或重复的内容；PPL 衡量的是「建模准不准」，不是「说话好不好」。评估生成质量要看 <a href="../13-evaluation/benchmarks.html">评估基准</a> 和人工评测。</li>
+          </ul>
+          <p>第三条值得多说一句，因为它是很多误判的源头。一个把「的」「了」「是」这类高频虚词预测得极准的模型，PPL 可以压得很低，但它未必真的理解内容——大量的 loss 权重被虚词吃掉了。反过来，一个经过强指令微调、习惯输出结构化长回答的模型，在纯文本语料上测 PPL 甚至可能比它的基座还高，因为它的输出分布已经被对齐目标改造过了。<strong>把 PPL 当成「模型好不好」的唯一指标，是评估环节最常见的方法论错误之一</strong>；它更合适的定位是「同一模型在训练过程中的进度条」。</p>
+
+          <div class="callout">
+            <span class="callout-t">一句话记牢</span>
+            交叉熵是 loss 的真身，KL 是交叉熵减掉真实熵剩下的「差距」，困惑度是给交叉熵换了个更直觉的皮肤。三者是同一个东西的三种说法，优化任一个等于优化全部。
+          </div>
+
+          <!-- ============ Section 6: 全流程落点 ============ -->
+          <h2>这四把尺子分别出现在训练的哪一步</h2>
+          <p>把概念放回真实流程，一次训练 step 里它们是这样接力的：</p>
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant D as 数据批次
+  participant M as 模型
+  participant S as Softmax
+  participant L as 交叉熵 Loss
+  participant O as 优化器
+  D->>M: 送入 token 序列
+  M->>S: 输出 logits 维度等于词表大小
+  S->>L: 归一化得到预测分布 q
+  D->>L: 给出真实的下一个 token
+  L->>L: 取 负 log q 正确token 并对 batch 求平均
+  Note over L: 这个标量就是训练曲线上那条 loss
+  L-->>M: 反传梯度 形式恰好是 q 减 onehot
+  M->>O: 交出各参数的梯度
+  O-->>M: 按学习率更新参数
+  Note over M,O: 下一步 loss 略降 等价于 PPL 略降
+            </div>
+            <figcaption>一次训练 step 里各个量的接力：softmax 产出 $q$，交叉熵把 $q$ 和真实答案压成一个标量，反传的梯度形式极其简洁（见下方深入块）。整条链路上没有任何一步用到熵或 KL 的显式计算——它们是解释工具，不是计算步骤。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>环节</th><th>用到哪个量</th><th>具体形态</th></tr></thead>
+              <tbody>
+                <tr><td><a href="../06-pretraining/objectives.html">预训练</a></td><td>交叉熵</td><td>next-token prediction 的标准 loss，全部算力都花在压它</td></tr>
+                <tr><td><a href="../07-posttraining/sft.html">SFT</a></td><td>交叉熵</td><td>同上，只是数据换成指令-回答对，且常只对回答部分算 loss</td></tr>
+                <tr><td><a href="../07-posttraining/rlhf.html">RLHF</a></td><td>KL 散度</td><td>在奖励里减去与参考模型的 KL，防止策略漂移</td></tr>
+                <tr><td><a href="../07-posttraining/distillation.html">蒸馏</a></td><td>KL 散度</td><td>学生分布对齐教师分布，用的是软标签而非 one-hot</td></tr>
+                <tr><td>训练监控</td><td>困惑度</td><td>把 loss 换算成 PPL 汇报，团队之间更好沟通</td></tr>
+                <tr><td>解码</td><td>熵</td><td>temperature、top-p 本质都在调输出分布的熵</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((信息论概念族))
+    描述单个分布
+      熵 不确定性
+      最大熵在均匀分布
+      最小熵为 0 在确定分布
+    描述两个分布
+      交叉熵 编码代价
+      KL 散度 额外代价 不对称
+      JS 散度 KL 的对称化版本
+    描述变量之间
+      条件熵 已知一个后另一个还剩多少不确定
+      互信息 两者共享了多少信息
+    工程化的读数
+      困惑度 交叉熵取指数
+      bits per byte 跨分词器可比
+      每 token 平均 loss
+            </div>
+            <figcaption>信息论概念族的分类地图。本节讲透了左边三支中最常用的部分；条件熵与互信息在 <a href="../13-evaluation/interpretability.html">机制可解释性</a> 里会再遇到。</figcaption>
+          </figure>
+
+          <!-- ============ Section 7: 动手 ============ -->
+          <h2>动手：手算与框架结果对一遍</h2>
+          <p>下面这段代码把本节所有数字都验证一遍。建议实际跑一次，看手算和框架是否吻合：</p>
+          <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+# ---- 1. softmax：手算的 0.659 / 0.242 / 0.099 ----
+logits = torch.tensor([2.0, 1.0, 0.1])
+q = F.softmax(logits, dim=-1)
+print(q)                                  # tensor([0.6590, 0.2424, 0.0986])
+
+# ---- 2. 温度：T=0.5 更尖锐，T=2 更平坦 ----
+for T in [0.5, 1.0, 2.0]:
+    print(T, F.softmax(logits / T, dim=-1))
+
+# ---- 3. 熵（bits）：手算 1.22 ----
+ent_bits = -(q * torch.log2(q)).sum()
+print(ent_bits)                           # tensor(1.2217)
+
+# ---- 4. 交叉熵 loss：真实答案是第 0 个 token ----
+target = torch.tensor([0])
+loss = F.cross_entropy(logits.unsqueeze(0), target)
+print(loss)                               # tensor(0.4170)  == -ln(0.6590)
+print(-torch.log(q[0]))                   # 完全一致
+
+# ---- 5. 困惑度 ----
+print(torch.exp(loss))                    # tensor(1.5174)
+
+# ---- 6. KL 的不对称性：手算 0.511 vs 0.368 ----
+p = torch.tensor([0.5, 0.5])
+r = torch.tensor([0.9, 0.1])
+kl_pr = (p * (p / r).log()).sum()
+kl_rp = (r * (r / p).log()).sum()
+print(kl_pr, kl_rp)                       # tensor(0.5108) tensor(0.3681)</code></pre>
+          <div class="callout warn">
+            <span class="callout-t">最高频的实现坑</span>
+            <code>F.cross_entropy</code> 内部<strong>已经包含了 log_softmax</strong>，它要的输入是原始 logits，不是概率。先 <code>softmax</code> 再 <code>cross_entropy</code> 等于算了两次 softmax，模型照样能训但收敛异常慢，而且不会报任何错。同理，<code>F.kl_div</code> 的第一个参数要求传<strong>对数概率</strong>（<code>log_softmax</code> 的输出），第二个参数传概率——参数约定不对称，是另一个高频翻车点，用之前务必查一次官方文档。
+          </div>
+
+          <details class="deep">
+            <summary>展开：为什么 softmax + 交叉熵的梯度这么漂亮</summary>
+            <div class="deep-body">
+              <p>把交叉熵对 logits 求导，结果简洁得令人意外：</p>
+              <div style="text-align:center">$$\frac{\partial L}{\partial z_i} = q_i - y_i$$</div>
+              <p>其中 $q_i$ 是 softmax 输出的概率，$y_i$ 是 one-hot 标签。也就是说，<strong>梯度就是「模型的预测」减去「真实答案」</strong>，没有任何多余的项。</p>
+              <p>这带来三个重要后果：</p>
+              <ul>
+                <li><strong>不会梯度饱和</strong>。对正确 token，梯度是 $q_{\text{正确}} - 1$；模型越错（$q$ 越接近 0），梯度绝对值越接近 1，仍然强劲。对比之下，如果用 MSE 配 sigmoid，预测越错梯度反而越接近 0，训练会卡死——这就是分类任务不用 MSE 的根本原因。</li>
+                <li><strong>数值上极其稳定</strong>。框架把 softmax 和 NLL 融合成一个算子（<code>cross_entropy</code>），中间不显式生成 $q$，避免了 $\log 0$ 和指数溢出。这也是为什么不要自己拆开写。</li>
+                <li><strong>梯度自动作用于全词表</strong>。对错误 token $j$，梯度是 $q_j - 0 = q_j$，正数，会把它的 logit 往下压。押得越高的错误答案被压得越狠。</li>
+              </ul>
+              <p>推导本身不难：$\frac{\partial q_i}{\partial z_j} = q_i(\delta_{ij} - q_j)$，代入 $L = -\sum_k y_k \log q_k$ 并利用 $\sum_k y_k = 1$ 化简即得。感兴趣可以在纸上推一遍，二十分钟就能走通，是理解 <a href="calculus-backprop.html">反向传播</a> 的绝佳练习。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：三个自测小题（含答案）</summary>
+            <div class="deep-body">
+              <p><strong>题 1</strong>：某模型在测试集上平均交叉熵为 2.3 nats，它的困惑度是多少？如果换算成 bits 该报多少？</p>
+              <p style="color:var(--text-2)">答：PPL $= e^{2.3} \approx 9.97$，约等于 10，说明模型平均在十来个候选里犹豫。换算成 bits 是 $2.3 \times 1.4427 \approx 3.32$ bits，注意 $2^{3.32} \approx 9.97$ 结果一致——<strong>换单位只换指数的底，PPL 不变</strong>。</p>
+              <p><strong>题 2</strong>：把 temperature 从 1.0 调到 0.7，输出分布的熵变大还是变小？生成结果会更保守还是更发散？</p>
+              <p style="color:var(--text-2)">答：变小、更保守。$T&lt;1$ 相当于把 logits 放大，差距被拉开，分布更尖锐，高概率 token 更容易被采到。极限 $T \to 0$ 就是贪心解码，熵为 0。</p>
+              <p><strong>题 3</strong>：训练刚启动时，一个词表 5 万的模型 loss 大约是多少才算「正常的随机初始化」？</p>
+              <p style="color:var(--text-2)">答：约 $\ln 50000 \approx 10.8$ nats。如果开局 loss 远低于这个值，八成是数据泄漏或标签对齐错了（比如输入和标签没错位）；如果远高于这个值，多半是初始化或数值精度出了问题。<strong>这是一条非常实用的开局体检指标</strong>。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>softmax</strong>：$q_i = e^{z_i}/\sum_j e^{z_j}$，只关心 logits 的差不关心绝对值；temperature 除在指数上，调的是输出分布的熵。</li>
+            <li><strong>链式法则</strong>：$P(x_1..x_n)=\prod_t P(x_t\mid x_{&lt;t})$，这是自回归语言模型的合法性来源；实现上一定取对数把连乘变连加。</li>
+            <li><strong>熵 $H(p)$</strong>：$-\sum p_i \log p_i$，衡量分布自身的不确定性，均匀分布取最大值 $\log N$，确定分布为 0。</li>
+            <li><strong>交叉熵 $H(p,q)$</strong>：$-\sum p_i \log q_i$。标签是 one-hot 时退化为 $-\log q_{\text{正确}}$，这就是训练 loss。</li>
+            <li><strong>KL 散度</strong>：$H(p,q) - H(p)$，非负、不对称（$p=(0.5,0.5)$ 对 $q=(0.9,0.1)$ 是 0.511 vs 0.368 nats）。前向 KL 覆盖所有峰，反向 KL 锁定单峰。</li>
+            <li><strong>困惑度</strong>：$\exp(H)$，直觉是「相当于在几个等概率候选里犹豫」。$\ln V$ 对应的 PPL 就是词表大小，是随机初始化时的开局值。</li>
+            <li><strong>关键梯度</strong>：softmax + 交叉熵对 logits 的梯度就是 $q - y$，不饱和、数值稳定，这是它取代 MSE 做分类的根本原因。</li>
+            <li><strong>常见坑</strong>：nats 与 bits 混用、跨分词器/跨语料比 PPL、把 PPL 当生成质量、对 softmax 结果再过一次 <code>cross_entropy</code>、<code>F.kl_div</code> 的两个参数一个要 log 一个不要。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Shannon《A Mathematical Theory of Communication》(1948) — 信息论的开山之作，熵、信道容量、编码定理都出自这里，本节所有概念的源头 · <a href="https://people.math.harvard.edu/~ctm/home/text/others/shannon/entropy/entropy.pdf" target="_blank" rel="noopener">原文 PDF</a></li>
+            <li>Goodfellow, Bengio, Courville《Deep Learning》第 3 章「Probability and Information Theory」— 深度学习视角的系统梳理，含交叉熵、KL、最大似然与概率图模型 · <a href="https://www.deeplearningbook.org/contents/prob.html" target="_blank" rel="noopener">deeplearningbook.org</a></li>
+            <li>PyTorch 文档 <code>torch.nn.functional.cross_entropy</code> — 训练 loss 的标准实现，文档里明确写了它包含 log_softmax、输入必须是 logits，是避开本节那个高频坑的第一手依据 · <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.cross_entropy.html" target="_blank" rel="noopener">官方文档</a></li>
+            <li>Hinton, Vinyals, Dean《Distilling the Knowledge in a Neural Network》— 知识蒸馏原始论文，把「温度」和「用 KL 对齐软标签」这两件事讲透，是本节温度与前向 KL 部分的最佳延伸 · <a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">arXiv:1503.02531</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            有了 loss，下一步就是「怎么把 loss 降下去」。这需要两块拼图：先看 <a href="calculus-backprop.html">微积分与反向传播</a> 搞清梯度从哪来、怎么算，再看 <a href="optimization.html">优化算法基础</a> 看 SGD、Adam 怎么用梯度更新参数。如果你对本节末尾提到的温度、top-p 更感兴趣，也可以直接跳到 <a href="../08-inference/decoding.html">解码策略</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script>
+  (function(){
+    function draw(){
+      if (typeof Chart === 'undefined') return;
+      var el = document.getElementById('chart-ce-curve');
+      if (!el) return;
+      var ps = [0.99,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1,0.05,0.02,0.01];
+      var loss = ps.map(function(p){ return +(-Math.log(p)).toFixed(3); });
+      var ch = new Chart(el, {
+        type: 'line',
+        data: {
+          labels: ps.map(function(p){ return p.toString(); }),
+          datasets: [{
+            label: '交叉熵 loss = -ln p（nats）',
+            data: loss,
+            borderColor: window.CB_COLORS ? window.CB_COLORS.red : '#e24b4a',
+            backgroundColor: window.CB_COLORS ? window.CB_COLORS.redSoft : '#fcebeb',
+            borderWidth: 2, fill: true, tension: 0.25, pointRadius: 3
+          }]
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: true } },
+          scales: {
+            x: { reverse: true, title: { display: true, text: '模型给正确答案的概率 p' } },
+            y: { beginAtZero: true, title: { display: true, text: 'loss（nats）' } }
+          }
+        }
+      });
+      if (window.CB_CHARTS) window.CB_CHARTS.push(ch);
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', draw);
+    else draw();
+  })();
+  </script>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>端侧部署与小模型 SLM · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="09-efficiency" data-topic="on-device-slm">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>端侧部署与小模型 SLM</h1>
+            <p class="lead">手机里的模型不是「缩小版的 GPT」，而是一套完全不同的工程权衡：它牺牲上限能力，换来隐私、延迟和零成本。理解 SLM 的能力边界、压缩手段、推理栈选型和端云协同的分工逻辑，才知道什么任务该交给本地，什么任务必须上云。本节从能力边界到工程落地，做完整拆解。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>端侧部署的本质是一条「能力 ↔ 代价」的交换线：量化、剪枝、蒸馏把模型压到 1–8B 参数、几个 GB 以内，塞进手机和 PC；系统层面再用 llama.cpp / MLX 等推理栈把它跑起来；最后用一个路由策略决定「本地算还是云端算」。三个环节缺一不可。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  U["用户请求"] --> R{"路由策略"}
+  R -->|"简单 / 隐私 / 离线"| L["端侧 SLM<br/>1-8B · 量化"]
+  R -->|"复杂 / 需联网知识"| C["云端大模型"]
+  L --> A["毫秒级响应<br/>数据不出设备"]
+  C --> B["最强能力<br/>可挂工具与知识库"]
+              </div>
+              <figcaption>端云协同：路由策略决定请求去向，两端各司其职</figcaption>
+            </figure>
+          </div>
+
+          <h2>一、SLM 能做什么，不能做什么</h2>
+          <p>小语言模型（Small Language Model）通常指 1B–8B 参数、能在单设备上运行的模型。典型代表有 Qwen-2.5-7B、Llama-3.2-3B、Phi-3.5-mini（3.8B）、Gemma-2-2B 等。先说结论：<strong>SLM 擅长「模式匹配型」任务，不擅长「知识密集型」和「多步推理型」任务</strong>。</p>
+
+          <p>这个能力边界的根源在于<strong>参数量与能力的关系不是线性的</strong>。模型的参数同时承担两个角色：存储知识和执行计算。参数少了，知识储量直接下降（事实性问答会出错），推理深度也受限（没有足够的「计算电路」做多步推导）。但语言模式识别——比如意图分类、摘要、改写——对参数量的需求低得多。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Easy["SLM 强项区（模式匹配型）"]
+    E1["意图分类 / 情感分析"]
+    E2["摘要 / 改写 / 补全"]
+    E3["命名实体识别"]
+    E4["简单翻译"]
+  end
+  subgraph Medium["SLM 可用区（需调优）"]
+    M1["简单问答（常识范围）"]
+    M2["格式化输出<br/>JSON / 表格"]
+    M3["代码补全（短片段）"]
+  end
+  subgraph Hard["SLM 弱项区（需上云）"]
+    H1["事实性问答"]
+    H2["多步推理 / 数学"]
+    H3["长文档理解"]
+    H4["复杂代码生成"]
+  end
+  Easy -->|"参数需求低"| Param["参数量<br/>1-3B 足够"]
+  Medium -->|"参数需求中"| Param2["参数量<br/>3-8B + 微调"]
+  Hard -->|"参数需求高"| Cloud["上云<br/>70B+ 模型"]
+            </div>
+            <figcaption>SLM 能力边界：按任务类型分为强项区、可用区、弱项区，参数需求逐级升高</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>任务类型</th><th>端侧 SLM 表现</th><th>推荐参数量</th><th>原因</th></tr></thead>
+              <tbody>
+                <tr><td>文本分类 / 意图识别</td><td>优秀</td><td>1-3B</td><td>任务模式固定，参数量足够拟合</td></tr>
+                <tr><td>摘要、改写、补全</td><td>良好</td><td>3-7B</td><td>不需要外部知识，靠语言模式即可</td></tr>
+                <tr><td>简单问答</td><td>一般</td><td>7B+ RAG</td><td>常识可能够用，事实性知识易错</td></tr>
+                <tr><td>格式化输出（JSON）</td><td>良好</td><td>3-7B</td><td>模式可学习，需少量 few-shot</td></tr>
+                <tr><td>多步推理 / 数学</td><td>偏弱</td><td>—</td><td>推理深度受参数量限制</td></tr>
+                <tr><td>最新资讯 / 私域知识</td><td>不可用</td><td>—</td><td>知识截止 + 没有检索入口</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            不要用「小模型也及格」的心态做产品。端侧模型回答错误时用户不会怪网络，只会怪产品。正确的姿态是：<strong>先明确哪些任务能接受 SLM 的错误率，再决定放端侧</strong>。用置信度路由做兜底——低置信度的请求升级到云端。
+          </div>
+
+          <h2>二、把模型塞进设备：压缩四件套</h2>
+          <p>设备可用内存通常只有 4–16 GB（且要和系统、其他 App 共享），而 7B 模型 FP16 权重就约 14 GB。要落地，必须叠加以下手段。这些手段不是「选一个」，而是「全都要」。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Original["原始模型"]
+    O1["7B 参数<br/>FP16 ≈ 14 GB"]
+  end
+  subgraph Step1["第一步：量化"]
+    S1["INT4 ≈ 3.5 GB<br/>精度损失 1-2%"]
+  end
+  subgraph Step2["第二步：蒸馏"]
+    S2["7B → 3B<br/>能力保留 85-90%"]
+  end
+  subgraph Step3["第三步：剪枝"]
+    S3["去掉 20% 低价值权重<br/>能力损失 ＜1%"]
+  end
+  subgraph Step4["第四步：KV 压缩"]
+    S4["运行时 KV INT8<br/>省一半运行内存"]
+  end
+  Original --> Step1 --> Step2 --> Step3 --> Step4
+  Step4 --> Final["最终：~1.5-2 GB<br/>可塞进手机"]
+            </div>
+            <figcaption>模型压缩四件套：量化、蒸馏、剪枝、KV 压缩，每一步都在压缩体积的同时尽量保持能力</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">压缩顺序有讲究</span>
+            四件套不是随意叠加的。通常先做<strong>蒸馏</strong>得到更小的基础模型（如 7B→3B），再对 3B 做<strong>量化</strong>（Q4）和<strong>剪枝</strong>，最后在运行时用 KV 压缩兜底。反过来先量化再蒸馏会很别扭——蒸馏需要教师模型的软标签，量化后的学生本身精度已受损。最稳妥的起点是：直接选一个官方出的「小模型 + 已量化」组合（如 Qwen2.5-3B-Instruct-Q4_K_M），而不是自己从头压。
+          </div>
+
+          <h3>2.1 量化：第一手段</h3>
+          <p>4-bit 量化把 7B 压到约 3.5 GB，是目前端侧主力手段。GGUF 格式（llama.cpp 生态）支持多种量化精度：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>量化格式</th><th>每参数比特</th><th>7B 模型大小</th><th>精度损失</th><th>推荐场景</th></tr></thead>
+              <tbody>
+                <tr><td>Q8_0</td><td>8.5</td><td>~7.2 GB</td><td>~0%</td><td>PC / 高内存设备</td></tr>
+                <tr><td>Q5_K_M</td><td>5.5</td><td>~4.8 GB</td><td>＜0.5%</td><td>高端手机</td></tr>
+                <tr><td>Q4_K_M</td><td>4.8</td><td>~4.1 GB</td><td>＜1%</td><td>主流手机（推荐）</td></tr>
+                <tr><td>Q3_K_M</td><td>3.9</td><td>~3.3 GB</td><td>1-2%</td><td>低内存设备</td></tr>
+                <tr><td>Q2_K</td><td>2.6</td><td>~2.7 GB</td><td>3-5%</td><td>极限压缩（不推荐）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>选型建议：<strong>Q4_K_M 是性价比之王</strong>——大小和精度的平衡点最好，适合绝大多数端侧场景。详见 <a href="quantization.html">量化 Quantization</a>。</p>
+
+          <h3>2.2 知识蒸馏：用大模型教小模型</h3>
+          <p>用大模型当老师，把小模型「教」到接近能力。蒸馏不是简单的微调，而是让小模型学习大模型的<strong>输出分布</strong>（软标签），而非硬标签。这样小模型能学到「虽然选 A，但 B 也有 30% 的概率」这种额外信息。</p>
+          <p>典型实践：Phi 系列用 GPT-4 生成高质量教科书数据训练 3.8B 模型，在部分基准上接近 Llama-2-70B 的表现。详见 <a href="../07-posttraining/distillation.html">知识蒸馏</a>。</p>
+
+          <h3>2.3 剪枝与稀疏</h3>
+          <p>去掉低价值神经元/注意力头，配合蒸馏恢复效果。剪枝分两种：</p>
+          <ul>
+            <li><strong>结构化剪枝</strong>：整行整列地删，删完模型架构变小，推理直接加速。代表方法如 SparseGPT、Wanda。</li>
+            <li><strong>非结构化剪枝</strong>：单个权重置零，需要稀疏矩阵支持才能加速，硬件友好性差。</li>
+          </ul>
+
+          <h3>2.4 KV 压缩与卸载</h3>
+          <p>降低长上下文时的显存尖峰。端侧场景的上下文通常较短（几百到几千 token），但 Agent 场景需要多轮对话，KV 会累积。配合 <a href="kv-offload.html">KV 分级存储</a> 的思路，把冷 KV 放到 CPU 内存。</p>
+
+          <h2>三、端侧推理栈：主流方案对比</h2>
+          <p>模型压缩完了，还需要一个高效的推理引擎把它在设备上跑起来。端侧推理栈的选型直接影响速度、兼容性和开发体验。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  M["模型权重<br/>FP16 ≈ 14GB(7B)"] --> Q["4-bit 量化<br/>≈ 4GB"]
+  Q --> F["GGUF / MLX 格式"]
+  F --> L["llama.cpp<br/>CPU / GPU / 移动端"]
+  F --> X["MLX<br/>Apple Silicon"]
+  F --> W["WebGPU<br/>浏览器"]
+  L --> D["设备内存 4-16GB"]
+  X --> D
+  W --> D
+            </div>
+            <figcaption>端侧部署链路：量化压缩 → 统一格式 → 平台推理栈 → 设备内存</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方案</th><th>平台</th><th>核心优势</th><th>核心限制</th><th>典型代表</th></tr></thead>
+              <tbody>
+                <tr><td>llama.cpp</td><td>CPU / GPU / 移动端全平台</td><td>纯 C/C++，零依赖，GGUF 生态最广</td><td>CPU 推理速度有上限</td><td>Llama、Qwen 系列 GGUF 版</td></tr>
+                <tr><td>MLX</td><td>Apple Silicon（M 系列）</td><td>苹果统一内存架构，CPU/GPU 无拷贝</td><td>仅限 Apple 平台</td><td>Apple 生态模型应用</td></tr>
+                <tr><td>WebGPU / ONNX</td><td>浏览器 / Windows</td><td>零安装，打开即用</td><td>浏览器沙箱限制，性能打折</td><td>Transformers.js、WebLLM</td></tr>
+                <tr><td>MNN / NCNN</td><td>移动端（Android/iOS）</td><td>移动端优化深，成熟工业方案</td><td>LLM 支持不如 llama.cpp 成熟</td><td>移动 App 集成</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>选型的直觉：<strong>生态优先选 llama.cpp</strong>（模型多、教程多、踩坑答案全）；Apple 生态深度优先选 MLX；要「零安装、打开即用」选 WebGPU 路线；原生移动 App 集成考虑 MNN/NCNN。</p>
+
+          <h3>3.1 内存预算分析</h3>
+          <p>端侧部署最核心的约束是内存。一个典型的手机内存预算分配：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Total["手机总内存 8-12 GB"] --> OS["操作系统 + 后台<br/>~3-4 GB"]
+  Total --> App["其他 App<br/>~1-2 GB"]
+  Total --> Avail["可用于模型<br/>~3-6 GB"]
+  Avail --> Weights["模型权重<br/>Q4 ≈ 3.5 GB(7B)"]
+  Avail --> KV["KV Cache<br/>~0.5-1 GB"]
+  Avail --> Activ["激活内存<br/>~0.2-0.5 GB"]
+  Weights --> Result["7B-Q4 可以跑<br/>但留给 KV 的空间有限"]
+            </div>
+            <figcaption>手机内存预算分配：7B Q4 模型刚好能挤进去，但上下文长度受限</figcaption>
+          </figure>
+
+          <p>这意味着在 8GB 内存的手机上跑 7B-Q4 模型，留给 KV Cache 的空间只有 0.5-1 GB，对应的上下文长度大约 2K-4K token。如果需要更长的上下文，要么降到 3B 模型，要么用 KV 量化 + 卸载。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            新手评估端侧模型时，最常见的错误是只看「模型文件能不能装进内存」，然后得出结论「能跑」。<strong>「放得下」和「跑得动」是两回事。</strong>装进内存只解决了容量问题；跑得动还受两个隐性约束：一是<strong>内存带宽</strong>——端侧芯片的带宽远低于服务器 GPU，每生成一个 token 都要把全部量化权重读一遍，带宽决定稳态 tok/s 的上限，这跟服务器推理的 Decode 瓶颈一模一样；二是<strong>散热与降频</strong>——满速推理几十秒就触发系统降频，速度直接腰斩。同样的 Q4 模型，在 A 手机上可能 25 tok/s，在 B 手机上因为带宽低或散热差可能只有 8 tok/s。所以「能装下」只够你继续往下论证，真正的验收标准是「在目标真机上、持续推理 1 分钟后的稳态速度」——用压测代替猜想。
+          </div>
+
+          <h3>3.2 性能基准参考</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>设备</th><th>模型</th><th>量化</th><th>内存占用</th><th>生成速度</th></tr></thead>
+              <tbody>
+                <tr><td>iPhone 15 Pro (8GB)</td><td>Qwen-2.5-7B</td><td>Q4_K_M</td><td>~4.1 GB</td><td>~15-20 tok/s</td></tr>
+                <tr><td>iPhone 15 Pro (8GB)</td><td>Phi-3.5-mini (3.8B)</td><td>Q4_K_M</td><td>~2.2 GB</td><td>~30-40 tok/s</td></tr>
+                <tr><td>MacBook Pro M3 (16GB)</td><td>Llama-3.1-8B</td><td>Q4_K_M</td><td>~4.7 GB</td><td>~40-60 tok/s</td></tr>
+                <tr><td>MacBook Pro M3 (16GB)</td><td>Qwen-2.5-14B</td><td>Q4_K_M</td><td>~8.5 GB</td><td>~20-30 tok/s</td></tr>
+                <tr><td>Android 旗舰 (12GB)</td><td>Llama-3.2-3B</td><td>Q4_K_M</td><td>~1.8 GB</td><td>~20-30 tok/s</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>注：以上数据为社区测试参考值，实际速度受设备状态、散热条件、输入长度等多种因素影响。</p>
+
+          <h2>四、端云协同：路由与分工</h2>
+          <p>端云协同不是「非此即彼」，而是让路由策略按任务特性分派。好的路由策略能在用户无感的情况下，既享受端侧的速度和隐私，又获得云端的能力。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Input["用户输入"] --> Classify{"任务分类器<br/>（端侧轻量模型）"}
+  Classify -->|"意图分类"| T1["分类结果"]
+  Classify -->|"文本生成"| T2["生成任务"]
+  Classify -->|"问答"| T3["问答任务"]
+
+  T1 --> R1{"隐私敏感?"}
+  R1 -->|"是"| Local1["端侧处理"]
+  R1 -->|"否"| R1b{"模型置信度<br/>>阈值?"}
+  R1b -->|"是"| Local1
+  R1b -->|"否"| Cloud1["云端处理"]
+
+  T2 --> R2{"需要联网<br/>知识?"}
+  R2 -->|"是"| Cloud2["云端 + RAG"]
+  R2 -->|"否"| Local2["端侧生成"]
+
+  T3 --> R3{"常识问题?"}
+  R3 -->|"是"| Local3["端侧回答"]
+  R3 -->|"否"| Cloud3["云端 + RAG"]
+
+  Local1 --> Resp["返回用户"]
+  Cloud1 --> Resp
+  Local2 --> Resp
+  Cloud2 --> Resp
+  Local3 --> Resp
+  Cloud3 --> Resp
+            </div>
+            <figcaption>端云协同路由策略：按任务类型、隐私需求、置信度三个维度决定请求去向</figcaption>
+          </figure>
+
+          <p>实践中常见的路由规则：</p>
+          <ul>
+            <li><strong>延迟敏感</strong>：输入法联想、实时语音转写 → 端侧（云端 RTT 100-300ms，端侧 10-50ms）。</li>
+            <li><strong>隐私敏感</strong>：医疗记录、聊天内容、文档草稿 → 端侧（数据不出设备）。</li>
+            <li><strong>离线可用</strong>：飞机、地铁、弱网 → 端侧（唯一选择）。</li>
+            <li><strong>知识密集</strong>：需要最新资讯或私域数据 → 云端（RAG 加持）。</li>
+            <li><strong>推理密集</strong>：数学、代码、长文规划 → 云端（参数量需求高）。</li>
+          </ul>
+
+          <p>「端侧一个模型、云端一个模型、两者怎么配合」这个问题，苹果在 2024 年的 Apple Intelligence 技术报告里给出了一个非常清晰的参考架构，下面这张是报告里的原图。</p>
+
+          <figure class="paper-figure">
+            <img src="https://arxiv.org/html/2407.21075v2/x2.png" alt="论文原图：Apple Intelligence 架构——端侧模型与服务器模型各挂一组 LoRA 适配器，按任务切换，图像模型与之并行" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：Apple Intelligence 的适配器架构——约 3B 的端侧模型与大型服务器模型共享同一套基座设计，通过可切换的 LoRA 适配器按任务分工</span>
+              <span class="pf-src">论文原图 · Gunter et al. (Apple), <em>Apple Intelligence Foundation Language Models</em>, 2024, Figure 2 · <a href="https://arxiv.org/abs/2407.21075" target="_blank" rel="noopener">arXiv:2407.21075</a></span>
+            </figcaption>
+          </figure>
+
+          <p>逐块读这张图，注意它把「端云协同」画成了三个层次。第一，<strong>最上面是模型本体</strong>：图里同时画出「端侧语言模型」（约 3B 参数，跑在设备上）和「服务器语言模型」（大模型，跑在 Private Cloud Compute 上）——两者是<strong>同一个家族、同一套架构</strong>，而不是两个毫不相关的模型。这个「同源」设计是端云协同的关键：端侧负责的「简单任务」和云端负责的「复杂任务」共享同一套分词、同一套能力底座，路由切换时行为一致性更好。第二，<strong>中间是成排的适配器（LoRA Adapter）</strong>：同一个基座模型挂着一排轻量适配器，每个适配器对应一类任务（如摘要、改写、特定领域问答）。这对应本页「压缩四件套」之外的第五种思路——<strong>不换模型，只换适配器</strong>：任务 A 用适配器 1，任务 B 切换成适配器 2，基座权重完全共享。适配器只有几 MB 到几十 MB，分发成本远低于换整个模型。第三，<strong>端侧与服务器侧各有一套适配器</strong>：图里端侧和服务器模型各自挂着自己的适配器组——这暗示了端云协同的完整分工：同一任务，端侧有一个「轻量版」适配器，服务器有一个「完整版」适配器，路由时按设备能力与任务复杂度选择。</p>
+          <p>这张图对工程实践最大的启示是：<strong>端云协同不一定是「两个不同公司造的模型拼起来」，更成熟的做法是「一个模型家族 + 按层拆分的部署」</strong>。它把「端侧 SLM 和云端大模型」从「竞争关系」变成了「同一系统的两个档位」——端侧挡位保底（隐私、离线、低延迟），云端挡位兜上限（能力、知识、推理）。做端云路由设计时，先把这两个档位画清楚，再考虑本文开头的五条路由规则，顺序不能反。</p>
+
+          <h3>4.1 置信度路由</h3>
+          <p>进阶做法是<strong>置信度路由</strong>：先让端侧模型给出答案和置信分，置信度低于阈值再升级到云端——既保住大部分请求的隐私与速度，又用云端兜住难例。</p>
+
+          <pre><code class="language-python">class EdgeCloudRouter:
+    """端云协同置信度路由"""
+
+    def __init__(self, local_model, cloud_api,
+                 confidence_threshold=0.7,
+                 max_local_tokens=512):
+        self.local = local_model
+        self.cloud = cloud_api
+        self.threshold = confidence_threshold
+        self.max_tokens = max_local_tokens
+
+    def route(self, query, context=""):
+        """路由决策：先端侧，低置信度则升级云端
+
+        Returns:
+            {"source": "local"|"cloud",
+             "answer": str,
+             "confidence": float,
+             "latency_ms": int}
+        """
+        import time
+        t0 = time.time()
+
+        # 1. 先尝试端侧模型
+        local_result = self.local.generate(
+            query,
+            context=context,
+            max_tokens=self.max_tokens,
+            return_confidence=True
+        )
+
+        # 2. 检查置信度
+        if local_result["confidence"] >= self.threshold:
+            return {
+                "source": "local",
+                "answer": local_result["text"],
+                "confidence": local_result["confidence"],
+                "latency_ms": int((time.time() - t0) * 1000)
+            }
+
+        # 3. 低置信度：升级到云端
+        cloud_result = self.cloud.chat(
+            messages=[
+                {"role": "user",
+                 "content": f"上下文：{context}\n\n问题：{query}"}
+            ]
+        )
+
+        return {
+            "source": "cloud",
+            "answer": cloud_result["content"],
+            "confidence": None,  # 云端不返回置信度
+            "latency_ms": int((time.time() - t0) * 1000),
+            "local_confidence": local_result["confidence"]
+        }
+
+    def batch_route(self, queries):
+        """批量路由：统计端侧命中率"""
+        results = [self.route(q) for q in queries]
+        local_count = sum(1 for r in results if r["source"] == "local")
+        print(f"端侧命中: {local_count}/{len(results)} "
+              f"({local_count/len(results)*100:.1f}%)")
+        return results</code></pre>
+
+          <p>代价是端侧模型需要校准自己的置信度——这是模型训练时就该设计的。校准不好的模型会「过度自信」（错误答案也给高分）或「不够自信」（正确答案也频繁升级云端），两者都会损害用户体验。</p>
+
+          <h2>五、电池与散热：被忽视的约束</h2>
+          <p>端侧推理的能耗和发热是产品层面的硬约束。一个 7B 模型满速推理时功耗可达 5-10W，持续 30 秒手机就会明显发热，系统会自动降频——速度从 20 tok/s 掉到 5 tok/s。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">发热不是小事</span>
+            手机芯片的降频是被动温控，应用层无法关闭。一旦触发，<strong>不是某个请求变慢，而是整机所有推理一起变慢</strong>——正在跑的其他用户请求也会受影响。更隐蔽的是「温热态」：手机从裤兜里拿出来时本来就 35°C，稍微一推理就到降频阈值。所以端侧服务不能按峰值算力设计 SLO，而应按「持续可维持算力」设计，通常只有峰值的一半甚至更低。
+          </div>
+
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Inference["持续推理"] --> Heat["芯片发热"]
+  Heat --> Throttle["系统降频"]
+  Throttle --> Slow["速度下降"]
+  Slow --> UX["用户体验恶化"]
+
+  Heat --> Battery["电池消耗"]
+  Battery --> Drain["续航缩短"]
+  Drain --> UX
+
+  Inference --> Fix1["限制推理频率<br/>节流到 5-10 tok/s"]
+  Inference --> Fix2["使用更小模型<br/>3B 替代 7B"]
+  Inference --> Fix3["批量处理<br/>积攒请求一次推理"]
+  Inference --> Fix4["温度监控<br/>过热时降级或暂停"]
+            </div>
+            <figcaption>端侧推理的发热与电池问题：持续推理导致降频形成恶性循环；四种缓解策略</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>策略</th><th>做法</th><th>效果</th><th>代价</th></tr></thead>
+              <tbody>
+                <tr><td>推理节流</td><td>限制生成速度到 5-10 tok/s</td><td>发热可控</td><td>用户等待时间增加</td></tr>
+                <tr><td>模型降级</td><td>发热时自动切到更小模型</td><td>功耗减半</td><td>输出质量下降</td></tr>
+                <tr><td>批量处理</td><td>积攒请求后一次性推理</td><td>减少冷启动开销</td><td>单请求延迟增加</td></tr>
+                <tr><td>温度感知</td><td>监控芯片温度，过热时暂停</td><td>保护硬件</td><td>服务中断</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：手算一次端侧生成的「时间 × 电量」账</summary>
+            <div class="deep-body">
+              <p>「端侧推理多耗电」这件事，用数字说话才直观。以 7B-Q4 模型（约 4.1 GB）、实测 20 tok/s、满速推理功耗约 5W 为例。</p>
+              <p><strong>第一笔账：生成 300 token（一段中等长度的回答）要多久。</strong>300 ÷ 20 = 15 秒。这 15 秒里芯片满速运行，如果手机同时在做别的事（后台刷新、播放音频），总功耗会更高。</p>
+              <p><strong>第二笔账：这 15 秒耗了多少电。</strong>能量 = 功率 × 时间 = 5W × 15s = 75 焦耳。换算成常用单位，1 瓦时 = 3600 焦耳，所以约 0.02 瓦时。手机电池容量约 15-20 瓦时，这意味着<strong>一次 300 token 的生成只占电池容量的千分之一</strong>——单次看确实不多。</p>
+              <p><strong>第三笔账：但发热是另一回事。</strong>耗电少不等于不发热。15 秒的持续 5W 高负载，芯片结温会迅速爬升，散热差的手机几十秒就顶到降频阈值——降频后速度掉到 5-8 tok/s，300 token 要 40-60 秒，用户直接感知到「越用越卡」。所以端侧真正的问题不是「总耗电」，而是<strong>「持续高功率的持续时间」</strong>：短促的 5W 没问题，连续 2 分钟的 5W 就会触发温控。</p>
+              <p style="margin-bottom:0">由此得到一个设计原则：<strong>把端侧任务设计成「短时、间断」，而不是「长时、连续」</strong>。需要长时间生成的（如整篇长文），要么拆成多段让芯片间歇休息，要么直接路由到云端；连续对话类产品（如语音陪伴）则要主动限速或降级到更小的模型，把持续功率压到 2-3W 以下，才能在「不降频」的前提下长期工作。</p>
+            </div>
+          </details>
+
+          <h2>六、模型分发与更新</h2>
+          <p>端侧模型的分发是一个容易被忽视的工程问题。一个 4GB 的量化模型通过 App Store 分发，意味着用户要下载 4GB 额外数据。更新模型意味着重新下载 4GB——这在移动网络环境下是很大的负担。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Cloud["云端模型实验室"]
+    C1["训练/微调新版本"]
+    C2["量化压缩"]
+    C3["A/B 测试验证"]
+  end
+  subgraph Distribution["分发渠道"]
+    D1["App Store 内置"]
+    D2["首次启动下载"]
+    D3["OTA 增量更新"]
+  end
+  subgraph Device["端侧"]
+    E1["模型存储<br/>~4 GB"]
+    E2["版本管理<br/>回滚机制"]
+    E3["加载与推理"]
+  end
+  Cloud --> Distribution --> Device
+            </div>
+            <figcaption>端侧模型分发流程：训练 → 量化 → 测试 → 分发 → 端侧管理，每一步都有工程成本</figcaption>
+          </figure>
+
+          <p>常见的分发策略：</p>
+          <ul>
+            <li><strong>App 内置</strong>：把模型打包进 App。优点是开箱即用，缺点是 App 体积大、更新慢。</li>
+            <li><strong>首次启动下载</strong>：App 体积小，首次使用时下载模型。优点是灵活，缺点是首次体验差。</li>
+            <li><strong>OTA 增量更新</strong>：只下载模型 diff。优点是流量小，缺点是实现复杂，需要差分压缩技术。</li>
+            <li><strong>多模型按需下载</strong>：按任务类型提供多个小模型，用户用到哪个下哪个。</li>
+          </ul>
+
+          <h2>七、2024-2026 SLM 生态全景</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模型</th><th>参数量</th><th>出品方</th><th>特点</th><th>端侧友好度</th></tr></thead>
+              <tbody>
+                <tr><td>Qwen-2.5 系列</td><td>0.5B / 1.5B / 3B / 7B</td><td>阿里</td><td>多尺寸覆盖，中文最强</td><td>★★★★★</td></tr>
+                <tr><td>Llama-3.2</td><td>1B / 3B</td><td>Meta</td><td>专为端侧设计，英文强</td><td>★★★★★</td></tr>
+                <tr><td>Phi-3.5 mini</td><td>3.8B</td><td>微软</td><td>合成数据训练，推理强</td><td>★★★★☆</td></tr>
+                <tr><td>Gemma-2</td><td>2B / 9B</td><td>Google</td><td>质量高，2B 版极轻量</td><td>★★★★☆</td></tr>
+                <tr><td>SmolLM2</td><td>135M / 360M / 1.7B</td><td>HuggingFace</td><td>超小尺寸，适合极轻量任务</td><td>★★★★★</td></tr>
+                <tr><td>MiniCPM</td><td>2B / 4B</td><td>面壁智能</td><td>中文端侧优化</td><td>★★★★☆</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>选型决策：中文场景优先 Qwen-2.5；英文场景优先 Llama-3.2；追求极致轻量选 SmolLM2 或 Gemma-2-2B；需要推理能力选 Phi-3.5。</p>
+
+          <h2>八、真实应用场景</h2>
+          <p>端侧 SLM 已经在多个方向规模化落地，核心逻辑都是「用有限的参数换取隐私、延迟和离线的确定性」：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Input["输入法与写作"]
+    I1["智能联想补全"]
+    I2["语法纠错"]
+    I3["摘要改写"]
+  end
+  subgraph Voice["语音与对话"]
+    V1["实时语音转写"]
+    V2["离线语音助手"]
+    V3["多语言翻译"]
+  end
+  subgraph Agent["Agent 场景"]
+    A1["本地 RAG<br/>文档问答"]
+    A2["隐私数据分析"]
+    A3["离线代码助手"]
+  end
+  subgraph Enterprise["企业场景"]
+    E1["内网知识库<br/>数据不出内网"]
+    E2["合规审计<br/>本地处理敏感数据"]
+    E3["边缘设备<br/>IoT / 车载"]
+  end
+            </div>
+            <figcaption>端侧 SLM 的四大应用场景：输入写作、语音对话、本地 Agent、企业合规</figcaption>
+          </figure>
+
+          <p>选型与落地路径总结：<strong>先确认任务类型是否匹配 SLM 能力边界 → 再按内存预算选模型尺寸与量化档位 → 选推理栈 → 设计路由策略 → 做好电池与分发管理</strong>。端侧不是大模型的替代，而是大模型的「最后一公里」——让最常用、最私密、最需要速度的能力出现在用户手里。</p>
+
+          <details class="deep">
+            <summary>展开：用 llama.cpp 在本地跑一个 7B 量化模型</summary>
+            <div class="deep-body">
+              <p>端侧推理最通用的入口是 llama.cpp。下面是从下载到调用的典型流程（命令以官方仓库最新用法为准，参数名可能随版本变化）：</p>
+              <pre><code class="language-bash"># 1. 拉取并构建（首次）
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp &amp;&amp; cmake -B build &amp;&amp; cmake --build build -j
+
+# 2. 下载一个 GGUF 量化模型（示例：Qwen2.5-7B-Instruct Q4_K_M）
+#    模型文件约 4.1 GB，从 HuggingFace 等源获取
+
+# 3. 交互式对话
+./build/bin/llama-cli \
+  -m models/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  -ngl 99 \
+  -p "用一句话解释什么是量化"
+
+# 4. 启动 OpenAI 兼容服务（供 App 调用）
+./build/bin/llama-server \
+  -m models/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 8080
+
+# 关键参数：
+# -ngl 99   把全部层卸载到 GPU（CPU -only 设备去掉此参数）
+# -c 4096   上下文窗口，越大占内存越多
+# -t N      使用的 CPU 线程数，通常设为物理核心数</code></pre>
+              <p style="margin-bottom:0">Apple Silicon 上更顺手的是 MLX：用 <code>pip install mlx-lm</code> 后执行 <code>mlx_lm.generate --model Qwen/Qwen2.5-3B-Instruct-4bit --prompt "..."</code> 即可，无需编译。选型原则：想跨平台、要最大模型覆盖选 llama.cpp；只在 Mac 上跑且追求统一内存零拷贝选 MLX。</p>
+            </div>
+          </details>
+
+          <h2>端侧技术栈地图</h2>
+          <p>把端侧部署涉及的模块收进一张图，能看清压缩、推理栈、协同、场景四块是怎么拼起来的——任何一块短板都会让其他三块的收益打折扣：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((端侧 SLM))
+    压缩
+      量化 Q4
+      蒸馏
+      剪枝
+    KV
+      量化
+      卸载
+    推理栈
+      llama.cpp
+      MLX
+      WebGPU
+    协同
+      路由策略
+      置信度兜底
+    场景
+      输入法
+      语音助手
+      本地 Agent
+            </div>
+            <figcaption>端侧 SLM 技术栈地图：压缩、KV、推理栈、协同、场景五块协同，任一块短板都会拖累整体</figcaption>
+          </figure>
+
+          <h2>延迟预算算例：30 tok/s 到底够不够用</h2>
+          <p>端侧模型的速度（token/s）经常被拿来和云端对比，但「够不够快」其实取决于用途，而不是绝对数字。把几类典型任务的延迟预算拆开算一遍，比空谈「快慢」有用得多。</p>
+          <p>先看交互式对话。人类阅读速度大约是每秒 4-8 个字，中文一个 token 通常对应 1-2 个字，所以 15-20 tok/s 已经超过了人类的阅读速度——模型生成的文字，人根本来不及读完。这也是为什么端侧 7B-Q4 的 15-20 tok/s 在聊天场景完全够用：用户读得比模型写得还慢，速度不再是人感知的瓶颈。真正影响体验的不是速度，而是首 token 延迟——如果按下发送后要等 2-3 秒才出第一个字，哪怕之后每秒钟 30 字，用户也会觉得「卡」。端侧的优势恰好在此：没有网络 RTT，首 token 通常几十毫秒，体验是「秒出」。所以端侧体验的核心指标其实是 TTFT，而不是稳态 tok/s。</p>
+          <p>再看输入法联想和语音转写这类「实时跟随」场景。输入法联想要求每击键一次就要给出候选词，可用预算约 10-30 ms；语音转写要求字幕基本跟得上说话速度，可用预算约 50-100 ms 每句。这些预算对 7B 模型来说太紧张，但对 0.5-1B 的超小模型（如 SmolLM2-135M、Gemma-2-2B）完全够用——它们跑在 30-60 tok/s 甚至更快，一次联想只需生成几个 token。这类场景选模型的标准是「够用里选最小」，而不是「最大里选够用」。</p>
+          <p>最后是长文档摘要、代码补全这类「一次性生成一大段」的任务。这里用户等的是总时长：如果一段 500 字的摘要用 20 tok/s 生成，约需 25-50 秒，这对移动场景来说偏长。此时才值得考虑三种手段：上云端、用更大模型（提高单次生成质量减少重试）、或者把任务拆小（分段摘要再合并）。反过来，如果只是抽取几个关键词或做意图分类，总产出只有几个 token，1-2 秒内就完成，端侧毫无压力。</p>
+          <p>把四类任务的预算汇总成一句话：<strong>短输出、频繁调用的任务，端侧延迟预算充裕；长输出、单次调用的任务，端侧容易触及等待时间上限</strong>。做产品设计时，先按任务的「输出长度 × 调用频率」画一张分布，再把端侧 tok/s 换算成每个任务的实际等待时间，就知道哪些任务天然适合端侧、哪些必须路由到云端。</p>
+
+          <h2>五个反面信号：什么时候别上端侧</h2>
+          <p>端侧部署的决策里，最容易被忽视的是「哪些场景不该用端侧」。以下五个信号只要中了两条以上，就该重新考虑是不是真的要上端侧。</p>
+          <p><strong>信号一：任务需要最新知识或私域数据。</strong>端侧模型的知识截止于训练时刻，且没有内置检索能力。如果产品核心是回答「今天有什么新闻」「我司内部文档怎么说」，端侧模型要么答错、要么需要复杂的本地 RAG 兜底——而本地 RAG 的检索质量、索引更新成本，往往比直接上云端高一个数量级。这类任务放端侧，是在用更大的工程复杂度换更差的结果。</p>
+          <p><strong>信号二：用户对错误率零容忍。</strong>医疗建议、法律意见、代码安全审查这类任务，端侧模型的幻觉是产品不可接受的。即使有置信度路由兜底，兜底本身也只是「把难例送去云端」——既然最终大部分还是要上云，不如直接上云，把端侧省下的那点成本让给更可靠的架构。</p>
+          <p><strong>信号三：模型需要频繁更新。</strong>端侧模型的更新依赖 OTA 分发，而一个 3-4 GB 的模型每次更新都是实打实的流量和用户打扰。如果业务模型每周都在迭代（新话术、新风格、新规则），端侧永远滞后于云端，产品能力会被分发节奏拖死。端侧适合「能力稳定、低频迭代」的模型。</p>
+          <p><strong>信号四：设备碎片化严重。</strong>iOS 和 Android 各有一堆芯片、内存档位、系统版本，同一个量化模型在不同设备上的表现（速度、内存、发热）可能差出一倍。如果要在几十种设备型号上逐一调优、测试、灰度，维护成本会迅速吞掉端侧省下的算力钱。团队没有足够的设备矩阵和测试资源时，端侧就是负担。</p>
+          <p><strong>信号五：没有持续的功耗与发热预算。</strong>7B 满速推理功耗 5-10W，30 秒就触发降频。如果产品的使用场景是「长时间连续对话」（如车载助手、语音陪伴），芯片会持续高负载，降频后体验反而比云端还差。端侧适合「短时、间断」的使用模式，不适合「持续、高强度」的负载。</p>
+          <p>最后补充一个判断框架：把「隐私、延迟、离线」三条端侧的核心价值，和「能力、更新、稳定性」三条云端的核心价值，放到一张表里逐项打分——只有当隐私/延迟/离线对你业务的权重明显高于能力/更新/稳定性时，端侧才值得投入。否则，端云协同中的「端」做得再漂亮，也只是一块成本，而不是能力。反过来也一样：如果隐私不是卖点、延迟不是痛点、离线只是「偶尔需要」，那端侧模型带来的能力折损、分发成本和测试负担，就全部变成了纯开销。此时把模型放回云端、用端侧只做轻量的任务分类与路由，往往才是整体成本最低的架构。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：端侧 SLM 用参数量换隐私、延迟、成本与离线能力，适合模式匹配型任务，不适合知识密集与多步推理。</li>
+            <li><strong>能力边界</strong>：分类/摘要/改写 → 强（1-3B）；简单问答/格式化 → 可用（3-7B+微调）；事实问答/推理/最新知识 → 弱（需上云）。</li>
+            <li><strong>压缩四件套</strong>：量化（Q4_K_M 主力）、蒸馏（大模型教小模型）、剪枝（去低价值权重）、KV 压缩（省运行内存）。</li>
+            <li><strong>推理栈选型</strong>：llama.cpp（全平台生态最好）、MLX（Apple 最优）、WebGPU（零安装）、MNN/NCNN（移动原生集成）。</li>
+            <li><strong>内存预算</strong>：8GB 手机跑 7B-Q4 刚好，留给 KV 只有 0.5-1GB（~2-4K 上下文）；3B 模型更从容。</li>
+            <li><strong>端云协同</strong>：按延迟/隐私/离线/知识/推理五个维度路由；置信度路由做兜底，低置信度升级云端。</li>
+            <li><strong>电池与散热</strong>：7B 满速推理 5-10W，30 秒发热降频；策略包括节流、模型降级、批量处理、温度感知。</li>
+            <li><strong>模型分发</strong>：内置（开箱即用但体积大）、首次下载（灵活但首次体验差）、OTA 增量（省流量但实现复杂）。</li>
+            <li><strong>常见坑</strong>：高估小模型能力导致产品翻车；忽视电池与发热（长上下文在端侧非常耗电）；忽视「模型更新要重新分发」的运维成本；不做置信度校准就上路由。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Apple Intelligence Foundation Language Models — 苹果端侧 + 服务器双模型与适配器架构的技术报告，本页论文原图来源 · <a href="https://arxiv.org/abs/2407.21075" target="_blank" rel="noopener">arXiv:2407.21075</a></li>
+            <li>llama.cpp 官方仓库 — GGUF 量化格式与多平台推理的事实标准 · <a href="https://github.com/ggerganov/llama.cpp" target="_blank" rel="noopener">GitHub</a></li>
+            <li>MLX 官方文档 — Apple Silicon 上的模型推理与训练框架 · <a href="https://ml-explore.github.io/mlx/" target="_blank" rel="noopener">ml-explore.github.io/mlx</a></li>
+            <li>MobileLLM: Optimizing Sub-billion Parameter Language Models for On-Device Use Cases — Meta 关于端侧模型设计原则的研究 · <a href="https://arxiv.org/abs/2402.14905" target="_blank" rel="noopener">arXiv:2402.14905</a></li>
+            <li>Phi-3 Technical Report — 微软用小模型 + 高质量数据的路线实证 · <a href="https://arxiv.org/abs/2404.14219" target="_blank" rel="noopener">arXiv:2404.14219</a></li>
+            <li>The Era of 1-bit LLMs（BitNet）— 端侧极致量化的前沿探索 · <a href="https://arxiv.org/abs/2402.17764" target="_blank" rel="noopener">arXiv:2402.17764</a></li>
+            <li>WebLLM 官方仓库 — 浏览器端 WebGPU 推理方案 · <a href="https://github.com/mlc-ai/web-llm" target="_blank" rel="noopener">github.com/mlc-ai/web-llm</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            端侧能跑起来的根基是模型足够小——先看 <a href="quantization.html">量化 Quantization</a> 是怎么把 7B 压进几个 GB 的；长上下文场景还要配合 <a href="kv-offload.html">KV 分级存储</a> 控制显存尖峰；再往深走，看端侧模型如何靠 <a href="../07-posttraining/distillation.html">知识蒸馏</a> 保持能力。
+          </div>
+
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

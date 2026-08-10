@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prompt 版本管理与评估门禁 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="12-llmops" data-topic="prompt-eval-ci">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>Prompt 版本管理与评估门禁</h1>
+            <p class="lead">改一个字 system prompt，可能让 10% 的请求从"答对"变成"答错"。但大多数团队改 prompt 的流程是：直接改代码 → 提交 → 上线 → 等用户反馈。这和"无测试直接部署"没有区别。本节讲怎么把 prompt 当成代码来版本管理，用 golden set 和 canary 做门禁，让改 prompt 这件事从"祈祷不出事"变成"有数据支撑的决策"。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>改一次 prompt 就是一次发布。和代码发布一样，它需要版本管理、自动化测试、灰度发布和回滚能力。Prompt registry 把"提示文本 + 变量模板 + 模型版本 + 参数"打包成一个不可变版本，通过 golden set 回归和 canary 流量验证后才允许上线。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  DEV["开发者改 Prompt"] --> REG["Prompt Registry<br/>打版本号"]
+  REG --> GOLD{"Golden Set<br/>回归测试"}
+  GOLD -->|"通过"| CAN["Canary 5% 流量"]
+  GOLD -->|"不通过"| BLOCK["阻断发布"]
+  CAN --> SIG{"生产信号<br/>正常?"}
+  SIG -->|"正常"| FULL["全量发布"]
+  SIG -->|"异常"| ROLL["自动回滚"]
+  BLOCK --> DEV
+  ROLL --> REG
+  style GOLD fill:#fff8e6,stroke:#d4a017
+  style BLOCK fill:#fce4e4,stroke:#c0392b
+  style FULL fill:#eaf3de,stroke:#639922
+              </div>
+              <figcaption>Prompt 发布流水线：版本化 → 回归门禁 → 灰度验证 → 全量或回滚。和代码 CI/CD 逻辑一致</figcaption>
+            </figure>
+          </div>
+
+          <h2>Prompt 不是代码，但需要比代码更严格的管理</h2>
+          <p>先做一个类比。代码和 prompt 的共同点是"改一行都可能出事"，但两者的安全网完全不同：<strong>代码有编译器、类型系统和单测替你兜底，prompt 什么都没有</strong>。你改一行 Java，编译器立刻告诉你类型不匹配；你改一个字 system prompt，没有任何工具会告诉你"这句话会让 10% 的请求答错"——它只会安静地让那 10% 的用户体验变差。这就是为什么 prompt 需要一套比代码更重的流程：既然没有免费的静态检查，就只能用"版本化 + 回归测试 + 灰度"来人工补上这道安全网。</p>
+          <p>代码改一行，编译器会帮你检查类型和语法。Prompt 改一个字，没有任何工具能告诉你"会不会出问题"。更要命的是，prompt 的改动影响面极难预测——加一个"请简洁回答"可能让某些场景的输出太短而丢信息，去掉一个约束条件可能让模型开始幻觉。</p>
+          <div class="callout warn">
+            <span class="callout-t">为什么 prompt 管理比代码管理更难</span>
+            代码是确定性的：同样输入一定同样输出。Prompt 是概率性的：同样 prompt 在不同输入上表现不同。你测了 100 条没问题，第 101 条可能就翻车。所以 prompt 的测试不能只看"通过率"，要看"有没有变差"，而且要和上一版做<strong>对比</strong>。
+          </div>
+
+          <h2>Prompt Registry：把 prompt 当不可变制品</h2>
+          <p>Prompt registry 的思路借鉴自 Docker 镜像 registry：每个 prompt 版本是一个不可变制品，包含完整的可复现信息。不是只存一段文本，而是存一个"可执行的规格说明书"。</p>
+
+          <h3>一个 prompt 版本要 pin 什么</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>字段</th><th>为什么必须 pin</th></tr></thead>
+              <tbody>
+                <tr><td><strong>提示文本</strong></td><td>system prompt + few-shot 示例 + 输出格式说明。一个字都不能含糊</td></tr>
+                <tr><td><strong>变量模板</strong></td><td>哪些变量在哪里插入、用什么分隔符。变量拼接 bug 是最常见的线上事故之一</td></tr>
+                <tr><td><strong>模型与版本</strong></td><td>不只是 "gpt-4o"，要精确到 "gpt-4o-2024-08-06"。同名不同版本行为可能差异显著</td></tr>
+                <tr><td><strong>采样参数</strong></td><td>temperature、top_p、max_tokens、stop sequences。temperature 从 0 改到 0.3 可能让输出质量波动翻倍</td></tr>
+                <tr><td><strong>依赖的配置</strong></td><td>RAG 检索的 top_k、工具定义列表、输出 schema 版本。这些变了，prompt 的行为也跟着变</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout tip">
+            <span class="callout-t">版本号策略</span>
+            用语义化版本号：<strong>major.minor.patch</strong>。改了输出格式或删了约束条件 = major（可能不兼容）；加了一个 few-shot 或调了措辞 = minor；修个错别字 = patch。Canary 和回滚策略根据 major/minor 级别决定严格程度。
+          </div>
+
+          <h3>一个版本的生命周期</h3>
+          <p>Registry 的价值不只在"存住了"，更在于每个版本有明确的<strong>状态</strong>，而状态之间的流转由门禁而不是由人的心情决定。把状态机画出来，团队里"这版到底能不能上"的争论会少一大半：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> draft: 开发者创建新版本
+  draft --> eval: 提交评估
+  eval --> draft: golden set 未过门禁，打回
+  eval --> shadow: 通过门禁
+  shadow --> canary: 影子对比无异常
+  shadow --> draft: 影子暴露长尾问题
+  canary --> live: 生产信号达标，逐步扩量
+  canary --> rolled_back: 信号异常，自动回滚
+  rolled_back --> draft: 分析原因后重做
+  live --> archived: 被更新的版本取代
+  archived --> [*]
+            </div>
+            <figcaption>Prompt 版本的状态机。注意 archived 不等于删除——历史版本必须可回滚、可复现，否则三个月前那条 trace 里的 prompt 你永远还原不出来</figcaption>
+          </figure>
+          <p>有两条边特别值得强调。<strong>一是 <code>rolled_back → draft</code>：回滚之后不能直接重试，必须先分析原因。</strong>见过太多团队回滚后隔天原样再发一次，指望"这次运气好点"。二是 <strong><code>live → archived</code> 而不是 <code>live → 删除</code></strong>：线上 trace 里记录的是版本号，如果对应的 prompt 内容被删了，几个月后排查历史问题时你会拿着一个版本号却看不到它当时长什么样。<strong>Registry 只增不删。</strong></p>
+
+          <details class="deep">
+            <summary>展开：Prompt Registry 的最小数据模型</summary>
+            <div class="deep-body">
+              <pre><code class="language-python"># prompt registry 中一个版本的最小数据模型
+prompt_version = {
+    "id": "summarizer-v3.2.0",           # 语义化版本号
+    "parent": "summarizer-v3.1.0",        # 基于哪个版本改的
+    "author": "zhang.san",
+    "created_at": "2024-12-01T10:00:00Z",
+
+    # 不可变的核心规格
+    "spec": {
+        "system_prompt": "你是一个摘要助手。请将输入文本...",
+        "user_template": "请摘要以下内容：\n{input_text}",
+        "variables": ["input_text"],
+        "model": "gpt-4o-2024-08-06",     # 精确到版本
+        "parameters": {
+            "temperature": 0.3,
+            "max_tokens": 500,
+            "stop": ["\n\n人类:"]
+        },
+        "dependencies": {
+            "rag_top_k": 5,
+            "tools": [],
+            "output_schema": "summary-v2.json"
+        }
+    },
+
+    # 评估结果（由 CI 流水线填充）
+    "eval_results": {
+        "golden_set_score": 0.87,          # 当前版本得分
+        "baseline_score": 0.85,            # 上一版本得分
+        "delta": +0.02,                    # 提升
+        "regression_count": 0,             # 退步的用例数
+        "evaluated_at": "2024-12-01T10:05:00Z"
+    },
+
+    # 发布状态
+    "status": "canary",   # draft → eval → canary → live → archived
+    "canary_traffic": 0.05
+}</code></pre>
+              <p style="margin-bottom:0">关键字段是 <code>eval_results</code> 和 <code>status</code>——它们让 registry 不只是存储，而是发布管理的核心。status 从 draft 到 live 的流转必须有评估门禁把关。</p>
+            </div>
+          </details>
+
+          <h2>Golden Set：回归测试的基石</h2>
+          <p>Golden set 是一组精心挑选的测试用例，用来回答一个问题：<strong>"这一版 prompt 和上一版比，是变好了还是变差了？"</strong>它不是越多越好，而是越有代表性越好。</p>
+
+          <h3>怎么挑 golden set 的用例</h3>
+          <ul>
+            <li><strong>从真实日志里挖</strong>：不要凭空编。从线上 trace 里挑出有代表性的请求，覆盖各种真实场景。这是 golden set 最大的价值来源。</li>
+            <li><strong>覆盖典型和边界</strong>：高频场景要有，但边界情况（空输入、超长输入、多语言混合、对抗性输入）更要有——这些是回归最容易出问题的地方。</li>
+            <li><strong>包含历史 bug</strong>：每次线上事故后，把触发事故的输入加入 golden set。这是"回归测试"的字面意义——确保修过的 bug 不再复发。</li>
+            <li><strong>规模适中</strong>：50-200 条足够。超过 500 条维护成本会失控，而且大部分用例会高度重复。定期清理不再有代表性的旧用例。</li>
+          </ul>
+
+          <h3>一条用例要存哪些字段</h3>
+          <p>Golden set 不是"一列输入 + 一列期望输出"这么简单。要让它在半年后还能用，每条用例至少需要下面这些字段：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>字段</th><th>作用</th></tr></thead>
+              <tbody>
+                <tr><td><code>case_id</code></td><td>稳定不变的标识。回归报告靠它把当前分数和历史分数对齐，改了 ID 就等于丢了这条用例的全部历史</td></tr>
+                <tr><td><code>input</code></td><td>各个变量的具体取值。来自线上日志的必须先脱敏，否则 golden set 本身就是一个 PII 数据集</td></tr>
+                <tr><td><code>context</code></td><td><strong>检索上下文的快照。</strong>RAG 场景下这一条最关键——如果不固定 context，每次评估时检索结果都在变，你测的其实是检索系统，不是 prompt</td></tr>
+                <tr><td><code>expected</code> / <code>rubric</code></td><td>期望输出，或者交给 Judge 的评分标准。开放式任务用 rubric，封闭式任务用 expected</td></tr>
+                <tr><td><code>judge_type</code></td><td>exact / rule / llm_judge / human。不同用例用不同判定方式，混在一个字段里比拆成四个表好维护</td></tr>
+                <tr><td><code>tags</code></td><td>场景标签 + 来源标签（线上挖掘 / 历史事故 / 人工构造）。回归报告按 tag 分组，能一眼看出是哪类场景退化了</td></tr>
+                <tr><td><code>weight</code></td><td>权重。高频场景的一条用例代表线上几万次请求，不该和一条边界用例等权</td></tr>
+                <tr><td><code>added_at</code> / <code>last_reviewed</code></td><td>用于定期清理。超过半年没复核过的用例要重新确认它是否还代表当前的业务形态</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout warn">
+            <span class="callout-t">RAG 场景一定要固定 context</span>
+            这是 golden set 最常见的设计错误。如果评估时让新 prompt 实时走一遍检索，那么两次评估之间检索结果的任何变化（索引更新了、向量模型换了、top-k 调了）都会混进"prompt 变更"的效果里，你根本分不清分数变化是谁造成的。<strong>正确做法是把检索结果快照存进用例</strong>，评估时直接注入。检索质量本身另外单独评估，见 <a href="rag-in-production.html">RAG 生产运维</a>。
+          </div>
+
+          <h3>评估方式：规则 + LLM-as-Judge 组合</h3>
+          <p>每条 golden set 用例需要一个"判定方式"来决定当前版本的输出是否可接受。实践中通常组合使用：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>判定方式</th><th>适用场景</th><th>局限</th></tr></thead>
+              <tbody>
+                <tr><td><strong>精确匹配</strong></td><td>输出是固定格式（分类标签、JSON 字段名）</td><td>无法处理同义表达</td></tr>
+                <tr><td><strong>规则校验</strong></td><td>检查格式、长度、必需字段、禁用词</td><td>只能抓格式问题</td></tr>
+                <tr><td><strong>LLM-as-Judge</strong></td><td>评估语义质量（准确性、完整性、简洁性）</td><td>Judge 有偏差，需要校准</td></tr>
+                <tr><td><strong>人工抽检</strong></td><td>定期抽 golden set 的子集人工复核</td><td>慢、贵，但最可靠</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>LLM-as-Judge 的关键不是找一个"完美的 Judge"，而是保持<strong>一致性</strong>：同一个 Judge、同一个评分 rubric、同一个比较方式，贯穿所有版本的评估。只要评估方式一致，版本间的相对比较就有意义。Judge 的各种偏差和校准方法详见 <a href="../13-evaluation/eval-methods.html">评估方法</a>。</p>
+
+          <h3>Deployment Gate：什么样的结果能过门禁</h3>
+          <p>不是"golden set 跑完分数高"就能上线。门禁规则要明确"什么情况下阻断"：</p>
+          <ul>
+            <li><strong>总分不低于基线</strong>：当前版本总分 ≥ 上一版本总分（允许微小波动，如 ±1%）。</li>
+            <li><strong>无严重回归</strong>：任何单条用例的分数下降超过阈值（如下降 30% 以上）即阻断，即使总分没掉。<strong>一个用例严重退化比整体微降更危险</strong>——它意味着某种特定输入场景彻底坏了。</li>
+            <li><strong>格式合规率 100%</strong>：输出格式（JSON schema、字段完整性）必须 100% 合规。哪怕一条格式错误也应该阻断——格式错误说明 prompt 对输出格式的约束不够强。</li>
+            <li><strong>拒答率不超标</strong>：如果 golden set 里有正常问题，新版本的拒答率不能比旧版本高太多。拒答率上升通常意味着 prompt 约束过度。</li>
+          </ul>
+
+          <h3>手算一个门禁判断：55 条用例怎么给出结论</h3>
+          <p>门禁规则写好了，但"怎么把分数读出来"本身是一门小功课。假设你的 golden set 有 55 条用例，旧版本通过 45 条、新版本通过 47 条，总分从 0.82 涨到 0.85。这算"变好了"吗？先把用例分成四类：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>类别</th><th>含义</th><th>本例条数</th></tr></thead>
+              <tbody>
+                <tr><td>旧过新也过</td><td>一直好的用例，无信息量</td><td>43</td></tr>
+                <tr><td>旧不过新也不过</td><td>一直坏的用例，无信息量</td><td>6</td></tr>
+                <tr><td><strong>旧过新不过</strong>（记为 b）</td><td>新版本导致的<strong>回归</strong></td><td>2</td></tr>
+                <tr><td><strong>旧不过新过</strong>（记为 c）</td><td>新版本带来的<strong>改进</strong></td><td>4</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这个例子里 b=2、c=4，方向上"改进多于回归"，但注意结论只建立在 6 条不一致用例上。再套上门禁规则看：这 2 条回归是不是"严重回归"？如果那 2 条恰好是"空输入"和"超长输入"这两类边界用例，而它们都是业务刚需场景，那么即使总分在涨，门禁也应该阻断——因为<strong>总分掩盖了边界场景的系统性退化</strong>。正确动作是：看回归列表 → 找到那 2 条用例的共同点 → 调整 prompt 让它们恢复 → 重新评估，而不是盯着 0.85 > 0.82 直接放行。</p>
+          <p>这个手算过程说明了一件事：<strong>门禁读的不是一个数字，而是一个分布</strong>。单条用例级别的"过/不过"翻转，才是真正值得讨论的证据。</p>
+
+          <details class="deep">
+            <summary>展开：只有 100 条用例时，分数差 2% 到底算不算变好？</summary>
+            <div class="deep-body">
+              <p>这是 golden set 使用中最容易犯的统计错误：把噪声当成信号。假设 golden set 有 100 条用例，旧版通过 85 条（0.85），新版通过 87 条（0.87），报告上写着"提升 2%"——但这个提升很可能什么都不是。</p>
+              <p><strong>先算一下噪声有多大。</strong>把每条用例看成一次伯努利试验，通过率 <code>p</code> 的标准误约为 <code>sqrt(p(1-p)/n)</code>。代入 <code>p=0.85</code>、<code>n=100</code>，得到约 <code>sqrt(0.85 × 0.15 / 100) ≈ 0.036</code>，也就是 <strong>3.6 个百分点</strong>。换句话说，即使两个版本完全一样，仅仅因为随机性，两次跑出来的分数差个 3-4 个百分点都很正常。<strong>2% 的"提升"完全淹没在噪声里。</strong></p>
+              <p><strong>那怎么办？答案是做配对比较，而不是比总分。</strong>关键在于：新旧版本跑的是<strong>同一批用例</strong>，这是配对数据，比两个独立样本的信息量大得多。具体做法是逐条对比，把用例分成三类：</p>
+              <ul>
+                <li><strong>一致通过</strong>和<strong>一致失败</strong>——这两类用例对"谁更好"这个判断<strong>不提供任何信息</strong>，应该从比较中剔除。</li>
+                <li><strong>不一致（discordant）</strong>——旧版过新版不过（记为 b 条），或旧版不过新版过（记为 c 条）。真正的信息全在这里。</li>
+              </ul>
+              <p>如果 b=1、c=3，那么"新版更好"这个结论建立在 4 条用例上，显然不足以下判断（这正是配对检验的思路：只看 b 和 c 的相对大小）。但如果 b=1、c=12，即使总分只差 11 个百分点，这个方向也是相当可信的。<strong>同样是"提升 2%"，b/c 的分布完全决定了它的含义。</strong></p>
+              <p><strong>第二个噪声源是 Judge 本身。</strong>LLM-as-Judge 即使 temperature 设成 0，换个日期、换个供应商快照，打分也可能漂移。缓解办法有三个：同一条用例让 Judge 跑 k 次（k 取 3 或 5）取多数或均值；<strong>新旧版本的评估必须在同一次任务里跑完</strong>，不要今天评旧版明天评新版；以及定期用人工标注的小样本校准 Judge，确认它的判断方向没有整体偏移。</p>
+              <p><strong>落到实践上，一条可操作的原则是：不要盯总分，要盯回归列表。</strong>总分是个被平均掉的、统计上很脆弱的数字；而"哪几条用例从通过变成了不通过"是具体的、可复核的、可以拿去和产品讨论的证据。这也是前面门禁规则里"无严重回归"比"总分不降"更重要的原因——<strong>前者看的是个体，后者看的是一个噪声很大的平均值。</strong></p>
+            </div>
+          </details>
+
+          <div class="callout">
+            <span class="callout-t">门禁不是目的，是决策工具</span>
+            门禁阻断不是"你不行"，而是"先看看哪里变了"。很多有价值的 prompt 改动会被门禁拦住——因为改善了一类场景但恶化了另一类。这时候正确的做法是分析回归用例、调整 prompt、重新评估，而不是绕过门禁硬上。
+          </div>
+
+          <h3>CI 失败分级：阻断、告警与放行</h3>
+          <p>门禁的产出不该是简单的"过 / 不过"两个状态。全部拦截会让团队想方设法绕过门禁，全部放行又等于没有门禁。更实用的做法是让每条规则和每条用例带上<strong>严重度</strong>，把结果分成三个等级：</p>
+          <ul>
+            <li><strong>阻断（blocker）</strong>：单条用例严重回归（分数下降超过阈值，如前面说的 30%）、格式合规率不达标、拒答率超标。这类失败必须阻断发布，并把回归列表精确到 <code>case_id</code> 推送给负责人。只有"哪条用例从通过变成不通过"这种具体证据，才能推动人去修，而不是去争辩。</li>
+            <li><strong>告警（warning）</strong>：总分在噪声范围内微降（参考前面算出的约 3.6 个百分点标准误）、非关键场景的轻微退化。放行但写进评估报告，由周会或自动化周报汇总跟踪。连续多次 warning 累积出的缓慢退化，往往比一次 blocker 更隐蔽。</li>
+            <li><strong>放行（pass）</strong>：总分不降、无单条严重回归、格式全合规。直接进入 canary 阶段。</li>
+          </ul>
+          <p>分级要真正落地，关键是把严重度做成用例或规则上的<strong>显式字段</strong>，而不是每次靠人现场判断。比如规则校验把"缺少必需字段"标成 blocker、"输出长度超限"标成 warning；golden set 用例按业务重要性标上 <code>weight</code> 和 <code>severity</code>。这样门禁引擎聚合时能稳定地回答"这版能不能上"，而且结论可复现、可回查——上个月为什么拦下某个版本，翻出当时的评估记录就能讲清楚，不会变成"当时那个同事觉得不行"。</p>
+
+          <h3>权威图：一次评估实验在工具里长什么样</h3>
+          <p>前面讲的门禁、回归列表、新旧对比，落到真实工具里是什么界面？LangSmith（LangChain 官方评估平台）的文档里有一张"评估实验视图"（experiment view）的截图，正好展示了一次评估实验的完整结果页——它就是 golden set 回归门禁的"产品化形态"。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/12-llmops/prompt-eval-ci/experiment-view.png" alt="权威图：LangSmith 官方文档展示的评估实验视图，含每条用例的输入、输出、评分结果" loading="lazy" style="max-width:680px">
+            <figcaption>
+              <span class="pf-title">图：LangSmith 的评估实验视图——一次实验把同一批用例在所有配置下的表现列出来，逐条打分、逐条对比</span>
+              <span class="pf-src">权威图 · LangSmith 官方文档, <em>Evaluation</em> · <a href="https://docs.smith.langchain.com/evaluation" target="_blank" rel="noopener">docs.smith.langchain.com/evaluation</a></span>
+            </figcaption>
+          </figure>
+
+          <p>这张图的关键不是它的具体样式，而是它体现的<strong>评估实验的结构</strong>。看懂它，你就能看懂任何一门评估工具。核心是三块：<strong>① 一个实验（experiment）绑定一份数据集</strong>——也就是本节说的 golden set，一份包含若干用例、每条用例有输入和判定标准的数据集；<strong>② 实验要对一个"配置"跑一遍</strong>——这个配置就是 prompt 版本 + 模型版本 + 采样参数的组合，同一份数据集可以在多个配置上各跑一次，形成对比；<strong>③ 结果页逐条展示每条用例的输出和评分</strong>——这正是门禁要看的"回归列表"：哪条用例在新配置上从过变不过，一眼可见。<strong>你不需要用 LangSmith 才能做门禁，但你需要理解它的数据模型：数据集、配置、实验、逐条结果，这四个概念是任何评估门禁的地基。</strong>工具可以换，结构不会变。</p>
+
+          <h2>Canary 发布：线上验证才是真验证</h2>
+          <p>Golden set 过了不等于线上没问题。Golden set 只有几百条，线上有长尾的千千万万。Canary 发布把新版本暴露给一小部分真实流量，用<a href="observability.html">可观测性</a>里讲的四个生产信号来验证。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  OLD["旧版本 95% 流量"] --> MIX["流量路由器"]
+  NEW["新版本 5% Canary"] --> MIX
+  MIX --> OBS["可观测性平台"]
+  OBS --> Q["质量分对比"]
+  OBS --> L["p95 延迟对比"]
+  OBS --> C["成本对比"]
+  OBS --> R["拒答率对比"]
+  Q --> DEC{"指标达标?"}
+  L --> DEC
+  C --> DEC
+  R --> DEC
+  DEC -->|"达标"| UP["扩大到 20% → 50% → 100%"]
+  DEC -->|"不达标"| DOWN["回滚到 0%"]
+  style NEW fill:#fff8e6,stroke:#d4a017
+  style DOWN fill:#fce4e4,stroke:#c0392b
+  style UP fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>Canary 发布流程：新旧版本并行，对比四个生产信号。信号达标则逐步扩大流量，否则自动回滚</figcaption>
+          </figure>
+
+          <h3>Canary 阶段的信号对比</h3>
+          <p>Canary 的核心是<strong>对比</strong>，不是看绝对值。新旧版本同时跑，对比同一时段的指标：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>信号</th><th>canary 达标标准</th><th>不达标意味着</th></tr></thead>
+              <tbody>
+                <tr><td>质量分</td><td>canary ≥ baseline - 1%</td><td>新 prompt 在真实分布上表现更差</td></tr>
+                <tr><td>p95 延迟</td><td>canary ≤ baseline × 1.1</td><td>新 prompt 导致输出更长或链路更复杂</td></tr>
+                <tr><td>错误与拒答率</td><td>canary ≤ baseline + 2pp</td><td>新 prompt 的约束过度或与模型不兼容</td></tr>
+                <tr><td>每请求成本</td><td>canary ≤ baseline × 1.15</td><td>新 prompt 的 token 消耗增加（可能上下文更长）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>逐步扩大流量的节奏通常是 5% → 20% → 50% → 100%，每步观察 1-2 小时（或足够多的请求数）。每一步都要有自动回滚机制：信号触发阈值时，canary 流量自动归零，不需要人工介入。</p>
+
+          <h3>自动回滚长什么样</h3>
+          <p>"自动回滚"这四个字经常停留在文档里。落到实现上，它是一个由指标聚合器驱动、发布控制器执行的闭环，全过程不需要人：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant G as 发布控制器
+  participant R as 流量路由器
+  participant N as 新版本 v3.2.0
+  participant O as 基线 v3.1.0
+  participant M as 指标聚合器
+
+  G->>R: 将 5% 流量切到 v3.2.0
+  loop 每 5 分钟一个评估窗口
+    R->>N: 5% 真实请求
+    R->>O: 95% 真实请求
+    N-->>M: 上报质量分、延迟、成本、拒答率
+    O-->>M: 上报同期基线指标
+    M->>G: 返回配对对比结果
+  end
+  M->>G: 拒答率高出基线 4 个百分点
+  G->>R: 立即将 canary 流量归零
+  G->>G: 冻结该版本并生成回滚报告
+  Note over G: 回滚是自动的，通知人是事后的
+            </div>
+            <figcaption>Canary 自动回滚的时序。核心设计是"先止血再叫人"——等值班同学看到告警再手动回滚，往往已经影响了成千上万次请求</figcaption>
+          </figure>
+          <p>做 canary 时有三个容易踩空的地方：</p>
+          <ul>
+            <li><strong>样本量不够就下结论。</strong>5% 流量在小体量业务上可能一小时才几十个请求，这个量级下质量分的波动完全是噪声。判据应该是<strong>请求数</strong>而不是<strong>时间</strong>——比如"累计 500 个请求且覆盖至少两个时段"再做判断。</li>
+            <li><strong>时段偏差。</strong>只在工作日白天跑 canary，可能完全避开了夜间的批处理流量或海外用户的语言分布。重要的版本变更至少要跨一个完整的日周期。</li>
+            <li><strong>同一用户在两版之间来回跳。</strong>如果按请求随机分流，同一个用户这一轮命中新版、下一轮命中旧版，多轮对话的风格会前后不一致。正确做法是<strong>按用户或会话哈希分流</strong>，保证同一个人在一个会话里始终看到同一版。</li>
+          </ul>
+
+          <h3>影子模式：不碰用户，先跑一轮</h3>
+          <p>在 canary 之前还有一个更安全的阶段：<strong>影子模式（shadow traffic）</strong>。把线上真实请求复制一份发给新版本，但新版本的输出不返回给用户，只记录到 trace 里对比。这样完全没有用户风险，可以收集大量对比数据。</p>
+          <div class="callout tip">
+            <span class="callout-t">影子模式的价值</span>
+            影子模式让你能在<strong>零风险</strong>下验证新 prompt 在真实流量上的表现。特别是当 golden set 过了但你不确定线上长尾会不会出问题时，影子模式是最好的"最后一道防线"。代价是额外的推理成本——但你只需要跑一段时间收集足够样本。
+          </div>
+
+          <h2>供应商换模型版本：你控制不了但必须应对</h2>
+          <p>使用闭源 API 时，一个常被忽略的风险是：<strong>供应商会在不通知的情况下更新模型版本</strong>。你的 prompt 没改、代码没改、数据没改，但模型行为变了。这本质上和"你改了 prompt"是同一件事——模型对同一 prompt 的响应变了。</p>
+          <div class="callout warn">
+            <span class="callout-t">真实场景</span>
+            某团队使用 gpt-4 模型，某天发现质量分突然下降 5%。排查发现 OpenAI 在同一名下推送了新版本快照，few-shot 示例的格式在新版本上不再生效。他们的 prompt 没问题，但 prompt 和新模型的"配合"出了问题。<strong>供应商换版本 = 你的 prompt 需要重新验证</strong>。
+          </div>
+          <p>应对策略：</p>
+          <ul>
+            <li><strong>锁定到具体版本快照</strong>：如果供应商支持版本快照（如 <code>gpt-4o-2024-08-06</code>），始终指定具体版本，不要用别名（如 <code>gpt-4o</code>）。这样供应商换版本时你不会被波及——直到你主动升级。</li>
+            <li><strong>供应商升级时走 canary 流程</strong>：当你决定从 <code>gpt-4o-2024-05-13</code> 升级到 <code>gpt-4o-2024-08-06</code> 时，走和改 prompt 一样的流程：golden set 回归 + canary 流量验证。不要假设"新版本一定更好"。</li>
+            <li><strong>监控供应商行为变化</strong>：即使锁定了版本，也要在 trace 里记录每次调用的精确模型版本。如果供应商在你的版本上做了热修复，你能从 trace 里发现。</li>
+            <li><strong>定期跑 golden set 作为漂移检测</strong>：每天定时用 golden set 跑一轮当前线上的 prompt + 模型组合。如果分数和上线时不一样了，说明模型行为变了——即使你什么都没改。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            很多人把 golden set 当"考试题库"：prompt 改了就在同一批题上刷分，分高就上线，从不更新题库。错在哪？黄金数据集回答的是"新版本是否比旧版本差"，而不是"新版本在真实流量上好不好"。线上用户的问法一直在漂移，而题库是三个月前挖的——一个在旧题库上刷了 95 分的 prompt，很可能已经和今天用户的真实提问脱节了。<strong>golden set 必须持续从线上回流新用例、淘汰旧用例</strong>（见 <a href="observability.html">可观测性</a>里的坏例回流），否则门禁测的是一套，线上跑的是另一套。
+          </div>
+
+          <h2>把 prompt 管理纳入工程流程</h2>
+          <p>最终目标是让 prompt 变更走和代码变更一样的工程流程。这意味着：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>工程实践</th><th>代码</th><th>Prompt</th></tr></thead>
+              <tbody>
+                <tr><td>版本管理</td><td>Git</td><td>Prompt Registry（或 Git 中的 prompt 目录）</td></tr>
+                <tr><td>代码审查</td><td>PR Review</td><td>Prompt Review（附 golden set 评估结果）</td></tr>
+                <tr><td>自动化测试</td><td>CI 跑单测</td><td>CI 跑 golden set + LLM-as-Judge</td></tr>
+                <tr><td>灰度发布</td><td>Feature flag / canary</td><td>Canary 5% → 100% 流量</td></tr>
+                <tr><td>回滚</td><td>Git revert + redeploy</td><td>Registry 切回上一版本</td></tr>
+                <tr><td>变更通知</td><td>Slack / 邮件</td><td>同左，附评估对比报告</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>一个常见问题是：prompt 放在代码仓库里还是独立的 prompt registry 里？小团队放在代码仓库的 <code>prompts/</code> 目录下加 Git 版本管理就够了；当 prompt 变更频率高于代码发版频率、或非工程团队（产品、运营）需要改 prompt 时，独立 registry + 管理界面更有价值。</p>
+
+          <details class="deep">
+            <summary>展开：踩坑实录——一个把 golden set 当摆设的团队是怎么翻车的</summary>
+            <div class="deep-body">
+              <p>某团队上线了完整的 prompt 门禁，golden set 有 120 条用例，LLM-as-Judge 每天都跑。但三个月后他们还是出事了：一次 system prompt 的措辞调整让线上"摘要准确率"掉了 8%，而门禁全程是绿的。复盘发现三个环环相扣的疏漏，每一个单独看都"不算大错"，合起来就是一次事故。</p>
+              <p><strong>疏漏一：golden set 三个月没更新。</strong>用例全部来自上线初期的线上日志。三个月里业务加了新的文档类型、用户问法也变了，但题库还是老的——于是门禁在测一个"已经不存在的业务"。</p>
+              <p><strong>疏漏二：Judge 的 rubric 和产品指标脱节。</strong>门禁里的 rubric 打分维度是"准确性、完整性、简洁性"，而产品的北极星指标是"摘要是否包含关键业务字段"。Judge 打了 9 分的摘要，可能一个业务字段都没提到——两个评估体系各打各的。</p>
+              <p><strong>疏漏三：总分数被平均掩盖。</strong>120 条里只有 3 条是"新增文档类型"用例，这次措辞调整恰好让这 3 条全挂。但 3/120 让总分只掉了 2.5%，在噪声范围内，被判定为 warning 放行了。</p>
+              <p>三条教训对应三个动作：<strong>给 golden set 定一个"数据新鲜度"指标</strong>（比如每月从线上重新抽样比对重叠率，低于某阈值就触发补集）；<strong>rubric 必须和产品北极星指标对齐</strong>（门禁打分维度的制定，产品和工程要一起参与）；<strong>对"高业务权重但低计数"的用例做加权</strong>，而不是让它们在平均值里被稀释。门禁不是"上了就安全"的护身符，它只是把"拍脑袋"变成了"有据可依"——依据本身仍需要持续维护。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：改一次 prompt 就是一次发布。需要版本管理、回归测试、灰度发布和回滚能力。</li>
+            <li><strong>Prompt Registry</strong>：把提示文本 + 变量模板 + 模型版本 + 采样参数 + 依赖配置 pin 成一个不可变制品。版本号用语义化版本。</li>
+            <li><strong>Golden Set</strong>：50-200 条真实代表性用例，规则 + LLM-as-Judge 组合评估。门禁标准：总分不降 + 无严重回归 + 格式 100% 合规。</li>
+            <li><strong>门禁读的是分布不是单数</strong>：把用例分成"旧过新不过/旧不过新过"两组看方向，回归列表比总分更值得盯。</li>
+            <li><strong>Canary 发布</strong>：5% → 20% → 50% → 100%，每步对比四个生产信号。影子模式做零风险预验证。</li>
+            <li><strong>供应商换版本 = 你的 prompt 要重新验证</strong>：锁定到具体版本快照；升级时走 canary 流程；定期跑 golden set 检测漂移。</li>
+            <li><strong>版本状态机</strong>：draft → eval → shadow → canary → live → archived，流转由门禁而不是人决定。回滚后必须先分析再重发；archived 只归档不删除，否则历史 trace 无法复现。</li>
+            <li><strong>RAG 场景固定 context</strong>：golden set 用例必须存检索结果快照，否则测的是检索系统而不是 prompt。</li>
+            <li><strong>别被总分骗了</strong>：100 条用例的通过率标准误约 3.6 个百分点，2% 的差异是噪声。要做配对比较，只看新旧不一致的那些用例，并盯回归列表而不是平均分。</li>
+            <li><strong>Canary 三要点</strong>：按请求数而非时间判定、跨完整日周期避免时段偏差、按用户或会话哈希分流保证体验一致。</li>
+            <li><strong>golden set 要保鲜</strong>：持续从线上回流坏例、淘汰旧例，rubric 和产品指标对齐，否则门禁测的是一套线上跑的是另一套。</li>
+            <li><strong>常见坑</strong>：用模型别名不锁定版本 → 供应商静默更新导致行为突变；只看总分不看单条回归 → 掩盖特定场景的严重退化；canary 流量太小没统计意义 → 至少需要数百条请求才能判断；golden set 只增不清理 → 用例陈旧、和线上分布脱节。</li>
+          </ul>
+
+          <section id="reproducible-eval-gate">
+            <h2>深化：可复现实验与多指标发布门禁</h2>
+            <p>前面的 Registry、Golden Set、Canary 和回滚分别解决了“存什么、测什么、怎么放量、怎么止血”。真正让门禁可以长期运行的，是把一次评测写成<strong>可复现的实验单元</strong>，并把质量、成本、延迟、安全和拒答率放到同一个决策面上。实验报告不能只留下一个平均分，而要能回答：谁在什么时间，用哪个 prompt、模型、参数、工具和检索快照，针对哪一层样本，得到什么输出，经过什么判定器，和哪一个基线比较，结论有多大不确定性。</p>
+
+            <h3>1. 实验单元：把一次运行冻结成可审计清单</h3>
+            <p>建议把一次评测定义为 <code>experiment_id</code>，并将配置与结果分离保存。配置是不可变的输入，结果是可追加的观测；重跑时只允许生成新的 experiment_id，不要覆盖旧结果。这样同一 prompt 在模型供应商发生漂移、检索索引更新或 Judge 版本变化后，仍然能回看当时的真实条件。RAG 用例必须保存检索上下文快照；工具调用则要保存工具 schema、工具版本、超时和返回值快照，否则“同一条用例”并不真正相同。</p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>实验字段</th><th>必须记录的内容</th><th>复现与审计用途</th></tr></thead>
+                <tbody>
+                  <tr><td><code>experiment_id</code> / 基线</td><td>运行时间、提交 SHA、parent experiment、比较的线上版本</td><td>区分重跑、增量评测与正式门禁，保留因果顺序</td></tr>
+                  <tr><td>prompt</td><td>registry 版本、system/user 模板、few-shot、变量序列化规则及内容 hash</td><td>证明评测的确是这一版文本，而不是工作区未提交文件</td></tr>
+                  <tr><td>model / 参数</td><td>模型精确快照、temperature、top_p、max_tokens、seed（若支持）、stop、响应格式</td><td>复现随机性和输出约束，识别供应商静默升级</td></tr>
+                  <tr><td>工具与检索</td><td>工具列表/schema、工具实现版本、超时；embedding、索引、reranker、top_k、context snapshot</td><td>隔离 Prompt 变化与工具、检索链路变化</td></tr>
+                  <tr><td>数据与判定</td><td>golden_set 版本、分层规则、样本 ID、脱敏策略、rubric、Judge 版本与校准集</td><td>知道结果代表哪些用户群体，以及分数如何产生</td></tr>
+                  <tr><td>原始观测</td><td>输入输出、token、耗时分位数、错误码、安全标签、拒答标签、逐条评分</td><td>支持重算指标、定位回归，不被汇总数字锁死</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>最小实践是为配置生成 canonical JSON，再计算 <code>spec_hash</code>；对于输入和输出只保存脱敏后的内容及加密对象存储引用。实验结果必须带 schema 版本，避免以后新增“安全判定”字段却无法解释旧报告。下面的伪代码展示门禁需要的最小闭环：</p>
+            <pre><code class="language-python">def run_experiment(spec, dataset, baseline):
+    # spec 已由 Registry 冻结：prompt/model/参数/工具/检索快照全部有 hash
+    run = create_run(spec_hash=hash_json(spec), dataset_version=dataset.version)
+    for case in stratified_sample(dataset):
+        output, trace = invoke(spec, case.input, context=case.context_snapshot)
+        scores = evaluate(output, case.rubric, judge=spec.judge_version)
+        record(run, case_id=case.id, output=redact(output), trace=trace,
+               scores=scores, tokens=trace.tokens, latency_ms=trace.latency_ms)
+    report = aggregate_with_ci(run, baseline)  # pointwise、pairwise、bootstrap CI
+    decision = multi_metric_gate(report, min_samples=spec.min_samples)
+    freeze_report(run, report, decision)
+    return decision</code></pre>
+
+            <h3>2. Golden Set 不只要“黄金”，还要分层和新鲜</h3>
+            <p>从线上日志抽样时，先按业务场景、语言、渠道、用户等级、输入长度、风险等级、工具路径和是否命中拒答策略分层，再在层内随机抽取。不能让高频的简单问句淹没低频但高损失的退款、身份核验或安全边界请求。每层保存总体占比、抽样数、权重和最近一次复核时间；报告同时给出宏观加权分数与每层分数。样本量不足的层标记为“方向性证据”，不能伪装成统计确定的结论。</p>
+            <p>建议让数据集由三部分组成：约一半来自近期真实流量，覆盖当前分布；约三成来自历史事故、投诉和人工构造的边界案例；其余为长期稳定的回归基准。真实日志先脱敏，保留必要的意图和上下文，不把个人信息复制进评测库。每周或每次重大事故后回流新样本，每月检查样本分布与线上分布的偏离；当新业务层占比上升、某层连续缺失或旧样本长期未复核时，触发补采而不是继续刷旧题库。</p>
+
+            <h3>3. Pairwise、Pointwise 与 Judge 校准</h3>
+            <p><strong>Pointwise</strong> 是对单个输出按 rubric 打分，适合同时监控事实性、完整性、格式、语气和安全等多维绝对要求；<strong>pairwise</strong> 是让 Judge 在相同输入下比较旧版与新版，选择 A、B、平局或无法判断，适合回答“相对是否变好”。两者要同时使用：pointwise 发现“新版本是否达到最低可用线”，pairwise 发现“新旧版本哪个更好”。对于封闭式分类、JSON schema 和必需字段，优先 exact/rule；开放式回答才使用 LLM judge，不能让 Judge 独自决定安全阻断。</p>
+            <p>LLM Judge 先用人工标注的校准集确定 rubric。校准集应覆盖各层、各严重度和容易混淆的正反例；让至少两名人工标注者独立评分，计算一致率，讨论分歧后冻结示例和评分锚点。随后在每次正式运行中混入盲测校准题：Judge 看不到“这是新还是旧”，也不能读取版本名。监控 Judge 与人工标签的一致性、偏好长度/位置/措辞的倾向、对拒答与安全边界的误判率；超过阈值就暂停门禁、换 Judge 版本或人工复核，而不是继续用漂移的 Judge 产生绿灯。正式样本至少抽检一部分，按风险分层并优先查看回归、低分、Judge 不确定和工具失败的用例。</p>
+
+            <h3>4. 多指标门禁：先看硬约束，再看统计证据</h3>
+            <p>质量门禁不能压成一个总分。建议把指标分为硬门槛、软目标和观察项：安全违规、个人信息泄露、工具越权、格式无法解析属于硬门槛；质量、成本、延迟和拒答率在满足最低样本量后做新旧对比；观察项用于发现慢性漂移。阈值应按业务和流量基线配置，下面是可直接落地的示例，百分比均应按场景分层查看。</p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>维度</th><th>建议观测</th><th>门禁示例</th><th>触发动作</th></tr></thead>
+                <tbody>
+                  <tr><td>质量</td><td>pointwise rubric、pairwise 胜率、关键字段召回、严重回归数</td><td>总体不低于基线；关键层不降；严重回归为 0</td><td>阻断并展示 case_id 与输出差异</td></tr>
+                  <tr><td>成本</td><td>输入/输出 token、工具调用次数、每请求成本 p50/p95</td><td>平均成本不高于基线 15%，高价值层另设预算</td><td>超预算告警或阻断，检查上下文与循环调用</td></tr>
+                  <tr><td>延迟</td><td>端到端 p50/p95/p99、首 token、工具等待时间</td><td>p95 不超过基线 10%，超时率不升</td><td>阻断高峰扩量，检查长输出和串行工具</td></tr>
+                  <tr><td>安全</td><td>违规率、越权工具率、敏感信息泄露率、护栏拦截误报</td><td>高风险违规与泄露必须为 0；护栏不可绕过</td><td>立即阻断/回滚，保留安全事件样本</td></tr>
+                  <tr><td>拒答</td><td>正常请求拒答率、应拒请求放行率、拒答原因分布</td><td>正常请求拒答不高于基线 +2pp；高风险放行不升</td><td>拆分“安全拒答”和“误拒答”后再决策</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>聚合时采用“<strong>硬约束 AND 统计门槛 AND 风险分层</strong>”而不是加权平均。即使质量提高，安全硬门槛失败仍然阻断；即使平均成本下降，p99 延迟或关键客户层退化也不能放行。把阈值、观察窗口、最小样本量和责任人一起写入 Registry 的 release policy，避免发布时临时改规则。</p>
+
+            <h3>5. Bootstrap、置信区间与最小样本量</h3>
+            <p>每条样本的得分、耗时和成本都不是无噪声的。报告至少给出均值或中位数、分层结果、基线差值及 95% 置信区间。对配对样本，先计算每条用例的新旧差值，再以用例为单位 bootstrap 重采样，例如重复 2000 次，每次有放回抽取同样数量的 case，得到差值分布的 2.5% 和 97.5% 分位数。若区间跨过 0，就说“方向性变化”，不能写成显著提升；若是比例指标，可用配对 bootstrap 或 McNemar 检验；延迟和成本通常使用分位数 bootstrap，不要只比较平均值。</p>
+            <p>最小样本量应在实验前确定。对于通过率，粗略估计可用 <code>n ≈ z² p(1-p) / e²</code>，其中 <code>e</code> 是允许误差；比较版本时还要考虑目标差异、配对相关性、分层数量和多重比较。低频高风险层即使只有几十条，也不能用“总体样本够了”掩盖不确定性：应提高抽样权重、延长 shadow/canary，或直接采取人工审批。显著性不是上线的唯一条件，实际提升幅度、业务损失、成本和安全风险必须一起判断；统计显著但只有 0.1pp 的提升，可能不值得增加 20% 成本。</p>
+
+            <h3>6. Shadow、Canary、版本追踪与失败复盘</h3>
+            <p>Shadow 先复制真实请求但不返回新输出，适合发现长尾输入、工具错误、token 爆炸和安全误判；通过后再按用户或会话稳定哈希做 5% canary，依次扩到 20%、50%、100%。每个阶段以请求数和分层覆盖作为退出条件，并跨越必要的高峰、低峰和语言时段。路由、日志、trace 和用户反馈都必须带 <code>prompt_version</code>、<code>model_snapshot</code>、<code>experiment_id</code>、<code>retrieval_snapshot</code>、<code>toolset_version</code> 和 <code>policy_version</code>，这样一次线上异常才能沿版本链回溯。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  A["评测报告"] --> B{"硬门槛与 CI"}
+  B -->|通过| C["Shadow 真实流量"]
+  B -->|失败| X["阻断并修复"]
+  C --> D{"分层指标 + CI"}
+  D -->|通过| E["Canary 5%"]
+  D -->|失败| X
+  E --> F{"质量/成本/延迟/安全/拒答"}
+  F -->|达标| G["20% → 50% → 100%"]
+  F -->|任一硬门槛失败| H["自动回滚到基线"]
+  H --> I["冻结版本、保留 trace、失败复盘"]
+  I --> J["补充 Golden Set 并重跑"]
+  J --> B
+  style X fill:#fce4e4,stroke:#c0392b
+  style H fill:#fce4e4,stroke:#c0392b
+  style G fill:#eaf3de,stroke:#639922
+              </div>
+              <figcaption>多指标发布闭环：任何硬门槛失败都先止血，再把证据转成新的回归用例</figcaption>
+            </figure>
+            <p>自动回滚要有清晰的触发器：安全违规、越权工具、格式不可解析、错误率或拒答率超过硬阈值时立即归零；质量、成本和延迟的软阈值可要求连续两个窗口失败，避免单个异常点误触发。回滚后冻结版本，不允许原样重发。失败复盘至少记录时间线、受影响分层、变化的 spec hash、最先异常的指标、代表性输入输出、根因（Prompt、模型、检索、工具、路由或数据漂移）、检测延迟、修复动作和新增测试。复盘结论必须回流 Golden Set 或 release policy，才算关闭事件。</p>
+
+            <h3>7. 面试系统设计题：企业客服 Prompt 发布流水线</h3>
+            <p><strong>题目：</strong>为一个日均百万请求、支持退款和订单查询的企业客服系统设计 Prompt 发布流水线。要求客服能快速迭代话术，但不能因为一次改动造成误拒答、越权退款或成本飙升。回答时先澄清 SLO、风险等级、数据合规和回滚目标，再画出数据流：Prompt Registry → CI 评测 → Shadow → Canary → 全量。重点不是堆工具名，而是说明每一步的输入、输出和失败动作。</p>
+            <ol>
+              <li><strong>制品：</strong>将 system prompt、模板、模型快照、参数、工具 schema、检索快照、输出 schema 和策略版本打包，生成不可变 spec hash；审批记录产品、客服运营和安全负责人。</li>
+              <li><strong>离线门禁：</strong>按意图、语言、客户等级、风险和工具路径分层采样；规则检查 JSON、金额和权限；pointwise 评最低质量，pairwise 与基线比变化；Judge 经校准且混入人工盲检。</li>
+              <li><strong>线上验证：</strong>Shadow 观察全量真实分布，Canary 按会话固定分流；仪表盘同时显示质量、成本、p95/p99、错误、安全违规、正常拒答和高风险放行。</li>
+              <li><strong>控制面：</strong>发布控制器根据窗口、最小样本量、置信区间和硬阈值自动扩量或回滚；所有请求可由 trace 反查版本链，紧急开关只允许切回最近稳定版本。</li>
+              <li><strong>运营闭环：</strong>把投诉、人工转接、退款失败和安全事件脱敏后回流数据集；失败复盘有 owner、截止时间和回归用例，避免“修完就忘”。</li>
+            </ol>
+
+            <h3>8. 面试问答与故障排查 checklist</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>面试追问/故障现象</th><th>应答与排查顺序</th></tr></thead>
+                <tbody>
+                  <tr><td>“平均分涨了，为什么不放行？”</td><td>先看安全硬门槛、关键分层和旧过新不过列表；再看配对 CI、样本量和人工抽检，而不是只看总均值。</td></tr>
+                  <tr><td>“Judge 和人工不一致怎么办？”</td><td>检查 rubric 锚点、盲测校准集、Judge 版本和分歧类别；暂停自动放行，按风险层增加人工复核。</td></tr>
+                  <tr><td>“线上质量突然下降但 Prompt 没改？”</td><td>对照 model snapshot、供应商响应、retrieval/tool/schema hash、流量分布和数据漂移；重跑同一 experiment 以隔离变量。</td></tr>
+                  <tr><td>“成本升高、延迟变慢？”</td><td>先按版本和分层看 input/output token，再查检索上下文长度、工具循环、并发、p95/p99；不要用平均延迟掩盖长尾。</td></tr>
+                  <tr><td>“拒答率升高是好事还是坏事？”</td><td>拆成应拒请求放行率与正常请求误拒率，按风险层比较；安全违规上升必须阻断，正常请求误拒上升则回滚或修订策略。</td></tr>
+                  <tr><td>“回滚后能否直接再发？”</td><td>不能。冻结失败 spec，保留 trace 和指标窗口，完成根因复盘并新增回归样本后，创建新版本重新走门禁。</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <ul>
+              <li><strong>发布前：</strong>spec hash 是否稳定？golden set 是否脱敏、分层、足够新？检索/工具快照是否存在？Judge 是否通过校准？最小样本量、阈值和 owner 是否已写入策略？</li>
+              <li><strong>评测中：</strong>是否同批配对运行？是否记录逐条输出和 token/延迟？是否报告分层差异、bootstrap CI、回归列表和人工抽检结果？是否把无法判断的 Judge 结果单独统计？</li>
+              <li><strong>灰度中：</strong>是否按会话稳定分流？是否覆盖完整时段？每个窗口是否达到请求数与分层覆盖要求？硬门槛是否能自动归零？告警是否先止血后通知？</li>
+              <li><strong>事故后：</strong>能否从 trace 还原全部版本？是否冻结版本并保存现场？根因属于 Prompt、模型、数据、检索、工具还是路由？是否把失败样本加入 Golden Set，并验证修复没有伤害其他层？</li>
+            </ul>
+            <div class="callout tip">
+              <span class="callout-t">记忆点</span>
+              可复现评测的最小闭环是“冻结配置、分层取样、逐条比较、区间而非点估计、多指标硬门槛、影子与灰度、自动回滚、失败回流”。这套结构与 <a href="https://docs.smith.langchain.com/evaluation" target="_blank" rel="noopener">LangSmith Evaluation</a> 的数据集/实验/逐条结果模型、以及 <a href="https://sre.google/workbook/canarying-releases/" target="_blank" rel="noopener">Google SRE Canarying Releases</a> 的灰度思想一致，但实现可以留在团队现有 Registry、CI 和可观测性系统中。
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Langfuse Prompt Management 文档 — prompt 版本管理、评估流水线与 A/B 测试的工程实现 · <a href="https://langfuse.com/docs/prompts" target="_blank" rel="noopener">langfuse.com/docs/prompts</a></li>
+            <li>LangSmith Evaluation 文档 — golden set 评估、LLM-as-Judge 与在线评估的官方实践，本文实验视图截图出处 · <a href="https://docs.smith.langchain.com/evaluation" target="_blank" rel="noopener">docs.smith.langchain.com/evaluation</a></li>
+            <li>Promptflow (Microsoft) — 微软开源的 prompt 开发与评估工具链，支持 CI/CD 集成 · <a href="https://microsoft.github.io/promptflow/" target="_blank" rel="noopener">microsoft.github.io/promptflow</a></li>
+            <li>OpenAI Model Deprecation 政策 — 模型版本生命周期与升级时间线 · <a href="https://platform.openai.com/docs/deprecations" target="_blank" rel="noopener">platform.openai.com/docs/deprecations</a></li>
+            <li>OpenAI Evals — 开源评估框架，可作为 golden set 与自动判定器的组织方式参考 · <a href="https://github.com/openai/evals" target="_blank" rel="noopener">github.com/openai/evals</a></li>
+            <li>DSPy — 把 prompt 视作可优化程序的框架，提供了与手工版本管理不同的另一条路径 · <a href="https://github.com/stanfordnlp/dspy" target="_blank" rel="noopener">github.com/stanfordnlp/dspy</a></li>
+            <li>Google SRE Workbook《Canarying Releases》 — 灰度发布的样本量、观察窗口与自动回滚设计 · <a href="https://sre.google/workbook/canarying-releases/" target="_blank" rel="noopener">sre.google/workbook/canarying-releases</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            改得动之后，下一步是算得清和拦得住。<a href="cost-engineering.html">推理成本工程</a>讲怎么让系统不烧钱，<a href="guardrails.html">护栏与输出校验</a>讲怎么拦住不安全的输入输出。线上质量监控的基础设施见 <a href="observability.html">可观测性与全链路追踪</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>注意力变体全景 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="04-modern-arch" data-topic="attention-variants">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+              <span class="tag-frontier">2026 前沿</span>
+            </div>
+            <h1>注意力变体全景</h1>
+            <p class="lead">标准多头注意力（MHA）的 $O(n^2)$ 复杂度和 KV Cache 显存膨胀，是长上下文和高吞吐推理的两大瓶颈。从 MQA 到 GQA 再到 MLA，再到 NSA 和滑动窗口注意力（SWA）——这些变体都在回答同一个问题：能不能少存点 K/V、少算点分数矩阵，同时尽量不损失精度？这一节做一次全景对比，并给出 2026 年的工程选型经验。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>所有注意力变体都在做同一件事的权衡：<strong>压缩 KV 的存储和计算量，代价是注意力精度的损失</strong>。MHA 每个头有独立的 KV（最精确，最贵）；MQA 所有头共享一组 KV（最省，最糙）；GQA 折中——分组共享；MLA 用低秩压缩把 KV 压成一个小向量，推理时再解压——省显存但不丢精度。SWA 和 NSA 则从"少算一些位置"的角度切入。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  subgraph MHA["MHA：每个头独立 KV"]
+    direction LR
+    M_H1["头 1<br/>K₁ V₁"] --- M_H2["头 2<br/>K₂ V₂"] --- M_H3["头 3<br/>K₃ V₃"]
+  end
+  subgraph GQA["GQA：分组共享 KV"]
+    direction LR
+    G_H1["头 1-2<br/>共享 K₁ V₁"] --- G_H2["头 3-4<br/>共享 K₂ V₂"]
+  end
+  subgraph MQA["MQA：全部头共享一组 KV"]
+    direction LR
+    Q_H1["头 1"] --- Q_H2["头 2"] --- Q_H3["头 3"]
+    Q_All["共享 K V"]
+  end
+  subgraph MLA["MLA：低秩压缩 KV"]
+    direction LR
+    L_C["压缩向量 c<br/>低维"] --> L_D["推理时解压<br/>恢复 K V"]
+  end
+  MHA -->|"省显存"| GQA
+  GQA -->|"更激进"| MQA
+  MHA -->|"换思路"| MLA
+  style MHA fill:#e8f5e9,stroke:#2e7d32
+  style MQA fill:#ffebee,stroke:#c62828
+  style MLA fill:#e3f2fd,stroke:#1565c0
+              </div>
+              <figcaption>四种 KV 组织方式：从每头独立（MHA）到完全共享（MQA），再到低秩压缩（MLA），精度与效率的权衡各不相同</figcaption>
+            </figure>
+          </div>
+
+          <h2>问题起点：MHA 的 KV Cache 瓶颈</h2>
+          <p>标准多头注意力（MHA）中，每个注意力头有自己独立的 Q、K、V 矩阵。推理时为了不重复计算历史 token 的 K 和 V，这些 K/V 被缓存在显存里——这就是 <a href="kv-cache.html">KV Cache</a>。在解码阶段，每生成一个新 token，都要和缓存里全部历史 K/V 做注意力，因此 KV Cache 的大小直接决定了"能撑多长的上下文"以及"能并行多少条请求"。</p>
+          <p>问题在于 KV Cache 的显存占用随序列长度线性增长，且随注意力头数成正比。其字节数可以拆成下面几个因子：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{KV Cache 字节数} = n_{layers} \times n_{kv\_heads} \times d_{head} \times 2 \times seq\_len \times \text{dtype\_bytes}$$
+          </div>
+          <p>注意这里用的是 $n_{kv\_heads}$ 而不是 $n_{heads}$：在 MHA 里二者相等，但在 MQA/GQA/MLA 里 KV 头数被压低了——这正是所有变体"省显存"的杠杆点。以 LLaMA-2 7B 为例：32 层、32 头、$d_{head}=128$、FP16（2 字节）。单条请求 KV Cache 每增加一个 token 就多占 $32 \times 32 \times 128 \times 2 \times 2 = 524{,}288$ 字节 ≈ 0.5 MB。当上下文拉到 32K，单条请求的 KV Cache 就要约 16 GB——和模型权重（约 14 GB FP16）一个量级。当 batch size 上去、并发请求多了，KV Cache 成了显存的第一大消耗者，而模型权重只是"一次性"的固定开销。</p>
+
+          <p>下面这张图把几种方案在"单 token KV Cache 相对大小"上放在一起比较（以 MHA 为 100%，数值为示意，基于约 32 层、128 维头、FP16 的典型设定）。可以看到：MQA 和 MLA 都能把 KV Cache 压到约 1/32，但达成方式完全不同——MQA 靠牺牲头的多样性，MLA 靠低秩压缩且几乎不损精度。</p>
+          <div class="figure" style="text-align:center;max-width:680px;margin:12px auto">
+            <canvas id="kvChart" height="260"></canvas>
+            <figcaption>不同方案下单 token KV Cache 相对大小（MHA = 100%，示意值）</figcaption>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">两堵墙</span>
+            注意力变体同时面对两堵墙：<strong>计算墙</strong>——$O(n^2)$ 的注意力分数矩阵随序列长度平方增长；<strong>显存墙</strong>——KV Cache 随序列长度和头数线性增长。MHA→MQA/GQA/MLA 主要攻显存墙（减少 KV 头数或压缩 KV），SWA/NSA 主要攻计算墙（减少需要计算注意力的位置对数）。两者可以叠加。
+          </div>
+
+          <h2>全景分类：它们到底在攻哪堵墙</h2>
+          <p>在深入每个变体之前，先用一张思维导图把家族关系理清楚。一个有用的视角是：这些方案要么在"攻显存墙"（少存 KV），要么在"攻计算墙"（少算分数），而 FlashAttention 这种 IO 重排方案严格说不属于"变体"，因为它不改算法、只改访存顺序。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root((注意力变体))
+    攻显存墙·KV Cache
+      MQA(全头共享1组KV)
+      GQA(分组共享KV)
+      MLA(低秩压缩KV)
+    攻计算墙·分数矩阵
+      SWA(滑动窗口限局部)
+      NSA(训练时学稀疏)
+    精确等价·不改算法
+      FlashAttention(IO重排)
+            </div>
+            <figcaption>注意力变体按"优化目标"分两支：攻显存墙 vs 攻计算墙；FlashAttention 走的是精确等价的 IO 路线，不在同一坐标系</figcaption>
+          </figure>
+
+          <h2>MQA：最激进的 KV 共享</h2>
+          <p><strong>Multi-Query Attention（MQA）</strong> 是最极端的简化：所有注意力头<strong>共享同一组 K 和 V</strong>，只有 Q 保持多头。也就是说，从 $h$ 组 KV 变成 1 组 KV，KV Cache 直接缩减到原来的 $1/h$。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  subgraph MQA_Detail["MQA：Q 多头，K/V 单头"]
+    Q1["Q 头 1"] --> S1["注意力"]
+    Q2["Q 头 2"] --> S2["注意力"]
+    Q3["Q 头 3"] --> S3["注意力"]
+    KV["共享 K / V"] --> S1
+    KV --> S2
+    KV --> S3
+  end
+  style KV fill:#fff3e0,stroke:#e65100
+            </div>
+            <figcaption>MQA 的结构：所有头的 Q 独立，但 K 和 V 完全共享同一组</figcaption>
+          </figure>
+          <p>MQA 的 KV Cache 缩减效果惊人——以 32 头为例，KV Cache 显存直接降到 1/32。推理时所有头读同一份 K/V，显存带宽压力也小，吞吐大幅提升。但代价是<strong>精度下降明显</strong>：所有头看到的 K/V 完全相同，失去了多头的多样性，模型质量有可感知的下降，尤其在需要细粒度区分的任务（如检索、长程推理）上更明显。</p>
+          <p>工程上 MQA 还带来一个隐忧：因为 K/V 只有一份，它成了所有头的"单一信息瓶颈"，训练时梯度对这组共享 K/V 的更新非常集中，有时会导致训练不稳定。MQA 在 PaLM、Falcon 等模型中被采用，但后续大多被 GQA 取代——因为 GQA 几乎能达到同样的省显存收益，却把精度损失压到很小。</p>
+
+          <h2>GQA：折中的分组共享（附代码）</h2>
+          <p><strong>Grouped-Query Attention（GQA）</strong> 是 MHA 和 MQA 的插值：把 $h$ 个头分成 $g$ 组，每组内的头共享同一组 K/V。当 $g = h$ 时就是 MHA，当 $g = 1$ 时就是 MQA。GQA 让你在精度和效率之间选一个甜点。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方案</th><th>KV 头数</th><th>KV Cache 相对 MHA</th><th>精度</th><th>代表模型</th></tr></thead>
+              <tbody>
+                <tr><td><strong>MHA</strong></td><td>$h$（全头独立）</td><td>1×（基准）</td><td>最高</td><td>原版 Transformer、GPT-2/3</td></tr>
+                <tr><td><strong>GQA</strong></td><td>$g$（分组共享）</td><td>$g/h$</td><td>接近 MHA</td><td>LLaMA-2（部分）、LLaMA-3、Mistral、Qwen-2</td></tr>
+                <tr><td><strong>MQA</strong></td><td>1（全共享）</td><td>$1/h$</td><td>有损</td><td>PaLM、Falcon</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>实践经验表明，GQA 在 $g = 8$（即 8 组 KV）时就能在大多数任务上逼近 MHA 的精度，同时把 KV Cache 压到原来的 $8/h$。LLaMA-2 70B 使用了 GQA（$g=8$），LLaMA-3 全系列都采用 GQA。GQA 已成为 2024 年后新模型的<strong>事实标准</strong>——在不显著损精度的前提下大幅降低推理显存。</p>
+
+          <p>GQA 这个想法本身很简单，但它的原始论文真正难的是「怎么把一个已经训练好的 MHA 模型变成 GQA 模型」，而不必从头重训。下面两张图来自提出 GQA 的那篇论文《GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints》，第一张讲 MHA 怎么转成更激进的 MQA，第二张讲 GQA 的分组方法本身。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/04-modern-arch/attention-variants/fig1.png" alt="论文原图：GQA 论文 Figure 1——MHA 到 MQA 的转换，所有头的 K/V 投影矩阵取平均合并成单头" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：从多头（MHA）到单头（MQA）的转换——把所有注意力头的 K/V 投影矩阵「取平均」合并成一组</span>
+              <span class="pf-src">论文原图 · Ainslie et al., <em>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">arXiv:2305.13245</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，抓住三点就够：<strong>① 图里的 K 和 V 是「投影矩阵」不是「缓存」</strong>——它展示的是权重层面怎么合并，而不是推理时缓存里有多少组 KV；<strong>② 合并方式是「均值池化」（mean pooling）</strong>，也就是把所有头的 K 投影矩阵加在一起取平均，得到一个代表「全体平均视角」的共享 K/V；<strong>③ Q 头原封不动</strong>——合并的只有 K/V，Query 的多样性被完整保留。一句话：这张图演示的是「把 32 本不同的笔记抄成 1 本平均笔记」，而 Q 还是 32 个不同的人各自提问。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/04-modern-arch/attention-variants/fig2.png" alt="论文原图：GQA 论文 Figure 2——MHA 每头独立 KV、MQA 全部共享、GQA 按组分共享三种方式对比" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：MHA、MQA、GQA 三种 KV 组织方式的对比——GQA 为每「组」Q 头共享一组 K/V，是两者的插值</span>
+              <span class="pf-src">论文原图 · Ainslie et al., <em>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</em>, 2023, Figure 2 · <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">arXiv:2305.13245</a></span>
+            </figcaption>
+          </figure>
+
+          <p>第二张图是 GQA 的「本体」。从上往下看三行：<strong>第一行 MHA</strong> 是 $H$ 个 Q 头配 $H$ 组 K/V，一一对应；<strong>第二行 MQA</strong> 是 $H$ 个 Q 头共用 1 组 K/V，图里那根「共用的长条」就是被所有 Q 头共享的单份 K/V；<strong>第三行 GQA</strong> 是把 Q 头按颜色分成若干「组」，每组内部共用一组 K/V，组与组之间各自独立。注意图上 GQA 一行里「共享的 K/V 条」的数量介于前两行之间——这就是论文图题里说的「在 MHA 和 MQA 之间插值」。</p>
+          <p>从实现角度看，GQA 不需要真的去"合并" KV 头，而是用一种很省事的技巧：让 K/V 投影只产出 $g$ 个头，然后在算注意力前把每个 KV 头 <code>repeat_interleave</code> 成 $h/g$ 份去对齐 Q 头的维度。下面这段 PyTorch 代码展示了核心思想：</p>
+          <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+def gqa_attention(q, k, v, n_rep):
+    # q: [B, n_q_heads, T, d]   每个 Q 头独立
+    # k, v: [B, n_kv_heads, T, d], 其中 n_kv_heads = n_q_heads // n_rep
+    # 把每个 KV 头重复 n_rep 次，等价于“分组共享”到对齐 Q 头数
+    k = k.repeat_interleave(n_rep, dim=1)   # [B, n_q_heads, T, d]
+    v = v.repeat_interleave(n_rep, dim=1)
+    scores = torch.matmul(q, k.transpose(-2, -1)) / (q.size(-1) ** 0.5)
+    attn = F.softmax(scores, dim=-1)
+    return torch.matmul(attn, v)            # [B, n_q_heads, T, d]</code></pre>
+          <p>正因为 GQA 本质只是"KV 头比 Q 头少"，它和现成的 FlashAttention 内核（如 <code>flash_attn_varlen_func</code> 支持的 <code>n_kv_heads</code> 参数）天然兼容，几乎零额外成本。这也是为什么 GQA 落地比 MLA 容易得多。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">选型经验</span>
+            如果你从零训练一个模型，直接用 GQA，KV 头数取 8 是一个安全起点。如果你是在已有 MHA 模型上做推理优化，可以用 <strong>QA 上采样</strong>（把 MHA 的 KV 头做平均合并成 GQA）来获得近似收益——不过这通常不如原生 GQA 训练效果好，且需要先训练一个 MHA checkpoint 再转换。
+          </div>
+
+          <h2>上采样（Uptraining）：不重训也能把 MHA 变成 GQA</h2>
+          <p>你可能会问：如果我手里已经有一个训好的 MHA 模型（比如老版本的 LLaMA），又想要 GQA 的推理收益，是不是只能从头重训一个？GQA 论文给出了一个非常实用的回答——<strong>不需要，把 K/V 投影矩阵取平均合并，再用原预训练计算量约 5% 继续训练一小段即可</strong>。这个把 MHA 检查点「改装」成 GQA 的过程，论文里叫<strong>上采样（uptraining）</strong>。</p>
+          <p>为什么只花 5% 的算力就能完成转换？因为模型的「知识」绝大多数存在 Q 投影和 FFN 里，K/V 的合并只是把原本就高度冗余的多份笔记「叠起来」，损失的是注意力头的多样性而非知识本身。论文的实验结论是：<strong>从 MHA 上采样得到的 GQA，质量接近原始 MHA，速度接近 MQA</strong>——两头的好处都拿到了。上采样得到的模型还可以继续参与后续的微调流程，不会「锁死」。</p>
+
+          <details class="deep">
+            <summary>展开：手算一遍——MHA 检查点怎么变成 GQA</summary>
+            <div class="deep-body">
+              <p>设某层有 $h=32$ 个 Q 头，KV 头数也是 32（MHA）。我们想转成 GQA-8（8 组），于是 KV 头数降为 $g=8$，每个 KV 头对应一组 4 个 Q 头。</p>
+              <p><strong>第一步：均值池化 K/V 投影。</strong>原来的 32 个 K 投影矩阵 $W_{K,1},\dots,W_{K,32}$ 中，属于第 1 组的 4 个（假设是头 0-3）取平均，得到新的共享 K 投影 $W'_K = \frac{1}{4}\sum_{i=0}^{3}W_{K,i}$。V 同理。8 组各自平均，就得到 8 个新的 K/V 投影。这一步只做矩阵加法与除法，<strong>不需要任何训练</strong>。</p>
+              <p><strong>第二步：用 5% 算力继续训练。</strong>把上一步得到的模型放进常规训练流程，用约原预训练 5% 的计算量继续跑。目的不是学新知识，而是让注意力头「适应」共享后的 K/V 分布——毕竟原来的 4 个头是各看各的，现在被迫共读一份笔记。</p>
+              <p><strong>第三步：验证推理收益。</strong>以 32 头、$d_{head}=128$、FP16、32K 上下文的单条请求为例：MHA 的 KV Cache 约 16 GB，转成 GQA-8 后降到约 4 GB（1/4），转成 GQA-4 约 2 GB（1/8）。这还没算 Decode 阶段 memory-bound 的带宽收益——KV 小了，每一步搬运的字节数同比减少，吞吐几乎同比上升。</p>
+              <p style="margin-bottom:0">注意均值池化只是最简单的合并方式；论文里还讨论了其他组合（如直接拷贝单头的 K/V），具体哪种最优依赖模型与任务，以论文原文为准。</p>
+            </div>
+          </details>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            GQA 的「分组」很容易被误解成「把几个 Q 头也合并成一个」。实际上<strong>Q 头一个都没少，少的只是 K/V 头</strong>：32 个 Q 头仍然独立存在，只是每 4 个共享一组 K/V。另一个常见误解是「GQA 的 KV 头数比 Q 头少，所以注意力变弱了」——恰恰相反，正是因为 Q 头保留了多样性、K/V 只是被查询的内容，所以 GQA 在大多数任务上能逼近 MHA 的精度。判断一个 GQA 实现对不对，就检查一点：<strong>KV 投影只产出 $g$ 组，然后用 <code>repeat_interleave</code> 复制成 $h$ 份去对齐 Q 头</strong>——Q 头数永远不变。
+          </div>
+
+          <h2>MLA：低秩压缩，省显存不丢精度（附代码）</h2>
+          <p><strong>Multi-head Latent Attention（MLA）</strong> 是 DeepSeek 在 V2/V3 中提出的方案，思路和 GQA 完全不同。GQA 靠"共享"减少 KV 头数，MLA 靠<strong>低秩压缩</strong>——把每个位置的 KV 压缩成一个很小的隐向量 $c$，推理时只缓存 $c$，需要时再"解压"恢复成完整的 K 和 V。</p>
+          <p>具体来说，MLA 把 K 和 V 联合压缩到一个低维隐向量 $\mathbf{c}_{KV}$，维度 $d_c$ 远小于 $n_{heads} \times d_{head}$。KV Cache 里只存 $\mathbf{c}_{KV}$，计算注意力时再通过上投影矩阵恢复出 K 和 V：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathbf{c}_{KV} = W_{DKV} \mathbf{x} \quad (\text{压缩})$$
+            $$\mathbf{K} = W_{UK} \mathbf{c}_{KV}, \quad \mathbf{V} = W_{UV} \mathbf{c}_{KV} \quad (\text{解压})$$
+          </div>
+          <p>关键在于：$W_{UK}$ 和 $W_{UV}$ 是可以吸收进 Q 投影里的，所以推理时<strong>不需要真的做解压</strong>——可以直接在压缩空间里算注意力。这使得 MLA 的 KV Cache 只需存 $d_c$ 维向量（DeepSeek-V3 取 $d_c = 512$），而非 $n_{heads} \times d_{head}$ 维（如 128 头 × 128 维 = 16384 维），压缩比达 32 倍。</p>
+          <p>MLA 的优势在于<strong>几乎不损精度</strong>——低秩压缩保留了 KV 的核心信息，且每个头仍然有"不同视角"（通过不同的上投影恢复），不像 MQA/GQA 那样靠牺牲头多样性来省显存。代价是实现复杂度更高，且训练时的注意力计算量没有减少（只是推理 KV Cache 变小了）。下面用一段 PyTorch 代码展示 MLA 的核心结构：</p>
+          <pre><code class="language-python">import torch
+import torch.nn as nn
+
+class MLA(nn.Module):
+    def __init__(self, d_model, n_heads, d_c=512):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_c = d_c
+        self.d_head = d_model // n_heads
+        # 下投影：把 x 压成低维隐向量 c（推理时只缓存 c）
+        self.W_DKV = nn.Linear(d_model, d_c, bias=False)
+        # 上投影：从 c 恢复 K 与 V
+        self.W_UK = nn.Linear(d_c, n_heads * self.d_head, bias=False)
+        self.W_UV = nn.Linear(d_c, n_heads * self.d_head, bias=False)
+        self.W_Q  = nn.Linear(d_model, n_heads * self.d_head, bias=False)
+
+    def forward(self, x):
+        c = self.W_DKV(x)                                   # [B, T, d_c]，缓存这个
+        k = self.W_UK(c).view(x.size(0), -1, self.n_heads, self.d_head)
+        v = self.W_UV(c).view(x.size(0), -1, self.n_heads, self.d_head)
+        q = self.W_Q(x).view(x.size(0), -1, self.n_heads, self.d_head)
+        # 训练时在完整空间算；推理时 W_UK/W_UV 可吸收进 W_Q
+        scores = torch.einsum('bthd,bThd->bhtT', q, k) / (self.d_head ** 0.5)
+        attn = scores.softmax(dim=-1)
+        return torch.einsum('bhtT,bThd->bthd', attn, v)</code></pre>
+
+          <details class="deep">
+            <summary>深入：MLA 为什么能"免解压"——上投影吸收进 Q</summary>
+            <p>MLA 最精妙的一点是：推理时根本不需要把 $\mathbf{c}_{KV}$ 解压回完整的 $\mathbf{K}$。原因在于注意力分数只用到 $\mathbf{q}^\top \mathbf{k}$，而 $\mathbf{k} = W_{UK} \mathbf{c}_{KV}$，于是：</p>
+            <div class="figure" style="text-align:center">
+              $$\mathbf{q}^\top \mathbf{k} = (W_Q \mathbf{x})^\top (W_{UK} \mathbf{c}_{KV}) = \mathbf{x}^\top (W_Q^\top W_{UK}) \mathbf{c}_{KV}$$
+            </div>
+            <p>记 $W_{QK} = W_Q^\top W_{UK}$，这是一个可以把 $\mathbf{x}$ 直接映射到"与 $\mathbf{c}_{KV}$ 内积"空间的矩阵。换言之，我们可以预先把上投影 <strong>吸收进 Q</strong>，让 Query 端持有 $W_{QK}$，而 KV Cache 端只持有 $\mathbf{c}_{KV}$。这样注意力完全在"压缩空间"里进行，省掉了每次都重建完整 K 的这一步，KV Cache 也只需要存 $d_c$ 维的 $\mathbf{c}_{KV}$。</p>
+            <p>这里有个工程细节：DeepSeek 的 MLA 还用了 <strong>解耦 RoPE（decoupled RoPE）</strong>。标准 RoPE 会把位置编码揉进 K，使得 $\mathbf{k}$ 无法被低秩压缩（因为位置相关部分破坏了低秩结构）。DeepSeek 的做法是额外用一部分"带 RoPE 的"维度来做位置感知，而主体 KV 仍然走可压缩的 $\mathbf{c}_{KV}$ 路线。这就是为什么 MLA 既能吃 RoPE 的位置优势，又能保持 KV Cache 极小。实现时不要忘记这个解耦处理，否则位置编码会破坏压缩比。</p>
+          </details>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>GQA</th><th>MLA</th></tr></thead>
+              <tbody>
+                <tr><td><strong>省显存思路</strong></td><td>共享 KV 头（减少 KV 组数）</td><td>低秩压缩 KV（存隐向量而非完整 KV）</td></tr>
+                <tr><td><strong>KV Cache 压缩比</strong></td><td>取决于组数 $g$</td><td>取决于压缩维度 $d_c$，通常更高</td></tr>
+                <tr><td><strong>精度损失</strong></td><td>有小幅损失</td><td>几乎无损</td></tr>
+                <tr><td><strong>实现复杂度</strong></td><td>简单（改头分组即可）</td><td>较高（需要压缩-解压矩阵和吸收技巧）</td></tr>
+                <tr><td><strong>训练计算量</strong></td><td>不变</td><td>不变（甚至略增）</td></tr>
+                <tr><td><strong>代表模型</strong></td><td>LLaMA-3、Qwen-2、Mistral</td><td>DeepSeek-V2、DeepSeek-V3</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>SWA：滑动窗口注意力，攻计算墙</h2>
+          <p><strong>Sliding Window Attention（SWA）</strong> 从另一个维度切入：不改 KV 的组织方式，而是<strong>限制每个 token 只能"看到"前后 $w$ 个 token</strong>，而不是整个序列。注意力分数矩阵从 $n \times n$ 变成 $n \times w$ 的带状稀疏矩阵，计算复杂度从 $O(n^2)$ 降到 $O(n \cdot w)$。</p>
+          <p>SWA 的直觉是：大多数信息交互发生在局部——一个词最相关的上下文通常就在它附近。全局注意力虽然理论更优，但 $O(n^2)$ 的代价在长序列下不现实。SWA 用 $O(nw)$ 的代价覆盖局部交互，再通过<strong>层叠</strong>让信息间接传播到远处——第 $L$ 层的感受野是 $L \times w$，几层之后就覆盖了整个序列。</p>
+          <p>但"只靠层叠传播"有个隐患：最早期的 token 信息要经过很多层才能传到后面，容易衰减。因此实际系统常配合"全局 token"或"注意力汇聚点（attention sink）"——把序列开头的若干特殊 token 设为全局可见，保证关键全局信息不被窗口截断。Mistral 7B（窗口 4096）和 Gemma 2 采用了 SWA 与全局注意力的交替层设计——奇数层做滑动窗口，偶数层做全局注意力，兼顾局部效率和全局覆盖。Longformer、BigBird 等早期工作也探索了类似的稀疏注意力模式。</p>
+
+          <h2>稀疏注意力家族：三种稀疏模式的实现取舍</h2>
+          <p>SWA 只是稀疏注意力家族中的一员。把「哪些位置对参与注意力」画成稀疏矩阵，历史上出现过三种主流模式，它们可以自由组合：</p>
+          <ul>
+            <li><strong>局部窗口（local window）</strong>：每个 token 只看到前后 $w$ 个邻居，对应 SWA。实现最简单——把 $n\times n$ 的分数矩阵换成 $n\times w$ 的带状矩阵，计算和显存从 $O(n^2)$ 降到 $O(nw)$。代价是远处信息只能靠层叠传递。</li>
+            <li><strong>全局 token（global tokens）</strong>：指定少数几个 token（如序列开头的 CLS，或每 128 个 token 放一个全局位）对全部位置可见。实现上就是把这几个位置从窗口里「豁免」出来。代价是全局 token 本身成为信息瓶颈——所有跨距离通信都要经它中转。</li>
+            <li><strong>随机连接（random sparse）</strong>：随机选一部分位置对参与注意力，BigBird 用它模拟「图上任意两点大概率能连上」的性质，保证任意两个 token 之间的信息传播路径都很短。代价是随机性破坏了矩阵的规则结构，GPU 上实现效率很低。</li>
+          </ul>
+          <p>以 $n=4096$、窗口 $w=256$ 为例，把数字代进去：标准注意力要算 $4096^2 \approx 1677$ 万个分数；换成局部窗口后只剩 $4096 \times 256 \approx 105$ 万，约 1/16。如果再加上每 128 个 token 一个全局位（共 32 个），每个全局位要算 4096 个分数，总开销变成 $105$ 万 $+ 32 \times 4096 \approx 118$ 万——依然比标准注意力低一个数量级，但多出的那部分正好买了「任意 token 都能直达全局」的能力。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模式</th><th>每个 token 看到的邻居</th><th>复杂度（$n=4096, w=256$）</th><th>覆盖全局的能力</th><th>实现难度</th></tr></thead>
+              <tbody>
+                <tr><td><strong>标准注意力</strong></td><td>全部</td><td>1677 万（基准）</td><td>天然全局</td><td>最简单</td></tr>
+                <tr><td><strong>局部窗口 SWA</strong></td><td>$w$ 个邻居</td><td>约 105 万（1/16）</td><td>靠层叠间接覆盖</td><td>简单</td></tr>
+                <tr><td><strong>局部 + 全局 token</strong></td><td>$w$ 个邻居 + 少量全局位</td><td>约 118 万</td><td>全局位直达</td><td>中等</td></tr>
+                <tr><td><strong>局部 + 全局 + 随机</strong></td><td>三者叠加</td><td>约 130 万 + 随机开销</td><td>图上任意两点路径短</td><td>高（GPU 不友好）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>三条取舍线值得记下来。<strong>第一，精度-效率曲线不是线性的</strong>：从标准注意力切到 SWA，计算量立刻降一个数量级，但「全局视野」基本归零；补上全局 token 后，计算量只小幅回升，全局能力却大幅恢复——这也是 Mistral 和 Gemma 2 选择「窗口 + 全局交替」的原因。<strong>第二，稀疏模式的硬件效率差异巨大</strong>：窗口和全局位都是规则矩阵，可以用分块 GEMM 高效实现；随机连接是非规则的，在 GPU 上几乎只能逐元素取数，往往「省了浮点运算却费了访存」，实际加速远不如理论。<strong>第三，稀疏模式最终都要过「训练时就用」这一关</strong>：训练时用稀疏注意力、推理时也用同样的稀疏模式，模型才能自适应；如果训练用全局、推理才切换成稀疏，精度损失会明显放大——这与 NSA「训练即稀疏」的核心思想是一致的。</p>
+          <p>还有一个经常被忽略的问题：稀疏注意力省的是「计算量」，但它并没有直接减小 KV Cache——窗口外的历史 K/V 通常还要存（后续位置随时可能用到窗口内的内容），除非配合流式淘汰。因此纯稀疏方案常常要和 KV 压缩类方案（GQA/MLA）搭配使用：一个攻计算墙，一个攻显存墙。这也是为什么 Mistral 的窗口注意力、Longformer 的带状注意力，最终都会在工程系统里和 KV Cache 管理一起出现，而不是单独存在。</p>
+          <p>如果你是第一次接触这类方案，可以记住一个粗粒度的心智模型：<strong>稀疏注意力回答「每个位置和多少位置说话」的问题，KV 压缩回答「每个位置的信息用什么形式存」的问题，FlashAttention 回答「这些计算在内存里怎么搬」的问题</strong>。三者分别解决算什么、存什么、怎么搬，互不冲突，也都可以叠加——大多数能跑 1M 上下文的生产系统，正是这三者的组合。</p>
+
+          <h2>NSA：原生稀疏注意力，2025 前沿</h2>
+          <p><strong>Native Sparse Attention（NSA）</strong> 是 2025 年由 DeepSeek 团队提出的更先进的稀疏注意力方案。它的核心想法是：<strong>让模型从预训练阶段就学会"该稀疏地看哪些位置"</strong>，而不是训练后再做近似稀疏化。这点至关重要——推理时的"事后稀疏"（比如只保留最近的 K/V）是近似，会有精度损失；而"训练时就稀疏"，模型会自适应地去利用稀疏模式，损失小得多。</p>
+          <p>NSA 把注意力分成三个并行的分支，最后用门控融合：</p>
+          <ul>
+            <li><strong>压缩分支</strong>：把序列分块后压缩成 chunk 级表示，做粗粒度注意力——快速定位"哪些块值得细看"。</li>
+            <li><strong>选择分支</strong>：根据压缩分支的分数，选出 Top-N 个最重要的块，只对这些块做细粒度注意力。</li>
+            <li><strong>滑动窗口分支</strong>：和 SWA 一样，保证局部信息的完整覆盖。</li>
+          </ul>
+          <p>三个分支的输出通过门控融合。NSA 在 64K 上下文下可以把注意力的计算和显存都压到 $O(n)$ 量级，同时因训练阶段就学习了稀疏模式，精度损失远小于推理时做的近似稀疏化。它的前向路径可以用一张状态图表示：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 压缩分支
+  压缩分支 --> 选择分支: 用块级分数选 Top-N 块
+  压缩分支 --> 滑动窗口分支: 并行执行
+  选择分支 --> 滑动窗口分支: 并行执行
+  选择分支 --> 门控融合: 细粒度注意力
+  滑动窗口分支 --> 门控融合: 局部注意力
+  压缩分支 --> 门控融合: 粗粒度注意力
+  门控融合 --> [*]
+            </div>
+            <figcaption>NSA 的三分支前向：压缩分支做粗筛，选择分支做细看，滑动窗口分支保局部，三者门控融合</figcaption>
+          </figure>
+
+          <details class="deep">
+            <summary>深入：NSA 选择分支为什么可训练</summary>
+            <p>NSA 最巧妙的地方在于"选择 Top-N 块"这个操作本身不可导（硬选择），但它用一个可微的技巧绕过去了。思路是：先让<strong>压缩分支</strong>对所有 chunk 算一次粗粒度注意力，得到每个 chunk 的重要度分数（softmax 之前的 logits 或之后的权重）。这个分数天然是可导的，于是 NSA <strong>用压缩分支的分数作为"选择器信号"</strong>，挑出分数最高的 Top-N 个 chunk；随后只对这些被选中的 chunk 做昂贵的细粒度注意力。</p>
+            <p>反向传播时，梯度可以经由"压缩分支分数→选择决策"这条可导路径流回，让模型在训练中逐渐学会"该把注意力放在哪些块上"。门控融合则是一个可学习的向量（每个分支一个门控权重），由模型自己决定三个分支各占多少比重。这样 NSA 既拿到了 $O(n)$ 的稀疏收益，又保持了端到端可训练。</p>
+          </details>
+
+          <div class="callout">
+            <span class="callout-t">算法近似 vs IO 重排：正交关系</span>
+            本页所有变体（MQA/GQA/MLA/NSA/SWA）都是<strong>算法层的近似</strong>——它们改变了"算什么"，输出和标准 MHA 不完全一致，用精度换效率。<a href="../05-systems/flash-attention.html">FlashAttention</a> 则是完全不同的路线：它<strong>不改算法，只改内存访问顺序</strong>，数学上和标准注意力完全等价，是精确计算而非近似。两者正交，可以叠加——比如 GQA + FlashAttention 是主流推理引擎的标配组合。
+          </div>
+
+          <h2>演进时间线：从 MHA 到 NSA</h2>
+          <p>把这些方案放在时间轴上，能清楚看到"先做显存优化（MQA/GQA/MLA），再做计算优化（SWA/NSA）"的脉络：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+timeline
+  2017 : Transformer 提出 MHA（基准）
+  2019 : MQA（PaLM 等采用）
+  2023 : GQA 提出并成为事实标准 : Mistral 引入 SWA
+  2024 : MLA（DeepSeek-V2）
+  2025 : NSA 原生稀疏注意力
+            </div>
+            <figcaption>注意力变体演进：先解决 KV 显存（MQA/GQA/MLA），再解决长序列计算（SWA/NSA）</figcaption>
+          </figure>
+
+          <h2>全景对比：选哪个？</h2>
+          <p>把六种方案放到一张表里对比优化目标、机制、复杂度、精度和适用场景，就能看出各自的甜点区间。注意"精度"这一列描述的是<strong>相对 MHA 的信息损失趋势</strong>，实际选型和具体任务、训练数据强相关。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>变体</th><th>优化目标</th><th>核心机制</th><th>复杂度</th><th>精度</th><th>适用场景</th></tr></thead>
+              <tbody>
+                <tr><td><strong>MHA</strong></td><td>无（基准）</td><td>每头独立 KV</td><td>$O(n^2)$ 时间，$O(n \cdot h \cdot d)$ KV</td><td>基准</td><td>短上下文、研究原型</td></tr>
+                <tr><td><strong>MQA</strong></td><td>KV Cache</td><td>全头共享 1 组 KV</td><td>$O(n^2)$ 时间，$O(n \cdot d)$ KV</td><td>有损</td><td>极致推理吞吐</td></tr>
+                <tr><td><strong>GQA</strong></td><td>KV Cache</td><td>分组共享 KV</td><td>$O(n^2)$ 时间，$O(n \cdot g \cdot d)$ KV</td><td>接近 MHA</td><td><strong>通用首选</strong></td></tr>
+                <tr><td><strong>MLA</strong></td><td>KV Cache</td><td>低秩压缩 KV</td><td>$O(n^2)$ 时间，$O(n \cdot d_c)$ KV</td><td>几乎无损</td><td>超大模型、极致显存</td></tr>
+                <tr><td><strong>SWA</strong></td><td>计算量</td><td>滑动窗口限局部</td><td>$O(nw)$ 时间</td><td>局部无损，全局靠层叠</td><td>长文本局部建模</td></tr>
+                <tr><td><strong>NSA</strong></td><td>计算+显存</td><td>训练时学稀疏模式</td><td>$O(n)$ 时间</td><td>训练即稀疏，精度好</td><td>超长上下文前沿</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>如果你想直观感受 MLA 在推理时的"压缩-缓存"数据流，可以看下面这张时序图——关键只有一步：缓存的是压缩向量 $\mathbf{c}$，而不是完整 K/V。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant X as 输入 x_t
+  participant D as 下投影 W_DKV
+  participant C as KV Cache（只存 c）
+  participant Q as 当前 Query
+  participant A as 注意力计算
+  X->>D: 压缩得到 c_t
+  D->>C: 存入压缩向量 c_t（d_c 维）
+  Note over C: 只占完整 KV 的约 1/32
+  Q->>A: 提供 q_t（W_Q 已吸收上投影）
+  C->>A: 推理时按需恢复 K/V（可吸收进 Q）
+  A->>A: 在压缩/吸收空间算 softmax
+  A-->>X: 输出下一隐藏状态
+            </div>
+            <figcaption>MLA 推理数据流：缓存的是压缩向量 c，注意力在压缩空间完成，省下大量 KV 显存</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">2026 选型经验</span>
+            <strong>通用新模型</strong>：GQA（$g=8$）是安全默认，生态支持最好。<br>
+            <strong>极致显存效率</strong>：MLA，适合千亿级模型，DeepSeek 路线已验证。<br>
+            <strong>超长上下文</strong>：SWA + 全局交替，或 NSA（前沿）。<br>
+            <strong>推理加速</strong>：以上任一都可以叠加 <a href="../05-systems/flash-attention.html">FlashAttention</a>，正交不冲突。
+          </div>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：所有变体都在做 KV 压缩或注意力稀疏化，用可接受的精度损失换显存和计算效率。</li>
+            <li><strong>MHA → MQA → GQA</strong>：从头独立到完全共享到分组共享。GQA 是当前事实标准。</li>
+            <li><strong>MLA</strong>：低秩压缩 KV，省显存几乎不损精度，但实现复杂（且需注意解耦 RoPE）。DeepSeek 路线。</li>
+            <li><strong>SWA</strong>：滑动窗口限制注意力范围，攻计算墙而非显存墙。通过层叠扩展感受野，常配全局 token/attention sink。</li>
+            <li><strong>NSA</strong>：原生稀疏注意力，训练阶段学习稀疏模式，2025 前沿，三分支门控融合，选择分支用可微方式实现 Top-N。</li>
+            <li><strong>与 FlashAttention 的关系</strong>：正交。变体改算法（有精度取舍），FlashAttention 改 IO（精确等价），可叠加。</li>
+            <li><strong>常见坑</strong>：GQA 的组数太少退化成 MQA 精度下降；MLA 实现时忘记吸收上投影导致推理时多算一次解压、或忘记解耦 RoPE 破坏压缩比；SWA 的窗口太小导致全局信息传不到；NSA 若训练后才稀疏则精度损失大，必须训练即稀疏。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Fast Transformer Decoding: One Write-Head is All You Need — MQA 原始论文 · <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener">arXiv:1911.02150</a></li>
+            <li>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints — GQA 原始论文，从 MHA 模型上采样得到 GQA · <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">arXiv:2305.13245</a></li>
+            <li>DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model — 提出 MLA 的论文，低秩压缩 KV 的原始设计 · <a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">arXiv:2405.04434</a></li>
+            <li>Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention — NSA 原始论文，训练即稀疏的三分支设计 · <a href="https://arxiv.org/abs/2502.11089" target="_blank" rel="noopener">arXiv:2502.11089</a></li>
+            <li>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness — FlashAttention 原始论文，与所有变体正交可叠加 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></li>
+            <li>Longformer: The Long-Document Transformer — 带状（滑动窗口）稀疏注意力早期代表作 · <a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noopener">arXiv:2004.05150</a></li>
+            <li>Big Bird: Transformers for Longer Sequences — 局部 + 全局 + 随机三种稀疏模式组合的代表作 · <a href="https://arxiv.org/abs/2007.14062" target="_blank" rel="noopener">arXiv:2007.14062</a></li>
+            <li>LLaMA 2: Open Foundation and Fine-Tuned Chat Models — LLaMA-2 70B 采用 GQA 的官方文档 · <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">arXiv:2307.09288</a></li>
+            <li>Mistral 7B — 滑动窗口注意力（SWA）与 GQA 组合的工业案例 · <a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">arXiv:2310.06825</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            注意力变体解决了"算得少"的问题，但上下文窗口从 4K 扩到 128K 甚至 1M 还需要另一组技术：<a href="long-context.html">长上下文技术</a> 讲位置插值和长文本训练；<a href="kv-cache.html">KV Cache</a> 讲推理时的缓存管理；<a href="../05-systems/flash-attention.html">FlashAttention</a> 讲 IO 层的精确加速——三者与本页的变体可叠加使用。变体里反复提到的「KV 头数 $H_{kv}$ 是显存杠杆」，对应的完整推导见 <a href="kv-cache.html">KV Cache 原理与优化</a> 的显存账本一节；MLA 用到的低秩思想，在 <a href="linear-attention.html">线性与混合注意力</a> 里以更一般的形式出现。
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+    window.addEventListener('load', function () {
+      if (typeof Chart === 'undefined') return;
+      var c = window.CB_COLORS || { red: '#e24b4a', blue: '#378add', green: '#639922', amber: '#ef9f27' };
+      var ch = new Chart(document.getElementById('kvChart'), {
+        type: 'bar',
+        data: {
+          labels: ['MHA', 'GQA(g=8)', 'MQA', 'MLA'],
+          datasets: [
+            { label: '单 token KV Cache 相对大小 (%)', data: [100, 25, 3.1, 3.1], backgroundColor: [c.blue, c.green, c.red, c.amber] }
+          ]
+        },
+        options: {
+          scales: { y: { title: { display: true, text: '相对 MHA = 100%' }, beginAtZero: true } },
+          plugins: { legend: { position: 'top' } }
+        }
+      });
+      (window.CB_CHARTS = window.CB_CHARTS || []).push(ch);
+    });
+  </script>
+</body>
+</html>

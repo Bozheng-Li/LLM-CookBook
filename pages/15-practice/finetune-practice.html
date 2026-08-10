@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实战：LoRA 微调全流程 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="15-practice" data-topic="finetune-practice">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>实战：LoRA 微调全流程</h1>
+            <p class="lead">从一份原始数据到一个可上线的微调模型，中间有五个关卡：数据准备、模型加载、LoRA 训练、权重合并、评估验证。这一页用完整可运行的代码走通全流程，不省略任何一个环节——因为生产环境里最常出问题的，恰好就是被省略的那些步骤。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>LoRA 微调的核心思想：<strong>冻结原模型权重，只训练一个低秩补丁</strong>。训练量从全参数的数十亿降到几百万，单卡就能跑，合并后推理无额外开销。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  A["原始数据<br/>JSON/CSV"] --> B["数据格式化<br/>instruction格式"]
+  B --> C["加载基座模型<br/>Qwen/Llama"]
+  C --> D["注入 LoRA Adapter<br/>冻结原权重"]
+  D --> E["训练<br/>仅更新adapter"]
+  E --> F{"评估通过?"}
+  F -- 否 --> B
+  F -- 是 --> G["合并权重<br/>adapter→base"]
+  G --> H["量化部署<br/>vLLM/llama.cpp"]
+  style D fill:#e3f2fd
+  style G fill:#e8f5e9
+              </div>
+              <figcaption>LoRA 微调全流程：数据 → 训练 → 合并 → 部署，每个环节都有对应的代码</figcaption>
+            </figure>
+          </div>
+
+          <h2>为什么选 LoRA</h2>
+          <p>全参数微调一个 7B 模型需要至少 4 张 A100（权重 14GB + 梯度 14GB + 优化器状态 28GB + 激活 ≈ 60GB+）。LoRA（Low-Rank Adaptation）的思路是：模型权重的变化量 $\Delta W$ 是低秩的，可以分解为 $\Delta W = B \times A$，其中 $A \in \mathbb{R}^{r \times d}$，$B \in \mathbb{R}^{d \times r}$，$r \ll d$。换句话说，全量微调是「重训半个模型」，LoRA 是「在模型外面贴一张轻薄的补丁」——贴上去容易，撕下来也方便，一个基座可以同时挂多个不同任务的补丁，这正是它工程上最受欢迎的原因。</p>
+          <p>训练时冻结原始权重 $W$，只更新 $A$ 和 $B$。参数量从 $d \times d$ 降到 $2 \times r \times d$。以 7B 模型为例，$r=8$ 时 LoRA 参数通常只有 8-20M——不到全参数的 0.3%。单张消费级 GPU（如 RTX 3090/4090）就能训练。</p>
+          <p>但 LoRA 不是万能的。当你的任务需要模型「学全新的知识」（而不是「换一种说话方式」）时——比如让模型记住你私有的、训练时完全没见过的专业文档——LoRA 往往不够，因为它改不动基座已经固化的知识表征。这种场景更该考虑 RAG（见 <a href="rag-practice.html">搭建 RAG 系统</a>）或在私有语料上做继续预训练。另外，LoRA 合并后推理确实零开销，但多个 LoRA 之间切换需要重新加载权重，在高并发、多租户场景下，有时反而不如直接部署几个全量模型省事。</p>
+          <p>还有一个容易被忽略的点：LoRA 的效果天花板由基座决定。用 0.5B 的小基座做客服微调，再怎么调参也追不上 7B 基座的同理心和质量。所以「选多强的基座」往往比「LoRA 参数怎么设」更影响最终结果。先选够强的底座，再用 LoRA 做轻量适配，是性价比最高的组合。</p>
+          <p>什么时候该放弃 LoRA、上全参数微调？一个实用的判断标准：如果任务需要模型「学会一套新的输出协议」——比如输出严格的 JSON Schema、模仿某种全新的文风、掌握私有 API 的调用格式——LoRA 通常够用；但如果任务需要「重组模型底层的知识关联」，比如让模型理解一个全新的符号系统，LoRA 的低秩假设（权重变化集中在一小部分方向）就不成立了，效果会明显受限。另一个场景是「领域适应」：目标领域和基座训练语料的分布差异很大时，先做一层继续预训练（在领域语料上续训）再做 LoRA 适配，往往比直接 LoRA 效果好得多——一句话概括：LoRA 适合「微调行为」，不适合「重灌知识」。</p>
+          <p>LoRA 的原理和变体（QLoRA、AdaLoRA 等）详见 <a href="../07-posttraining/peft-lora.html">PEFT 与 LoRA</a>。本页专注工程实操。</p>
+
+          <h2>环境准备</h2>
+          <pre><code class="language-bash">pip install torch transformers peft trl datasets accelerate bitsandbytes</code></pre>
+          <p>如果你的机器没有 GPU，也可以先在 CPU 上用很小的模型（如 <code>Qwen/Qwen2.5-0.5B-Instruct</code>）把整条流水线跑通、确认代码和数据都没问题，再换到 GPU 上跑 7B——先验证流程、再投入算力，能省下大量无效等待。环境装好后建议先跑一行 <code>print(torch.cuda.is_available())</code> 确认 PyTorch 能看到显卡，再往下走。</p>
+
+          <h2>第一步：数据准备</h2>
+          <p>微调的核心不是代码——是数据。垃圾进，垃圾出。LoRA 微调的典型数据格式是 <strong>instruction-response 对</strong>：给模型一个指令，期望它生成特定回答。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TD
+  RAW["原始数据<br/>客服记录/文档/对话日志"] --> CLEAN["清洗去重<br/>去掉噪声样本"]
+  CLEAN --> FORMAT["格式化<br/>→ instruction + input + output"]
+  FORMAT --> SPLIT["划分数据集<br/>train 90% / eval 10%"]
+  SPLIT --> CHECK["人工抽检<br/>50条目测质量"]
+  CHECK --> READY["可训练数据"]
+  style CHECK fill:#fff3e0
+            </div>
+            <figcaption>数据准备流程：最耗时的环节是清洗和人工抽检，不是写代码</figcaption>
+          </figure>
+
+          <pre><code class="language-python">import json
+from datasets import Dataset
+
+# 假设你有一份原始数据，需要转成 instruction 格式
+# 原始数据示例：客服对话记录
+raw_data = [
+    {"user": "我的订单还没到，已经三天了", "agent": "抱歉给您带来不便，请提供订单号，我帮您查询物流状态。"},
+    {"user": "怎么退款", "agent": "请在订单页面点击「申请退款」，选择退款原因后提交，1-3 个工作日到账。"},
+    # ... 更多数据
+]
+
+# 转成 instruction 格式
+def format_example(item):
+    return {
+        "instruction": "你是一个客服助手，请友好专业地回答用户问题。",
+        "input": item["user"],
+        "output": item["agent"],
+    }
+
+formatted = [format_example(d) for d in raw_data]
+
+# 保存为 JSONL
+with open("train.jsonl", "w", encoding="utf-8") as f:
+    for item in formatted:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+# 加载为 HuggingFace Dataset
+dataset = Dataset.from_list(formatted)
+dataset = dataset.train_test_split(test_size=0.1, seed=42)
+print(f"训练集: {len(dataset['train'])} 条, 验证集: {len(dataset['test'])} 条")</code></pre>
+
+          <p>这段代码有几个细节值得品味。第一，<code>format_example</code> 把原始客服对话转成统一的 instruction 格式——指令是固定的系统指令「你是客服助手」，input 是用户问题，output 是期望回答。格式统一为什么重要？因为模型在训练时学到的是「输入格式 → 输出格式」的映射，如果样本之间格式漂移，模型会把精力花在「猜格式」而不是「学内容」上。第二，输出保存为 JSONL 而不是 JSON——每行一个样本，追加写入方便、断点续传友好，是处理大规模数据集的标配。第三，<code>train_test_split(test_size=0.1, seed=42)</code> 固定随机种子，保证每次划分一致、评估可复现——如果多次实验间随意切分，验证集里混入训练样本，评估指标就是骗自己的。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">数据质量的三个红线</span>
+            ① <strong>去重</strong>：重复样本会让模型过拟合特定表述，用 MinHash 或简单字符串去重。② <strong>长度过滤</strong>：output 少于 5 字的样本删掉，它们没有训练信号。③ <strong>人工抽检</strong>：训练前必须肉眼看 50 条，确保格式一致、内容正确。90% 的微调效果差，根因都是数据。
+          </div>
+          <p>数据量的经验值：让 LoRA 明显起效，一个指令任务通常需要至少 500-2000 条干净样本；少于 500 条时，模型容易「背下」样本而不是学到规则，此时加大 dropout、减少 epoch 能缓解。超过 2 万条时，数据带来的提升会进入平台期，值得先想想是不是任务本身太难或格式不统一。一个常用的质检手段是「指令多样性检查」：统计指令的句式模板数，如果 2000 条样本只有几十种句式，说明分布太窄，生成的回答会缺少泛化——多来源采集、人为改写指令措辞，是低成本提升数据质量的有效手段。</p>
+
+          <p>接下来把 instruction 格式转成模型能吃的 <code>input_ids</code>。关键是用<strong>对话模板（chat template）</strong>把 instruction、input、output 拼成一段连续文本，只在 output 部分计算 loss。</p>
+          <pre><code class="language-python">from transformers import AutoTokenizer
+
+model_name = "Qwen/Qwen2.5-7B-Instruct"  # 以 Qwen2.5 为例
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+def preprocess(examples):
+    """把 instruction + input + output 转成 token ids，只在 output 上计算 loss"""
+    input_texts = []
+    label_texts = []
+    for inst, inp, out in zip(examples["instruction"], examples["input"], examples["output"]):
+        # 用 tokenizer 的 chat template 构造对话
+        messages = [
+            {"role": "system", "content": inst},
+            {"role": "user", "content": inp},
+        ]
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        full = prompt + out + tokenizer.eos_token
+        input_texts.append(full)
+        # label 中 prompt 部分设为 -100（忽略），只对 output 计算 loss
+        label_texts.append([-100] * len(tokenizer(prompt)["input_ids"]) + tokenizer(out + tokenizer.eos_token)["input_ids"])
+
+    model_inputs = tokenizer(input_texts, truncation=True, max_length=512, padding=False)
+    model_inputs["labels"] = [
+        labels[:512] for labels in label_texts
+    ]
+    return model_inputs
+
+tokenized = dataset.map(preprocess, batched=True, remove_columns=dataset["train"].column_names)</code></pre>
+
+          <p>preprocess 函数是整个数据管线里最容易出错的一环，理解它的两个关键点。第一，<code>apply_chat_template</code> 会把 system/user 消息按模型自己的模板拼成 prompt——不同模型的模板不同（Qwen、Llama、DeepSeek 的都不一样），一定要用 tokenizer 自带的方法而不是手拼字符串，否则对话格式错乱，训练时模型根本学不对「谁在说话」。第二，labels 里把 prompt 部分全部设成 -100：交叉熵在计算时忽略 -100 的位置，这样模型只在 output 上学习、不会去「预测问题」。如果这一步漏了，模型会同时学「预测用户问题」和「预测回答」，最终表现为「训练 loss 一直不降」或「生成时自问自答」。这也是排查微调效果差时首先要检查的地方。</p>
+
+          <h2>第二步：加载模型 + 注入 LoRA</h2>
+          <pre><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, TaskType
+
+# 4-bit 量化加载（QLoRA）：省显存，单卡可跑 7B
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map="auto",
+    torch_dtype=torch.float16,
+)
+
+# LoRA 配置
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=8,                          # 秩，常用 8/16/32，越大效果越好但参数越多
+    lora_alpha=32,                # 缩放系数，经验上设为 r 的 2 倍
+    lora_dropout=0.05,            # Dropout 防过拟合
+    # 只对注意力层的 q_proj 和 v_proj 加 LoRA，这是最省参数的配置
+    # 效果不够时可以加上 k_proj, o_proj, gate_proj, up_proj, down_proj
+    target_modules=["q_proj", "v_proj"],
+)
+
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+# 输出示例: trainable params: 3,538,944 || all params: 7,621,843,968 || trainable%: 0.0464</code></pre>
+
+          <p>这段加载代码里藏着 QLoRA 的全部秘密：<code>load_in_4bit=True</code> 把基座权重压缩到 4-bit 加载（NF4 格式，保留比普通 int4 更好的数值质量），<code>compute_dtype=torch.float16</code> 让计算仍在 fp16 下进行——4-bit 只是存储格式，运算时会反量化回 fp16，所以「量化」损失的只是存储精度，计算精度不受影响。<code>double_quant</code> 对量化常量再做一次量化，进一步省显存。注意 <code>device_map="auto"</code> 让框架自动把模型层分布到可用显存上，多卡或 CPU offload 场景下是必须的。还有个容易踩的坑：4-bit 基座权重是被量化压缩的，<code>print_trainable_parameters</code> 里显示的「全部参数」包含量化后的权重，而「可训练参数」只有 LoRA 那几百万个——两者相差三个数量级，这正是 QLoRA 的底气。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">target_modules 怎么选</span>
+            最小配置只加 <code>q_proj</code> 和 <code>v_proj</code>（注意力层的 Query 和 Value），参数最少。如果效果不够，扩展到所有线性层（<code>q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj</code>），参数翻几倍但效果通常更好。<strong>先用最小配置跑一遍，再根据评估结果决定是否扩展</strong>。
+          </div>
+
+          <h2>第三步：训练</h2>
+          <pre><code class="language-python">from transformers import TrainingArguments, Trainer, DataCollatorForSeq2Seq
+
+training_args = TrainingArguments(
+    output_dir="./lora-output",
+    num_train_epochs=3,
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=8,
+    gradient_accumulation_steps=4,    # 等效 batch_size = 4 × 4 = 16
+    learning_rate=2e-4,               # LoRA 学习率比全量微调大 10 倍
+    warmup_ratio=0.1,                 # 前 10% 步骤做 warmup
+    lr_scheduler_type="cosine",       # 余弦退火
+    logging_steps=20,
+    eval_strategy="steps",            # 每 eval_steps 步评估一次
+    eval_steps=100,
+    save_strategy="steps",
+    save_steps=100,
+    save_total_limit=3,               # 最多保留 3 个 checkpoint
+    bf16=True,                        # 如果 GPU 支持 bf16，否则用 fp16=True
+    report_to="none",                 # 不用 wandb/tensorboard，设为 "wandb" 可开启
+)
+
+# 数据对齐 collator：动态 padding 到 batch 内最长
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer=tokenizer,
+    padding=True,
+    return_tensors="pt",
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized["train"],
+    eval_dataset=tokenized["test"],
+    data_collator=data_collator,
+)
+
+trainer.train()
+
+# 保存 LoRA adapter（只保存几百 MB，不是完整的 14GB）
+trainer.save_model("./lora-output/final")</code></pre>
+
+          <p>训练参数里最值得琢磨的是 <code>gradient_accumulation_steps=4</code>：它让优化器每积累 4 个 batch 才更新一次权重，等效 batch size = 4 × 4 = 16。为什么不用更大的 per-device batch？因为显存装不下——7B 模型即便 QLoRA，单卡一次性前向几条 512 token 的样本也很吃力。梯度累积是「用时间换显存」的经典手段：计算量不变，只是把大 batch 拆成小 batch 分批算，等价于「在小显存上模拟大 batch」。另一个值得注意的是 <code>learning_rate=2e-4</code>：LoRA 只更新几百万参数，学习率可以比全量微调大一个数量级；如果沿用全量微调的 1e-5，LoRA 会半天学不动，表现为 loss 下降极慢。最后，<code>save_total_limit=3</code> 只保留最近三个 checkpoint，避免磁盘被历史版本占满——这些小习惯在生产训练脚本里都是标配。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">训练常见问题</span>
+            <strong>OOM（显存不足）</strong>：减小 <code>per_device_train_batch_size</code>，增大 <code>gradient_accumulation_steps</code>。7B 模型 QLoRA 在 24GB 显存上 batch_size=4 通常可行。<strong>loss 不下降</strong>：检查数据格式（labels 是否正确设了 -100），检查学习率（LoRA 通常 1e-4 到 5e-4）。<strong>eval loss 上升</strong>：过拟合了，减少 epoch 或增大 dropout。
+          </div>
+
+          <h2>第四步：合并权重</h2>
+          <p>训练完成后，你得到的是一个 LoRA adapter（几百 MB）。推理时有两个选择：<strong>动态加载</strong>（base + adapter 分开加载）和<strong>合并</strong>（把 adapter 融入 base，变成一个完整模型）。生产部署通常选择合并——推理框架不需要额外支持 PEFT，延迟也更低。</p>
+          <pre><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+# 1. 加载基座模型（不要量化，合并需要全精度）
+base_model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    device_map="auto",
+)
+
+# 2. 加载 LoRA adapter
+model = PeftModel.from_pretrained(base_model, "./lora-output/final")
+
+# 3. 合并权重
+model = model.merge_and_unload()
+
+# 4. 保存合并后的完整模型
+model.save_pretrained("./merged-model")
+tokenizer.save_pretrained("./merged-model")
+print("合并完成。模型保存在 ./merged-model")</code></pre>
+
+          <div class="callout warn">
+            <span class="callout-t">合并的注意事项</span>
+            合并必须在<strong>非量化</strong>的基座上进行——如果你用 4-bit 加载训练，合并时要重新加载全精度基座。合并后的模型和全参数微调的模型在推理时<strong>行为完全一致</strong>，没有任何额外开销。这也是 LoRA 相比其他 PEFT 方法最大的工程优势。
+          </div>
+          <p>「动态加载 vs 合并」的选择可以进一步展开。动态加载适合「一个基座、多个任务、频繁切换」的场景：内存里只放一份基座权重，每个任务挂自己的 adapter，切换就是换一行代码的事，省内存，但推理框架要支持 PEFT 的推理路径。合并则把 adapter 数学地写进权重（W' = W + BA），得到的是一个「普通模型」，任何推理引擎都能直接加载，也没有 adapter 切换的运行时开销——代价是每个任务需要一份完整权重，多任务并存时磁盘占用大。多数生产部署选择合并，正是因为「合并后和全参数模型无差别」这个属性带来的简单性：不用给推理侧引入任何 LoRA 概念。</p>
+
+          <h2>第五步：评估与上线</h2>
+          <p>训练完不评估就上线，等于盲飞。评估分两层：<strong>自动指标</strong>（快但粗）和<strong>人工评估</strong>（慢但准）。</p>
+          <pre><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# 加载合并后的模型
+model = AutoModelForCausalLM.from_pretrained("./merged-model", torch_dtype=torch.float16, device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained("./merged-model")
+
+# 自动评估：在验证集上计算困惑度和 BLEU/ROUGE
+def evaluate(eval_samples):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for sample in eval_samples:
+            messages = [
+                {"role": "system", "content": sample["instruction"]},
+                {"role": "user", "content": sample["input"]},
+            ]
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            # 生成回答
+            outputs = model.generate(**inputs, max_new_tokens=256, temperature=0.1, do_sample=True)
+            response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            print(f"问题: {sample['input']}")
+            print(f"期望: {sample['output']}")
+            print(f"生成: {response}")
+            print("---")
+
+# 在验证集上评估
+evaluate(dataset["test"][:5])</code></pre>
+
+          <p>自动指标只能告诉你「没变差」，不能告诉你「变好了」。真正判断微调效果需要<strong>人工对比评估</strong>：让评估者盲比较微调前和微调后的输出，选择更好的那个。通常 100-200 条样本就能得到统计显著的结论。</p>
+          <p>人工评估的具体做法值得细化：把「微调前基座」和「微调后模型」对同一批问题生成的回答打乱顺序，让评估者看不出哪个来自哪个模型，逐条选择「哪一个更好」。100-200 条样本足够把「显著更好」和「没差别」区分开，因为配对比较（A/B）比单独打分（满分制）的评估者一致性高得多。还有一个容易被忽略的点：评估集要和上线后的真实用户问题分布对齐，而不是从训练集里抽——否则测的是「记忆」而不是「泛化」。如果预算允许，可以准备第二套「留出集」专门做回归测试，每次改数据或改参数后都跑一遍，防止「修好 A 弄坏 B」。</p>
+
+          <h3>上线部署</h3>
+          <p>合并后的模型用 vLLM 部署，一行命令启动服务：</p>
+          <pre><code class="language-bash">pip install vllm
+
+# 启动 OpenAI 兼容的 API 服务
+python -m vllm.entrypoints.openai.api_server \
+    --model ./merged-model \
+    --port 8000 \
+    --max-model-len 2048</code></pre>
+          <pre><code class="language-bash"># 测试接口
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "./merged-model", "messages": [{"role": "user", "content": "怎么退款"}]}'</code></pre>
+
+          <h2>LoRA 数学原理：低秩分解到底省了什么</h2>
+          <p>回到那个核心公式：$\Delta W = B \times A$，其中 $A \in \mathbb{R}^{r \times d}$，$B \in \mathbb{R}^{d \times r}$，$r$ 是秩。原始权重 $W \in \mathbb{R}^{d \times d}$ 有 $d^2$ 个参数，而 $A$ 和 $B$ 加起来只有 $2 \times r \times d$ 个。当 $r \ll d$ 时，这就是数量级的节省——7B 模型 $d=4096$，全量更新约 1600 万参数每层的某一矩阵，LoRA 用 $r=8$ 时只有约 6.5 万。</p>
+          <p>直觉上，权重更新量其实是「低秩」的：它不需要在 $d \times d$ 的全部方向上都改变，只需要在少数几个「主方向」上调整就足够让模型适应新任务。LoRA 假设这少数主方向的数量是 $r$，于是只去学这 $r$ 个方向的组合。$r$ 越大，能表达的变化越丰富，但参数也越多、越容易过拟合。</p>
+          <p>还有一个关键的初始化细节：A 用高斯初始化、B 用全零初始化，这样训练刚开始时 BA=0，W'=W，模型行为与基座完全一致——loss 从基座的水平开始平滑下降，而不是从随机位置开始。这也是 LoRA 训练稳定的第二个原因。相应地，训练完成时 W'=W+BA 中的 BA 相对 W 只是一个小扰动——这就是为什么合并后模型的「身份」还是那个基座，只是被往任务方向轻轻推了一把，通用能力几乎没有损伤。</p>
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  W0["原始权重 W<br/>d × d（冻结）"] --> ADD["W' = W + BA"]
+  BA["低秩补丁<br/>B ∈ d×r, A ∈ r×d"] --> ADD
+  ADD --> OUT["新权重 W'<br/>推理时等价全量"]
+  style BA fill:#e3f2fd
+  style ADD fill:#e8f5e9
+            </div>
+            <figcaption>LoRA 的本质：冻结的大权重 W 加上一个可训练的低秩补丁 BA，推理时两者合并成等价全量权重</figcaption>
+          </figure>
+
+          <h2>显存账：全量微调 vs QLoRA</h2>
+          <p>为什么非要用 QLoRA？算一笔显存账就清楚了。以 7B 模型为例，训练时显存主要有四块：权重、梯度、优化器状态、激活值。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>项目</th><th>全参数微调（FP16）</th><th>QLoRA（4-bit 基座 + LoRA）</th></tr></thead>
+              <tbody>
+                <tr><td>基座权重</td><td>约 14 GB（FP16）</td><td>约 3.5 GB（NF4）</td></tr>
+                <tr><td>梯度</td><td>约 14 GB</td><td>0（基座冻结，不存梯度）</td></tr>
+                <tr><td>优化器状态</td><td>约 28 GB（AdamW FP32）</td><td>约 0.1 GB（只存 LoRA 参数）</td></tr>
+                <tr><td>激活值</td><td>数 GB</td><td>数 GB（可用梯度检查点压）</td></tr>
+                <tr><td>训练总显存</td><td>60 GB 以上</td><td>约 6–10 GB</td></tr>
+                <tr><td>所需显卡</td><td>多卡 A100</td><td>单张 24GB（如 RTX 4090）</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>差距来自两个地方：一是 4-bit 量化把基座权重压到原来的 1/4；二是基座冻结后不再需要存梯度和优化器状态，这部分原本占了显存的大头。于是单张消费级显卡就能微调 7B——这正是 QLoRA 论文能在单张 48GB 显卡上微调 65B 模型的底气。</p>
+          <p>这张表还解释了另一个常见困惑：为什么 QLoRA 训练时显卡占用看起来「忽高忽低」？因为 4-bit 基座在前向时按需反量化、算完即释放，激活值则随 batch 大小浮动；如果显存峰值远超 10GB，优先检查 batch size 和序列长度——序列长度从 512 加到 1024 会让激活显存接近翻倍——其次是激活值有没有开梯度检查点。记住一个经验：QLoRA 的显存大头不是权重，而是激活值；这也意味着「调小序列长度」往往比「调小 batch」更有效地降显存。</p>
+
+          <h2>target_modules：低秩补丁加在哪些层</h2>
+          <p><code>target_modules</code> 决定低秩补丁注入到哪些线性层。不同选择直接影响参数量、训练速度和最终效果。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>配置</th><th>注入层</th><th>参数量（7B, r=8）</th><th>特点</th></tr></thead>
+              <tbody>
+                <tr><td>最小</td><td>q_proj, v_proj</td><td>约 400 万</td><td>最省，适合简单任务快速验证</td></tr>
+                <tr><td>中等</td><td>+ k_proj, o_proj</td><td>约 800 万</td><td>注意力全注入，效果更稳</td></tr>
+                <tr><td>最大</td><td>所有线性层</td><td>约 1.5–2 亿</td><td>含 FFN，效果上限高但易过拟合</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>经验法则：<strong>先用最小配置跑通整条流水线</strong>，确认数据、loss、评估都没问题，再根据评估结果决定是否扩展。盲目上最大配置既慢又容易过拟合，还难排查问题。</p>
+
+          <details class="deep">
+            <summary>深入：为什么 LoRA 学习率能比全量大 10 倍</summary>
+            <p>全参数微调时，每一步更新直接作用在「已经学得很好的大权重」上，步长必须很小，否则会把预训练学到的知识冲掉。而 LoRA 训练的是「从零开始的小补丁」$A$ 和 $B$，它们的初始值接近 0（对原始权重几乎没影响），所以可以用大学习率快速找到合适的低秩方向。</p>
+            <p>另一个视角：$\Delta W = BA$ 是<strong>乘积形式</strong>。即使 $A$、$B$ 的梯度较大，乘起来对最终权重的影响也被 $r$ 这个较小的维度约束住了，不容易一步跨太远。这也解释了为什么 LoRA 默认学习率常设在 1e-4 到 5e-4，而全量微调多在 1e-5 量级。</p>
+            <p>顺带一提，$r$（秩）和表达能力的关系不是线性的：$r=8$ 到 $r=16$ 通常有明显提升，$r=16$ 到 $r=64$ 提升就很小了，再大反而过拟合。所以除非任务极难，一般不必超过 32。</p>
+          </details>
+
+          <h2>LoRA 方法家族</h2>
+          <p>LoRA 之后衍生出一整套低秩微调方法，核心差异在「怎么约束这个低秩补丁」。一张图理清关系。</p>
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((低秩微调))
+    LoRA
+      冻结基座加 BA
+    QLoRA
+      4-bit 量化基座
+    AdaLoRA
+      自适应分配秩
+    DoRA
+      权重分解加方向缩放
+    IA3
+      激活缩放向量
+            </div>
+            <figcaption>低秩微调方法族：从基础 LoRA 到量化、自适应、方向感知等变体</figcaption>
+          </figure>
+          <p>选型建议：99% 的场景用标准 LoRA 就够了；QLoRA 只是显存不够时的「以精度换显存」选择，4-bit 量化带来的精度损失在大多数任务上可忽略——但如果你的任务对数值敏感（比如微调后要用于数学或代码生成），建议用 bf16 基座 + LoRA 而不是 4-bit。AdaLoRA 和 DoRA 这类变体通常只带来 1-3 个百分点的收益，换来的是额外的调参复杂度，适合基线已经稳定、想再榨一点效果的阶段。对绝大多数人来说，把时间花在数据清洗上，性价比远高于换用花哨的 LoRA 变体。</p>
+
+          <h2>微调效果不好，怎么归因</h2>
+          <p>微调上线前总要做一次「效果归因」：是数据问题、训练问题，还是基座问题？按下面顺序排查，八成能定位。</p>
+          <ul>
+            <li><strong>先看数据</strong>：抽 50 条样本肉眼看，格式对不对？label 是不是真回答了 instruction？重复样本多不多？这是最高频的根因。</li>
+            <li><strong>再看训练曲线</strong>：train loss 不降，说明学习率太小或数据没进模型（labels 没设 -100 常见于「loss 一直很高」）；eval loss 远低于 train loss，说明 eval 数据泄漏或太简单。</li>
+            <li><strong>最后看基座</strong>：如果换更大基座、同样数据效果立刻变好，说明是基座能力天花板，不是你微调的问题，那就换更强的底座或上更多数据。</li>
+          </ul>
+          <p>一个反直觉的事实：大多数「微调失败」其实是「基座本来就不行」或「数据根本没对齐格式」。先排除这两类，再去怀疑 LoRA 参数。换句话说，<strong>LoRA 是把好模型变专才的工具，不是把烂模型变聪明的魔法</strong>。</p>
+          <p>再补充一条排查顺序上的提醒：<strong>先复现，再优化</strong>。如果换了数据、改了 LoRA 参数，效果忽好忽坏，先把实验「基线锁定」——同样的数据、同样的参数、同样的随机种子，重跑一遍确认结果可复现，再做下一步改动。微调实验的变量太多（数据、模板、学习率、秩、epoch、量化开关），一次只改一个变量，否则你永远不知道哪个改动带来了提升，哪些只是噪声。</p>
+
+          <h2>LoRA 超参速查表</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>超参</th><th>推荐值</th><th>调节建议</th></tr></thead>
+              <tbody>
+                <tr><td>r（秩）</td><td>8-16</td><td>简单任务用 8，复杂任务用 16-32。再大收益递减。</td></tr>
+                <tr><td>lora_alpha</td><td>r 的 2 倍</td><td>r=8 时 alpha=32。控制 LoRA 更新的缩放强度。</td></tr>
+                <tr><td>lora_dropout</td><td>0.05-0.1</td><td>数据少于 1000 条时用 0.1，数据多时用 0.05。</td></tr>
+                <tr><td>target_modules</td><td>q_proj, v_proj</td><td>效果不够时扩展到所有线性层。</td></tr>
+                <tr><td>learning_rate</td><td>1e-4 ~ 5e-4</td><td>比全量微调大 10 倍。发散就降，学不动就升。</td></tr>
+                <tr><td>epochs</td><td>2-5</td><td>数据少（&lt; 1k）用 5，数据多（&gt; 10k）用 2。</td></tr>
+                <tr><td>batch_size</td><td>16-32（等效）</td><td>用 gradient_accumulation 凑够等效 batch。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/07-posttraining/peft-lora/fig1.png" alt="论文原图：LoRA 在冻结的预训练权重旁注入低秩可训练矩阵 A 和 B" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：LoRA 低秩适配——冻结预训练矩阵 W，旁路训练低秩矩阵 A 与 B，输出为 W x + B A x</span>
+              <span class="pf-src">论文原图 · Hu et al., <em>LoRA: Low-Rank Adaptation of Large Language Models</em>, 2021, Figure 1 · <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">arXiv:2106.09685</a></span>
+            </figcaption>
+          </figure>
+          <p>图的主干是左侧冻结的预训练权重 W：输入先经过原有线性层，原模型能力因此保留。旁边的低秩支路由 A 和 B 两个小矩阵组成，先把高维输入压到 r 维，再投影回原维度，最后与主干输出相加；训练期间只有这条支路更新，显存和优化器状态都大幅减少。</p>
+          <p>读图时不要把“低秩”理解成只保留输入的一部分 token，它约束的是<strong>权重更新矩阵的秩</strong>。r 越小，补丁能表达的方向越少；r 增大可提升适配能力，但也会增加参数、过拟合和训练成本。合并时把 BA 加回 W，图中的两条路径就变成一个普通线性层，因此推理侧无需认识 LoRA。</p>
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            LoRA 只训练 adapter，不会自动把新知识安全地“写进”基座；如果训练数据少、模板错或 labels 没屏蔽 prompt，loss 可能下降但模型仍不会按预期回答。先检查可训练参数比例、样本格式和输出区间，再调 r、alpha 或学习率。
+          </div>
+          <details class="deep">
+            <summary>展开：最小可运行版本、验证步骤与排查清单</summary>
+            <div class="deep-body">
+              <p>最小版本先用小型 Instruct 模型、几十条格式一致的样本和 <code>r=8、target_modules=["q_proj", "v_proj"]</code>，只训练 1 个 epoch。启动前打印 <code>trainable% </code>，确认可训练参数远小于总参数；训练中保存 train/eval loss，训练后固定 5 条输入同时跑基座和 adapter，检查输出是否真的改变且没有破坏通用回答。</p>
+              <p>验证分三步：先验证 tokenizer 的 chat template，再验证 labels 中 prompt 位置全部为 -100，最后在非量化基座上执行 <code>merge_and_unload</code> 并比较合并前后 logits。常见报错按顺序排查 CUDA OOM、bitsandbytes 与 CUDA 版本、target module 名称、bf16/fp16 支持和 checkpoint 路径；没有 GPU 时用更小模型验证管线，生产前再换 QLoRA。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>数据是第一优先级</strong>：去重、长度过滤、人工抽检——90% 的微调效果差是数据问题。</li>
+            <li><strong>QLoRA 单卡可训 7B</strong>：4-bit 量化基座 + LoRA adapter，24GB 显存够用。</li>
+            <li><strong>labels 设 -100</strong>：只在 output 部分计算 loss，prompt 部分用 -100 屏蔽。</li>
+            <li><strong>target_modules</strong>：最小配置 q_proj + v_proj，效果不够扩展到所有线性层。</li>
+            <li><strong>合并后推理零开销</strong>：merge_and_unload 后，LoRA 模型和全参数模型推理行为完全一致。</li>
+            <li><strong>评估要人工</strong>：自动指标只能确认「没变差」，人工对比才能确认「变好了」。</li>
+            <li><strong>学习率比全量微调大 10 倍</strong>：LoRA 只更新少量参数，需要更大的步长。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>LoRA: Low-Rank Adaptation of Large Language Models — LoRA 原始论文 · <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">arXiv:2106.09685</a></li>
+            <li>QLoRA: Efficient Finetuning of Quantized LLMs — 4-bit 量化 + LoRA，单卡微调 65B · <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">arXiv:2305.14314</a></li>
+            <li>PEFT 官方文档 — HuggingFace 的 LoRA/AdaLoRA/IA3 实现和教程 · <a href="https://huggingface.co/docs/peft" target="_blank" rel="noopener">链接</a></li>
+            <li>TRL 官方文档 — SFTTrainer 等，简化微调流程的高层 API · <a href="https://huggingface.co/docs/trl" target="_blank" rel="noopener">链接</a></li>
+            <li>Unsloth — 优化的 LoRA 训练框架，速度比原生 PEFT 快 2 倍，显存省 50% · <a href="https://github.com/unslothai/unsloth" target="_blank" rel="noopener">GitHub</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            LoRA 微调让你有了定制模型的能力。想深入理解 LoRA 的数学原理和变体，看 <a href="../07-posttraining/peft-lora.html">PEFT 与 LoRA</a>。想让模型基于你的文档回答问题而不只是对话，看 <a href="rag-practice.html">搭建 RAG 系统</a>。想从零搭建一个模型理解底层原理，看 <a href="build-minigpt.html">从零实现 miniGPT</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>隐私保护与模型安全 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="14-governance" data-topic="privacy-security">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>隐私保护与模型安全</h1>
+            <p class="lead">模型会把训练数据里的个人信息「背」出来，也可能被人用巧妙的查询「钓」出来。隐私攻击不是科幻：提取攻击、成员推断、模型窃取都有成熟的攻击链。这一页讲清三类主要威胁、它们的攻击原理，以及差分隐私、联邦学习等缓解手段到底能挡住什么、挡不住什么。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>威胁分三类：攻击者想让模型吐出训练数据里的私人信息（提取）、判断某个人的数据是否在训练集里（成员推断）、复制模型的全部能力（窃取）。缓解手段从「训练时」（差分隐私）到「数据时」（脱敏/过滤）再到「服务时」（限流/扰动）层层设防。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  subgraph AT["攻击者目标"]
+    direction TB
+    AT1["提取训练数据<br/>复述私人信息"]
+    AT2["成员推断<br/>数据是否在训练集"]
+    AT3["模型窃取<br/>复制能力"]
+  end
+  subgraph DF["防御手段"]
+    direction TB
+    DF1["差分隐私 DP-SGD"]
+    DF2["数据脱敏 / 过滤"]
+    DF3["服务侧限流 / 扰动"]
+  end
+  AT1 -.-> DF
+  AT2 -.-> DF
+  AT3 -.-> DF
+              </div>
+              <figcaption>三类隐私攻击 vs 三层防御：没有银弹，只有纵深防御</figcaption>
+            </figure>
+          </div>
+
+          <h2>一、攻击一：训练数据提取</h2>
+          <p>做法：对模型发起大量针对性提示，诱导它复述训练语料——尤其是那些「高频出现」或「格式特殊」的片段（邮箱、电话、完整引文）。研究反复证明：<strong>模型对训练集中重复出现的个人身份信息（PII）记忆最强</strong>，只要数据被重复过几十次，大概率能被钓出来。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Attacker["攻击者"] --> Query["构造针对性提示<br/>『请复述含手机号的文本』"]
+  Query --> Model["目标模型"]
+  Model -->|"命中记忆"| Leak["吐出 PII<br/>邮箱 / 电话 / 地址"]
+  Model -->|"未命中"| Reject["拒绝 / 泛化回答"]
+  Leak --> Impact["泄露私人信息"]
+  subgraph Conditions["促成条件"]
+    C1["数据在语料中重复多次"]
+    C2["结构规整（姓名+电话）"]
+    C3["模型容量大 / 过拟合"]
+  end
+  Impact -.-> Conditions
+            </div>
+            <figcaption>提取攻击链路：针对性提示诱导模型复述记忆中的 PII，重复度高的数据最容易被钓出</figcaption>
+          </figure>
+
+          <ul>
+            <li><strong>促成条件</strong>：数据在语料中重复多次；文本结构规整（如「姓名 + 电话」）；模型容量大、过拟合程度高。</li>
+            <li><strong>现实性</strong>：不是「每个模型都能被提取大量数据」，但「少量高价值数据被提取」是现实风险。</li>
+            <li><strong>防御</strong>：训练前 PII 脱敏与去重（降低重复度最有效）；训练中差分隐私；服务侧对「疑似复述请求」的检测。</li>
+          </ul>
+
+          <p>提取攻击里最值得单独拎出来说的是「去重」这条防线，因为它是成本最低、效果却最被低估的。模型的记忆本质是「统计上的惯性」：一段文本在语料里出现的次数越多，模型对它学得越牢，越容易被复述出来。反过来想，只要让敏感信息在语料里只出现一次，模型对它的「记忆强度」就会大幅下降——即使没能彻底抹掉，也足以让提取难度显著上升。这也是为什么很多团队把「精确去重」和「近似去重」当成隐私工程的第一个步骤，而不是等到出事了再做：去重不仅对隐私有用，还能提升训练效率和模型质量，属于「怎么算都不亏」的动作。</p>
+
+          <p>但要清醒认识去重的边界：它只对「重复出现的 PII」有效，对「只出现一次但恰好被完整记住」的敏感数据无能为力。比如一篇深度访谈里提到的某个未公开的住址，全文只出现一次，去重完全不会碰到它，可如果模型把这段访谈背了下来，依然可能被诱导复述。所以去重是「大幅降低整体风险」的手段，不是「保证零泄露」的承诺。把它和输出侧过滤、服务侧检测组合起来，才是完整的纵深。</p>
+
+          <h2>二、攻击二：成员推断</h2>
+          <p>攻击者想知道「某个特定记录（如某人的病历）是否在训练集里」。判定信号包括：模型对该记录的置信度异常高、perplexity 异常低、或者回答「是否认识这条记录」时表现出熟悉。成员推断的杀伤力在于它是提取攻击的「侦察兵」——先确认数据在集内，再重点提取。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant A as 攻击者
+  participant M as 目标模型
+  A->>M: 提交样本 A（在训练集内）
+  M-->>A: 低困惑度 / 高置信度
+  A->>A: 信号异常 → 判定在集内
+  A->>M: 提交样本 B（不在训练集）
+  M-->>A: 高困惑度 / 置信度正常
+  A->>A: 信号正常 → 判定不在集内
+  Note over A: 对判定"在集内"的样本<br/>重点发起提取攻击
+            </div>
+            <figcaption>成员推断原理：模型对训练过的样本表现出异常的熟悉度（低困惑度、高置信度），据此做二值判断</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            提取攻击问「把秘密告诉我」，成员推断只问「你有没有这个秘密」——后者更容易成功，因为它只需要一个二值判断，而它的成功又让前者变得有的放矢。
+          </div>
+
+          <h2>三、攻击三：模型窃取</h2>
+          <p>通过反复调用商业 API，用「问答对」蒸馏出功能接近的开源替代——本质上就是 <a href="../07-posttraining/distillation.html">知识蒸馏</a> 的黑客用法。攻击者不需要知道模型权重，只需要「问得够多」，就能训练出一个行为相近的替身。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Victim["受害者（目标 API）"]
+    V1["商业模型<br/>封闭权重"]
+  end
+  subgraph Attacker["攻击者"]
+    A1["海量查询<br/>（十万级问答对）"]
+    A2["用『问答对』<br/>训练开源小模型"]
+    A3["得到功能接近<br/>的替身模型"]
+  end
+  subgraph Defense["服务侧防御"]
+    D1["查询限流"]
+    D2["异常模式检测"]
+    D3["输出扰动"]
+  end
+  A1 --> V1
+  V1 -->|"返回答案"| A2
+  A2 --> A3
+  A1 -.-> Defense
+            </div>
+            <figcaption>模型窃取攻击链：海量查询采集问答对，蒸馏出功能接近的替身；服务侧限流与检测是主要防线</figcaption>
+          </figure>
+
+          <ul>
+            <li><strong>为什么难防</strong>：正常用户也在「提问-学习」，窃取与正常使用的边界模糊；</li>
+            <li><strong>现实影响</strong>：模型窃取通常无法完全复制能力（尤其安全对齐部分），但足以复制「大部分通用能力」；</li>
+            <li><strong>防御</strong>：服务侧限流、行为模式检测（如请求分布异常）、对高价值能力做扰动或加密。</li>
+          </ul>
+
+          <p>模型窃取之所以在商业上让人头疼，是因为它的成本结构太不对称。对攻击者而言，窃取的「原料」只是调用 API 的账单——假设一次查询成本是固定的几分钱，采集十万个问答对的总成本仍然远低于自己从零预训练一个大模型的成本，甚至低于雇一支数据标注团队。而对防守方来说，你投入了巨大的训练成本，攻击者用不到你万分之一的成本就复制走了大部分通用能力。更麻烦的是「边界模糊」：一个正常的第三方开发者基于你的 API 做微调、做蒸馏（见 <a href="../07-posttraining/distillation.html">知识蒸馏</a>）以降低推理成本，这本身是生态的一部分；当这个「正常开发者」换成一个想白嫖你核心能力的对手时，行为模式几乎一样。</p>
+
+          <p>所以窃取防御从来不是「彻底阻止」，而是「提高成本 + 控制风险」。服务侧能做的有限而具体：一是限流与配额，限制单账户的请求速率与总量，让采集十万问答对变得又慢又贵；二是行为特征检测，正常用户的问题分布是长尾的、主题分散的，而窃取者的问题往往集中在少数高价值能力上且高度重复，这类统计异常可以被监控系统捕捉；三是对最高价值的能力做分层部署——把最容易被复制的通用能力放在公开 API 后面，把高价值能力放在更贵的准入门槛后面。没有任何一种手段能单独挡住窃取，但组合起来，可以把「复制你的模型」从「十几块钱的脚本」变成「一笔需要权衡的投资决策」。</p>
+
+          <h2>四、防御手段：差分隐私到底能挡住什么</h2>
+          <p>差分隐私（Differential Privacy）是最著名的训练侧防御。它的思路是：在训练过程中给梯度加噪声，让「某条数据在不在训练集里」对最终模型的影响有界——从而从理论上抑制成员推断和提取攻击。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  Data["训练数据"] --> Batch["梯度计算"]
+  Batch --> Noise["加噪 DP-SGD<br/>裁剪 + 噪声"]
+  Noise --> Update["更新权重"]
+  Update --> Model["模型"]
+  subgraph Theory["数学保证"]
+    T1["ε-差分隐私<br/>ε 越小隐私越强"]
+    T2["对『单条数据是否参与』<br/>的影响有界"]
+  end
+  Model -.-> Theory
+            </div>
+            <figcaption>DP-SGD 原理：梯度裁剪 + 加噪，让单条数据对模型的影响被 ε 界住</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>手段</th><th>原理</th><th>能挡住</th><th>挡不住 / 代价</th></tr></thead>
+              <tbody>
+                <tr><td>差分隐私 DP-SGD</td><td>梯度加噪，ε 界住单样本影响</td><td>成员推断、提取攻击（理论上）</td><td>模型质量下降显著；ε 小的场景不实用</td></tr>
+                <tr><td>PII 脱敏 / 过滤</td><td>训练前剔除/替换敏感信息</td><td>大部分 PII 提取</td><td>只防已知格式；脱敏不彻底</td></tr>
+                <tr><td>数据去重</td><td>移除重复文本</td><td>重复记忆（最有效的现实手段）</td><td>不防单次出现的敏感数据</td></tr>
+                <tr><td>服务侧限流/检测</td><td>识别异常提取请求</td><td>大规模自动化提取</td><td>防不住巧妙的手工查询</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>必须诚实的结论：<strong>DP-SGD 在当前大模型训练里几乎不可用</strong>——因为 ε 要做到有意义的保护级别，噪声会显著损伤模型能力。现实中主要靠「数据侧去重 + 脱敏 + 服务侧检测」的组合，这些手段便宜且有效。</p>
+
+          <details class="deep">
+            <summary>深读：ε 到底意味着什么，以及噪声的真实代价</summary>
+            <p>差分隐私里 ε 是隐私预算，直觉含义是「一个观察者通过查看训练后的模型，能推断出『某条数据是否参与训练』的概率上界」。ε 越小，推断成功的概率越接近猜硬币，隐私越强。学术界常用的量级是 ε 在 1–8 之间算「较强保护」，ε 到几十上百则基本形同虚设。但这里有个容易被忽略的工程现实：<strong>同样的 ε，在小模型与大模型上的代价完全不同</strong>。</p>
+            <p>DP-SGD 的做法是两步：先把每个样本的梯度裁剪到固定范数 C，再往裁剪后的梯度上叠加高斯噪声。加噪的方差正比于 C² 和训练轮数。理论保证成立的前提是「每一条数据对梯度的影响都不超过 C」——而大模型动辄千亿参数，梯度范数天然很大，裁到 C 本身就扭曲了梯度方向，再叠噪声就双重损失。经验上，把 ε 控制到 10 以下的同时保持大模型可用，到今天仍是公开难题；而小模型（分类器、推荐模型）上 DP 早已量产。</p>
+            <p>另一个被低估的点是「隐私预算会被消耗」：每训练一个 epoch 就消耗一部分预算，训练得越久、迭代越多，ε 累积越大。如果你想用同一批数据反复实验、调超参、重训，预算会迅速耗尽。所以 DP 适合「一次性训练 + 谨慎迭代」的场景，不适合大模型这种「疯狂调参重训」的工作流。这也是为什么大模型隐私实践中，去重和脱敏这种「一次性、免费」的手段反而成了主力。</p>
+          </details>
+
+          <h2>五、防御手段：联邦学习与隐私计算的定位</h2>
+          <p>联邦学习（Federated Learning）经常和隐私保护绑在一起讨论，但要分清它到底保护什么。联邦学习的核心是「数据不动、模型动」——各方在本地训练，只上传梯度/模型更新。它保护的是<strong>数据传输过程</strong>，而不是训练结果。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Clients["参与方（数据不出本地）"]
+    C1["医院 A<br/>本地病历"]
+    C2["医院 B<br/>本地病历"]
+    C3["医院 C<br/>本地病历"]
+  end
+  subgraph Server["中央服务器"]
+    S1["聚合梯度<br/>不接触原始数据"]
+  end
+  C1 -->|"只传梯度"| S1
+  C2 -->|"只传梯度"| S1
+  C3 -->|"只传梯度"| S1
+  S1 -->|"下发更新"| C1
+  S1 -->|"下发更新"| C2
+  S1 -->|"下发更新"| C3
+  Note["局限：梯度本身可能泄露信息<br/>需配合差分隐私 / 同态加密"]
+            </div>
+            <figcaption>联邦学习架构：数据不出本地只传梯度，但梯度本身可能泄露信息，需叠加隐私技术</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>技术</th><th>保护对象</th><th>强度</th><th>现实应用</th></tr></thead>
+              <tbody>
+                <tr><td>联邦学习</td><td>数据传输过程</td><td>中（梯度可能泄露）</td><td>医疗、金融多方协作</td></tr>
+                <tr><td>差分隐私</td><td>训练结果（单样本影响）</td><td>理论强 / 实际有损</td><td>统计发布、小模型</td></tr>
+                <tr><td>同态加密</td><td>计算过程</td><td>强但慢</td><td>小规模场景</td></tr>
+                <tr><td>可信执行环境 TEE</td><td>运行环境</td><td>强（硬件）</td><td>云上敏感推理</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>六、实战：输出侧 PII 检测的实现</h2>
+          <p>不管训练阶段做了多少防护，最可靠的兜底是<strong>在模型输出侧拦截 PII</strong>——反正用户看不到内部，输出过滤是最便宜有效的最后防线。一个生产可用的输出过滤器：</p>
+
+          <pre><code class="language-python">import re
+
+class PIIOutputFilter:
+    """模型输出侧 PII 过滤器"""
+
+    # 常见 PII 模式（生产环境应使用更完整的正则 + 实体识别模型）
+    PATTERNS = {
+        "phone": re.compile(
+            r'(?<!\d)(1[3-9]\d{9})(?!\d)'),            # 中国大陆手机号
+        "email": re.compile(
+            r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),
+        "id_card": re.compile(
+            r'(?<!\d)\d{17}[\dXx](?!\d)'),              # 身份证号
+        "ip": re.compile(
+            r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
+    }
+
+    def __init__(self, mode="mask"):
+        self.mode = mode  # mask: 打码 | block: 拒绝输出
+
+    def check(self, text):
+        """返回 (是否含 PII, 命中的类型列表, 处理后的文本)"""
+        hits = []
+        processed = text
+        for name, pattern in self.PATTERNS.items():
+            matches = pattern.findall(text)
+            if matches:
+                hits.append(name)
+                if self.mode == "mask":
+                    # 打码：保留首尾字符，中间替换
+                    for m in matches:
+                        masked = m[0] + "*" * max(len(m) - 2, 3) + m[-1]
+                        processed = processed.replace(m, masked)
+                # block 模式：调用方决定是否整体拒绝
+        return bool(hits), hits, processed
+
+    def safe_generate(self, generate_fn, prompt):
+        """包装生成函数：输出前过滤"""
+        raw_output = generate_fn(prompt)
+        has_pii, hits, filtered = self.check(raw_output)
+        if has_pii and self.mode == "block":
+            return {
+                "output": None,
+                "blocked": True,
+                "reasons": hits,
+                "raw": raw_output
+            }
+        return {
+            "output": filtered,
+            "blocked": False,
+            "reasons": hits
+        }
+
+
+# 使用示例
+filter_ = PIIOutputFilter(mode="mask")
+result = filter_.safe_generate(
+    generate_fn=lambda p: "联系 13812345678 或 a@b.com",
+    prompt="帮我写一个联系方式"
+)
+print(result["output"])  # 联系 138****5678 或 a***@b.com</code></pre>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant G as 模型生成
+  participant D as PII 检测器
+  participant P as 策略引擎
+  participant U as 用户
+  G->>D: 原始输出
+  D->>D: 正则 + NER 实体识别
+  alt 未命中 PII
+    D->>U: 直接放行
+  else 命中 PII
+    D->>P: 进入策略决策
+    alt 打码模式 mask
+      P->>U: PII 打码后返回（保留可读性）
+    else 拒绝模式 block
+      P->>U: 整体拒绝，返回安全提示
+    end
+  end
+            </div>
+            <figcaption>输出侧 PII 过滤流程：检测命中后按策略打码或拒绝，作为最后的兜底防线</figcaption>
+          </figure>
+
+          <p>工程要点：正则只能抓「固定格式」的 PII，更隐蔽的（如人名、病历描述）需要 NER 实体识别模型；打码保留首尾字符是兼顾可读性与隐私的常见折中；高风险场景（医疗、金融）建议直接 block 并记录日志。</p>
+
+          <p>把输出侧过滤器做到生产级，还有三个值得考虑的细节。第一，<strong>过滤时机与流式输出</strong>：如果模型是流式逐 token 吐字的，你不能等整段生成完再过滤——用户已经看到内容了。常见的折中是「分片过滤」：每攒一小段就检查一次，命中 PII 就中断生成并回退到安全文本。但这会带来「已经吐出去的字无法收回」的残留问题，所以高风险场景更推荐在入口就做「前置评估」：对提示词与上下文先扫描，评估本次生成落入 PII 高发区域的概率，提前决定是否启动保守模式。</p>
+
+          <p>第二，<strong>误伤的权衡</strong>：输出侧过滤本质上是「拦敏感内容」和「别拦正常内容」之间的博弈。一个医学问答机器人里，「患者 138xxxx 的用药记录」是必须拦的，但「青霉素过敏史」这种描述型信息在医疗语境里反而是核心知识。所以生产级过滤器通常不做「一刀切」，而是把命中项分为「必拦类」（明文手机号、身份证号）和「风险类」（姓名与敏感词共现），分别配置不同策略——必拦类直接 block，风险类只打码并降级展示。这样既守住红线，又不至于让产品在敏感行业完全不可用。</p>
+
+          <p>第三，<strong>记录与审计</strong>：每一次拦截、打码都应该写入日志：命中的类型、策略、处理结果、时间戳。这些日志的价值在两方面——一是线上复盘，发现某类 PII 频繁出现说明上游数据侧脱敏没做透，要回去补；二是合规证明，当监管问「你们怎么防止模型吐出用户隐私」时，日志就是最直接的证据。和训练侧台账一样，输出侧过滤的关键从来不只是算法，而是「处理过且有记录」。</p>
+
+          <h2>七、现实中的「记忆-隐私」权衡</h2>
+          <p>一个被反复忽视的事实：<strong>模型的「记忆能力」和「隐私风险」是同一枚硬币的两面</strong>。想让模型擅长代码、擅长复述知识，就必须让它记住大量文本——而记住得越多，越可能背出敏感内容。工程上只能做「取舍」而非「既要又要」。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((记忆 ↔ 隐私 权衡))
+    记忆强
+      知识丰富
+      易被提取
+      通用助手倾向
+    记忆弱
+      隐私安全
+      知识贫乏
+      敏感行业倾向
+    平衡点
+      按场景选择
+      通用助手：偏向记忆
+      医疗金融：偏向隐私
+      工程手段调平衡
+            </div>
+            <figcaption>记忆与隐私的权衡：通用助手偏向记忆，敏感行业偏向隐私，按场景定平衡点</figcaption>
+          </figure>
+
+          <p>把这个权衡落成产品决策，可以问两个问题。第一，你的产品「记住」用户数据是不是核心价值？如果用户期望聊天助手记得他的偏好，那记忆就是卖点，隐私风险要靠「用户明示同意 + 数据最小化」来管理。第二，模型输出的容错空间有多大？医疗、金融场景里一个被提取的隐私信息可能直接造成实质伤害，必须压紧隐私；通用写作场景则更宽容。没有唯一正确答案，但先回答这两个问题，团队就不容易在「该记忆还是该忘记」上反复摇摆。</p>
+
+          <h2>八、2024-2026 的最新进展</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方向</th><th>进展</th><th>意义</th></tr></thead>
+              <tbody>
+                <tr><td>机器遗忘（Unlearning）</td><td>删除特定数据在模型中的影响</td><td>响应「被遗忘权」，但技术不成熟</td></tr>
+                <tr><td>PII 检测增强</td><td>NLP 模型自动识别脱敏</td><td>数据侧防御更便宜</td></tr>
+                <tr><td>输出侧隐私过滤</td><td>检测「复述 PII」的输出</td><td>服务侧兜底</td></tr>
+                <tr><td>TEE 推理</td><td>云端推理运行在可信硬件内</td><td>推理阶段隐私保护</td></tr>
+                <tr><td>隐私评估基准</td><td>标准化评估模型的隐私风险</td><td>让「隐私」可度量</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>九、实战：PII 检测与脱敏流水线的一个算例</h2>
+          <p>前面讲了很多概念，这一节用一个完整的算例把「数据侧脱敏」的流水线串起来，让数字可感知。假设你的团队要处理一批从公开论坛抓取的用户生成内容，规模是 50 万条帖子，目标是训练一个通用的对话助手。脱敏流水线通常由四个环节构成：格式识别 → 实体识别 → 脱敏策略 → 人工抽查。</p>
+
+          <p><strong>环节一：格式识别。</strong>用正则把「固定格式」的 PII 抓出来：手机号、邮箱、身份证号、银行卡号、IP 地址、URL。这一步的特点是召回率高、但只能抓「长得很标准的」PII。对 50 万条帖子做一次正则扫描，大约能命中约 1.2 万条包含至少一个格式 PII 的帖子。注意：正则抓出来的东西不一定要全部删掉，很多时候是「邮箱地址」这种低敏感信息，是否保留取决于你的隐私政策——但至少要打标记录。</p>
+
+          <p><strong>环节二：实体识别。</strong>用 NER 模型抓「非固定格式」但同样是 PII 的内容：人名、地名、机构名、病历描述、职业细节。这一环节的成本比正则高一个数量级，因为要跑模型，但对论坛语料特别重要——论坛里大量隐私不是「一串数字」，而是「我妈上个月在协和医院做了心脏支架手术」这种描述。用规则 + NER 结合，可以把可疑实体的召回从「只抓格式」提升到「抓住叙事型 PII」。工程上常见的做法是：正则全量扫一遍（便宜），NER 只对正则未命中的部分做二次扫描，控制总成本。</p>
+
+          <p><strong>环节三：脱敏策略。</strong>对命中项做处理，通常是四选一：删除整条（高敏感，如身份证+姓名同现）、替换为占位符（中敏感，如「[手机号]」）、泛化（把「张三」替换为「[人名]」）、保留但加标记（低敏感，如公开的邮箱）。一个常见的经验法则：<strong>能删除的尽量不替换，能替换的尽量不保留</strong>——脱敏不彻底的数据，到了训练环节还是要被模型「记住」。算例里，约 1.2 万条格式 PII 帖子中约 2000 条命中高敏感规则被整体删除，其余替换为占位符；NER 环节额外识别出约 6000 条叙事型 PII，其中约 1500 条被删除。最终从 50 万条原始帖子中删除了约 3500 条、脱敏约 1.45 万条，干净语料约 48 万条。</p>
+
+          <p><strong>环节四：人工抽查。</strong>自动脱敏一定有漏网之鱼，所以要在成品语料里随机抽样，比如抽 1% 由人去复核「还有没有明显的 PII 残留」。抽查结果既是质量指标，也是审计证据：如果抽查漏检率高于可接受线，就要回炉调规则。这一步的成本不高，但它是整套流水线「可对外交代」的关键——很多合规事件都是因为「没有抽查记录」而百口莫辩。</p>
+
+          <p>这个算例想传达的核心是：<strong>隐私脱敏不是「跑一遍工具」的一次性动作，而是「规则 + 模型 + 人工」三层配合、持续迭代的工程流程</strong>。每一层都有明确的失败模式：正则漏掉叙事型 PII、NER 误伤正常文本、脱敏策略一刀切破坏语料价值。好的流水线，是让每一层的失败能被下一层兜住，并且每一层的处理都留痕。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>三类攻击</strong>：提取（诱导复述 PII）、成员推断（判断数据是否在集内）、模型窃取（蒸馏出替身）。</li>
+            <li><strong>提取攻击促成条件</strong>：数据重复多次、结构规整、模型过拟合——去重是最有效的现实防御。</li>
+            <li><strong>成员推断</strong>：利用「低困惑度 + 高置信度」信号做二值判断，是提取攻击的侦察兵。</li>
+            <li><strong>模型窃取</strong>：问答对蒸馏成替身，难防（与正常使用边界模糊），靠限流与检测缓解。</li>
+            <li><strong>差分隐私</strong>：理论强但大模型几乎不可用（ε 小则质量崩），现实靠数据去重 + 脱敏 + 服务侧检测。</li>
+            <li><strong>联邦学习</strong>：保护「传输过程」而非「训练结果」，梯度仍可能泄露，需叠加 DP/加密。</li>
+            <li><strong>记忆-隐私权衡</strong>：同一枚硬币的两面，通用助手偏向记忆、敏感行业偏向隐私。</li>
+            <li><strong>常见坑</strong>：以为差分隐私是万灵药；忽视「去重」这个最便宜的防御；把联邦学习当完整隐私方案；忘记输出侧也可能复述 PII。</li>
+          </ul>
+
+          <h2>新手练习：把隐私风险拆成攻击面与证据</h2>
+          <p>把模型隐私想成一座档案馆：提取攻击是在问「请把某份档案念出来」，成员推断是在问「这份档案是否在馆里」，模型窃取是在大量询问后复制馆员的回答风格。三者都叫隐私风险，但需要的证据和防御不同。新手最容易把「数据不出服务器」当成隐私安全；数据不出服务器只能减少传输暴露，不能保证训练后的模型不会记住或泄露。</p>
+          <p>手算一个输出过滤例子：1000 次生成中，检测器命中 20 次手机号，其中 18 次正确命中、2 次误报；漏掉 3 次真实手机号。精确率是 18/20 = 90%，召回率是 18/21 ≈ 85.7%。如果这是医疗系统，团队还要决定这两个错误哪一个更不能接受：漏报可能直接泄露，误报则可能影响可用性。阈值、策略和人工复核必须按场景定，不能只追求一个漂亮的平均分。</p>
+          <div class="callout warn"><span class="callout-t">新手最容易搞错</span>差分隐私给出的是形式化保证，不是「模型绝不会泄露」；联邦学习保护的是数据协作方式，不自动保护梯度、服务器或最终模型；正则表达式也只能覆盖固定格式 PII。边界必须写进威胁模型和验收标准。</div>
+          <details class="deep">
+            <summary>深读：成员推断的阈值为什么要在独立数据上校准</summary>
+            <div class="deep-body">
+              <p>成员推断常把一个分数变成二值判断，例如困惑度低于阈值就判定「在训练集」。如果阈值和评测样本来自同一批数据，攻击者会得到过于乐观的结果；正确做法是把成员样本、非成员样本和校准集分开，并报告基线攻击、准确率、精确率、召回率以及样本规模。</p>
+              <p>还要区分「能判断是否见过」与「能恢复具体秘密」。成员推断成功不代表提取一定成功，但它说明模型对该样本存在异常记忆，值得进一步做数据删除、去重、输出侧阻断和访问审计。隐私报告应记录攻击预算、查询次数、模型版本和防御配置，否则不同版本之间无法公平比较。</p>
+            </div>
+          </details>
+          <figure class="paper-figure">
+            <img src="../../assets/figures/13-evaluation/contamination/fig1.png" alt="相关论文原图：从预训练语料检索与评测内容重叠来识别污染" loading="lazy" style="max-width:560px">
+            <figcaption><span class="pf-title">相关论文原图：通过来源语料检索、重叠检测和结果标记定位数据泄漏风险</span><span class="pf-src">相关论文原图 · Xu 等，<em>Benchmark Data Contamination of Large Language Models: A Survey</em>，2024，Figure 1 · <a href="https://arxiv.org/abs/2406.04244" target="_blank" rel="noopener">arXiv:2406.04244</a></span></figcaption>
+          </figure>
+          <p>逐块看图左侧的「来源语料—待测内容—检索」链路：隐私治理也需要把数据来源、去重结果、PII 检测结果和训练版本串起来。它不能直接证明某条个人信息已经泄露，但能帮助你定位哪些来源、格式和重复模式更可能进入记忆风险区域。</p>
+          <p>再看右侧的结果标记：检测结果应带证据和置信度，而不是只返回「安全/不安全」。这与提取攻击和成员推断的评估方式一致：保留攻击配置、查询预算、命中样本和误报漏报，才能判断防御是否真的改善。原图研究的是数据污染，不是隐私攻击；这里引用它是为了说明数据泄漏调查的可审计流程，隐私结论仍应结合 <a href="https://arxiv.org/abs/2011.09528" target="_blank" rel="noopener">训练数据提取论文</a>、<a href="https://arxiv.org/abs/1610.05820" target="_blank" rel="noopener">成员推断论文</a>和 <a href="https://arxiv.org/abs/1607.00133" target="_blank" rel="noopener">DP-SGD 原论文</a>。</p>
+          <div class="callout tip"><span class="callout-t">更新日期</span>2026-08。隐私技术与监管要求仍在演进；上线前应依据真实数据类型、攻击者能力和适用法律重新评估。</div>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Extracting Training Data from Large Language Models — 提取攻击的奠基工作 · <a href="https://arxiv.org/abs/2011.09528" target="_blank" rel="noopener">arXiv:2011.09528</a></li>
+            <li>Membership Inference Attacks Against Machine Learning Models — 成员推断经典论文 · <a href="https://arxiv.org/abs/1610.05820" target="_blank" rel="noopener">arXiv:1610.05820</a></li>
+            <li>Deep Learning with Differential Privacy — DP-SGD 原始论文 · <a href="https://arxiv.org/abs/1607.00133" target="_blank" rel="noopener">arXiv:1607.00133</a></li>
+            <li>Communication-Efficient Learning of Deep Networks from Decentralized Data — 联邦学习奠基论文 · <a href="https://arxiv.org/abs/1602.05629" target="_blank" rel="noopener">arXiv:1602.05629</a></li>
+            <li>Machine Unlearning 相关综述 — 「被遗忘权」技术现状（检索最新综述）</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            隐私是治理与合规的一部分，完整框架见 <a href="governance.html">AI 治理框架</a>；训练数据的版权问题见 <a href="data-copyright.html">数据版权与合规</a>；模型被攻击后的安全防护见 <a href="safety-redteam.html">安全红队</a>。
+          </div>
+
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

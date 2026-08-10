@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>预训练目标 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="06-pretraining" data-topic="objectives">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>预训练目标</h1>
+            <p class="lead">同样一堆语料，你可以让模型「接着往下写」，也可以挖空让它「填回去」。选哪一种，决定了模型学到什么、每份数据能榨出多少梯度信号，也在很大程度上决定了它未来是个生成器还是个理解器。这一页回答的问题只有一个：模型在预训练时到底在学什么。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>预训练目标就是<strong>一套把无标注文本改造成有监督样本的规则</strong>。同一段原始文本，用不同规则改造，就得到不同的「自监督习题」：CLM 是遮住右边让你续写，MLM 是随机挖几个字让你填空，去噪目标是挖掉整个短语让你重写。习题类型不同，学到的能力和每份数据的产出效率也就不同。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  D["原始语料<br/>一段连续文本"] --> C["CLM<br/>遮住右侧 预测下一个 token"]
+  D --> M["MLM<br/>随机挖空 双向还原"]
+  D --> S["去噪目标<br/>挖掉连续片段 生成式重建"]
+  C --> R1["每个位置都产生监督信号<br/>天然适配生成"]
+  M --> R2["仅被掩位置产生信号<br/>表征强 生成弱"]
+  S --> R3["片段级信号<br/>Encoder-Decoder 友好"]
+  C --> T["MTP<br/>一次预测未来多步"]
+  T --> R4["信号密度进一步提高<br/>并为推测解码铺路"]
+  style C fill:#e6f1fb,stroke:#185fa5
+  style T fill:#e6f1fb,stroke:#185fa5
+              </div>
+              <figcaption>四类主流预训练目标：同一份语料，不同的「出题方式」。右侧一列是每种出题方式带来的直接后果。</figcaption>
+            </figure>
+          </div>
+
+          <h2>训练信号密度：被低估的那把尺子</h2>
+          <p>大多数教材讲 CLM 与 MLM 的差别，只说「单向 vs 双向」。这个说法没错，但它解释不了一个更要紧的事实：为什么 2020 年之后，做大规模基座模型的团队几乎清一色转向了 CLM。</p>
+          <p>真正的分水岭在<strong>训练信号密度</strong>——一条长度为 $T$ 的序列，前向传播一次，能产生多少个用于反向传播的预测目标。</p>
+          <ul>
+            <li><strong>CLM</strong>：因果掩码保证了第 $t$ 个位置只能看到 $t$ 之前的内容，所以<strong>每个位置都可以同时充当「输入」和「标签」</strong>。一条长为 $T$ 的序列产生 $T$ 个预测目标，信号密度 100%。</li>
+            <li><strong>MLM</strong>：BERT 的做法是随机挑选约 15% 的 token 掩掉，只在这些位置计算损失。剩下 85% 的位置只贡献上下文，不产生梯度信号。同样一条序列、同样一次前向的算力，产出的监督信号只有 CLM 的约六分之一。</li>
+          </ul>
+
+          <p>把这件事换算成具体数字会更有冲击力。取一条常见的 4096 长度训练序列，看看不同目标各能产出多少个「参与反向传播的预测」：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>目标</th><th>一条 4096 序列产生的预测目标数</th><th>相对 CLM 的信号效率</th><th>为什么是这个数</th></tr></thead>
+              <tbody>
+                <tr><td><strong>CLM</strong></td><td>4095</td><td><strong>100%</strong>（基准）</td><td>标签右移一位，除最后一个位置外每个位置都有标签</td></tr>
+                <tr><td><strong>MLM（掩码率 15%）</strong></td><td>约 614</td><td>约 <strong>15%</strong></td><td>只有被选中的 15% 位置进入损失求和</td></tr>
+                <tr><td><strong>T5 span 去噪（腐蚀率 15%）</strong></td><td>解码器侧约 614 + 哨兵符</td><td>约 <strong>15%</strong> 且需多跑一个解码器</td><td>只重建被挖掉的片段，编码器侧完全不算损失</td></tr>
+                <tr><td><strong>MTP（$D=4$）</strong></td><td>约 16380</td><td>约 <strong>400%</strong>（但远端头信噪比低）</td><td>每个位置同时对 $t{+}1$ 到 $t{+}4$ 出题</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:13px;color:var(--text-3)">上表按定义直接推算，用于建立数量级直觉；实际实现中因 packing、特殊符号、动态掩码等细节会有出入。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            算力买的是「前向 + 反向」这一次完整的计算。CLM 相当于一张卷子上每道题都算分，MLM 相当于同样一张卷子只批改其中 15% 的题——纸和时间花得一样多，收获却少了很多。
+          </div>
+          <p>为什么 MLM 不干脆把掩码比例提到 50%、80%？因为掩得越多，剩下的上下文就越残缺，任务从「根据充分语境推断」退化成「瞎猜」，学到的表征质量反而下降。掩码率是一个卡在<strong>信号密度</strong>与<strong>上下文完整性</strong>之间的权衡，而 CLM 用因果结构巧妙地绕开了这个权衡：它不需要破坏任何输入，就能让每个位置都有标签。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>掩码率</th><th>信号密度</th><th>剩余上下文</th><th>任务性质的变化</th></tr></thead>
+              <tbody>
+                <tr><td>5%</td><td>很低</td><td>几乎完整</td><td>太容易，模型靠局部搭配就能填对，梯度信息量小</td></tr>
+                <tr><td><strong>15%</strong>（BERT 默认）</td><td>低</td><td>充分</td><td>经验上的甜点区：既需要理解语境，上下文又没被破坏</td></tr>
+                <tr><td>40%</td><td>中</td><td>开始残缺</td><td>部分位置已无法从语境推断，标签噪声上升</td></tr>
+                <tr><td>80%+</td><td>高</td><td>严重残缺</td><td>退化为「无条件生成」，训练目标本身失去意义</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这条性质叠加 <a href="scaling-laws.html">Scaling Laws</a> 的视角就很有杀伤力：在给定算力预算下，谁能把每 FLOP 换成更多有效梯度信号，谁就能在同样的曲线上跑得更远。这是 CLM 成为基座默认目标的核心经济学原因，而不仅仅是「生成任务需要单向」。</p>
+
+          <h2>一次训练 step 到底发生了什么</h2>
+          <p>公式看起来很抽象，但落到代码里，一次预训练 step 只有六个动作。把它们串起来看，很多「论文不写、代码里全是」的细节就藏在环节之间：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant DS as 语料分片
+  participant TK as 分词器
+  participant PK as 打包器
+  participant GPU as 模型前向
+  participant LS as 损失计算
+  participant OP as 优化器
+  DS->>TK: 取出若干篇原始文档
+  TK->>PK: 转成 token id 序列 每篇长度不一
+  PK->>PK: 首尾相连切成定长 4096 的样本
+  PK->>GPU: 送入 input_ids 与 attention 掩码
+  GPU->>GPU: 因果掩码屏蔽未来位置
+  GPU->>LS: 输出 logits 形状 B×T×V
+  LS->>LS: 标签右移一位 padding 置 -100
+  LS->>OP: 回传交叉熵梯度
+  OP->>GPU: 更新参数 进入下一 step
+            </div>
+            <figcaption>一次 CLM 训练 step 的完整链路。真正容易出错的不是模型前向，而是「打包」和「标签右移」这两个环节。</figcaption>
+          </figure>
+
+          <p>其中<strong>打包（packing）</strong>是新手最容易忽略的一步。语料里的文档长短不一：一条微博几十个 token，一篇论文几万个 token。如果一篇文档占一条样本，短文档会被 padding 塞满，算力大量浪费在填充符上。所以实际做法是把多篇文档首尾相连，再按固定长度切开：</p>
+
+          <pre><code class="language-python">EOS = tokenizer.eos_token_id
+SEQ_LEN = 4096
+
+def pack_documents(doc_token_lists, seq_len=SEQ_LEN):
+    """把变长文档首尾相连，切成定长样本；同时记录每个位置属于第几篇文档"""
+    buf_ids, buf_doc = [], []
+    doc_counter = 0
+    for tokens in doc_token_lists:
+        buf_ids.extend(tokens + [EOS])           # 用 EOS 标记文档边界
+        buf_doc.extend([doc_counter] * (len(tokens) + 1))
+        doc_counter += 1
+        while len(buf_ids) &gt;= seq_len:
+            yield buf_ids[:seq_len], buf_doc[:seq_len]
+            buf_ids, buf_doc = buf_ids[seq_len:], buf_doc[seq_len:]</code></pre>
+
+          <p>打包把 GPU 利用率拉满了，却引入一个新问题：一条 4096 的样本里可能塞了五六篇毫不相干的文档，第二篇的开头会「注意」到第一篇的结尾。要不要切断这种跨文档注意力，是一个必须显式做出的决策，下面的深入块里展开讲。</p>
+
+          <h2>CLM：因果语言建模</h2>
+          <p>CLM（Causal Language Modeling，也叫自回归语言建模）的目标函数就是序列的负对数似然：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{CLM}} = -\sum_{t=1}^{T} \log P_\theta\!\left(x_t \mid x_{&lt;t}\right)$$
+          </div>
+          <p>实现上只需要两件事：一个<strong>因果掩码</strong>（上三角置为 $-\infty$，让位置 $t$ 看不到未来），以及一次<strong>标签右移</strong>（labels 就是 input_ids 往左错一位）。整条序列的所有位置在一次前向里并行算完，这正是 <a href="../03-transformer/attention.html">注意力机制</a> 相比 RNN 的关键红利。</p>
+          <pre><code class="language-python"># CLM 的全部秘密：labels 就是右移一位的 input_ids
+logits = model(input_ids)                    # (B, T, V)
+loss = F.cross_entropy(
+    logits[:, :-1, :].reshape(-1, V),        # 预测第 1..T-1 个位置
+    input_ids[:, 1:].reshape(-1),            # 标签是第 2..T 个 token
+)</code></pre>
+          <p>CLM 的另一个隐性优势是<strong>训练与推理形态完全一致</strong>：训练时学的是「给定前缀预测下一个」，推理时做的也是「给定前缀预测下一个」。MLM 则存在明显的落差——训练时输入里有 <code>[MASK]</code> 这个特殊符号，而下游任务的真实文本里根本不会出现它，这种<strong>预训练-微调不一致</strong>是 BERT 系列一直要打补丁的问题。</p>
+
+          <h3>读懂 loss 的数值</h3>
+          <p>训练时你盯着的那个 loss 到底意味着什么？CLM 的交叉熵损失和<strong>困惑度（perplexity）</strong>之间是简单的指数关系 $\text{PPL} = e^{\mathcal{L}}$，而困惑度可以直观解释为「模型在每个位置平均在多少个候选之间犹豫」：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>交叉熵 loss</th><th>对应困惑度</th><th>直观含义</th><th>大致对应的阶段</th></tr></thead>
+              <tbody>
+                <tr><td>约 10.4</td><td>约 33000</td><td>完全随机猜，相当于在整个词表上均匀分布</td><td>参数刚初始化，第 0 步</td></tr>
+                <tr><td>约 6.0</td><td>约 403</td><td>学会了词频先验，知道「的」比「饕」常见</td><td>训练最初几百步</td></tr>
+                <tr><td>约 3.0</td><td>约 20</td><td>掌握基本语法搭配</td><td>小模型收敛区</td></tr>
+                <tr><td><strong>约 2.0</strong></td><td>约 7.4</td><td>能利用较长上下文，续写基本通顺</td><td>常见基座模型的量级</td></tr>
+                <tr><td>约 1.5</td><td>约 4.5</td><td>接近高质量文本的信息熵下界</td><td>大模型充分训练后</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p style="font-size:13px;color:var(--text-3)">困惑度由 $e^{\mathcal{L}}$ 直接算得；具体 loss 数值高度依赖分词器与语料，跨模型比较 loss 是没有意义的。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            「A 模型 loss 1.8，B 模型 loss 2.1，所以 A 更强」——这个推断通常不成立。loss 依赖分词器的词表大小与切分粒度：词表越大、单个 token 承载的信息越多，同等能力下 loss 数值反而越高。只有<strong>同一分词器、同一验证集</strong>下的 loss 才有可比性；跨模型请比 bits-per-byte 或直接比下游任务。
+          </div>
+
+          <h2>MLM：掩码语言建模</h2>
+          <p>MLM 让模型看到完整的双向上下文，只把其中一部分位置挖掉去还原。先别急着看公式——我们看一眼提出 MLM 的那篇论文（BERT）里的原图，把「预训练到微调」的整体格局建立起来，再回来看损失函数怎么定义。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/06-pretraining/objectives/fig1.png" alt="论文原图：BERT 预训练与微调流程——预训练阶段在无标注语料上用掩码语言建模和下一句预测，微调阶段在带标注数据上调整同一套权重" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：BERT 的「预训练 → 微调」双阶段流程——左边在大规模无标注语料上跑 MLM 与下一句预测，右边把同一套权重搬到具体任务上微调</span>
+              <span class="pf-src">论文原图 · Devlin et al., <em>BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding</em>, 2018, Figure 1 · <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">arXiv:1810.04805</a></span>
+            </figcaption>
+          </figure>
+
+          <p>这张图是理解「预训练目标」最佳的第一手材料，新手读它抓三个块：<strong>① 左半张是预训练（Pre-training）</strong>，输入是无标注的句子对——上面的句子被随机挖掉一些 token 变成 <code>[MASK]</code>，让模型预测它们（这就是 MLM）；下面的句子还要判断「这是不是上一句的下一句」，叫<strong>下一句预测（NSP）</strong>。两个任务共享同一套模型权重，同时被优化。<strong>② 中间的三个框（Token Embeddings + Segment Embeddings + Position Embeddings）</strong>是模型的输入表示：一个 token 被编码成「词向量 + 句号向量 + 位置向量」三部分相加，对应你之前在 <a href="../02-representation/embeddings.html">嵌入与表示</a> 里学的静态嵌入知识。<strong>③ 右半张是微调（Fine-tuning）</strong>，把预训练好的权重搬到一个具体任务上——这里画了句子对分类、问答、单句分类三个例子，任务的输入结构变了，但底下的 Transformer 块和参数是同一套，只是用少量任务标注数据再训几步。</p>
+          <p>这张图还回答了一个新手常见困惑：<strong>为什么 MLM 要分「掩码、随机词、原词」三档（80/10/10）？</strong>因为预训练时的输入分布必须尽量贴近微调时的真实输入。微调阶段句子里没有 <code>[MASK]</code> 这个符号，如果训练时 100% 都把它放进去，模型会形成「看见 mask 才预测」的依赖，迁移到真实文本就失灵。所以 BERT 把被选中的 15% 位置再做一次划分：80% 换成真的 <code>[MASK]</code>（教模型用双向语境还原），10% 换成随机词（教它容忍输入噪声、学会纠错），10% 保持原词（教它连没被破坏的位置也要产出有用表征）。这个设计的本质，就是本页贯穿始终的那句话：<strong>目标函数在「训练-推理一致性」上花的心思，往往比公式本身更重要</strong>。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            「预训练目标」和「训练任务」不是一回事。预训练目标是<strong>无监督地制造监督信号</strong>的规则（MLM 挖词让你填空），它不需要任何人工标注；而「训练任务」通常指预训练之后针对具体下游（分类、问答、翻译）的微调，那才需要带标签的数据。BERT 论文这张图左半是「目标」，右半是「任务」——很多人把两边混为一谈，才会误以为 MLM 也是要人工标注的。
+          </div>
+
+          <h3>MLM 的损失函数</h3>
+          <p>MLM 的数学形式如下，注意求和号只跑被掩位置：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{MLM}} = -\sum_{t \in \mathcal{M}} \log P_\theta\!\left(x_t \mid x_{\setminus \mathcal{M}}\right)$$
+          </div>
+          <p>其中 $\mathcal{M}$ 是被掩位置的集合，$x_{\setminus \mathcal{M}}$ 表示未被掩的全部上下文。注意求和号只跑被掩位置——这就是信号密度只有约 15% 的来源。</p>
+
+          <h3>手算：一条样本里到底有多少个「有效标签」</h3>
+          <p>把前面「信号密度」的概念落到一笔具体账上，最能建立肌肉记忆。假设一条训练序列长度 $T=128$ 个 token：</p>
+          <ul>
+            <li><strong>CLM</strong>：标签右移一位，除最后一个位置外每个位置都是标签，有效标签数 = $128 - 1 = 127$。</li>
+            <li><strong>MLM（掩码率 15%）</strong>：先随机选 $128 \times 15\% \approx 19$ 个位置进入「被选中」集合；但这 19 个位置里只有 80% 真的换成 <code>[MASK]</code>，另外 10% 换随机词、10% 保持原词——<strong>三者都要预测</strong>，所以参与损失求和的位置仍是约 19 个。有效标签数 = 19，约为 CLM 的 15%。</li>
+          </ul>
+          <p>这个对比的直觉意义很直接：<strong>同样一次前向传播（同样的算力和显存），CLM 拿到 127 个梯度信号，MLM 只拿到约 19 个</strong>。剩下那 108 个位置的信息不是没用——它们作为上下文帮模型推断被掩的词——但它们在「参与反向传播的监督信号」这个维度上确实被浪费了。这就是为什么在算力预算固定的前提下，追求信号密度的团队会倾向于 CLM 或 ELECTRA 这类「每位置都出题」的目标。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一个容易混淆的点</span>
+            掩码率 15% 指的是「被选中进入掩码处理流程」的位置比例，不是「被换成 [MASK]」的比例。80/10/10 是对这 15% 的二次分配：真正显示为 <code>[MASK]</code> 的只有 $15\% \times 80\% = 12\%$。写代码时如果没分清这两层，统计出来的「实际掩码占比」会和你以为的差一大截。
+          </div>
+          <p>为了缓解「训练时见得到 <code>[MASK]</code>、推理时见不到」的落差，BERT 对被选中的 15% 位置又做了一次三分：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>处理方式</th><th>占被选中位置的比例</th><th>输入看起来像什么</th><th>为什么要这么做</th></tr></thead>
+              <tbody>
+                <tr><td>替换为 <code>[MASK]</code></td><td>80%</td><td>今天天气 <code>[MASK]</code> 好</td><td>主任务：从双向语境还原被遮住的词</td></tr>
+                <tr><td>替换为随机词</td><td>10%</td><td>今天天气 <strong>螺丝刀</strong> 好</td><td>逼模型对「输入本身可能是错的」保持警惕，学会纠错</td></tr>
+                <tr><td>保持原词不变</td><td>10%</td><td>今天天气 <strong>真</strong> 好</td><td>让模型对未被掩的位置也保持有意义的表征，缩小训练-推理差距</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>MLM 换来的是<strong>真正的双向表征</strong>。判断一个词的含义时，右边的上下文常常比左边更关键：「苹果<u>发布</u>了新款手机」与「苹果<u>很甜</u>」，决定「苹果」语义的信息在它右侧。CLM 在编码「苹果」时看不到右边，只能靠后续位置去补救。所以在句向量、检索召回、序列标注、文本分类这类<strong>理解型任务</strong>上，同等规模下 MLM 训出的编码器至今仍有优势，现代检索系统的 <a href="../02-representation/embeddings.html">嵌入模型</a> 里 MLM 路线依然活跃。</p>
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            「MLM 已经被淘汰了」是不准确的说法。被淘汰的是「用 MLM 训通用基座对话模型」这条路；在 embedding、reranker、以及需要强双向表征的场景里，MLM 仍然是主力目标。选目标要看下游形态，不要看年份。
+          </div>
+
+          <h2>去噪目标：从填词到重写片段</h2>
+          <p>MLM 挖的是<strong>单个 token</strong>，模型往往能靠局部搭配蒙对（「北京是中国的首[MASK]」几乎不需要理解）。T5 提出的 <strong>span corruption</strong> 把这个任务加难：一次挖掉<strong>连续的一小段</strong>，用一个哨兵标记（sentinel token）占位，让解码器把整段内容按顺序生成回来。T5 的默认配置是腐蚀率 15%、被挖片段的平均长度为 3 个 token。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>阶段</th><th>内容</th></tr></thead>
+              <tbody>
+                <tr><td>原文</td><td>注意力机制 让每个位置 直接看到 序列里所有其他位置</td></tr>
+                <tr><td>编码器输入</td><td>注意力机制 <code>&lt;X&gt;</code> 直接看到 <code>&lt;Y&gt;</code> 位置</td></tr>
+                <tr><td>解码器目标</td><td><code>&lt;X&gt;</code> 让每个位置 <code>&lt;Y&gt;</code> 序列里所有其他 <code>&lt;Z&gt;</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这样一改，任务性质发生了三个变化：被挖掉的是有语义完整性的片段，蒙不过去；模型必须<strong>生成变长的输出</strong>，而不是在固定位置做分类；同时它还保留了编码器侧的双向视野。T5 用这个目标把「所有 NLP 任务都变成文本到文本」这套范式跑通了，去噪目标也因此成为 Encoder-Decoder 架构的标配。</p>
+          <p>顺着「加什么噪声」这个旋钮往下拧，还能得到一整族变体。BART 系统地实验了多种加噪方式——随机掩码、删除 token、打乱句子顺序、旋转文档起点、片段填充——发现「片段填充 + 句子打乱」的组合在生成任务上最好。UL2 更进一步，把不同的去噪配置（短片段低腐蚀率、长片段高腐蚀率、极端的前缀续写）混在一起训，称为 <strong>mixture-of-denoisers</strong>，试图用一个模型同时拿到理解和生成两头的好处。</p>
+          <p>去噪思路还有一个更激进的变体：如果不是挖掉 15%，而是把<strong>整句都加噪成掩码</strong>，再让模型分多步、并行地把所有位置一起还原，会发生什么？那就不再是自回归模型，而是<strong>掩码扩散语言模型</strong>——它把「去噪」从一次性的填空推广成一个多步迭代过程，从而摆脱了逐 token 串行生成的限制。这是从预训练目标这个岔路口分出去的另一条完整路线。</p>
+          <div class="callout">
+            <span class="callout-t">分叉路线</span>
+            把去噪目标推到极致就得到并行生成的另一种范式，详见 <a href="../04-modern-arch/diffusion-llm.html">扩散语言模型</a>。本页讲的是「如何出题」，那一页讲的是「把噪声加满之后，解码方式会怎样彻底改变」。
+          </div>
+
+          <h2>MTP：一次预测多步</h2>
+          <p>CLM 的信号密度已经是 100%，还能再高吗？<strong>MTP（Multi-Token Prediction，多 token 预测）</strong> 的回答是：可以，让每个位置不止预测下一个 token，而是同时预测未来 $D$ 个：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{MTP}} = -\sum_{t}\sum_{k=1}^{D} \log P_\theta^{(k)}\!\left(x_{t+k} \mid x_{\le t}\right)$$
+          </div>
+          <p>典型实现是在主干后面挂上若干个轻量预测头（每个头对应一个未来偏移量 $k$），主干共享，头各自算损失。代码骨架非常短：</p>
+
+          <pre><code class="language-python">class MTPLoss(nn.Module):
+    """在共享主干之上挂 D 个预测头，每个头预测未来第 k 个 token"""
+    def __init__(self, hidden, vocab, depth=4, weights=None):
+        super().__init__()
+        self.heads = nn.ModuleList([nn.Linear(hidden, vocab) for _ in range(depth)])
+        # 越远的头越不可靠，通常给递减权重
+        self.weights = weights or [1.0, 0.5, 0.25, 0.125][:depth]
+
+    def forward(self, h, input_ids):
+        # h: (B, T, hidden)  主干最后一层输出
+        total = 0.0
+        for k, head in enumerate(self.heads, start=1):
+            logits = head(h[:, :-k, :])              # 位置 t 预测 t+k
+            target = input_ids[:, k:]                # 标签左移 k 位
+            total = total + self.weights[k - 1] * F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), target.reshape(-1),
+                ignore_index=-100,
+            )
+        return total</code></pre>
+
+          <p>它带来两重好处：</p>
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">训练侧：更密的信号 + 更长的视野</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">同一次前向产生 $D$ 倍的预测目标。更重要的是，被迫预测 $t+2$、$t+3$ 会逼模型在当前位置就编码更长程的规划信息，而不是只做贪心的局部续写。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">推理侧：自带草稿模型</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">额外的预测头天然可以一次吐出多个候选 token，交给主模型一次性并行校验。这正是 <a href="../09-efficiency/speculative-decoding.html">推测解码</a> 需要的草稿来源，省掉了单独训练小模型的麻烦。</p>
+            </div>
+          </div>
+          <p>MTP 并不是新想法，但近年重新受重视，很大程度上是因为第二点：在推理成本主导总账的今天，一个「训练时提点、推理时提速」的目标函数性价比极高。DeepSeek-V3 就在预训练中采用了 MTP 目标，并说明其 MTP 模块可以在推理时用于推测解码。</p>
+          <div class="callout warn">
+            <span class="callout-t">工程提醒</span>
+            MTP 的额外预测头会增加训练显存和计算量，且 $k$ 越大预测越不准（远处的 token 本身就更不确定），$D$ 通常取很小的值。另外，如果只想要基座的下一 token 能力，训练完成后可以丢弃额外的头，不影响标准推理。
+          </div>
+
+          <h2>还应该知道的三个目标</h2>
+          <p>CLM、MLM、去噪、MTP 是主干，但真实世界里还有三个目标你迟早会撞见，尤其是做代码模型的时候。</p>
+
+          <h3>ELECTRA：把「填空」换成「找茬」</h3>
+          <p>ELECTRA 的思路很聪明：既然 MLM 只有 15% 的位置产生信号，那就换个出题方式。它用一个小生成器把部分 token 替换成看似合理的假词，再让主模型（判别器）对<strong>每一个位置</strong>做二分类——这个词是原文的，还是被替换过的。这样一来信号密度回到了 100%，代价是任务从「生成」变成了「判别」，模型不再能直接用于生成。在同等算力下训判别式编码器，ELECTRA 路线的性价比明显高于原味 MLM。</p>
+
+          <h3>前缀 LM：一半双向，一半单向</h3>
+          <p>前缀语言建模（Prefix LM）在注意力掩码上做文章：序列的前一段（前缀）内部彼此可见，是双向的；后一段仍然是因果的，只能看左边。损失只算在后半段。它相当于在「BERT 的双向理解」和「GPT 的自回归生成」之间开了一个连续旋钮，UL2 的极端去噪配置本质上就是这个思路。工程上它的价值在于：<strong>做长 prompt + 短生成的任务时，prompt 部分不必受因果约束</strong>。</p>
+
+          <h3>FIM：代码模型的必修课</h3>
+          <p>写代码时你常常不是「从头往下写」，而是「在光标处补一段，前后文都在」。纯 CLM 训出来的模型不擅长这件事，因为它从没见过「后文已知」的训练样本。<strong>FIM（Fill-in-the-Middle）</strong>的做法是对一部分训练文档做一次改写：把文档随机切成前缀 / 中段 / 后缀三块，用哨兵符重排成一条仍然是自回归的序列。</p>
+          <pre><code class="language-text">原始文档:   [PREFIX][MIDDLE][SUFFIX]
+
+PSM 排列:   &lt;PRE&gt; PREFIX &lt;SUF&gt; SUFFIX &lt;MID&gt; MIDDLE &lt;EOT&gt;
+            └────── 作为条件的上下文 ──────┘ └── 要预测的内容 ──┘
+
+SPM 排列:   &lt;PRE&gt;&lt;SUF&gt; SUFFIX &lt;MID&gt; PREFIX MIDDLE &lt;EOT&gt;</code></pre>
+          <p>关键在于：<strong>改写只发生在数据层，模型结构和 CLM 损失完全不变</strong>。模型照样是「预测下一个 token」，只不过它现在学会了在看到后缀的情况下补中间。FIM 的论文提出了一个「FIM-for-free」的观察：在预训练中混入一定比例的 FIM 样本，几乎不损害模型原有的从左到右生成能力，却白得了中间填充的本事。这也是各家代码大模型普遍在预训练阶段就混入 FIM 的原因。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            上面这三个目标提示了一个通用套路：<strong>换目标不一定要换架构</strong>。ELECTRA 换的是「问什么」，前缀 LM 换的是注意力掩码，FIM 干脆只换了数据的排列顺序。改动越靠近数据层，落地成本越低。
+          </div>
+
+          <h2>目标函数的演进脉络</h2>
+          <p>把时间轴拉开看，预训练目标的主线是一次「分叉又收敛」的过程：先是生成式与判别式各走各路，随后大模型时代把主流收拢到 CLM，最近几年又在 CLM 之上做加法。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 预训练目标的演进主线
+  2018 : GPT 用 CLM 做生成式预训练 : BERT 用 MLM 拿下理解类任务
+  2019 : T5 提出 span 去噪 : BART 系统比较多种加噪方式 : ELECTRA 用判别式提高信号密度
+  2020 : GPT-3 证明 CLM 加规模即可泛化 : 编码器路线转向表示学习与检索
+  2022 : UL2 把多种去噪混合训练 : FIM 让代码模型学会中间填充
+  2024 : MTP 重新受重视 训练提点推理提速 : 扩散语言模型把去噪推向多步并行
+            </div>
+            <figcaption>目标函数的演进：2020 年后基座主线收敛到 CLM，编码器路线转向表示学习，近年的新增量集中在「CLM 之上加什么」。</figcaption>
+          </figure>
+
+          <p>这条线索里有一个反复出现的规律值得记住：<strong>每一次目标函数的改动，都是在「信号密度」「上下文视野」「训练-推理一致性」这三者之间重新分配预算</strong>。MLM 用信号密度换视野，ELECTRA 用生成能力换信号密度，FIM 用一点数据改写换来了双向填充能力，MTP 则用一点显存换信号密度和推理速度。</p>
+
+          <h2>横向对比与选型</h2>
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("预训练目标"))
+    自回归族
+      CLM
+        标准下一 token 预测
+        FIM 数据层改写
+      MTP
+        多预测头
+        自带草稿模型
+    掩码族
+      MLM
+        BERT 式随机掩码
+        整词掩码
+      ELECTRA
+        判别式找茬
+    去噪族
+      T5 span corruption
+      BART 多种加噪
+      UL2 去噪混合
+    扩散族
+      掩码扩散
+        多步并行还原
+    混合视野
+      前缀 LM
+        前缀双向 后缀因果
+            </div>
+            <figcaption>目标函数家族地图：四大主族加一个混合视野的变体。族内的差别是「怎么加噪」，族间的差别是「监督信号从哪来」。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>目标</th><th>损失定义</th><th>信号密度</th><th>上下文视野</th><th>适配架构</th><th>代表模型</th></tr></thead>
+              <tbody>
+                <tr><td><strong>CLM</strong></td><td>预测下一个 token</td><td>100%（每位置）</td><td>单向（左侧）</td><td>Decoder-only</td><td>GPT 系、Llama 系</td></tr>
+                <tr><td><strong>MLM</strong></td><td>还原被掩 token</td><td>约 15%</td><td>双向</td><td>Encoder-only</td><td>BERT 系、多数 embedding 模型</td></tr>
+                <tr><td><strong>ELECTRA</strong></td><td>判断每个 token 是否被替换</td><td>100%（判别式）</td><td>双向</td><td>Encoder-only</td><td>ELECTRA 系</td></tr>
+                <tr><td><strong>Span 去噪</strong></td><td>生成式重建连续片段</td><td>片段级，中等</td><td>编码器双向 + 解码器单向</td><td>Encoder-Decoder</td><td>T5 系、BART</td></tr>
+                <tr><td><strong>前缀 LM</strong></td><td>前缀双向条件下续写后缀</td><td>后缀部分 100%</td><td>前缀双向 + 后缀单向</td><td>Decoder-only 改掩码</td><td>UL2 的部分配置</td></tr>
+                <tr><td><strong>FIM</strong></td><td>仍是 CLM，只改数据排列</td><td>100%</td><td>形式上单向，实质可见后缀</td><td>Decoder-only</td><td>各家代码大模型</td></tr>
+                <tr><td><strong>MTP</strong></td><td>同时预测未来 $D$ 个 token</td><td>高于 CLM</td><td>单向（左侧）</td><td>Decoder-only</td><td>DeepSeek-V3</td></tr>
+                <tr><td><strong>掩码扩散</strong></td><td>多步迭代去噪还原全序列</td><td>取决于噪声调度</td><td>双向</td><td>Diffusion LM</td><td>见 <a href="../04-modern-arch/diffusion-llm.html">扩散语言模型</a></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>落到实际决策，只有四条经验值得记住：</p>
+          <ul>
+            <li><strong>要做通用生成 / 对话基座</strong>：CLM，没有悬念。想在推理侧再抠一点，叠加 MTP。</li>
+            <li><strong>要做检索、分类、句向量</strong>：优先考虑 MLM 或 ELECTRA 训练的编码器，或在 CLM 基座上做双向化改造后再对比。</li>
+            <li><strong>要做代码补全</strong>：CLM + 混入 FIM 样本，这是几乎零成本的能力增量。</li>
+            <li><strong>不要为了「看起来先进」换目标</strong>：目标函数的收益必须放在总算力预算里衡量，换目标带来的数据管线、评测口径、下游适配成本往往比想象中大。</li>
+          </ul>
+
+          <details class="deep">
+            <summary>展开：一个容易忽略的细节——损失要不要算在 padding 和文档边界上</summary>
+            <div class="deep-body">
+              <p>实际训练中语料会被打包（packing）成定长序列，一条 4096 长的样本里可能塞了好几篇不相干的文档。这会带来两个坑：</p>
+              <ul>
+                <li><strong>padding 位置必须屏蔽</strong>：把 label 置为 <code>-100</code>（PyTorch 交叉熵的默认忽略值），否则模型会花力气去学「预测填充符」。</li>
+                <li><strong>跨文档注意力要不要切断</strong>：如果不加文档级掩码，一篇文档的开头会去注意上一篇文档的结尾，学到虚假的关联。是否切断在不同实现里做法不一，但这是一个必须显式做出的决策，而不是默认正确的。</li>
+              </ul>
+              <p>切断的实现并不复杂——在因果掩码之上再叠一层「同文档」条件即可：</p>
+              <pre><code class="language-python">def build_mask(doc_ids):
+    """doc_ids: (T,) 每个位置所属的文档编号
+       返回 (T, T) 布尔掩码，True 表示允许注意"""
+    T = doc_ids.size(0)
+    causal = torch.tril(torch.ones(T, T, dtype=torch.bool))     # 只看左边
+    same_doc = doc_ids[:, None] == doc_ids[None, :]             # 只看同一篇
+    return causal &amp; same_doc</code></pre>
+              <p>代价是这层掩码破坏了标准因果注意力的结构规整性，很多高效 kernel 需要走 variable-length 的专用路径才能兼容。是否值得，取决于你的语料里短文档占比有多高：如果大量是几百 token 的短文档，一条 4096 序列里塞进十几篇，不切断带来的噪声就相当可观。</p>
+              <p style="margin-bottom:0">这些细节不改变目标函数的数学形式，却实实在在影响最终效果，属于「论文不写、代码里全是」的部分。相关的数据打包与配比策略见 <a href="data-engineering.html">数据工程</a>。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：动手 10 分钟——亲手量一次信号密度的差异</summary>
+            <div class="deep-body">
+              <p>信号密度这件事不必只停留在概念上。下面这段脚本不需要 GPU，只统计「同样一条序列，各目标各产生多少个进入损失的标签」，跑一遍就能对上文那张表建立肌肉记忆：</p>
+              <pre><code class="language-python">import torch
+
+T, D_MTP, MASK_RATE = 4096, 4, 0.15
+ids = torch.randint(0, 32000, (T,))
+
+# CLM: 标签右移一位，除最后一个位置外都有标签
+clm_labels = ids[1:].clone()
+
+# MLM: 随机选 15% 位置，其余置 -100
+mlm_labels = ids.clone()
+keep = torch.rand(T) &lt; MASK_RATE
+mlm_labels[~keep] = -100
+
+# MTP: 每个位置对未来 D 步各出一题
+mtp_count = sum(T - k for k in range(1, D_MTP + 1))
+
+print("CLM 有效标签数:", (clm_labels != -100).sum().item())
+print("MLM 有效标签数:", (mlm_labels != -100).sum().item())
+print("MTP 有效标签数:", mtp_count)</code></pre>
+              <p>把 <code>MASK_RATE</code> 从 0.15 调到 0.4 再跑一遍，你会看到 MLM 的标签数确实上去了。但请同时想清楚另一半代价：此时输入里有四成位置变成了 <code>[MASK]</code>，剩下的语境还够不够支撑推断？这正是掩码率无法一味调高的原因。</p>
+              <p style="margin-bottom:0">进一步的动手环节可以看 <a href="../15-practice/build-minigpt.html">实战：手写 MiniGPT</a>，那里会把 CLM 的完整训练循环从零跑通。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：预训练目标 = 把无标注文本自动改造成有监督样本的规则，决定模型学什么、每 FLOP 产出多少梯度信号。</li>
+            <li><strong>CLM</strong>：$-\sum_t \log P(x_t \mid x_{&lt;t})$，信号密度 100%，训练与推理形态一致，基座默认选择。</li>
+            <li><strong>MLM</strong>：只在被掩的约 15% 位置算损失，换来双向表征；被选中位置再按 80/10/10 分成掩码、随机词、原词三类。</li>
+            <li><strong>去噪</strong>：span corruption 挖连续片段生成式还原，T5 默认腐蚀率 15%、平均片段长 3；推到极致就是掩码扩散。</li>
+            <li><strong>MTP</strong>：多头预测未来 $D$ 步，训练信号更密、隐含长程规划，且额外的头可直接用作推测解码的草稿。</li>
+            <li><strong>三个补充目标</strong>：ELECTRA 用判别式把信号密度拉回 100%；前缀 LM 让前缀双向；FIM 只改数据排列就让 CLM 学会中间填充。</li>
+            <li><strong>读 loss</strong>：$\text{PPL} = e^{\mathcal{L}}$；loss 数值依赖分词器，跨模型比较无意义。</li>
+            <li><strong>常见坑</strong>：padding 位置必须置 <code>-100</code>；文档打包时跨文档注意力是否切断要显式决策。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：CLM 和 MLM 的训练信号有什么区别？</h3>
+              <p><span class="answer-label">标准回答：</span>CLM 按因果顺序预测下一个 token，通常每个位置都产生损失；MLM 随机遮住部分 token，只在被选中的位置计算损失。CLM 与 Decoder-only 生成天然一致，MLM 则利用双向上下文，适合理解和表示学习。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：MLM 的 80/10/10 是什么意思？</h3>
+              <p><span class="answer-label">标准回答：</span>在被选中预测的 token 中，约 80% 替换为 mask，约 10% 替换为随机 token，约 10% 保持原 token。它不是“全体 token 中 80% 被 mask”，也不是所有被选位置都使用特殊符号。</p>
+              <details class="deep">
+                <summary>追问：为什么只对被选位置算 loss？</summary>
+                <div class="deep-body">
+                  <p>未被选位置没有被构造成预测目标，如果也计算损失，训练目标会混入大量“直接复制输入”的简单任务，削弱预训练想要学习的恢复能力。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：为什么 Decoder-only 常用 CLM，而不是 MLM？</h3>
+              <p><span class="answer-label">标准回答：</span>CLM 的训练条件与生成条件一致，推理时不需要看到未来 token；每个位置都有训练信号，目标函数、KV Cache 和在线生成链路也更统一。</p>
+              <p><span class="follow-label">面试追问：</span>代码模型还可能加入 FIM，让模型学习根据前缀和后缀填充中间内容；这仍然是对生成条件的重新组织，不等于普通 MLM。</p>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Devlin et al., "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding" (2018) — MLM 与 80/10/10 掩码策略的原始出处 · <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">arXiv:1810.04805</a></li>
+            <li>Raffel et al., "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer" (2019) — T5 论文，span corruption 与腐蚀率、片段长度的系统消融 · <a href="https://arxiv.org/abs/1910.10683" target="_blank" rel="noopener">arXiv:1910.10683</a></li>
+            <li>Lewis et al., "BART: Denoising Sequence-to-Sequence Pre-training..." (2019) — 系统比较多种加噪方式对生成与理解任务的影响 · <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">arXiv:1910.13461</a></li>
+            <li>Clark et al., "ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators" (2020) — 判别式目标如何把信号密度拉回 100% · <a href="https://arxiv.org/abs/2003.10555" target="_blank" rel="noopener">arXiv:2003.10555</a></li>
+            <li>Tay et al., "UL2: Unifying Language Learning Paradigms" (2022) — mixture-of-denoisers 与前缀 LM 配置的提出 · <a href="https://arxiv.org/abs/2205.05131" target="_blank" rel="noopener">arXiv:2205.05131</a></li>
+            <li>Bavarian et al., "Efficient Training of Language Models to Fill in the Middle" (2022) — FIM 的 PSM/SPM 排列与「FIM-for-free」结论 · <a href="https://arxiv.org/abs/2207.14255" target="_blank" rel="noopener">arXiv:2207.14255</a></li>
+            <li>Gloeckle et al., "Better &amp; Faster Large Language Models via Multi-token Prediction" (2024) — MTP 目标的系统实验与推测解码用法 · <a href="https://arxiv.org/abs/2404.19737" target="_blank" rel="noopener">arXiv:2404.19737</a></li>
+            <li>DeepSeek-AI, "DeepSeek-V3 Technical Report" (2024) — 在大规模预训练中实际采用 MTP 的工程报告 · <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arXiv:2412.19437</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            目标定了，下一个问题是拿什么语料去喂——见 <a href="data-engineering.html">数据工程</a>；想知道给定算力该配多大模型、喂多少 token，见 <a href="scaling-laws.html">Scaling Laws</a>；如果对「把去噪推到极致」那条分叉路线感兴趣，见 <a href="../04-modern-arch/diffusion-llm.html">扩散语言模型</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

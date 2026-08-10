@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多智能体与 A2A 协作协议 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="11-agents" data-topic="multi-agent">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>多智能体与 A2A 协作协议</h1>
+            <p class="lead">一个 Agent 装不下所有能力时，让多个 Agent 分工协作。但多 Agent 不是「多开几个模型」——角色怎么分、消息怎么传、谁来编排，每一样都是设计决策。这一页覆盖角色分工、通信拓扑、编排模式，以及互操作协议 A2A（Agent2Agent），把「多 Agent 系统」拆到可以上手搭。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>多智能体系统的三个层次：底层是「角色」（谁干什么），中间是「拓扑」（谁和谁说话），顶层是「编排」（谁来主导）。A2A 协议解决的是跨厂商互操作——不同团队做的 Agent 能互相发现、派活、汇报。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  OR["编排器 Orchestrator"] --> P["Planner<br/>拆任务"]
+  P --> W1["Worker A<br/>检索"]
+  P --> W2["Worker B<br/>代码"]
+  P --> W3["Worker C<br/>写作"]
+  W1 --> C["Critic<br/>审查结果"]
+  W2 --> C
+  W3 --> C
+  C -->|"不合格打回"| P
+  C -->|"合格"| OUT["汇总交付"]
+              </div>
+              <figcaption>经典多 Agent 编排：Planner 拆解 → Workers 执行 → Critic 审查打回</figcaption>
+            </figure>
+          </div>
+
+          <h2>一、为什么要拆成多个 Agent</h2>
+          <p>拆的动机通常来自三个瓶颈：<strong>上下文</strong>（一个 Agent 塞不下所有工具与记忆）、<strong>角色冲突</strong>（「既当运动员又当裁判」会互相干扰）、<strong>并行性</strong>（子任务可并行时，多 Agent 显著提速）。但拆也有代价：协调开销、错误传播、token 成倍增加。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Motive{"为什么要拆?"} --> M1["上下文瓶颈<br/>工具 + 记忆超限"]
+  Motive --> M2["角色冲突<br/>运动员兼裁判"]
+  Motive --> M3["并行提速<br/>子任务可独立"]
+  M1 --> Single{"单 Agent + 工具<br/>能否搞定?"}
+  M2 --> Single
+  M3 --> Single
+  Single -->|"能"| No["别拆<br/>协调开销 > 收益"]
+  Single -->|"不能"| Yes["拆<br/>但控制 Agent 数量"]
+  Yes --> Cost1["协调开销 ↑"]
+  Yes --> Cost2["错误传播 ↑"]
+  Yes --> Cost3["token 成本 ↑"]
+            </div>
+            <figcaption>拆分决策树：单 Agent 能搞定就别拆；拆了要正视三项代价</figcaption>
+          </figure>
+
+          <p>判断标准很简单——<strong>如果单 Agent 加工具就能干完，就别拆</strong>。多 Agent 是「必要之恶」而非「越多越好」。业界经验：3-5 个 Agent 的系统协调收益最大，超过 10 个 Agent 协调成本常常超过收益。</p>
+
+          <h2>二、角色分工：常见的三种模式</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模式</th><th>组成</th><th>适用</th><th>代表场景</th></tr></thead>
+              <tbody>
+                <tr><td>Planner–Worker</td><td>一个拆任务，多个执行</td><td>任务可分解、子任务独立</td><td>多步调研、报告生成</td></tr>
+                <tr><td>Worker–Critic</td><td>执行者 + 审查者，不合格打回</td><td>质量要求高、结果可复查</td><td>代码、写作、方案评审</td></tr>
+                <tr><td>辩论/协商</td><td>多个立场 Agent 互相质询</td><td>决策类任务，求收敛于更稳结论</td><td>方案选型、风险评估</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Mode1["Planner-Worker"]
+    P1["Planner<br/>拆任务"] --> W1a["Worker A"]
+    P1 --> W1b["Worker B"]
+  end
+  subgraph Mode2["Worker-Critic"]
+    W2a["Worker<br/>执行"] --> C2["Critic<br/>审查"]
+    C2 -->|"打回"| W2a
+  end
+  subgraph Mode3["辩论协商"]
+    D1["正方"] <--> D2["反方"]
+    D2 <--> D3["裁判"]
+  end
+            </div>
+            <figcaption>三种角色模式：拆解执行、执行审查、辩论协商，按任务性质选择</figcaption>
+          </figure>
+
+          <h2>三、通信拓扑：谁和谁说话</h2>
+          <p>角色定了之后，还要决定信息怎么流动。拓扑决定了系统的容错性、可扩展性和协调成本。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph Star["星型（中心化）"]
+    S1["编排器"] --> S2["Worker 1"]
+    S1 --> S3["Worker 2"]
+    S1 --> S4["Worker 3"]
+  end
+  subgraph Mesh["网状（去中心化）"]
+    M1["Agent 1"] <--> M2["Agent 2"]
+    M2 <--> M3["Agent 3"]
+    M3 <--> M1
+  end
+  subgraph Hier["层级（树状）"]
+    H1["顶层协调者"] --> H2["中层 A"]
+    H1 --> H3["中层 B"]
+    H2 --> H4["叶子 1"]
+    H3 --> H5["叶子 2"]
+  end
+            </div>
+            <figcaption>三种通信拓扑：星型易控制、网状最灵活、层级适合大规模</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>拓扑</th><th>结构</th><th>优点</th><th>缺点</th><th>适用</th></tr></thead>
+              <tbody>
+                <tr><td>星型</td><td>编排器 ↔ 各 Worker</td><td>控制简单、流程清晰</td><td>单点故障、编排器瓶颈</td><td>任务可拆解的常规场景</td></tr>
+                <tr><td>网状</td><td>任意 Agent 互连</td><td>最灵活、无单点</td><td>协调成本高、难调试</td><td>研究探索、小型团队</td></tr>
+                <tr><td>层级</td><td>树状分组管理</td><td>可扩展、分组隔离</td><td>深度深时延迟高</td><td>大规模系统、企业场景</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>四、编排模式：谁来主导</h2>
+          <p>「谁来主导」是多 Agent 系统的灵魂问题。三种主流模式对应不同的人机协作哲学：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph Auto["完全自治"]
+    A1["LLM 编排器<br/>自主拆解分派"]
+    A2["优点：自动化高"]
+    A3["缺点：不可控<br/>跑偏难发现"]
+  end
+  subgraph Human["人在回路"]
+    H1["关键节点<br/>人工审批"]
+    H2["优点：可控可靠"]
+    H3["缺点：慢"]
+  end
+  subgraph Flow["流程编排"]
+    F1["预定义工作流<br/>固定步骤"]
+    F2["优点：稳定可预测"]
+    F3["缺点：不灵活"]
+  end
+  Auto --> Decide{"按需求选择"}
+  Human --> Decide
+  Flow --> Decide
+  Decide --> R1["探索期：自治"]
+  Decide --> R2["生产期：流程 + 人在回路"]
+            </div>
+            <figcaption>三种编排模式：完全自治、人在回路、流程编排，生产环境通常用后两种组合</figcaption>
+          </figure>
+
+          <h2>五、A2A 协议：跨厂商互操作</h2>
+          <p>2025 年 4 月，Google 联合多家厂商发布 A2A（Agent2Agent）开放协议，目标是让不同团队构建的 Agent 能「互相发现、派活、汇报」——就像 HTTP 让不同网站互通一样，A2A 让不同 Agent 互通。不过在讲协议之前，先看一张论文原图——它是 AutoGen 论文的第一张图，展示了多 Agent 协作最经典的画面：两个 Agent 之间一场能跑出结果的对话。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/11-agents/multi-agent/fig1.png" alt="论文原图：AutoGen 中多个 Agent 通过会话协作解决问题的示意图" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：AutoGen 的多 Agent 对话协作——左侧是用户，中间是多个 LLM Agent 通过「会话」接力解决问题，右侧是工具/环境，展示「对话即协作」的核心理念</span>
+              <span class="pf-src">论文原图 · Wu et al., <em>AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2308.08155" target="_blank" rel="noopener">arXiv:2308.08155</a></span>
+            </figcaption>
+          </figure>
+
+          <p>手把手读这张图。图的整体是一个「会话驱动」的协作画面：用户（User）在最左侧，只跟第一个 Agent 说话；中间是几个承担不同角色的 LLM Agent——比如一个负责「规划拆解」的 Agent、一个负责「写代码」的 Agent、一个负责「评审/批判」的 Agent；最右侧是工具与环境（Tools）。它们之间的每条连线都是一次<strong>消息交换</strong>。注意中间没有画一个「大总管」把所有人连起来——这正是 AutoGen 与编排式的区别：<strong>协作不是由外部控制器指挥，而是由 Agent 之间的对话自然推进</strong>。A 说出它的输出，B 作为输入接收并继续产出，如此接力直到任务收敛。</p>
+
+          <p>这张图点破了一个常被误解的点：<strong>多 Agent 的核心不是「多个模型」，而是「多个角色 + 一种消息协议」</strong>。角色定义「谁负责什么」，消息协议定义「角色之间怎么交流」。AutoGen 论文里用的就是自然语言消息（一段对话文本），而这正是 A2A 协议想要标准化的东西——只不过 A2A 更进一步，要求消息走 JSON-RPC、用 Agent Card 描述能力，让不同公司构建的 Agent 也能互相对话。所以把这张图和后面 A2A 的图放在一起看，你看到的就是「多 Agent 协作」从论文原型走向工业标准的过程。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Client["客户端 Agent"]
+    C1["用户侧 Agent<br/>（任务发起方）"]
+  end
+  subgraph Protocol["A2A 协议层"]
+    P1["Agent Card<br/>能力描述（发现）"]
+    P2["Task 生命周期<br/>任务状态机"]
+    P3["消息传递<br/>JSON-RPC"]
+  end
+  subgraph Server["远程 Agent"]
+    S1["企业 Agent<br/>（任务执行方）"]
+    S2["第三方 Agent<br/>（任务执行方）"]
+  end
+  Client --> Protocol --> Server
+  P1 -.->|"能力发现"| C1
+            </div>
+            <figcaption>A2A 协议结构：Agent Card 发现能力、Task 状态机管理任务、JSON-RPC 传递消息</figcaption>
+          </figure>
+
+          <p>A2A 的三个核心机制：</p>
+          <ul>
+            <li><strong>Agent Card</strong>：每个 Agent 发布一张「能力名片」（能干什么、输入输出格式），客户端据此发现并选择合适的 Agent；</li>
+            <li><strong>Task 生命周期</strong>：任务在 submitted → working → input-required → completed 等状态间流转，两端同步任务进度；</li>
+            <li><strong>消息传递</strong>：基于 JSON-RPC 的 HTTP 传输，消息类型包括任务、工件（artifact）、消息等。</li>
+          </ul>
+
+          <p>A2A 与 MCP 的关系常被混淆：<strong>MCP 是「Agent 用工具」，A2A 是「Agent 找 Agent」</strong>——MCP 把 Agent 的能力暴露给客户端调用（工具语义），A2A 让 Agent 作为对等实体协作（任务语义）。两者互补：一个 Agent 既可以通过 MCP 暴露工具，也可以通过 A2A 与其他 Agent 协作。详见 <a href="tool-use-mcp.html">工具调用与 MCP</a>。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph MCP["MCP 语义：工具"]
+    M1["Agent"] -->|"调用工具"| M2["工具 / 数据源"]
+    M3["一次调用一个动作"]
+  end
+  subgraph A2A["A2A 语义：任务"]
+    A1["Agent"] -->|"委派任务"| A2["其他 Agent"]
+    A3["一次委派一个任务<br/>持续到完成"]
+  end
+  MCP --> Q{"区别"}
+  A2A --> Q
+  Q --> Ans["MCP: 工具互操作<br/>A2A: 智能体互操作"]
+            </div>
+            <figcaption>MCP 与 A2A 的分工：工具语义 vs 任务语义，两者互补而非替代</figcaption>
+          </figure>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            新手最容易把「多 Agent」当成「把 prompt 里的角色设定拆成多个系统提示」——写了三个 system prompt 就觉得是三个 Agent。判断标准其实很硬：<strong>有没有独立的「消息通道」和「独立的执行循环」</strong>。三个角色放在同一个 prompt 里，本质还是一个模型、一次推理、一个上下文；而真正的多 Agent 是三个独立的模型调用、各自维护自己的上下文、通过显式的消息交换协作。另一个常见误解是把 <a href="tool-use-mcp.html">MCP</a> 当成多 Agent 协议——MCP 是「Agent 用工具」（人机语义），A2A 才是「Agent 找 Agent」（任务语义），两者互补不替代。区分这两点，多 Agent 系统的一半概念就清楚了。
+          </div>
+
+          <h2>六、多 Agent 系统的常见失败模式</h2>
+          <p>多 Agent 系统比单 Agent 更容易「失控」，认识失败模式是工程基本功：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  Start["多 Agent 运行"] --> F1{"任务漂移?"}
+  F1 -->|"是（Agent 偏离目标）"| D1["原因：指令不清晰<br/>应对：明确验收标准"]
+  F1 -->|"否"| F2{"回声室?"}
+  F2 -->|"是（互相附和）"| D2["原因：同质化模型<br/>应对：引入 Critic / 多样性"]
+  F2 -->|"否"| F3{"协调爆炸?"}
+  F3 -->|"是（消息成倍增长）"| D3["原因：拓扑过密<br/>应对：收敛拓扑 / 减少 Agent"]
+  F3 -->|"否"| F4{"错误传播?"}
+  F4 -->|"是（一个错带崩一串）"| D4["原因：无隔离<br/>应对：结果校验 + 回滚"]
+  F4 -->|"否"| OK["正常运行 ✓"]
+            </div>
+            <figcaption>多 Agent 四种常见失败模式：任务漂移、回声室、协调爆炸、错误传播</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>失败模式</th><th>表现</th><th>应对</th></tr></thead>
+              <tbody>
+                <tr><td>任务漂移</td><td>Agent 偏离原始目标</td><td>明确验收标准、定期对齐</td></tr>
+                <tr><td>回声室</td><td>互相附和、无有效质疑</td><td>引入独立 Critic、角色差异化</td></tr>
+                <tr><td>协调爆炸</td><td>消息量随 Agent 数平方增长</td><td>收敛拓扑、减少 Agent 数量</td></tr>
+                <tr><td>错误传播</td><td>上游错误污染下游</td><td>逐步校验、回滚机制</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>七、协作模式深度对比：编排式、辩论式、群体式</h2>
+          <p>第二章把角色分成 Planner-Worker、Worker-Critic、辩论协商三种，那是「角色」层面的分类。站在「系统怎么转起来」的层面，业界更常谈三种协作模式：<strong>编排式</strong>、<strong>辩论式</strong>、<strong>群体式</strong>。三者对应不同的控制哲学，也对应不同的适用场景——选错模式，系统要么难用、要么不可控。</p>
+          <p>编排式（Orchestration）是最常见的模式：一个明确的「主导者」负责拆任务、派活、收集结果，其他 Agent 是被动响应者。它的优点是控制流清晰，每一步谁在干什么都说得清，天然适合需要严格流程的生成任务；缺点是主导者本身成为瓶颈和单点——它既要理解全局，又要调度所有下游，主导者一旦跑偏，全盘皆输。下面这张时序图展示了编排式协作的一个典型回合：Orchestrator 派活、Worker 交回工件、Critic 审查打回，所有消息都经过主导者，没有人越过它直接通信。</p>
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant O as Orchestrator
+  participant W1 as Worker A(检索)
+  participant W2 as Worker B(写作)
+  participant C as Critic(审查)
+  O->>W1: 子任务1: 检索资料
+  W1-->>O: 返回检索结果
+  O->>W2: 子任务2: 基于结果写作
+  W2-->>O: 返回初稿
+  O->>C: 请审查初稿
+  C-->>O: 不合格, 原因: 结构松散
+  O->>W2: 打回修改(附审查原因)
+  W2-->>O: 返回修订稿
+  O->>C: 复审
+  C-->>O: 通过
+  O-->>User: 交付最终稿
+            </div>
+            <figcaption>编排式协作时序：Orchestrator 全程主导，Worker 只响应不决策，Critic 把关质量</figcaption>
+          </figure>
+          <p>辩论式（Debate）则完全相反：没有主导者，多个立场 Agent 各自独立推理、互相质询，最后靠裁判或投票收敛。它的价值在于用「观点对抗」压制单个模型的确认偏误——同一个模型可能因为 prompt 措辞不同就给出倾向性答案，但「正方 vs 反方」的对抗能让双方都把论据漏洞摆到台面上。代价是 token 消耗大（每轮质询都是完整推理）、耗时随轮数线性上涨，而且裁判本身也可能被带偏。群体式（Swarm）介于两者之间：没有显式主导者，Agent 通过共享的「黑板」或消息队列自发协作，行为是涌现的。它最灵活，但也最难预测——你无法事前画出完整的调用图，只能靠事后观测轨迹来理解系统在做什么。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>编排式</th><th>辩论式</th><th>群体式</th></tr></thead>
+              <tbody>
+                <tr><td>主导者</td><td>显式 Orchestrator</td><td>无，靠裁判或投票</td><td>无，涌现式</td></tr>
+                <tr><td>可控性</td><td>高，流程可审计</td><td>中，结果可控过程难控</td><td>低，过程难预测</td></tr>
+                <tr><td>观点多样性</td><td>低，容易趋同</td><td>高，立场天然对抗</td><td>高，行为自发涌现</td></tr>
+                <tr><td>成本</td><td>可控，消息量 O(N)</td><td>高，质询轮数乘以完整推理</td><td>高，消息量 O(N²)</td></tr>
+                <tr><td>适用场景</td><td>业务流程、内容生成</td><td>方案评审、风险研判</td><td>研究探索、开放式问题</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>选型建议：业务系统（要可解释、可审计）选编排式；开放决策（要压制偏差、结论稳）选辩论式；研究探索（要涌现能力、不要求可控）才考虑群体式。这个取舍本质上是在「可控性」和「多样性」之间权衡，没有免费的午餐。</p>
+
+          <h2>八、通信开销：N 个 Agent 的 O(N²) 消息账本</h2>
+          <p>多 Agent 系统里最容易被低估的成本是<strong>消息本身</strong>。每一条「Agent 给 Agent」的消息，都要经过一次完整的模型推理——发消息的 Agent 要生成它，收消息的 Agent 要读它并接着推理。也就是说，消息量和总 token 成本、总延迟直接挂钩，而通信量的增长规律非常反直觉：<strong>在两两可互通的网状拓扑里，N 个 Agent 需要维护的对话边数是 N(N−1)/2</strong>，消息量随 N 的平方增长。</p>
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant A as Agent A
+  participant B as Agent B
+  participant C as Agent C
+  A->>B: 消息1: 中间结果
+  A->>C: 消息2: 中间结果
+  B->>A: 消息3: 中间结果
+  B->>C: 消息4: 中间结果
+  C->>A: 消息5: 中间结果
+  C->>B: 消息6: 中间结果
+  Note over A,B,C: 3 个 Agent 两两互发 = 6 条消息
+            </div>
+            <figcaption>网状拓扑下 3 个 Agent 两两通信需要 6 条消息；N 个 Agent 的消息量是 O(N²)</figcaption>
+          </figure>
+          <p>算一笔具体的账。假设单条 Agent 间消息平均消耗 3000 token（包含上下文重放和推理），3 个 Agent 网状协作完成一轮「各发一条给所有人」的同步需要 6 条消息、约 18000 token；5 个 Agent 时，单轮全互联是 20 条消息、约 60000 token；如果每个 Agent 还要逐条回复别人的消息（多轮全互联），消息数直接涨到 N(N−1) 量级——10 个 Agent 就是 90 条以上、单轮超过 27 万 token。这也是为什么「超过 10 个 Agent 协调成本失控」不是感觉而是数学：不是 Agent 变笨了，是通信矩阵本身撑不住了。</p>
+          <p>三个降低通信开销的工程手段：一是<strong>收敛拓扑</strong>——从网状收成星型，让编排器做信息的「汇聚与转发」，边数从 N(N−1)/2 降到 N；二是<strong>消息精简</strong>——只传「结论 + 引用」而不是全量上下文，比如 Worker 只上报「检索到 3 条相关结果，来源分别为…」，一条 3000 token 的消息能压到 300 token；三是<strong>异步批处理</strong>——把「一问一答」改成「攒一批再统一处理」，减少同步等待的时间成本。三者叠加，往往能把通信成本砍掉一个数量级，而系统能力几乎不变——因为 Agent 间真正需要传递的信息，通常远少于它推理时占用的 token。</p>
+          <details class="deep">
+            <summary>展开：一个 10-Agent 全互联系统的完整账本</summary>
+            <div class="deep-body">
+              <p>假设一个 10 个 Agent 的全互联网状系统，每个 Agent 每轮同步把自己的中间结果广播给其余 9 个、并回复收到的每条消息。消息总数约 N(N−1) = 90 条。设单条消息平均 3000 token（含上下文重放与回复推理），单轮全同步的 token 消耗约 27 万。若按主流 API 定价粗估（输入约 0.5-1.5 美元 / 百万 token，输出贵数倍），单轮仅消息成本就在 0.2-1 美元量级，而一次真实任务往往要跑几十轮。</p>
+              <p>对比同一个 10-Agent 任务改成星型拓扑：每条消息只在编排器和单个 Worker 之间传，单轮消息数降到 10 条（每个 Worker 一条结果加一条指令），token 量约 3 万，成本下降一个数量级；如果再配合「只传结论不传上下文」的精简，消息成本还能再降 3-5 倍。这个算例想说明的是：通信拓扑的选择不是风格问题，而是实打实的成本问题。</p>
+              <p style="margin-bottom:0">以上定价为数量级参考，不同模型与计费方式差异很大；真正要紧的不是精确数字，而是「O(N²) 增长」这个形状——N 从 5 到 10，消息量翻了 4 倍。</p>
+            </div>
+          </details>
+
+          <h2>九、死锁与歧义：通信层的失败模式</h2>
+          <p>第六章讲的四种失败模式（任务漂移、回声室、协调爆炸、错误传播）是「目标层面」的失败；这一节看「通信层面」的失败——它们同样致命，但更难排查，因为表象常常只是「系统卡住了」或「结果怪怪的」。</p>
+          <p>第一种是<strong>死锁</strong>。多 Agent 协作里的死锁，形态不是并发系统经典的「持锁互等」，而是「互相等待对方的输入」：Agent A 的下一步需要 Agent B 的结果，Agent B 的下一步又需要 Agent A 的结果，于是两者都停在「等待」状态，谁也不会先动。典型诱因是协作图里有环——编排式系统很少踩这个坑，因为主导者决定了依赖方向；而网状或群体式系统里，环形依赖几乎是设计时的常态。防御手段很朴素：<strong>每条消息带超时</strong>。任何 Agent 等待回复超过阈值（比如 30 秒）就必须主动进入「超时处理」分支：放弃当前子任务，或向更高级别的协调者上报，而不是无限期等下去。</p>
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 运行
+  运行 --> 等待回复 : 发出请求
+  等待回复 --> 运行 : 收到回复, 继续推进
+  等待回复 --> 死锁 : 双方互等对方结果
+  死锁 --> 超时处理 : 等待超过阈值(如30秒)
+  超时处理 --> 运行 : 放弃或重试当前请求
+  超时处理 --> 上报 : 多次超时, 上报协调者
+  上报 --> [*]
+  运行 --> 歧义检测 : 收到语义矛盾的回复
+  歧义检测 --> 澄清请求 : 追问或要求结构化输出
+  澄清请求 --> 运行
+            </div>
+            <figcaption>通信层状态机：死锁靠超时打破，歧义靠澄清化解——两种失败都要「显式处理」而不是放任</figcaption>
+          </figure>
+          <p>第二种是<strong>歧义</strong>。Agent 之间的消息是自然语言，自然语言天然有歧义。Worker 收到「把结果整理一下」——「整理」是指格式化？是摘要？还是翻译成另一种风格？如果双方对「整理」的理解不一致，下游就会拿到货不对板的东西，而且错误一路传播，直到最终交付才发现。防御有两个层面：一是<strong>结构化协议</strong>——重要消息用固定字段（如 {"action": "summarize", "target": "report", "format": "markdown"}）而不是自由文本，把歧义消灭在协议层；二是<strong>确认回执</strong>——收消息方先回「我理解的任务是 X，对吗？」，双方对齐后再干活。前者压成本，后者保正确，实践中通常混用：常规消息走结构化字段，关键节点加一次确认。</p>
+          <p>第三种是<strong>部分失败</strong>：一个 Agent 崩了或返回垃圾，其他 Agent 还在按原计划推进，直到最后一步才发现整体不可用。这要求系统层做「结果校验 + 隔离」——每个子任务的产出在进入下一个环节之前先过一道校验（格式对不对、字段全不全、是否明显偏离），校验不过就把失败限制在局部，而不是让脏数据流向下游。三种失败模式有一个共同点：它们都不是「模型不够聪明」，而是「协议和流程不够健壮」——这也是为什么多 Agent 系统的工程重点在框架层，而不在模型层。</p>
+
+          <h2>十、工程落地：消息总线、超时与可观测性</h2>
+          <p>前面的讨论都在「架构」层面，落地时三个基础设施问题绕不开：消息怎么传、超时怎么管、出了事怎么查。把这三个问题解决在框架层，业务代码就能只关心「自己的 Agent 干什么」，而不是「怎么和其他 Agent 通信」。先看系统在组件层面大概长什么样：</p>
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((多 Agent 系统))
+    控制层
+      编排器
+      流程引擎
+    执行层
+      Worker A(检索)
+      Worker B(代码)
+      Worker C(写作)
+    通信层
+      消息总线
+      超时与重试
+      轨迹追踪
+    质量层
+      Critic 审查
+      结果校验
+            </div>
+            <figcaption>多 Agent 系统的组件分工拓扑：控制、执行、通信、质量四层，通信层是系统级基础设施</figcaption>
+          </figure>
+          <p>再看消息怎么传。最简单的实现是直接函数调用——Agent A 直接调 Agent B 的方法。但一旦超过三五个 Agent，「点对点硬编码」就维护不动了：谁调了谁、消息有没有丢、能不能回放，全都说不清。更可靠的做法是引入一个<strong>消息总线</strong>（或消息队列）：所有 Agent 只和总线通信，总线负责路由、持久化、失败重试。下面是一个极度简化的骨架，两个 Agent 通过一个内存队列协作——它刻意省略了几乎所有生产级细节，但保留了「解耦 + 异步」的核心形态：</p>
+          <pre><code class="language-python">import queue
+import threading
+
+bus = queue.Queue()  # 消息总线：全局唯一的队列
+
+def worker(name):
+    """Worker 循环：从总线取任务，产出结果发回总线"""
+    while True:
+        msg = bus.get()  # 阻塞等待消息
+        if msg.get("to") != name:
+            bus.put(msg)  # 不是发给我的，放回队尾（简化版轮询）
+            continue
+        task = msg["task"]
+        if task == "检索":
+            result = "检索结果: 3 条相关论文"
+        elif task == "写作":
+            result = "初稿: 基于检索结果完成第一章"
+        else:
+            result = f"[{name}] 未知任务"
+        bus.put({"to": "orchestrator", "from": name, "result": result})
+
+def orchestrator(plan):
+    """编排器：按计划派活，然后收集结果"""
+    for step in plan:
+        bus.put({"to": step["agent"], "from": "orchestrator",
+                 "task": step["task"]})
+    received = 0
+    while received &lt; len(plan):
+        msg = bus.get(timeout=5)  # 最多等 5 秒
+        if msg.get("to") == "orchestrator":
+            print(f"[orchestrator] 收到 {msg['from']}: {msg['result']}")
+            received += 1
+
+# 注册两个 Worker 线程
+threading.Thread(target=worker, args=("worker_a",), daemon=True).start()
+threading.Thread(target=worker, args=("worker_b",), daemon=True).start()
+
+# 编排器派活并收结果（生产环境必须有超时、去重与错误标记）
+orchestrator([
+    {"agent": "worker_a", "task": "检索"},
+    {"agent": "worker_b", "task": "写作"},
+])</code></pre>
+          <p>这段代码刻意省略了三件生产必需的事。第一是<strong>超时</strong>：bus.get(timeout=5) 只是「最多等 5 秒」，真实系统里每个子任务都要有独立的超时和重试策略——Agent 推理时间波动很大，同一任务有时 2 秒、有时 30 秒，固定超时要么误杀要么形同虚设，通常用「上限 + 指数退避重试」组合。第二是<strong>可观测性</strong>：生产级总线会给每条消息加 trace_id，让一次任务的完整消息链可以按 ID 拉出来重放——这是排查「多 Agent 到底怎么得出这个结果」的唯一手段，也是审计和安全合规的基础。第三是<strong>流控与背压</strong>：当某个 Worker 处理不过来时，总线要能缓冲或拒绝新消息，而不是无限堆积。把这三点补上，一个「能跑」的消息总线就接近「能上线」了。</p>
+          <p>最后回到一个反直觉的结论：多 Agent 系统的复杂度，大部分不是来自「多个模型」，而是来自「通信」。模型再聪明，也救不了协议上的漏洞；反过来，协议足够健壮，即便单个 Agent 偶尔犯错，系统也能兜住。这也是这一页从角色、拓扑、编排一路讲过来，最后落在消息总线上、而不是落在某个 Agent 内部的原因。</p>
+
+          <h2>十一、多 Agent 的评测：怎么知道「协作」真的有效</h2>
+          <p>单 Agent 好办：给任务、看输出、算分。多 Agent 系统的评测难在两个地方：一是「任务输出」和「协作过程」要分开评；二是过程质量很难自动化。如果只盯着最终结果，一个靠「回声室互相附和」糊弄出来的结论和一个经过真实质询收敛的结论，得分可能一样高——但可靠性完全不同。</p>
+          <p>评测多 Agent 系统，业界通常拆成三个层次。第一层是<strong>任务成功率</strong>：沿用单 Agent 的评测思路（如 τ-bench 这类工具-用户交互基准），看系统在真实场景里完成任务的比率。第二层是<strong>过程可验证性</strong>：任务完成后，能否从轨迹里回放「哪个 Agent 干了什么、消息怎么流转、关键决策由谁做出」——这层不量化分数，但它决定结论能不能被审计、被复现。第三层是<strong>消融对比</strong>：把多 Agent 系统替换成单 Agent + 工具，或去掉 Critic，看分数掉多少。如果去掉 Critic 分数几乎不变，说明 Critic 形同虚设；如果多 Agent 和单 Agent 分数差不多，说明这个任务根本不需要拆——这正好呼应了第一章「单 Agent 能搞定就别拆」的判断。</p>
+          <p>一个实操建议：给多 Agent 系统建「过程指标」而不是只看结果指标。常见的三个过程指标是——<strong>每任务消息数</strong>（是不是协调爆炸了）、<strong>每 Agent 平均活跃度</strong>（有没有 Agent 在挂机附和）、<strong>打回重做率</strong>（Critic 真正抓到几次错）。这三个数字能比「最终成功率」更早暴露系统退化：消息数暴涨通常发生在拓扑失控之前，活跃度塌陷通常发生在回声室形成之前。把这些指标接进上一节说的可观测性基础设施，多 Agent 系统的调优就从「玄学」变成了「看数据」。</p>
+          <p>最后提醒一个评测容易踩的坑：<strong>评测样例的粒度</strong>。用「单轮问答」式的样例去测多 Agent 系统，几乎测不出协作能力——协作系统的价值恰恰体现在需要拆分、需要多轮往返的长任务上。建议评测集里至少包含一部分「必须分步、且步骤之间存在依赖」的任务；否则跑出来的分数只能说明「模型本身强不强」，和协作设计好不好基本无关。这一条反过来也成立：如果你的业务场景都是单轮短任务，那大概率不需要多 Agent，回到第一章「单 Agent 能搞定就别拆」的判断即可。</p>
+
+          <details class="deep">
+            <summary>展开：一个编排式协作的真实消息日志——看 Critic 如何打回</summary>
+            <div class="deep-body">
+              <p>下面是一个 3-Agent 编排式系统处理「写一份 RAG 技术调研报告」的消息日志。注意看 Critic 打回时发生了什么——这是多 Agent 里最值钱的一环：</p>
+              <pre><code class="language-text">[orchestrator] → [worker_a] 子任务1: 检索 RAG 相关的 3 篇核心论文
+[worker_a] → [orchestrator] 返回: 找到 3 篇 (Lewis2020, Chen2023, Wang2024) + 各 1 行摘要
+[orchestrator] → [worker_b] 子任务2: 基于上述摘要撰写 300 字综述
+[worker_b] → [orchestrator] 返回: 初稿完成(300字)
+[orchestrator] → [critic] 请审查初稿
+[critic] → [orchestrator] 不合格: 缺少「与朴素 RAG 的对比」, 且未引用 Wang2024 的核心观点
+[orchestrator] → [worker_b] 打回修改: 补充对比段落, 并纳入 Wang2024 观点
+[worker_b] → [orchestrator] 返回: 修订稿完成(420字)
+[orchestrator] → [critic] 复审
+[critic] → [orchestrator] 通过
+[orchestrator] → [user] 交付最终稿</code></pre>
+              <p style="margin-bottom:0">三个要点：<strong>① 打回时必须带具体原因</strong>（「缺少对比」「未引用核心观点」），否则 worker 只能盲目重写；<strong>② 限制打回次数</strong>（比如同一稿最多打回 2 次），防止「批评-重写」死循环烧 token；<strong>③ 记录打回重做率</strong>——如果 Critic 每次都打回，说明 worker 太弱或任务拆解不合理；如果从不打回，说明 Critic 形同虚设。</p>
+            </div>
+          </details>
+
+          <h2>十二、2024-2026 进展与趋势</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方向</th><th>进展</th><th>影响</th></tr></thead>
+              <tbody>
+                <tr><td>A2A 协议落地</td><td>多厂商支持、开源实现出现</td><td>跨厂商 Agent 协作成为可能</td></tr>
+                <tr><td>Agent 框架成熟</td><td>AutoGen、CrewAI、LangGraph 等稳定</td><td>多 Agent 搭建成本大降</td></tr>
+                <tr><td>多 Agent 评估</td><td>τ-bench 等协作基准出现</td><td>「协作能力」可度量</td></tr>
+                <tr><td>可观测性</td><td>轨迹追踪、审计工具完善</td><td>生产可用性提升</td></tr>
+                <tr><td>人类监督接口</td><td>人在回路的标准化</td><td>安全可靠落地</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：多 Agent = 角色分工 + 通信拓扑 + 编排模式，拆的目的是解决上下文、角色冲突、并行性三大瓶颈。</li>
+            <li><strong>拆分判断</strong>：单 Agent + 工具能搞定就别拆；3-5 个 Agent 协调收益最大，超过 10 个成本失控。</li>
+            <li><strong>三种角色</strong>：Planner-Worker（拆解执行）、Worker-Critic（执行审查）、辩论协商（立场质询）。</li>
+            <li><strong>三种拓扑</strong>：星型（易控制）、网状（最灵活）、层级（可扩展），按规模与容错需求选择。</li>
+            <li><strong>三种编排</strong>：完全自治（快但不可控）、人在回路（可靠但慢）、流程编排（稳定但不灵活）；生产用后两者组合。</li>
+            <li><strong>A2A 协议</strong>：Agent Card 发现 + Task 状态机 + JSON-RPC 消息；与 MCP 互补——MCP 管工具、A2A 管任务。</li>
+            <li><strong>失败模式</strong>：任务漂移、回声室、协调爆炸、错误传播，各有对应防御。</li>
+            <li><strong>常见坑</strong>：Agent 越多越好；同质化模型互相附和无质疑；拓扑过密导致消息爆炸；忽视上游错误传播。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>A2A Protocol 官方文档 — Agent2Agent 开放协议规范 · <a href="https://a2a-protocol.org" target="_blank" rel="noopener">a2a-protocol.org</a></li>
+            <li>AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation — 多 Agent 框架 · <a href="https://arxiv.org/abs/2308.08155" target="_blank" rel="noopener">arXiv:2308.08155</a></li>
+            <li>Communicative Agents for Software Development（ChatDev）— 多 Agent 软件开发 · <a href="https://arxiv.org/abs/2307.07924" target="_blank" rel="noopener">arXiv:2307.07924</a></li>
+            <li>τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains — 多 Agent 协作基准 · <a href="https://arxiv.org/abs/2406.12045" target="_blank" rel="noopener">arXiv:2406.12045</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            多 Agent 是 Agent 系统的协作形态，单 Agent 范式见 <a href="agent.html">Agent 范式</a>；Agent 调用的工具语义见 <a href="tool-use-mcp.html">工具调用与 MCP</a>；Agent 能力的评估见 <a href="agent-eval.html">Agent 评估</a>。
+          </div>
+
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

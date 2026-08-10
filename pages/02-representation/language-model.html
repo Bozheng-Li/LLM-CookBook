@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>语言模型是什么 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="02-representation" data-topic="language-model">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>语言模型是什么</h1>
+            <p class="lead">在读到「注意力」「Transformer」「预训练」这些概念之前，你需要先理解一件最基础的事：把一个句子当成一个概率对象来建模——知道每一个词接在什么后面更有可能出现。这就是语言模型。后面所有的一切：GPT、ChatGPT、RAG、Agent——都从这个最朴素的想法长出来。这一节会带你从链式法则手算一遍 bigram，看清 n-gram 的天花板在哪，再走到神经语言模型和自回归生成。</p>
+          </div>
+
+          <!-- ============ 一图看懂 ============ -->
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>语言模型的核心就是在做一件事：<strong>给定前面的词，算出下一个词是每个候选词各自的概率是多少</strong>。这听起来简单，但当你能算准这个概率的时候，你就已经掌握了语言的统计规律——知道什么搭配常见、什么说法别扭、什么内容接在什么语境后面合理。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  T["前缀<br/>今天我去了"] --> M["语言模型<br/>算条件概率"]
+  M --> P["整个词表上的<br/>概率分布"]
+  P --> W1["超市 0.42"]
+  P --> W2["学校 0.28"]
+  P --> W3["月球 0.0001"]
+  P --> W4["其余数万个词"]
+  W1 -. "按解码策略采样" .-> O["输出 超市"]
+  O -. "拼回前缀 再来一轮" .-> T
+
+  style M fill:#e6f1fb,stroke:#185fa5
+  style O fill:#eaf3de,stroke:#639922
+              </div>
+              <figcaption>给定前缀「今天我去了」，语言模型给词表里<strong>每一个</strong>候选词打分。注意这不是一个硬判决，而是一整条概率分布；采样出来的词会被拼回前缀，构成下一轮的输入——这个环就是自回归。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ 发展脉络 ============ -->
+          <h2>先看一眼四十年的脉络</h2>
+          <p>语言模型不是 2022 年才有的东西。它是自然语言处理里最古老的题目之一，中间换过三次技术底座，但要解的那道数学题从来没变过。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 语言模型的技术底座换了三次
+  统计时代 : 1948 香农用 n-gram 近似英文并提出信息熵
+           : 1990s n-gram 配合 Kneser-Ney 平滑成为语音识别与统计机器翻译的标配
+  神经时代 : 2003 Bengio 提出神经概率语言模型 用稠密词向量替代离散计数
+           : 2010 前后 RNN 与 LSTM 语言模型突破固定窗口限制
+           : 2013 Word2Vec 让词向量成为通用基础设施
+  预训练时代 : 2017 Transformer 用注意力取代循环 彻底并行化
+             : 2018 起 GPT 与 BERT 把语言建模变成通用预训练目标
+             : 2020 之后 规模化让同一个目标涌现出对话与推理能力
+            </div>
+            <figcaption>三个时代换的是「怎么算条件概率」的手段：查表计数 → 稠密向量前馈网络 → 注意力堆叠。但目标函数几乎一个字都没改：最大化真实语料的似然。</figcaption>
+          </figure>
+
+          <p>如果你只记得一张「语言模型为什么越训越强」的权威证据图，那就是下面这张——来自 OpenAI 的《Scaling Laws for Neural Language Models》（神经语言模型的规模法则）。它用一条几乎平滑的幂律曲线，回答了「把模型做大到底有没有用」这个当时争议很大的问题。注意看它的横轴和纵轴都是对数坐标：</p>
+
+          <figure class="paper-figure">
+            <img src="https://ar5iv.labs.arxiv.org/html/2001.08361/assets/x1.png" alt="论文原图：语言模型在测试集上的损失（纵轴）随参数量、数据量、算力三者（横轴）按幂律平滑下降，三张子图各对应一个因素" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：语言建模性能随模型规模、数据量与算力平滑提升——三张子图从左到右依次是「损失 vs 参数量」「损失 vs 数据量」「损失 vs 算力」，对数坐标下接近直线</span>
+              <span class="pf-src">论文原图 · Kaplan et al. (OpenAI), <em>Scaling Laws for Neural Language Models</em>, 2020, Figure 1 · <a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener">arXiv:2001.08361</a></span>
+            </figcaption>
+          </figure>
+
+          <p>逐块读这张图，抓三个点。第一，<strong>横轴是规模，纵轴是损失</strong>：横轴依次是参数量、数据集大小、训练算力，纵轴是测试集上的交叉熵损失——也就是本页后面会讲的「困惑度的亲戚」。损失越低，说明语言模型把下一个词猜得越准。第二，<strong>三条线都是「越往右下越低」的直线</strong>：在对数坐标下接近直线，意味着损失和规模之间存在<strong>幂律关系</strong>（幂律，power law，指「某个量的对数与另一个量的对数成正比」的规律）——参数每翻一倍，损失稳定下降一格，没有「突然失效」的断崖。第三，也是最容易被忽略的：<strong>三个因素必须同时放大才能达到最优</strong>——只加大参数量而数据跟不上，曲线会先下降后停滞（论文里称之为「数据瓶颈」）。这张图后来成了整个行业「无脑堆规模」决策的数学依据，也是「大语言模型」这个名字里「大」字最有说服力的来源。</p>
+          <p>把这张图和上面那条时间线连起来看，结论就很清楚：<strong>语言模型要解的数学题四十年没变，而三任技术底座（统计计数、循环网络、注意力）解决的其实是「怎么把同一个条件概率算得更准、更省」，真正把性能推上去的，是规模和算力的系统性放大。</strong>这也是为什么本页后面的 n-gram 讲起来像考古，却必须讲——因为它是理解「现代方法到底优化了什么」的基线。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            语言模型不是「把意思压缩成概率」，它天生<strong>只需要</strong>建模概率。而那些看起来像是「理解」的行为——分辨歧义、判断合理性、补全上下文——都是从「猜下一个词猜得准」这个目标里被动长出来的副产品。在整个预训练过程中，<strong>没有人在任何时刻教过模型什么叫语法和逻辑</strong>。
+          </div>
+
+          <!-- ============ 链式法则 ============ -->
+          <h2>从链式法则讲起</h2>
+          <p><strong>先把问题翻译成生活场景</strong>：想象你正在玩「词语接龙」，规则是每轮只能说一个词，而且必须和前面所有词连起来像一句通顺的话。一个聪明玩家的策略是——不盲目接，而是先看看已经说了什么，再挑「最可能接得上」的词。语言模型做的就是这件事的数学化：给定前面所有词，算出每个候选词接在后面的概率。而「整个句子的概率等于所有接龙步骤概率的乘积」这个事实，就是下面这条公式的全部内容。</p>
+          <p>一个句子就是由 $n$ 个词组成的有序序列 $w_1, w_2, \dots, w_n$。概率论里有一条<strong>链式法则</strong>：任何联合概率都可以分解成一系列条件概率的乘积：</p>
+
+          <div class="figure" style="text-align:center">
+            $$P(w_1, \dots, w_n) = P(w_1) \cdot P(w_2 \mid w_1) \cdot P(w_3 \mid w_1, w_2) \cdots P(w_n \mid w_1, \dots, w_{n-1})$$
+          </div>
+
+          <p>这个恒等式只是把联合概率换了一种写法，本身没有做任何近似。<strong>但它指出了语言建模的真正问题所在</strong>：要算 $P(w_n \mid w_1, \dots, w_{n-1})$，你需要考虑前面<em>所有</em>历史——当句子很长时，这个条件依赖直接爆炸。在维基百科那几十亿个可能的上下文组合里，绝大多数组合你连一次都见不到。</p>
+
+          <p>把它落到一个具体句子上感受一下。「我 爱 吃 苹果」这四个词的联合概率被拆成：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>因子</th><th>要回答的问题</th><th>需要统计的条件</th></tr></thead>
+              <tbody>
+                <tr><td>$P(\text{我})$</td><td>句首是「我」的概率</td><td>无条件，最容易估</td></tr>
+                <tr><td>$P(\text{爱} \mid \text{我})$</td><td>「我」后面接「爱」的概率</td><td>1 个词的历史</td></tr>
+                <tr><td>$P(\text{吃} \mid \text{我 爱})$</td><td>「我爱」后面接「吃」的概率</td><td>2 个词的历史</td></tr>
+                <tr><td>$P(\text{苹果} \mid \text{我 爱 吃})$</td><td>「我爱吃」后面接「苹果」的概率</td><td><strong>3 个词的历史，语料里可能只出现过几次</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>看最后一行：句子才四个词，条件历史就已经长到让计数变得不可靠了。真实文本动辄几百上千词，历史条件的组合数是天文数字。所以语言建模的全部历史，就是<strong>一段如何逼近上式中那个不可计算的长条件概率的故事</strong>。n-gram 用马尔可夫假设砍掉远处的历史，神经网络用稠密向量学出一个上下文压缩函数。两种解法共享同一个目标，走的却是完全不同的路。</p>
+
+          <!-- ============ n-gram ============ -->
+          <h2>n-gram：最简单的语言模型</h2>
+          <p><strong>先给一个生活化的类比</strong>：n-gram（读作「恩-gram」，指连续 n 个词的片段，2-gram 也叫 bigram、3-gram 也叫 trigram）的做法，相当于一个人记性很差，只记得最近一两句话就敢接着聊天。你说「昨天在超市买了____」，他凭「买了」这两个字大概率能猜出「苹果」，但你要是提了二十句话之前的主语，他就彻底跟不上了。这个「记不住远历史」的设定不是缺点，而是它<strong>故意做的取舍</strong>——用「只看最近 n-1 个词」的马尔可夫近似（Markov assumption，指「未来只依赖当前状态、与更早的历史无关」的简化假设），换来概率可数、可算。</p>
+          <p>n-gram 的核心假设是一条<strong>马尔可夫近似</strong>：下一个词只和最近的 $n-1$ 个词有关，更早的历史全部忽略。用公式写出来就是：</p>
+
+          <div class="figure" style="text-align:center">
+            $$P(w_t \mid w_1, \dots, w_{t-1}) \approx P(w_t \mid w_{t-n+1}, \dots, w_{t-1})$$
+          </div>
+
+          <p>对于 2-gram（也叫 bigram），每个词只看它前面那一个：</p>
+
+          <div class="figure" style="text-align:center">
+            $$P(\text{今天 我 去了 超市}) \approx P(\text{今天}) \cdot P(\text{我} \mid \text{今天}) \cdot P(\text{去了} \mid \text{我}) \cdot P(\text{超市} \mid \text{去了})$$
+          </div>
+
+          <p>条件概率怎么算？<strong>数数就行</strong>。$P(\text{超市} \mid \text{去了})$ 等于语料中「去了 超市」出现的次数除以「去了」出现的总次数。不需要训练，不需要反向传播——建一张巨大的概率表就完事了。</p>
+
+          <h3>用一个 6 句话的语料手算一遍</h3>
+          <p>假设我们的全部语料只有这六句（已分好词，句首补 <code>&lt;s&gt;</code>，句尾补 <code>&lt;/s&gt;</code>）：</p>
+          <ul>
+            <li>我 爱 吃 苹果</li>
+            <li>我 爱 吃 香蕉</li>
+            <li>我 爱 你</li>
+            <li>他 爱 吃 苹果</li>
+            <li>他 不 爱 吃 苹果</li>
+            <li>我 不 爱 你</li>
+          </ul>
+
+          <p>统计一下和「爱」相关的 bigram 计数：「爱」总共出现 6 次，其后接「吃」4 次、接「你」2 次。于是：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>条件概率</th><th>分子（bigram 计数）</th><th>分母（前词计数）</th><th>估计值</th></tr></thead>
+              <tbody>
+                <tr><td>$P(\text{吃} \mid \text{爱})$</td><td>4</td><td>6</td><td><strong>0.667</strong></td></tr>
+                <tr><td>$P(\text{你} \mid \text{爱})$</td><td>2</td><td>6</td><td><strong>0.333</strong></td></tr>
+                <tr><td>$P(\text{苹果} \mid \text{吃})$</td><td>3</td><td>4</td><td>0.75</td></tr>
+                <tr><td>$P(\text{香蕉} \mid \text{吃})$</td><td>1</td><td>4</td><td>0.25</td></tr>
+                <tr><td>$P(\text{橘子} \mid \text{吃})$</td><td><strong>0</strong></td><td>4</td><td><strong>0（灾难）</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>前四行都合理。问题出在最后一行：「吃 橘子」显然是一个合法搭配，但因为这六句话里没出现过，模型直接判它概率为 0。而句子概率是连乘的——只要中间有一个因子是 0，<strong>整句话的概率就塌成 0</strong>，哪怕其余部分都完美。这不是「概率很低」，是「绝对不可能」，是模型在睁眼说瞎话。</p>
+
+          <p>自然语言里绝大多数合法的 n-gram 组合在训练语料里<strong>根本没有出现过</strong>——不是因为它们不可能，只是因为语料不够大。你翻遍整个维基百科也找不到「猫 骑着 自行车 送 外卖」这个 5-gram，但你知道这句话完全合理。这就是<strong>数据稀疏</strong>：n 越大，见过的 n-gram 越少，没见过的 n-gram 越多。</p>
+
+          <h3>为什么 n 大不起来：一张图看懂组合爆炸</h3>
+          <p>假设词表有 5 万个词。n-gram 需要为每一种「前 $n-1$ 个词的组合」维护一行概率，理论上的上下文组合数就是 $V^{\,n-1}$。下面这张图纵轴取的是<strong>以 10 为底的对数</strong>——也就是说柱子每高 1 格，实际数量就多一个零。</p>
+
+          <div class="chart-box"><canvas id="chart-lm-context-explosion"></canvas></div>
+          <p style="font-size:13px;color:var(--text-3);margin-top:-4px">纵轴为 $\log_{10}(V^{\,n-1})$，词表 $V = 50000$。这是纯组合数学的推算，不是实测数据：4-gram 的理论上下文数已达 $10^{14}$ 量级，而人类有史以来产生的全部文本也远远填不满这张表。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">n 的困境</span>
+            n 太小（如 2）：依赖窗口太窄，缺乏上下文分辨力，「他把苹果放进了冰箱，因为它太<strong>凉</strong>了」这种跨越十几个词的指代完全看不到。n 太大（如 5）：数据稀疏炸裂，绝大多数组合概率为零。所以传统 n-gram 往往只做到 3 或 4，这就已经把概率表撑到几千万到几十亿条目了——存得下，但覆盖不了语言的丰富性。
+          </div>
+
+          <!-- ============ 平滑 ============ -->
+          <h2>平滑：对抗零概率</h2>
+          <p>当一个 n-gram 在语料里没出现过，n-gram 模型会直接给它分配概率 $0$。上一节已经看到，一个零概率会让整个句子的概率变成零。平滑技术就是为了把这些零填上——<strong>从见过的组合那里「抽一点税」，分给没见过的组合</strong>。</p>
+
+          <p>几种经典平滑方法，由简到难：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方法</th><th>核心思想</th><th>代价</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>Add-k 平滑</strong><br/><span style="color:var(--text-3);font-size:12.5px">k=1 时称拉普拉斯平滑</span></td>
+                  <td>所有计数加一个小的常数 $k$，确保没有任何组合的概率为零。上面例子里若取 $k=1$、词表 8 个词，$P(\text{橘子} \mid \text{吃})$ 就从 0 变成 $1/(4+8) \approx 0.083$</td>
+                  <td>过于粗暴：常见和罕见组合一视同仁地加，概率会严重偏向低频项。词表越大，被「抽走」的概率质量越多</td>
+                </tr>
+                <tr>
+                  <td><strong>Katz 回退</strong></td>
+                  <td>如果 3-gram 没出现过，退回用 2-gram 的概率乘以折扣因子来估计；2-gram 也没见过就退到 1-gram。「见过就用长的，没见过就用短的」</td>
+                  <td>需要精心设计折扣系数，否则回退路径上概率不归一</td>
+                </tr>
+                <tr>
+                  <td><strong>Kneser-Ney 平滑</strong></td>
+                  <td>不仅看词的出现频率，还看它<em>出现在多少种不同的上文里</em>——一个词越是跟各种不同的词搭配过，越可能在陌生上下文里合理</td>
+                  <td>计算量大，但在 n-gram 时代是被公认效果最好的平滑方法</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：Kneser-Ney 为什么比单纯数频率聪明</summary>
+            <div class="deep-body">
+              <p>举一个经典反例。英文里 <code>Francisco</code> 这个词的出现频率并不低，因为 <code>San Francisco</code> 是个高频地名。如果只按 unigram 频率做回退，模型会认为「Francisco 是个常见词，可以接在任何地方后面」。</p>
+              <p>但实际上，<code>Francisco</code> 几乎<strong>只</strong>出现在 <code>San</code> 后面——它的「上文多样性」极低。而像 <code>问题</code>、<code>时候</code> 这类词，能跟在成百上千种不同的词后面，上文多样性极高。</p>
+              <p>Kneser-Ney 的核心改动就是：<strong>回退时用的不是「这个词出现了多少次」，而是「有多少种不同的词出现在它前面」</strong>（continuation count）。这样 <code>Francisco</code> 在陌生上下文里就不会被高估。这个「看上文多样性而不是看绝对频率」的思路，本质上和后来嵌入向量捕捉「分布相似性」是同一个哲学，见 <a href="embeddings.html">词嵌入与向量空间</a>。</p>
+            </div>
+          </details>
+
+          <p>平滑让 n-gram 模型从一个「只会复读见过的东西」的查表机器，变成一个有<strong>泛化能力</strong>的统计模型。但它的泛化是打了折的：本质还是退回到更短的 n-gram，损失了大量上下文信息。这也是为什么神经网络最终取代了 n-gram。</p>
+
+          <!-- ============ 困惑度 ============ -->
+          <h2>怎么判断一个语言模型好不好：困惑度</h2>
+          <p>既然语言模型输出的是概率，评价它的方式自然也是概率：<strong>拿一份模型没见过的测试文本，看模型给这份真实文本打的概率有多高</strong>。给得越高，说明模型越「预料到了」真实语言长什么样。</p>
+
+          <p>直接用联合概率不方便（几百个小于 1 的数连乘会下溢），所以业界用它的等价变形——<strong>困惑度（Perplexity, PPL）</strong>：</p>
+
+          <div class="figure" style="text-align:center">
+            $$\text{PPL} = \exp\!\left(-\frac{1}{N}\sum_{t=1}^{N} \log P(w_t \mid w_{&lt;t})\right)$$
+          </div>
+
+          <p>括号里那一坨正是<strong>平均交叉熵损失</strong>——也就是训练语言模型时那个 loss。所以困惑度和训练 loss 之间只隔着一个指数函数：<code>PPL = exp(loss)</code>。你在训练日志里看到 loss 从 3.0 掉到 2.5，对应的就是 PPL 从约 20.1 掉到约 12.2。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">困惑度的物理含义</span>
+            PPL 可以理解成<strong>「模型在每个位置上平均要在多少个候选词之间犹豫」</strong>。PPL = 1 表示模型完全确定，每次都只有一个候选；PPL = 50000 表示模型等于在整个词表里瞎猜（这正是均匀分布时的 PPL 值，等于词表大小）。所以 PPL 越低越好，而它的上界天然就是词表大小。
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>情形</th><th>困惑度大致水平</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>在词表上均匀瞎猜</td><td>等于词表大小 $V$</td><td>理论上界，模型完全没学到东西</td></tr>
+                <tr><td>训练得好的模型</td><td>显著低于 $V$，且随规模持续下降</td><td>具体数值高度依赖测试集、分词器和词表大小</td></tr>
+                <tr><td>模型见过测试集（数据污染）</td><td>异常地低</td><td>不是模型变强了，是<a href="../13-evaluation/contamination.html">数据污染</a>，见评估篇</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错：跨模型比 PPL 没有意义</span>
+            困惑度是「每个 token 的平均惊讶度」，而<strong>不同模型的 token 切法完全不同</strong>。一个把中文切成单字的分词器和一个把常见词整体成词的分词器，同一段文本的 token 数可能差一倍，PPL 数字之间没有可比性。只有在<strong>同一分词器、同一测试集</strong>的前提下，PPL 才能用来比较模型。这也是为什么现在评估更多看下游任务基准，见 <a href="../13-evaluation/benchmarks.html">评测基准</a>。
+          </div>
+
+          <!-- ============ 神经语言模型 ============ -->
+          <h2>从 n-gram 到神经网络</h2>
+          <p>n-gram 的根本矛盾是<strong>离散</strong>：每个词是一个独立符号，「苹果」和「梨」在概率表里没有任何共享参数的通道。你见到「买了三个苹果」，对「买了三个梨」的概率估计毫无帮助——但你知道这两个词的行为应该很像。</p>
+
+          <p>神经语言模型换了一条路：<strong>把每个词映射成一个稠密的实数向量</strong>。这个向量不是手工定义的，而是训练出来的——语义相近的词，向量在空间里也相近。「苹果」和「梨」的向量很接近，意味着它们在语言模型里被模型「视为」高度可互换。这就是 <a href="embeddings.html">词嵌入</a> 的核心思想。</p>
+
+          <p>第一代神经语言模型（Bengio et al., 2003）做的事情很直观：用一个前馈网络同时输入前面几个词的向量，直接输出下一个词的概率分布。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  W1["前第3个词<br/>token id"] --> E1["查嵌入表"]
+  W2["前第2个词<br/>token id"] --> E2["查嵌入表"]
+  W3["前第1个词<br/>token id"] --> E3["查嵌入表"]
+  E1 --> CAT["拼接成一个长向量"]
+  E2 --> CAT
+  E3 --> CAT
+  CAT --> H["隐藏层<br/>tanh 非线性"]
+  H --> OUT["输出层<br/>维度等于词表大小"]
+  OUT --> SM["Softmax<br/>归一化成概率分布"]
+  SM --> Y["下一个词的概率"]
+
+  style E1 fill:#e6f1fb,stroke:#185fa5
+  style E2 fill:#e6f1fb,stroke:#185fa5
+  style E3 fill:#e6f1fb,stroke:#185fa5
+  style SM fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>Bengio 2003 神经概率语言模型的结构。注意两点：一是嵌入表被<strong>所有位置共享</strong>，这就是「苹果」和「梨」共享统计强度的通道；二是输入窗口<strong>依然是固定的</strong>——它解决了稀疏问题，但没解决「看不远」的问题。</figcaption>
+          </figure>
+
+          <p>结构上它和 n-gram 一样只看固定窗口，但因为词用了稠密向量表示，泛化行为发生了质变：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>n-gram</th><th>神经语言模型（NNLM）</th><th>Transformer 语言模型</th></tr></thead>
+              <tbody>
+                <tr><td><strong>词的表示</strong></td><td>离散 ID，互相独立</td><td>稠密向量，相似词参数共享</td><td>稠密向量 + 逐层上下文加工</td></tr>
+                <tr><td><strong>能看多远</strong></td><td>固定 $n-1$ 个词</td><td>固定窗口（通常几个词）</td><td>整个上下文窗口内任意位置</td></tr>
+                <tr><td><strong>参数量随 n 增长</strong></td><td>指数级爆炸</td><td>线性增长</td><td>与序列长度解耦</td></tr>
+                <tr><td><strong>没见过的组合</strong></td><td>概率为 0，靠平滑硬凑</td><td>靠向量相似性自然泛化</td><td>同左，且泛化能力更强</td></tr>
+                <tr><td><strong>训练成本</strong></td><td>只需数数，几乎为零</td><td>需要反向传播，中等</td><td><strong>极高，需要大规模集群</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>注意，第一代神经语言模型还是固定窗口的——它没有解决 n-gram 的另一个核心问题：无法看远。之后的 RNN/LSTM（<a href="pre-transformer.html">Transformer 前史</a>）和最终的 Transformer（<a href="../03-transformer/attention.html">注意力机制</a>）才逐一解掉了远距离依赖。</p>
+
+          <!-- ============ 自回归 ============ -->
+          <h2>自回归：一个词接一个词</h2>
+          <p>在语言模型的语境下，<strong>自回归（Autoregressive）</strong>的意思只有一句话：每次生成一个 token 后，把它拼回前缀，用这个更长的前缀去生成下一个 token。循环往复，直到打出结束符。</p>
+
+          <p>这个定义在整本书里被反复引用，因此值得在这里逐步骤拆开：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>步骤</th><th>输入</th><th>模型计算</th><th>输出</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td>「今天」</td><td>$P(\cdot \mid \text{今天})$</td><td>「天气」</td></tr>
+                <tr><td>2</td><td>「今天 天气」</td><td>$P(\cdot \mid \text{今天、天气})$</td><td>「不错」</td></tr>
+                <tr><td>3</td><td>「今天 天气 不错」</td><td>$P(\cdot \mid \text{今天、天气、不错})$</td><td>「。」</td></tr>
+                <tr><td>4</td><td>「今天 天气 不错。」</td><td>$P(\cdot \mid \dots)$</td><td>⟨结束符⟩，停止</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as 用户
+  participant P as 前缀缓冲区
+  participant M as 语言模型
+  participant D as 解码器策略
+  U->>P: 给出提示词 今天
+  loop 每生成一个 token
+    P->>M: 送入当前完整前缀
+    M->>M: 前向传播 得到最后位置的隐状态
+    M->>D: 输出词表上的概率分布
+    D->>D: 按 temperature 与 top-p 采样
+    D->>P: 把选中的 token 追加到前缀末尾
+  end
+  P->>U: 遇到结束符 返回完整回答
+            </div>
+            <figcaption>自回归生成的时序：模型本身只负责「给出一条概率分布」，<strong>选哪个词是解码策略的事</strong>。同一个模型配不同的 temperature，输出风格可以差很远。注意每一轮都要把完整前缀重新送进模型——这正是 KV Cache 要优化掉的重复计算。</figcaption>
+          </figure>
+
+          <p>三点值得注意：</p>
+          <ul>
+            <li><strong>递归，不是循环</strong>。每步的输入是不一样的（比上一步多了一个 token），所以每一次前向传播都产生一组新的激活值、一个新的概率分布。这意味着推理成本随生成长度线性增长，这是 KV Cache 要解决的问题（<a href="../04-modern-arch/kv-cache.html">KV Cache 原理与优化</a>）。</li>
+            <li><strong>训练时不许偷看</strong>。训练阶段不需要自回归——你有完整答案，可以直接把整个序列喂进去并行计算。关键约束是<strong>因果掩码</strong>：每个位置只能看到自己之前的 token，不能提前看答案。这个掩码就是自回归概念在训练里的物理体现（<a href="../03-transformer/multi-head.html">自注意力与多头注意力</a>）。</li>
+            <li><strong>采样决定风格</strong>。输出不只是概率最高的词——从分布里怎么采（temperature、top-p）决定了生成是保守还是冒险（<a href="../08-inference/decoding.html">解码策略</a>）。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">一个真实的坑：错误会滚雪球</span>
+            自回归生成有个结构性弱点叫<strong>暴露偏差</strong>：训练时每一步的输入都是<em>真实</em>的上文，而推理时每一步的输入是<em>模型自己刚生成的</em>上文。一旦某一步采到了一个不太合适的词，它就会被当成既成事实拼进前缀，后面所有步都在这个错误基础上继续推理。这就是为什么长文生成到后半段容易「跑偏」，也是为什么很多场景需要在生成之外加一层校验（见 <a href="../08-inference/verifier-prm.html">验证器与过程奖励模型</a>）。
+          </div>
+
+          <!-- ============ 三种范式 ============ -->
+          <h2>不止一种建模方式：三种范式</h2>
+          <p>「语言模型」这四个字在今天几乎等同于「自回归模型」，但严格说来，只要是对文本分布建模的都算语言模型。历史上出现过三种主流的预训练目标，它们的差别在于<strong>「用什么条件预测什么」</strong>：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("语言建模的三种范式"))
+    自回归 因果语言模型
+      目标 用左边全部预测下一个
+      擅长 开放式生成与对话
+      代表 GPT 系列 Llama Qwen
+      今天的主流选择
+    掩码语言模型
+      目标 挖掉部分词 用双向上下文还原
+      擅长 句子理解 分类 抽取
+      代表 BERT RoBERTa
+      不擅长自由生成
+    序列到序列
+      目标 编码一段 生成另一段
+      擅长 翻译 摘要 结构化改写
+      代表 T5 BART
+      编码器解码器成对出现
+            </div>
+            <figcaption>三种范式的分工。为什么最后是自回归赢了？因为它的目标最「通用」——任何任务都能改写成「续写」，而掩码模型天生不会生成，Seq2Seq 又需要成对的输入输出数据。关于目标函数的取舍，详见 <a href="../06-pretraining/objectives.html">预训练目标</a>。</figcaption>
+          </figure>
+
+          <!-- ============ 动手 ============ -->
+          <h2>动手：三十行写一个 bigram 语言模型</h2>
+          <p>把前面手算的过程写成代码。这段程序只用标准库，能训练、能算困惑度、能生成句子——它就是一个货真价实（虽然很笨）的语言模型。</p>
+
+          <pre><code class="language-python">import math, random
+from collections import defaultdict, Counter
+
+corpus = [
+    "我 爱 吃 苹果", "我 爱 吃 香蕉", "我 爱 你",
+    "他 爱 吃 苹果", "他 不 爱 吃 苹果", "我 不 爱 你",
+]
+
+# 1) 统计 bigram 计数
+bigram = defaultdict(Counter)   # bigram[前词][后词] = 次数
+unigram = Counter()
+for line in corpus:
+    toks = ["&lt;s&gt;"] + line.split() + ["&lt;/s&gt;"]
+    for prev, cur in zip(toks, toks[1:]):
+        bigram[prev][cur] += 1
+        unigram[prev] += 1
+
+vocab = set(unigram) | {w for c in bigram.values() for w in c}
+V = len(vocab)
+
+# 2) 带 Add-1 平滑的条件概率:避免没见过的搭配概率为 0
+def prob(prev, cur, k=1.0):
+    return (bigram[prev][cur] + k) / (unigram[prev] + k * V)
+
+print(round(prob("爱", "吃"), 3))    # 见过 4 次,概率高
+print(round(prob("爱", "橘子"), 3))  # 没见过,但不再是 0
+
+# 3) 困惑度:对数概率取平均再取指数
+def perplexity(sentence):
+    toks = ["&lt;s&gt;"] + sentence.split() + ["&lt;/s&gt;"]
+    logp = sum(math.log(prob(p, c)) for p, c in zip(toks, toks[1:]))
+    return math.exp(-logp / (len(toks) - 1))
+
+print(round(perplexity("我 爱 吃 苹果"), 2))   # 语料里的句式,困惑度低
+print(round(perplexity("苹果 吃 爱 我"), 2))   # 语序颠倒,困惑度高
+
+# 4) 自回归生成:每步按概率分布采样,把结果拼回前缀
+def generate(max_len=10):
+    cur, out = "&lt;s&gt;", []
+    for _ in range(max_len):
+        cands = list(vocab)
+        weights = [prob(cur, w) for w in cands]
+        cur = random.choices(cands, weights=weights)[0]
+        if cur == "&lt;/s&gt;":
+            break
+        out.append(cur)
+    return " ".join(out)
+
+print(generate())</code></pre>
+
+          <p>跑一下你会发现两件事。第一，<strong>困惑度确实能区分「像人话」和「不像人话」</strong>——语序颠倒的句子困惑度明显更高，模型真的学到了语序规律。第二，生成出来的句子经常前言不搭后语，因为 bigram 只记得前一个词，「我 爱 吃 你」这种句子它一点都不觉得奇怪。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">这就是全部区别了</span>
+            把上面代码里的 <code>prob()</code> 换成一个几十层的 Transformer，把六句话的语料换成几万亿 token，把 <code>random.choices</code> 换成 top-p 采样——你就得到了 GPT。<strong>骨架完全一样：算条件概率、采样、拼回前缀、再来一轮。</strong>变的只是「怎么算那个条件概率」。
+          </div>
+
+          <details class="deep">
+            <summary>展开：为什么训练目标是「交叉熵」而不是别的</summary>
+            <div class="deep-body">
+              <p>训练语言模型的标准做法是<strong>最大似然估计</strong>：让模型给真实语料的概率尽可能大。写成最小化形式，就是最小化负对数似然：</p>
+              <div class="figure" style="text-align:center;background:transparent;border:none">
+                $$\mathcal{L} = -\frac{1}{N}\sum_{t=1}^{N} \log P_\theta(w_t \mid w_{&lt;t})$$
+              </div>
+              <p>这个式子同时有三种解读，它们在数学上是同一个东西：</p>
+              <ul>
+                <li><strong>最大似然</strong>：让训练数据在模型下的概率最大。</li>
+                <li><strong>交叉熵</strong>：真实分布（one-hot，真词位置为 1）与模型预测分布之间的交叉熵。因为真实分布是 one-hot，交叉熵只剩下「真词那一项的负对数概率」，所以实现上就是 <code>cross_entropy(logits, target_ids)</code> 一行。</li>
+                <li><strong>压缩</strong>：由信息论，最优编码长度等于 $-\log_2 P$ 比特。所以最小化这个 loss 等价于<strong>让模型成为最好的文本压缩器</strong>。这个视角解释了为什么「预测下一个词」能逼出通用能力——要把文本压到极致，你必须理解它的结构、逻辑甚至事实。</li>
+              </ul>
+              <p>信息论基础见 <a href="../01-foundations/probability-info.html">概率与信息论</a>，工程实现见 <a href="../06-pretraining/objectives.html">预训练目标</a>。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>语言模型</strong>：对 $P(w_t \mid w_1, \dots, w_{t-1})$ 建模，本质是「给定上下文，猜下一个词」的概率分布。</li>
+            <li><strong>链式法则</strong>：联合概率 = 条件概率连乘。恒等式，无近似——问题出在条件历史太长，不可计算。</li>
+            <li><strong>n-gram</strong>：马尔可夫假设砍掉远处历史，只保留最近 $n-1$ 个词。简单但数据稀疏；词表 5 万时 4-gram 的理论上下文组合已达 $10^{14}$ 量级。</li>
+            <li><strong>零概率灾难</strong>：句子概率是连乘，一个没见过的搭配就能让整句概率塌成 0。</li>
+            <li><strong>平滑</strong>：给没出现过的组合分配非零概率。Kneser-Ney 用「上文多样性」代替绝对频率，是 n-gram 时代的巅峰。</li>
+            <li><strong>困惑度</strong>：$\text{PPL} = \exp(\text{平均交叉熵})$，含义是「平均在多少个词之间犹豫」。上界是词表大小；<strong>跨分词器比较无意义</strong>。</li>
+            <li><strong>神经 LM 的碾压</strong>：稠密向量让「苹果」和「梨」天然共享统计强度——读一个词就顺便学了几千个相似词。但第一代 NNLM 仍是固定窗口。</li>
+            <li><strong>自回归</strong>：每生成一个 token 就拼回前缀，循环往复。训练可并行（因果掩码），推理必须串行。</li>
+            <li><strong>暴露偏差</strong>：训练看真上文、推理看自己生成的上文，错误会沿生成方向滚雪球。</li>
+            <li><strong>三种范式</strong>：自回归（GPT，会生成）、掩码（BERT，会理解）、Seq2Seq（T5，会转换）。自回归最通用，所以赢了。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Speech and Language Processing（Jurafsky &amp; Martin，第 3 版草稿）— 「N-gram Language Models」一章把计数、平滑、困惑度讲得极为细致，是本节 n-gram 部分最好的教科书级参考 · <a href="https://web.stanford.edu/~jurafsky/slp3/" target="_blank" rel="noopener">stanford.edu/~jurafsky/slp3</a></li>
+            <li>A Neural Probabilistic Language Model（Bengio et al., 2003, JMLR）— 神经语言模型的开山之作，第一次用稠密词向量替代离散计数来对抗数据稀疏 · <a href="https://www.jmlr.org/papers/v3/bengio03a.html" target="_blank" rel="noopener">jmlr.org/papers/v3/bengio03a</a></li>
+            <li>Attention Is All You Need（Vaswani et al., 2017）— 语言模型换上 Transformer 底座的转折点，本页「看不远」的问题在这里被彻底解决 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></li>
+            <li>Language Models are Few-Shot Learners（Brown et al., 2020）— GPT-3 论文，展示了同一个「预测下一个词」的目标在规模化之后涌现出的少样本能力 · <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener">arXiv:2005.14165</a></li>
+            <li>Recurrent Neural Network Based Language Model（Mikolov et al., 2010, INTERSPEECH）— 用循环网络突破固定窗口的代表工作，衔接本页与 <a href="pre-transformer.html">Transformer 前史</a>（搜索获取）</li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            现在你知道语言模型要算 $P(w_t \mid w_1, \dots, w_{t-1})$——但在算出这个概率之前，有一件事必须先做：把输入文本从一段字符串切成模型能处理的整数序列。这就是 <a href="tokenization.html">词元化 Tokenization</a>，它决定了模型「看到」什么、每个 token 承载多少信息，是整条数据流的第一道工序。如果你更想直接动手，<a href="../15-practice/build-minigpt.html">实战：从零实现 miniGPT</a> 会把本页的 bigram 玩具升级成一个真正的 Transformer 语言模型。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+  (function(){
+    if (typeof Chart === 'undefined') return;
+    var ctx = document.getElementById('chart-lm-context-explosion');
+    if (!ctx) return;
+    var V = 50000;
+    var ns = [2, 3, 4, 5, 6];
+    var data = ns.map(function(n){ return +( (n - 1) * Math.log10(V) ).toFixed(2); });
+    var ch = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: ns.map(function(n){ return n + '-gram'; }),
+        datasets: [{
+          label: 'log10(可能的上下文组合数)',
+          data: data,
+          backgroundColor: window.CB_COLORS.blueSoft,
+          borderColor: window.CB_COLORS.blue,
+          borderWidth: 1.5
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: true } },
+        scales: {
+          y: { beginAtZero: true, title: { display: true, text: '数量级（10 的多少次方）' } }
+        }
+      }
+    });
+    if (window.CB_CHARTS) window.CB_CHARTS.push(ch);
+  })();
+  </script>
+</body>
+</html>

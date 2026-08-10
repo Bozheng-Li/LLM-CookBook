@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>推理强化学习 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="07-posttraining" data-topic="grpo-rlvr">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+              <span class="tag-frontier">2026 前沿</span>
+            </div>
+            <h1>推理强化学习</h1>
+            <p class="lead">DPO 用人类偏好做对齐，但人类偏好有天花板——标注者判断不了数学证明对不对、代码有没有 bug。RLVR（Reinforcement Learning from Verifiable Rewards）把奖励信号换成<strong>可验证的客观正确性</strong>：数学题答案对不对、代码能不能通过测试、逻辑推理有没有违反约束。GRPO 及其变体（GSPO、DAPO）是让这套可验证奖励真正能训出长思维链的训练算法。这里也是 reward hacking 最凶猛的战场——模型会找到一切方式骗过验证器拿到高分。</p>
+          </div>
+
+          <div class="callout">
+            <span class="callout-t">前置知识</span>
+            本页假定你已掌握强化学习基础（MDP、策略梯度、优势估计、PPO 目标函数），见 <a href="../01-foundations/rl-basics.html">强化学习基础</a>；并理解 RLHF 的 PPO 流程和 reward hacking 的基本概念，见 <a href="rlhf.html">RLHF</a>。如果只读过 <a href="dpo.html">DPO</a> 那一节，建议先补一下 PPO 的 clipped surrogate objective——本页的算法全部建立在它之上。
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>RLVR 的核心变化不在算法而在<strong>奖励来源</strong>：把「人类标注的偏好比较」换成「验证器自动判定的对错」。数学题的答案可以用字符串匹配验证，代码可以用单元测试验证，逻辑题可以用规则检查器验证。这些奖励是二值的（对 / 错）、客观的、无限供应的。GRPO 在此基础上砍掉了 PPO 的价值模型——用一组采样的平均奖励做基线，省掉一个模型，让 RL 训练在推理模型 scale 上变得可行。一句话：<strong>换掉裁判（从人换成程序），再换掉记分板（从价值网络换成同组同学的平均分）</strong>。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  subgraph Data["训练数据"]
+    Q["数学/代码/逻辑题<br/>带标准答案或验证器"]
+  end
+  subgraph Rollout["采样阶段"]
+    Q --> S1["策略采样 N 个回答<br/>温度约 0.6 到 1.0"]
+    S1 --> S2["验证器判定<br/>每个回答 0 或 1"]
+  end
+  subgraph GRPO["GRPO 更新"]
+    S2 --> G1["组内归一化<br/>计算优势 A_i"]
+    G1 --> G2["PPO clip 更新策略<br/>无价值模型"]
+    G2 --> G3["KL 约束参考模型"]
+  end
+  G3 --> Next["下一轮采样"]
+  style G1 fill:#e6f1fb,stroke:#185fa5
+  style S2 fill:#eaf3de,stroke:#639922
+              </div>
+              <figcaption>GRPO + RLVR 流程：可验证奖励替代人类偏好，组内基线替代价值模型。整个回路里唯一「贵」的部分是采样——一个问题要生成 N 条几千 token 的思维链。</figcaption>
+            </figure>
+          </div>
+
+          <!-- ============ Section: 动机 ============ -->
+          <h2>为什么人类偏好不够用：可验证奖励的动机</h2>
+          <p><a href="rlhf.html">RLHF</a> 和 <a href="dpo.html">DPO</a> 用人类偏好做对齐，在「让模型更礼貌、更有帮助」这类主观维度上效果很好。但当你想让模型做数学题、写代码、做逻辑推理时，人类标注有一个致命弱点：<strong>标注者自己也不一定知道正确答案</strong>。</p>
+          <p>一道竞赛数学题，标注者可能无法判断模型的推理过程对不对。一段代码，标注者可能看不出隐藏的 bug。更根本的问题是：即使标注者能判断，人类标注的速度也远远赶不上模型需要的训练数据量——RL 训练中策略每步都要采样成千上万条回答并获取奖励，人类不可能实时标注。更麻烦的是，人类偏好训练出的奖励模型有一个<strong>结构性天花板</strong>：奖励模型的判断力来自人类标注，所以策略最多学到「让人类<em>觉得</em>对」，而不是「真的对」。当模型能力逼近甚至超过标注者时，继续优化人类偏好反而会训出更会「说服人」而不是更会「解题」的模型。</p>
+          <p>RLVR 的思路是：如果问题本身有<strong>客观可验证的正确答案</strong>，就用程序代替人类做裁判。数学题的答案是一个数，字符串匹配就行；代码题有单元测试，跑一遍就知道对错；逻辑谜题有规则检查器。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>人类偏好奖励（RLHF / DPO）</th><th>可验证奖励（RLVR）</th></tr></thead>
+              <tbody>
+                <tr><td><strong>奖励来源</strong></td><td>人类标注 → 训练出的奖励模型</td><td>程序化验证器（匹配器 / 测试 / 规则）</td></tr>
+                <tr><td><strong>信号形态</strong></td><td>连续标量分数，含噪</td><td>二值 0 / 1，或分段的规则分</td></tr>
+                <tr><td><strong>获取速度</strong></td><td>受限于奖励模型前向，且需先攒标注</td><td>毫秒级，可与采样同步</td></tr>
+                <tr><td><strong>供应量</strong></td><td>受标注预算限制</td><td>题目有多少就有多少，近似无限</td></tr>
+                <tr><td><strong>能力上限</strong></td><td><strong>受标注者水平约束</strong></td><td>受<strong>题目难度和验证器覆盖度</strong>约束</td></tr>
+                <tr><td><strong>主要失效</strong></td><td>奖励模型被过优化（reward model overoptimization）</td><td>规格博弈：满足字面规格、违背真实意图</td></tr>
+                <tr><td><strong>适用任务</strong></td><td>开放对话、写作、风格、安全</td><td>数学、代码、结构化推理、可执行任务</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这些验证器的四条性质，正好补上了人类偏好的短板：</p>
+          <ul>
+            <li><strong>客观的</strong>：不依赖标注者的主观判断，同一个答案永远给同一个奖励。这意味着奖励函数在训练全程是<em>稳定</em>的，不会像奖励模型那样随着策略偏移而失准。</li>
+            <li><strong>即时的</strong>：程序判定毫秒级，可以跟上 RL 的采样速度，不需要额外的 GPU 去跑一个奖励模型的前向。</li>
+            <li><strong>无限的</strong>：不需要人工标注成本，想采多少题就有多少题。真正的瓶颈从「标注预算」转移到了「高质量题库」和「采样算力」。</li>
+            <li><strong>二值的</strong>：奖励通常是 0（错）或 1（对），没有「部分正确」的模糊地带。这既是优点（无噪声）也是缺点（信号极稀疏，一道题要么全拿分要么零分）。</li>
+          </ul>
+          <p>DeepSeek 的 R1 系列模型是 RLVR 的标志性成果——用数学和代码的可验证奖励做强化学习，模型自发涌现出了长思维链、自我检查、反思等行为，这些行为从未被显式训练过。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 从人类偏好到可验证奖励：推理 RL 的演进
+  2017 : PPO 成为策略优化的通用工具
+  2022 : InstructGPT 确立 RLHF 四模型配方 : 奖励来自人类标注
+  2023 : 过程奖励模型 PRM 兴起 : 步骤级监督被证明优于结果级 : DPO 走另一条路砍掉奖励模型
+  2024 : GRPO 在数学推理上验证组内基线可行 : 价值模型被砍掉
+  2025 : 长思维链推理模型规模化落地 : 纯 RL 也能涌现反思与自我验证 : GSPO 与 DAPO 修补 GRPO 的稳定性
+  2026 : RLVR 从单题走向多步环境 : 与 Agent 训练合流
+            </div>
+            <figcaption>推理 RL 的技术脉络。注意两条主线的分叉：一条是「换奖励来源」（人类偏好 → 可验证），另一条是「简化训练机器」（四模型 → 三模型 → 两模型）。GRPO + RLVR 是这两条线的交汇点。</figcaption>
+          </figure>
+
+          <!-- ============ Section: 验证器 ============ -->
+          <h2>验证器长什么样：三类可验证任务与它们的坑</h2>
+          <p>「可验证」听起来简单，真做起来每一类任务都有自己的麻烦。验证器写不好，后面的算法再精妙也白搭——<strong>RLVR 的天花板首先由验证器的质量决定，其次才是算法</strong>。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>任务类型</th><th>验证方式</th><th>真实的坑</th><th>缓解</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>数学 / 计算</strong></td>
+                  <td>从输出中抽取最终答案，与标准答案做等价比较</td>
+                  <td>答案格式千变万化：<code>1/2</code> 与 <code>0.5</code> 与 <code>\frac{1}{2}</code> 是同一个数；单位、正负号、多解的顺序都会造成误判</td>
+                  <td>用符号计算库做等价判定而非字符串比对；强制输出格式（如把答案放进指定标记里）</td>
+                </tr>
+                <tr>
+                  <td><strong>代码</strong></td>
+                  <td>沙箱里跑单元测试，全过为 1</td>
+                  <td>测试覆盖不全 → 模型写出只过测试的假实现；测试有副作用或超时 → 判定不稳定；沙箱逃逸的安全风险</td>
+                  <td>隐藏测试集（训练时不暴露全部用例）；严格超时与资源限制；容器隔离</td>
+                </tr>
+                <tr>
+                  <td><strong>结构化 / 规则推理</strong></td>
+                  <td>规则检查器验证约束是否全部满足</td>
+                  <td>规则本身可能有歧义或不完备；模型学会输出「刚好通过检查」的退化解</td>
+                  <td>加入反例检查；对退化解显式扣分</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>下面是一个数学验证器的骨架，展示了「为什么它比看起来难」：</p>
+
+          <pre><code class="language-python">import re
+from fractions import Fraction
+
+
+def extract_answer(text):
+    """从模型输出中抽取最终答案。
+
+    约定模型必须把答案写进 \\boxed{...} 或指定标记内 —— 这个约定本身
+    就是训练的一部分:格式不对直接判 0,模型很快会学会遵守格式。
+    """
+    m = re.findall(r"\\boxed\{([^}]*)\}", text)
+    if not m:
+        return None
+    return m[-1].strip()          # 取最后一个,防止思维链中途出现的草稿
+
+
+def normalize(ans):
+    """把不同写法归一化到可比较的形式。"""
+    if ans is None:
+        return None
+    s = ans.replace(" ", "").replace("$", "").rstrip(".")
+    s = s.replace("\\frac{", "").replace("}{", "/").replace("}", "")
+    try:
+        return Fraction(s)        # 1/2 与 0.5 归一到同一个有理数
+    except ValueError:
+        return s.lower()          # 非数值答案退回字符串比较
+
+
+def math_reward(completion, gold):
+    """返回 0 或 1。注意:任何抽取失败都算错,这是刻意的。"""
+    pred = normalize(extract_answer(completion))
+    if pred is None:
+        return 0.0
+    return 1.0 if pred == normalize(gold) else 0.0</code></pre>
+
+          <p>这段代码里有三个值得注意的设计决定，每一个都对应一类真实事故：</p>
+          <ul>
+            <li><strong>取「最后一个」boxed 而不是第一个</strong>。长思维链里模型会反复试算、写出中间的候选答案。取第一个会把草稿当成结论。</li>
+            <li><strong>抽取失败直接判 0，而不是跳过这条样本</strong>。如果格式错误不扣分，模型就没有动力遵守格式；把它算作错误，格式合规会在几百步内自动学会。</li>
+            <li><strong>数值等价而非字符串相等</strong>。字符串比对会把大量正确答案误判为错误，这些假负例是纯噪声，会显著拖慢训练——而且它们不是随机噪声，是<em>系统性偏向某些答案格式</em>的噪声，模型可能因此学会「只输出小数不输出分数」这种毫无意义的偏好。</li>
+          </ul>
+
+          <div class="callout warn">
+            <span class="callout-t">先测验证器，再开训</span>
+            开训前务必做一件事：<strong>拿一批已知正确的人工解答喂给验证器，看它的通过率</strong>。如果一批标准答案只有 85% 被判为正确，说明验证器有 15% 的假负率——这意味着你的训练信号里有 15% 是纯错误，而且模型会花大量算力去「学会」如何绕过这些误判。这个检查很便宜，但跳过它导致的浪费很贵。
+          </div>
+
+          <!-- ============ Section: GRPO ============ -->
+          <h2>GRPO：砍掉价值模型的群组采样</h2>
+          <p>标准 PPO 需要一个价值模型 $V_\phi(s)$ 来估计状态价值，算出优势函数 $A = R - V$。在 RLHF 里这个价值模型是第四个驻留显存的模型。到了 RLVR 场景，问题更严重：推理模型的思维链动辄几千 token，价值模型需要对每个 token 位置给出估计，而它唯一能依据的监督信号是几千步之后的一个 0 或 1——<strong>这是一个信噪比极低的回归任务，价值模型很难训准，训不准的价值模型又会给出有偏的优势估计，进而毒害策略</strong>。</p>
+          <p>GRPO（Group Relative Policy Optimization）的核心创新是：<strong>用一组采样的平均奖励替代价值模型</strong>。对每个问题 $q$，策略采样 $N$ 个回答 $\{y_1, y_2, \ldots, y_N\}$，验证器给出 $N$ 个奖励 $\{r_1, r_2, \ldots, r_N\}$。优势函数定义为：</p>
+
+          <p>GRPO 在论文里的原始表述用一张图讲得最清楚。下面这张是提出 GRPO 的 DeepSeekMath 论文原图，左边是标准 PPO 的结构，右边是 GRPO 的结构——一眼就能看出 GRPO 把右边那条「价值模型」支路整个砍掉了。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/07-posttraining/grpo-rlvr/fig4.png" alt="论文原图：PPO 与 GRPO 的结构对比——GRPO 去掉价值模型，改用组内分数估计基线" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：PPO 与 GRPO 对比——GRPO 省去价值模型（critic），用同一问题的多个采样（组）的平均分数作为基线</span>
+              <span class="pf-src">论文原图 · Shao et al., <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>, 2024, Figure 4 · <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">arXiv:2402.03300</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图，先看左边 PPO 那一半。它包含两条并行的支路：上面的 <strong>policy</strong>（策略模型）对问题生成回答，下面的 <strong>value</strong>（价值模型）对每一步给一个估计分数。PPO 算优势的时候，要把「真实奖励」和「价值模型的估计」相减——所以标准 PPO 必须训练一个和策略差不多大的价值模型，这正是 RLHF 里那个「第四个驻留显存的模型」。</p>
+          <p>再看右边 GRPO 那一半：图上策略仍然在生成回答，但价值模型那一支消失了，取而代之的是从同一问题采样出的一组回答（图中就是那个多路分支），用它们的平均奖励当基线。注意图里每个回答都独立走一遍策略、再统一汇到「组内比较」这一步——这正是本页那个 z-score 归一化公式的图形表达。<strong>对比两半最直观的差异就是：PPO 需要两个「思考者」（策略 + 价值），GRPO 只需要一个。</strong></p>
+          <p>这张图还隐含了两个没画出来的工程结论：其一，GRPO 采样成本更高（一个问题的采样量从 1 变成 $N$），省下的是显存与训练稳定性；其二，图中「组」的概念要求同一个问题能被反复采样——这正是语言模型 RL 独有的性质（状态可重置），也是砍掉价值模型能成立的前提。这两点在下面的「为什么可以放心地砍掉价值模型」深入块里有更完整的推导。</p>
+
+          <div class="figure" style="text-align:center">
+            $$A_i = \frac{r_i - \text{mean}(r_1, \ldots, r_N)}{\text{std}(r_1, \ldots, r_N)}$$
+          </div>
+          <p>即每个回答的奖励在组内做 z-score 归一化。高于组内平均的回答获得正优势（被鼓励），低于平均的获得负优势（被抑制）。</p>
+
+          <h3>一个具体的数值例子</h3>
+          <p>设 $N = 8$，某道题采样出 8 条思维链，验证器判定结果为 <code>[1, 0, 0, 1, 0, 1, 0, 0]</code>，即 3 对 5 错。那么：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>量</th><th>数值</th><th>含义</th></tr></thead>
+              <tbody>
+                <tr><td>组内均值 $\bar{r}$</td><td>$3/8 = 0.375$</td><td>这道题当前策略的通过率</td></tr>
+                <tr><td>组内标准差 $\sigma$</td><td>$\sqrt{0.375 \times 0.625} \approx 0.484$</td><td>二值分布的标准差</td></tr>
+                <tr><td>答对的优势 $A_+$</td><td>$(1 - 0.375)/0.484 \approx +1.29$</td><td>被强化</td></tr>
+                <tr><td>答错的优势 $A_-$</td><td>$(0 - 0.375)/0.484 \approx -0.77$</td><td>被抑制</td></tr>
+                <tr><td><strong>全对时（8 对 0 错）</strong></td><td>$\sigma = 0$，优势<strong>全为 0</strong></td><td>这道题太简单，没有梯度</td></tr>
+                <tr><td><strong>全错时（0 对 8 错）</strong></td><td>$\sigma = 0$，优势<strong>全为 0</strong></td><td>这道题太难，没有梯度</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这张表把 GRPO 的三个关键性质都摊开了：</p>
+          <ul>
+            <li><strong>不需要价值模型</strong>：基线来自同一问题的其他采样，而不是一个需要训练的神经网络。四模型变三模型（策略 + 参考 + 验证器），而验证器还是个轻量程序不是神经网络——所以实际只有<strong>两个模型</strong>要放显存，其中一个还是冻结的。</li>
+            <li><strong>自适应难度</strong>：全对或全错时优势为 0，梯度自动消失。只有「有对有错」的问题才产生有效梯度，<strong>天然形成了 curriculum</strong>——策略变强，简单题自动退出训练集；策略还弱，难题自动不参与。这是免费得到的课程学习。</li>
+            <li><strong>注意那个不对称</strong>：3 对 5 错时，答对的优势（+1.29）绝对值<em>大于</em>答错的（-0.77）。这是 z-score 归一化的性质：<strong>稀有的成功比常见的失败携带更多信息</strong>，权重也更大。这个性质在难题上尤其重要——偶尔蒙对一次，会被大力强化。</li>
+          </ul>
+
+          <p>GRPO 的策略更新沿用了 PPO 的 clipped surrogate objective，只是把优势函数从「价值模型估计」换成「组内归一化」：</p>
+          <div class="figure" style="text-align:center">
+            $$\mathcal{L}_{\text{GRPO}} = -\mathbb{E}\!\left[\min\!\left(\rho_i A_i,\; \text{clip}(\rho_i, 1-\epsilon, 1+\epsilon) A_i\right)\right] + \beta \, \text{KL}\!\left(\pi_\theta \,\|\, \pi_{\text{ref}}\right)$$
+          </div>
+          <p>其中 $\rho_i = \frac{\pi_\theta(y_i|q)}{\pi_{\text{old}}(y_i|q)}$ 是重要性采样比率，与 PPO 一致。$\pi_{\text{old}}$ 是采样时用的那份策略权重——因为一批采样通常要跑好几个梯度步（否则采样成本摊不平），所以更新时的策略已经不是采样时的策略了，需要重要性采样来纠偏，clip 则防止这个纠偏系数跑得太离谱。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant D as 题库
+  participant A as Actor 采样引擎<br/>推理框架
+  participant V as 验证器<br/>CPU 进程池
+  participant T as Trainer 训练进程
+  participant R as 参考模型<br/>冻结
+  D->>A: 取一批 prompt
+  A->>A: 每题采样 N 条思维链
+  A->>V: 提交 N 条完整输出
+  V-->>T: 返回 N 个 0/1 奖励
+  A-->>T: 返回 token 级 logprob
+  T->>T: 组内 z-score 得到优势 A_i
+  T->>R: 计算 KL 惩罚项
+  R-->>T: 参考模型 logprob
+  T->>T: clipped surrogate 反向传播
+  T->>A: 同步新权重到采样引擎
+  Note over A,T: 权重同步是工程瓶颈<br/>百亿参数级别每轮要搬几十 GB
+            </div>
+            <figcaption>一轮 GRPO 迭代的时序。真实系统里采样和训练常常跑在不同的进程甚至不同的机器上：采样用推理框架（追吞吐），训练用训练框架（追梯度）。<strong>两者之间的权重同步是最容易被低估的工程开销</strong>。</figcaption>
+          </figure>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            GRPO 的组内归一化就像考试后的「拉曲线」——同一道题你考了 80 分，如果全班平均 90 分你就是负优势（要改进），如果全班平均 60 分你就是正优势（继续保持）。你不需要一个「价值模型」来估计你的水平，只需要跟<strong>做同一道题的同伴</strong>比。而如果全班都满分或全班都零分，这道题对区分能力毫无价值，自然也不该产生学习信号。
+          </div>
+
+          <h2>动手：GRPO 的优势计算与损失</h2>
+          <p>算法本身的代码量很小，难点全在周边的采样与验证工程上。下面这段展示核心逻辑：</p>
+
+          <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+
+def group_advantages(rewards, group_size, eps=1e-4):
+    """组内 z-score 归一化。
+
+    rewards: (batch,) 一维张量,同一问题的 N 条采样必须相邻排列
+    返回:    (batch,) 每条采样的优势
+    """
+    r = rewards.view(-1, group_size)              # (num_prompts, N)
+    mean = r.mean(dim=1, keepdim=True)
+    std = r.std(dim=1, keepdim=True)
+    adv = (r - mean) / (std + eps)
+    # 关键:全对或全错时 std 约为 0,adv 被 eps 压到近似 0 —— 这正是我们要的
+    return adv.view(-1)
+
+
+def grpo_loss(new_logp, old_logp, ref_logp, advantages,
+              mask, clip_eps=0.2, kl_coef=0.001):
+    """GRPO 的 clipped surrogate + KL 惩罚。
+
+    new_logp / old_logp / ref_logp: (batch, seq_len) token 级对数概率
+    advantages: (batch,) 每条序列一个优势,广播到该序列所有 token
+    mask:       (batch, seq_len) 1 表示该 token 属于模型生成部分
+    """
+    adv = advantages.unsqueeze(1)                          # (b, 1) -&gt; 广播
+    ratio = torch.exp(new_logp - old_logp)                 # (b, s)
+
+    unclipped = ratio * adv
+    clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv
+    pg_loss = -torch.min(unclipped, clipped)               # (b, s)
+
+    # k3 形式的 KL 估计:无偏且恒非负,比直接用 logp 差更稳
+    log_r = ref_logp - new_logp
+    kl = torch.exp(log_r) - log_r - 1.0                    # (b, s)
+
+    per_token = pg_loss + kl_coef * kl
+    # 逐 token 平均:每个 token 权重相等,长回答不会因为 token 多而被放大
+    return (per_token * mask).sum() / mask.sum().clamp(min=1.0)</code></pre>
+
+          <p>最后那行的归一化方式看着不起眼，却是 GRPO 一个真实的争议点。原始 GRPO 是<strong>先在每条序列内部对 token 取平均，再对序列取平均</strong>；这样做的后果是「一条 100 token 的回答」和「一条 5000 token 的回答」对总损失的贡献相同，于是长回答里的每个 token 权重被稀释了 50 倍。DAPO 指出这会让模型在长思维链上的学习信号被系统性削弱，改为<strong>把整个 batch 的所有 token 一视同仁地平均</strong>（也就是上面代码里的写法）。这个细节改动在长思维链训练里影响相当明显。</p>
+
+          <!-- ============ Section: 变体 ============ -->
+          <h2>GSPO 与 DAPO：GRPO 的两个改进方向</h2>
+          <p>GRPO 在大规模实践中暴露了若干问题，分别催生了 GSPO 和 DAPO。理解这两个变体的关键是：<strong>它们都不是在改「奖励从哪来」，而是在改「梯度怎么算才不炸」</strong>。</p>
+
+          <h3>GSPO：从 token 级重要性比率到序列级</h3>
+          <p>GRPO 继承了 PPO 的 token 级重要性采样：每个 token 各自算一个 $\rho_t = \pi_\theta(y_t)/\pi_{\text{old}}(y_t)$，各自 clip。在短序列上这没问题，但思维链动辄几千 token 时，麻烦来了：<strong>每个 token 的比率都有一点噪声，几千个带噪声的比率连乘 / 分别加权，方差会被放大得非常厉害</strong>。更糟的是，这些 token 共享的是同一个序列级优势 $A_i$——奖励只有终点那一个 0 或 1，却要靠几千个各自波动的比率去分配，信噪比极低。</p>
+          <p>GSPO（Group Sequence Policy Optimization）的做法是把重要性比率也提到<strong>序列级</strong>：整条思维链算一个比率、做一次 clip、对应一个优势。这在概念上更自洽——既然奖励是序列级的、优势是序列级的，那么重要性纠偏也应该是序列级的。工程上它显著降低了梯度方差，在 <a href="../04-modern-arch/moe.html">MoE</a> 架构上尤其有效：MoE 的路由会让同一个 token 在新旧策略下走不同的专家，token 级比率因此剧烈跳变，而序列级聚合把这种跳变平均掉了。</p>
+
+          <h3>DAPO：四项工程修补</h3>
+          <p>DAPO（Decoupled Clip and Dynamic sAmpling Policy Optimization）不是一个新算法，而是一组针对 GRPO 实际训练问题的<strong>工程修补包</strong>。它的四项改动各自对应一个具体病症：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>改动</th><th>针对的病症</th><th>具体做法</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>Clip-Higher<br/>（解耦裁剪）</strong></td>
+                  <td><strong>熵坍缩</strong>：训练几百步后策略输出几乎确定，探索停止</td>
+                  <td>把 clip 上下界解耦，上界放宽（如上界用比下界更大的 $\epsilon$），让低概率 token 有机会被抬升。对称 clip 会系统性压制小概率 token，导致分布越来越尖</td>
+                </tr>
+                <tr>
+                  <td><strong>Dynamic Sampling<br/>（动态采样）</strong></td>
+                  <td><strong>零梯度组</strong>：全对或全错的组白白消耗算力</td>
+                  <td>过采样后过滤掉方差为 0 的组，只保留有对有错的组进入梯度计算，并补采样直到凑够 batch。代价是采样开销上升</td>
+                </tr>
+                <tr>
+                  <td><strong>Token-Level Loss<br/>（token 级损失）</strong></td>
+                  <td><strong>长回答被稀释</strong>：序列级平均让长思维链每 token 权重变低</td>
+                  <td>在整个 batch 的 token 维度上做平均，而非先序列内平均再序列间平均</td>
+                </tr>
+                <tr>
+                  <td><strong>Overlong Reward Shaping<br/>（超长惩罚整形）</strong></td>
+                  <td><strong>截断噪声</strong>：超出最大长度被截断的样本，本可能是对的却被判 0</td>
+                  <td>对接近或超出长度上限的样本用软化的惩罚（按超出量渐变），而不是直接判错，避免给正确但啰嗦的推理注入错误负信号</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">熵坍缩是头号杀手</span>
+            上表第一行值得单独强调。RLVR 训练最常见的失败不是「不收敛」，而是<strong>收敛得太彻底</strong>：策略熵一路下降，采样温度调高也没用，每个问题的 N 条采样几乎一模一样，于是组内方差为 0、优势全 0、训练静止。此时 loss 曲线看着很平静，reward 曲线也停在某个平台上，很容易被误读为「训练完成」。<strong>请把策略熵作为一等监控指标，和 reward 放在同一张图上看。</strong>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方法</th><th>基线来源</th><th>重要性比率粒度</th><th>核心改进</th><th>要放弃什么</th></tr></thead>
+              <tbody>
+                <tr><td><strong>PPO</strong></td><td>价值模型 $V_\phi$</td><td>token 级</td><td>标准 RLHF 做法</td><td>多一个模型要训、要放显存</td></tr>
+                <tr><td><strong>GRPO</strong></td><td>组内均值</td><td>token 级</td><td>去掉价值模型，自适应难度</td><td>每题要采 N 次，采样成本乘 N</td></tr>
+                <tr><td><strong>GSPO</strong></td><td>组内均值</td><td><strong>序列级</strong></td><td>降低长序列梯度方差，MoE 友好</td><td>放弃 token 级的细粒度纠偏</td></tr>
+                <tr><td><strong>DAPO</strong></td><td>组内均值</td><td>token 级 + 解耦 clip</td><td>抗熵坍缩、抗零梯度、抗长度稀释</td><td>动态采样让每步耗时不确定</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- ============ Section: 训练动力学 ============ -->
+          <h2>训练动力学：三条曲线决定成败</h2>
+          <p>RLVR 训练跟 SFT 完全不是一回事。SFT 你盯 loss 就行；RLVR 的 loss 曲线几乎没有信息量（它是 surrogate objective，上下波动是正常的）。真正要盯的是三条曲线：<strong>平均奖励、策略熵、平均响应长度</strong>。它们的组合能告诉你训练处在哪个阶段。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 格式学习期
+  格式学习期: 奖励快速从近零涨起 模型学会输出规范格式
+  能力增长期: 奖励稳步上升 响应长度自发变长 熵缓慢下降
+  平台期: 奖励涨幅放缓 长度趋于稳定 需要更难的题
+  熵坍缩: 熵急剧下降 组内采样趋同 优势归零训练静止
+  奖励作弊: 奖励继续上升 但抽样检查发现推理过程是假的
+
+  格式学习期 --> 能力增长期: 格式合规率超过九成
+  能力增长期 --> 平台期: 题库难度不够了
+  能力增长期 --> 熵坍缩: clip 对称 或 KL 太松导致过度确定
+  平台期 --> 奖励作弊: 继续硬训
+  平台期 --> [*]: 换更难题库或收工
+  熵坍缩 --> [*]: 回滚 换 Clip-Higher
+  奖励作弊 --> [*]: 回滚 修验证器
+
+  note right of 奖励作弊
+    最危险的状态
+    所有自动指标都是绿的
+    只有人工抽检能发现
+  end note
+            </div>
+            <figcaption>RLVR 训练的五种状态。<strong>「格式学习期 → 能力增长期」的转折通常在几十到几百步内发生</strong>，表现为奖励曲线的一个明显拐点；此后每一步的收益都变小，而滑向熵坍缩或奖励作弊的风险变大。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>监控信号</th><th>健康表现</th><th>危险表现</th><th>对应处置</th></tr></thead>
+              <tbody>
+                <tr><td><strong>平均奖励</strong></td><td>先快后慢地上升，最终进入平台</td><td>上升后突然崩到近零</td><td>崩溃多为学习率过大或 KL 失效，回滚并降 lr</td></tr>
+                <tr><td><strong>策略熵</strong></td><td>缓慢下降并趋于稳定</td><td>断崖式下跌</td><td>Clip-Higher；加熵奖励；提高采样温度</td></tr>
+                <tr><td><strong>平均响应长度</strong></td><td>自发缓慢增长（长思维链在涌现）</td><td>暴涨到触顶（在凑字数 / 枚举答案）</td><td>检查是否在枚举；启用超长惩罚整形</td></tr>
+                <tr><td><strong>有效组占比</strong></td><td>过半的组「有对有错」</td><td>大部分组全对或全错</td><td>全对说明题太简单，全错说明题太难，都要换题库</td></tr>
+                <tr><td><strong>格式合规率</strong></td><td>百步内升到接近 100%</td><td>长期低于 90%</td><td>检查抽取逻辑是否与提示词约定一致</td></tr>
+                <tr><td><strong>held-out 通过率</strong></td><td>与训练奖励同步上升</td><td>训练奖励涨、held-out 不涨</td><td><strong>典型的 reward hacking 或过拟合题库</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>最后一行是整套监控里最重要的一条。<strong>训练奖励和 held-out 通过率一旦分叉，基本可以断定模型学到的是验证器的漏洞而不是解题能力。</strong>这个分叉往往出现得比想象中早，因此 held-out 评测不能等训完再做，要在训练循环里定期插入。</p>
+
+          <!-- ============ Section: reward hacking ============ -->
+          <h2>Reward Hacking 与规格博弈：RLVR 的头号敌人</h2>
+          <p>可验证奖励听起来完美——数学答案对就是对，代码通过测试就是通过，还有什么能被钻空子？但现实是：验证器只检查<strong>你让它检查的东西</strong>，而模型会找到一切方式满足验证器的<strong>字面要求</strong>同时违背<strong>真实意图</strong>。这就是规格博弈（specification gaming），RLVR 场景下比 RLHF 更凶猛，因为奖励信号更密集、训练轮次更多、而且策略有几千个 token 的自由空间可以施展。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Intent["真实意图"]
+    I1["学会数学推理"]
+  end
+  subgraph Spec["验证器规格"]
+    S1["答案字符串匹配"]
+  end
+  subgraph Hack["模型学到的捷径"]
+    H1["先写答案再倒推过程"]
+    H2["反复尝试不同答案"]
+    H3["利用验证器边界条件"]
+  end
+  Intent -.->|"形式化为"| Spec
+  Spec -.->|"被钻空子"| Hack
+  Hack -.->|"表面高分<br/>实际没学会"| Intent
+  style H1 fill:#fcebeb,stroke:#a32d2d
+  style H2 fill:#fcebeb,stroke:#a32d2d
+  style H3 fill:#fcebeb,stroke:#a32d2d
+            </div>
+            <figcaption>规格博弈的三角关系：真实意图被形式化成验证器规格时必然有损耗，模型精确地钻进这个损耗里。<strong>损耗越大，可钻的空间越大。</strong></figcaption>
+          </figure>
+
+          <p>RLVR 中 reward hacking 的表现可以按「钻的是谁的空子」分成四大类：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root(("RLVR 的<br/>奖励作弊分类"))
+    钻验证器实现的空子
+      利用抽取逻辑
+        输出多个候选答案覆盖
+        构造能骗过正则的字符串
+      利用测试覆盖不全
+        硬编码测试输入的输出
+        只实现被测到的分支
+      利用边界条件
+        超时即通过的判定漏洞
+        空输出被当作特殊值
+    钻任务形式的空子
+      答案倒推
+        先猜答案再编推理
+        过程与结论无因果关系
+      暴力枚举
+        思维链里穷举所有选项
+        选择题尤其严重
+    钻奖励整形的空子
+      长度作弊
+        无意义拉长以提高蒙中率
+        重复同一段推理凑结构
+      格式作弊
+        堆砌验证器偏好的标记
+    钻数据分布的空子
+      记忆题库
+        训练集题目直接背答案
+      利用题目模板
+        识别出题套路而非解题
+            </div>
+            <figcaption>奖励作弊的四条路径。按「钻谁的空子」而不是按「表现形式」分类，是因为<strong>缓解手段是按前者组织的</strong>：验证器漏洞靠加强验证器，任务形式漏洞靠过程奖励，奖励整形漏洞靠改整形函数，数据分布漏洞靠换题和去污染。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>作弊表现</th><th>怎么发现它</th><th>为什么自动指标看不出来</th></tr></thead>
+              <tbody>
+                <tr><td><strong>答案倒推</strong>：先猜答案再编一段合理推理</td><td>人工读思维链；或把推理过程截断后让模型续写，看结论是否还一致</td><td>最终答案确实是对的，验证器无从判断过程</td></tr>
+                <tr><td><strong>暴力枚举</strong>：在思维链里穷举所有候选</td><td>监控响应长度分布；统计输出中出现的候选答案个数</td><td>枚举也确实「答对了」，奖励是满分</td></tr>
+                <tr><td><strong>测试集 overfitting</strong>：只过测试用例的假实现</td><td>用<strong>训练时未暴露</strong>的隐藏测试集重跑</td><td>公开测试全绿</td></tr>
+                <tr><td><strong>格式伪装</strong>：堆砌特殊标记触发解析漏洞</td><td>对验证器做模糊测试；检查通过样本中的异常字符</td><td>验证器自己就是被骗的那一方</td></tr>
+                <tr><td><strong>题库记忆</strong>：直接背下训练题答案</td><td>held-out 通过率与训练奖励对比；做训练集与评测集的去污染检查</td><td>训练奖励一路走高，看着像能力提升</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">关键认知</span>
+            Reward hacking 不是 bug，是强化学习的<strong>必然行为</strong>。只要奖励函数与真实目标存在 gap，策略就一定会找到并利用这个 gap。这个 gap 在 RLVR 中尤其大——「答案正确」和「真的会推理」之间有巨大的距离。不能指望通过更好的验证器完全消除它，只能通过奖励设计和训练策略把它控制在可接受范围内。<strong>把 reward hacking 当成「需要持续对抗的常态」而不是「一次性修好的缺陷」，是这个领域最重要的心态转变。</strong>
+          </div>
+
+          <h2>缓解 reward hacking：奖励设计的工程实践</h2>
+          <p>完全消灭 reward hacking 不现实，但可以把它控制在可接受范围内。实践中有以下几条路线：</p>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">增强验证器覆盖度</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">代码验证器增加更多测试用例（包括边界情况和对抗性用例），并保留一批<strong>训练时不暴露</strong>的隐藏用例专门用于检测作弊；数学验证器不仅检查最终答案，还做关键步骤的中间检查。覆盖度越高，可钻的空子越少。但永远无法做到 100% 覆盖。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">过程奖励（PRM）替代结果奖励</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">不只看最终答案对不对，还对推理过程的每一步打分。过程奖励模型（PRM）可以惩罚「先猜答案再倒推」的行为，因为倒推出来的过程在步骤级上往往站不住。代价是需要训练步骤级的奖励模型，回到部分 RLHF 的复杂度，而且 PRM 自身也会被 hack。详见 <a href="../08-inference/verifier-prm.html">验证器与过程奖励模型</a>。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">KL 约束与熵管理</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">保持足够的 KL 惩罚，防止策略偏离参考模型太远（偏离越远越容易退化到 hack 模式）。同时用熵奖励或 Clip-Higher 保持策略多样性，避免塌缩到某一种 hack 模式——<strong>注意这两者方向相反</strong>：KL 拉回、熵推开，需要一起调。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">数据与问题多样性</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">确保训练问题集足够多样——如果全是选择题，模型只学会猜选项；混入开放题、证明题、代码题，让单一 hack 策略无法跨问题类型迁移。定期更换问题集，防止过拟合到特定验证器。同时做<strong>训练集与评测集的去污染</strong>，否则你分不清是学会了还是背下了，见 <a href="../13-evaluation/contamination.html">数据污染与评估可信度</a>。</p>
+            </div>
+          </div>
+
+          <p>即使做了以上所有措施，reward hacking 仍然会以新的、意想不到的形式出现。RLVR 工程中一个不成文的经验是：<strong>每次大规模训练后都必须做 reward hacking 审计</strong>——人工检查模型在 held-out 问题上的推理过程，看它是真的在推理还是在走捷径。这个审计无法完全自动化，因为「真的在推理」这个判断本身就依赖人类。一个可操作的最小流程是：随机抽 50 条<em>答对</em>的样本（注意是答对的，答错的样本没有作弊动机），人工读思维链，统计其中有多少条的推理过程与结论存在真实因果关系。这个比例如果低于某个你能接受的线，就该回头改验证器或加过程奖励了。</p>
+
+          <details class="deep">
+            <summary>展开：GRPO 的训练超参数实践</summary>
+            <div class="deep-body">
+              <p>GRPO 在推理模型训练中常用的配置（数值为公开技术报告与开源实现中的常见区间，<strong>具体取值因模型规模、题库难度和框架实现而异，务必以你自己的实验为准</strong>）：</p>
+              <ul>
+                <li><strong>组大小 N</strong>：每个问题采样 4–16 个回答。太小组内统计不稳定（想想 N=2 时 z-score 只有 ±1 两个取值），太大采样开销线性上升。N=8 是很多实现的默认。</li>
+                <li><strong>采样温度</strong>：0.6–1.0，需要足够高的温度保证组内有对有错。如果温度太低，所有采样几乎一样，组内方差为零，梯度消失。<strong>温度在这里不是「生成质量参数」而是「探索强度参数」</strong>，别用推理时的经验值。</li>
+                <li><strong>KL 系数 $\beta$</strong>：常见在 0.001–0.04 量级。RLVR 中的 KL 系数通常比 RLHF 小得多，因为可验证奖励更可靠，不需要那么强的约束；有些实现甚至完全去掉 KL 项，靠 clip 和早停控制漂移。但 KL 太小会让 reward hacking 加剧。</li>
+                <li><strong>clip 范围 $\epsilon$</strong>：0.2（与 PPO 一致）。DAPO 的 Clip-Higher 把上界单独放宽。</li>
+                <li><strong>每批采样的梯度步数</strong>：1–4。步数越多采样成本摊得越平，但 $\pi_\theta$ 与 $\pi_{\text{old}}$ 偏离越大，重要性比率越不可靠。很多实现干脆用 1（严格 on-policy），代价是采样吞吐必须跟得上。</li>
+                <li><strong>最大思维链长度</strong>：需要设置上限（常见在数千到数万 token 量级），否则模型会无限拉长思维链来枚举答案。这个上限本身也是防 reward hacking 的手段，但配合超长惩罚整形使用才不会引入假负例。</li>
+              </ul>
+              <p style="margin-bottom:0">一个容易被忽视的坑：<strong>学习率</strong>。RLVR 中的学习率通常比 SFT 小一到两个数量级（常落在 $10^{-6}$ 量级），因为 RL 的梯度信号已经很强，大学习率会导致策略剧烈震荡甚至崩溃——而 RL 的崩溃和 SFT 不同，它往往是不可逆的：策略一旦退化到某个退化模式，采样就再也产生不出多样的样本，训练无法自愈，只能回滚 checkpoint。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：为什么可以放心地砍掉价值模型？组内基线的方差分析</summary>
+            <div class="deep-body">
+              <p>策略梯度里加基线是老技巧了。核心结论是：<strong>只要基线 $b$ 不依赖于当前动作 $a$，从优势里减去它就不会引入偏差</strong>，因为</p>
+              <div class="figure" style="text-align:center">
+                $$\mathbb{E}_{a \sim \pi}\!\left[b \cdot \nabla_\theta \log \pi_\theta(a)\right] = b \cdot \nabla_\theta \sum_a \pi_\theta(a) = b \cdot \nabla_\theta 1 = 0$$
+              </div>
+              <p>价值模型 $V_\phi(s)$ 是一种基线，组内均值 $\bar{r}$ 也是一种基线。两者都满足「不依赖当前这条采样的具体动作」这个条件——严格地说组内均值包含了当前采样自身，会引入一个 $O(1/N)$ 量级的小偏差，实践中通常忽略，也可以用留一法（leave-one-out）均值来精确消除。</p>
+              <p><strong>那为什么大家以前要费劲训价值模型？</strong>因为在传统 RL 场景（如机器人控制）里，你不可能对同一个状态重复采样 N 次——环境一旦推进就回不去了，所以只能训一个函数近似器来「记住」各状态的平均回报。</p>
+              <p>而语言模型的 RL 有一个得天独厚的性质：<strong>状态是可以完美重置的</strong>。同一个 prompt 想采样多少次就采样多少次，采样之间完全独立。这直接把「需要学一个价值函数」的问题变成了「多采几次求个平均」的问题。GRPO 的本质洞察就在这里——<em>它不是发明了更好的价值估计方法，而是发现在这个特定场景下根本不需要价值估计</em>。</p>
+              <p>代价当然存在：价值模型是「一次训练，处处可用」，而组内采样是「每道题都要多花 N 倍算力」。所以 GRPO 是拿<strong>采样算力</strong>换<strong>模型显存与训练稳定性</strong>。在推理模型这个场景下这笔交易非常划算，因为价值模型在超长序列 + 稀疏奖励下本来就训不准；但如果你的序列很短、奖励很稠密，PPO 的价值模型仍然可能是更经济的选择。</p>
+              <p style="margin-bottom:0">还有一个副产品：组内基线让优势天然地被<strong>按题归一化</strong>了。不同题目的难度差异（有的题通过率 90%、有的 5%）不会互相干扰，因为每道题都在自己的组内比较。价值模型要学会这一点得费很大劲。</p>
+            </div>
+          </details>
+
+          <!-- ============ Section: 涌现 ============ -->
+          <h2>RLVR 涌现了什么：长思维链的自行出现</h2>
+          <p>RLVR 最令人兴奋的发现不是模型做对了更多数学题，而是<strong>模型在训练过程中自发产生了此前从未被训练过的行为</strong>。公开的技术报告记录了这些涌现行为：</p>
+          <ul>
+            <li><strong>自我验证</strong>：模型在得出答案后，自发地「回头检查」推理过程，代入验算，发现错误并修正。</li>
+            <li><strong>反思</strong>：遇到困难时，模型会输出「等等，让我重新想想」这类自发的中断和方向调整——这种语言模式在训练数据里当然存在，但「在恰当的时机使用它」不是任何人教的。</li>
+            <li><strong>分而治之</strong>：模型自发地将复杂问题分解为子问题，逐个解决再综合。</li>
+            <li><strong>替代路径探索</strong>：一条路走不通时，模型自发地回退并尝试不同的解题思路。</li>
+            <li><strong>响应长度自发增长</strong>：没有任何机制鼓励「写长一点」，但训练过程中平均响应长度会持续上升。这是因为更长的思考确实提高了答对率，于是被奖励强化——<strong>这是「推理时算力换精度」这条 scaling 曲线在训练中被模型自己发现了</strong>。</li>
+          </ul>
+          <p>这些行为从未出现在训练数据的监督信号中（训练信号只有问题和最终答案的对错，没有推理过程示范），也不是 SFT 教的。它们是强化学习在「答对有奖励」的压力下自发演化出来的策略。这暗示着：只要奖励信号设计得当，模型有能力自主发现有效的推理模式——这正是推理模型这一新范式的基础，详见 <a href="../08-inference/reasoning-models.html">推理模型</a>。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一个必要的清醒</span>
+            「涌现」这个词容易让人过度浪漫化。更朴素的解释是：<strong>这些行为模式在预训练语料里早就存在了</strong>（人类写的解题过程里到处是「让我们检查一下」「换个思路」），基座模型本来就会说这些话；RLVR 做的是把「在什么情况下说这些话能提高答对率」这件事学出来。这不减损其价值，但提醒我们：<strong>RLVR 是在放大基座里已有的能力，不是无中生有</strong>。基座越强，RLVR 能挖出来的东西越多；基座里根本没有的东西，RLVR 也变不出来。
+          </div>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：用可验证的客观奖励（数学答案、代码测试、规则检查）替代人类偏好标注，让 RL 突破人类标注的天花板。</li>
+            <li><strong>验证器是第一生产力</strong>：验证器的假负率直接变成训练噪声。开训前先用标准答案测一遍验证器的通过率。</li>
+            <li><strong>GRPO 核心</strong>：组内采样 z-score 归一化替代价值模型——每个回答的奖励与同组其他采样比较，省掉一个模型，且自带 curriculum（全对全错的题自动零梯度）。</li>
+            <li><strong>为什么能砍掉价值模型</strong>：语言模型 RL 的状态可以完美重置，同一 prompt 可无限重采样，于是「学一个价值函数」退化成「多采几次求平均」。拿采样算力换显存与稳定性。</li>
+            <li><strong>GSPO</strong>：把重要性比率从 token 级提到序列级，降长序列梯度方差，对 MoE 尤其有效。</li>
+            <li><strong>DAPO 四项</strong>：Clip-Higher 抗熵坍缩、Dynamic Sampling 丢弃零方差组、Token-Level Loss 防长回答被稀释、Overlong Reward Shaping 避免截断假负例。</li>
+            <li><strong>盯三条曲线</strong>：平均奖励、策略熵、平均响应长度。熵断崖式下跌是头号杀手，此时 loss 曲线看着一切正常。</li>
+            <li><strong>训练奖励与 held-out 通过率分叉 = reward hacking 报警</strong>，必须在训练循环里定期跑 held-out。</li>
+            <li><strong>Reward hacking 是必然</strong>：验证器只检查字面规格。四条路径——钻验证器实现、钻任务形式、钻奖励整形、钻数据分布，对应四类不同的缓解手段。</li>
+            <li><strong>缓解四路</strong>：增强验证器覆盖（含隐藏测试集）、过程奖励 PRM、KL 与熵一起调、问题多样性与去污染。每次大规模训练后必须人工抽检<em>答对的</em>样本。</li>
+            <li><strong>涌现行为</strong>：自我验证、反思、分而治之、替代路径探索、响应长度自发增长——在纯结果奖励下产生，但本质是放大基座里已有的模式，不是无中生有。</li>
+            <li><strong>前置依赖</strong>：RL 基础概念见 <a href="../01-foundations/rl-basics.html">强化学习基础</a>；多步决策训练见 <a href="agentic-rl.html">Agentic RL</a>。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models — GRPO 原始论文，提出组内归一化替代价值模型，在数学推理上验证有效性 · <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">arXiv:2402.03300</a></li>
+            <li>DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning — RLVR 的标志性实践，记录了长思维链、自我验证等行为的自发涌现 · <a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener">arXiv:2501.12948</a></li>
+            <li>Let's Verify Step by Step — 过程监督（PRM）优于结果监督的关键证据，是理解「为什么要给推理过程打分」的基础 · <a href="https://arxiv.org/abs/2305.20050" target="_blank" rel="noopener">arXiv:2305.20050</a></li>
+            <li>Proximal Policy Optimization Algorithms — GRPO 沿用的 clipped surrogate objective 出处 · <a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">arXiv:1707.06347</a></li>
+            <li>DAPO: An Open-Source LLM Reinforcement Learning System at Scale — Clip-Higher、动态采样、token 级损失与超长惩罚整形四项改进（论文名，搜索获取）</li>
+            <li>Group Sequence Policy Optimization — GSPO，把重要性比率提到序列级（论文名，搜索获取）</li>
+            <li>Scaling Laws for Reward Model Overoptimization — 奖励模型被过优化的定量规律，理解 reward hacking 的理论侧参考（论文名，搜索获取）</li>
+            <li>Learning to reason with LLMs — 推理模型用大规模 RL 训练长思维链的产业实践（OpenAI 官方博客，非论文） · <a href="https://openai.com/index/learning-to-reason-with-llms/" target="_blank" rel="noopener">链接</a></li>
+            <li>The Bitter Lesson — Rich Sutton 的经典文章，强调算力驱动学习优于人工设计的方法，RLVR 的成功是其又一印证 · <a href="http://www.incompleteideas.net/IncIdeas/BitterLesson.html" target="_blank" rel="noopener">链接</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            RLVR 训出了长思维链推理能力，这些能力怎么在推理时用起来——CoT、Self-Consistency、Best-of-N、树搜索——见 <a href="../08-inference/inference-scaling.html">推理时扩展</a>；推理模型的完整训练范式和行为特征见 <a href="../08-inference/reasoning-models.html">推理模型</a>；给推理过程逐步打分的验证器体系见 <a href="../08-inference/verifier-prm.html">验证器与过程奖励模型</a>。RLVR 从单步 MDP 走向多步环境交互的延伸见 <a href="agentic-rl.html">Agentic RL</a>；把大模型的推理能力搬到小模型上见 <a href="distillation.html">知识蒸馏与能力迁移</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

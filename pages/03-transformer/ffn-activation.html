@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>前馈网络与激活函数 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="03-transformer" data-topic="ffn-activation">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level basic">入门</span>
+            </div>
+            <h1>前馈网络与激活函数</h1>
+            <p class="lead">注意力让词与词"看见"彼此，但真正把信息加工、存储、变换的，是每一层里的前馈网络（FFN）。它占了整个 Transformer 参数量的大头——动辄三分之二——却常常被注意力抢走聚光灯。这一节把 FFN 拆开，看它到底在算什么、激活函数怎么从 ReLU 演进到 SwiGLU、真实模型的中间维度是怎么定出来的，以及为什么换一个激活函数就得重算参数预算。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>FFN 是每个 token 独立经过的一个"两层 MLP 升维-降维"过程：<strong>先把隐藏维度放大（通常 4 倍），过一个非线性激活函数，再缩回原来的维度</strong>。注意力负责词之间的信息融合，FFN 负责对每个词的信息做深度加工。一个管"交流"，一个管"思考"。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  X["输入 x<br/>batch × seq × d"] --> U1["升维<br/>W1: d → 4d"]
+  U1 --> ACT{"激活函数<br/>ReLU / GELU / SwiGLU"}
+  ACT --> U2["降维<br/>W2: 4d → d"]
+  U2 --> Y["输出 y<br/>batch × seq × d"]
+  style ACT fill:#faeeda,stroke:#ba7517
+              </div>
+              <figcaption>FFN 的数据流：升维 → 非线性激活 → 降维，对每个位置独立做变换。进出维度相同，所以可以无限堆叠。</figcaption>
+            </figure>
+          </div>
+
+          <h2>FFN 在 Transformer 里的角色</h2>
+          <p>每个 Transformer Block 有两个子层：多头注意力和前馈网络。注意力部分让序列里每个位置互相"看"一眼，输出融合了上下文的新表示；FFN 则对<strong>每个位置独立</strong>做一次非线性变换——不同 token 之间不交互，只各自加工自己的向量。</p>
+          <p>为什么需要这个独立加工？因为注意力的本质是"加权平均"，它擅长<strong>信息路由</strong>（把相关的信息聚到一起），但加权平均是线性操作，表达能力有限。FFN 通过升维到更高维的空间、施加非线性、再降回来，让模型能学到复杂的特征变换——这更像传统 MLP 的"特征提取"角色。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            注意力是"开会讨论"，FFN 是"会后自己消化"。开会把信息汇总到每个人手里，但真正把信息吃透、变成自己的判断，还得靠每个人会后独立思考。
+          </div>
+
+          <p>标准 FFN 的计算是两层线性变换夹一个激活函数：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{FFN}(\mathbf{x}) = W_2 \; \sigma(W_1 \mathbf{x} + b_1) + b_2$$
+          </div>
+          <p>其中 $W_1 \in \mathbb{R}^{d_{ff} \times d}$、$W_2 \in \mathbb{R}^{d \times d_{ff}}$。$d_{ff}$ 是中间隐藏维度，原版 Transformer 取 $d_{ff} = 4d$。$\sigma$ 是激活函数。这个"升 4 倍再降回来"的设计让 FFN 的参数量远超注意力——以 $d=4096$ 为例，标准 FFN 两层权重共 $2 \times 4096 \times 16384 \approx 1.34$ 亿参数，而注意力的四个投影矩阵约 $4 \times 4096 \times 4096 \approx 6710$ 万，FFN 占了这个 Block 参数量的约 67%。</p>
+
+          <h3>"逐位置"到底是什么意思</h3>
+          <p>这个词在论文里叫 position-wise，初学者最容易误解。它的意思是：<strong>同一层里所有 token 共用同一套 $W_1$、$W_2$，但每个 token 各算各的，互不影响</strong>。换句话说，如果你把一个长度为 512 的序列打乱顺序再送进 FFN，出来的结果只是顺序被打乱，每个 token 自己的输出值完全不变——这和注意力形成鲜明对比，注意力打乱顺序后每个位置的输出都会变。</p>
+          <p>从实现角度看，这意味着 FFN 就是一次形状为 $(B\times n, d)\times(d, d_{ff})$ 的普通矩阵乘法，batch 和序列两个维度可以直接压平。这也是为什么 FFN 在 GPU 上极其高效：它是纯粹的大 GEMM，没有注意力那样的 softmax 和数据依赖。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+classDiagram
+  class TransformerBlock {
+    +d_model : int
+    +forward x
+  }
+  class MultiHeadAttention {
+    +W_Q  d×d
+    +W_K  d×d
+    +W_V  d×d
+    +W_O  d×d
+    +跨位置信息交换
+  }
+  class FeedForward {
+    +W_up    d×d_ff
+    +W_gate  d×d_ff
+    +W_down  d_ff×d
+    +逐位置非线性变换
+  }
+  class Activation {
+    +ReLU
+    +GELU
+    +SiLU
+  }
+  TransformerBlock *-- MultiHeadAttention : 子层1
+  TransformerBlock *-- FeedForward : 子层2
+  FeedForward *-- Activation : 内部非线性
+            </div>
+            <figcaption>Block 的模块组成：注意力持有四个 d×d 方阵，FFN 持有两到三个 d×d_ff 的长方阵——后者尺寸大得多，这就是参数量差距的来源。</figcaption>
+          </figure>
+
+          <div class="callout warn">
+            <span class="callout-t">参数量占比</span>
+            在标准 Transformer 中，FFN 占每层参数量的约 <strong>2/3</strong>。这意味着当你听到"这个模型 7B 参数"，其中相当大一部分在 FFN 里。也正因如此，FFN 是模型压缩（量化、剪枝、MoE 替换）的重点战场。
+          </div>
+
+          <h3>用真实模型核对这个比例</h3>
+          <p>光说"2/3"不够踏实，直接拿几个公开配置算一遍。下表按每层计算，注意力算 $W^Q/W^K/W^V/W^O$ 四个矩阵，FFN 按各自的结构算（标准 FFN 两个矩阵，SwiGLU 三个矩阵）：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模型</th><th>$d_{model}$</th><th>$d_{ff}$</th><th>倍率</th><th>激活</th><th>单层注意力参数</th><th>单层 FFN 参数</th><th>FFN 占比</th></tr></thead>
+              <tbody>
+                <tr><td>原版 Transformer base</td><td>512</td><td>2048</td><td>4.0×</td><td>ReLU</td><td>1.05M</td><td>2.10M</td><td><strong>66.7%</strong></td></tr>
+                <tr><td>GPT-2 small</td><td>768</td><td>3072</td><td>4.0×</td><td>GELU</td><td>2.36M</td><td>4.72M</td><td><strong>66.7%</strong></td></tr>
+                <tr><td>Llama-2-7B</td><td>4096</td><td>11008</td><td>2.69×</td><td>SwiGLU</td><td>67.1M</td><td>135.3M</td><td><strong>66.8%</strong></td></tr>
+                <tr><td>Llama-2-13B</td><td>5120</td><td>13824</td><td>2.70×</td><td>SwiGLU</td><td>104.9M</td><td>212.3M</td><td><strong>66.9%</strong></td></tr>
+                <tr><td>Llama-2-70B</td><td>8192</td><td>28672</td><td>3.5×</td><td>SwiGLU + GQA</td><td>151.0M</td><td>704.6M</td><td><strong>82.4%</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>两个观察。<strong>第一</strong>，前四行的比例惊人地稳定在 2/3 附近——这不是巧合，而是"SwiGLU 三矩阵 + 倍率降到 8/3"和"标准两矩阵 + 倍率 4"在参数量上刻意做了对齐。<strong>第二</strong>，70B 那一行跳到了 82%，原因是它用了 <a href="../04-modern-arch/attention-variants.html">GQA</a>：KV 头从 64 组砍到 8 组，注意力侧参数被压掉一大块，而 FFN 侧没动，比例自然向 FFN 倾斜。<strong>现代模型越优化注意力，FFN 的占比就越突出</strong>。</p>
+
+          <div class="chart-box"><canvas id="chart-ffn-share"></canvas></div>
+          <p style="font-size:13px;color:var(--text-3);margin-top:-4px">单层参数量对比（单位：百万），按上表公式计算。注意 70B 的注意力柱被 GQA 明显压低，而 FFN 柱一枝独秀。</p>
+
+          <h2>激活函数的演进：从 ReLU 到 GELU</h2>
+          <p>FFN 里那个激活函数 $\sigma$ 的选择，看似是个小细节，却直接影响模型的表达能力和训练稳定性。</p>
+
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">ReLU</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">$\max(0, x)$。原版 Transformer 的选择。简单高效，但有"死神经元"问题：负输入梯度为 0，一旦神经元"死"了就不再更新。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">GELU</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">高斯误差线性单元。GPT 系列、BERT 的选择。在 0 附近平滑过渡，没有 ReLU 的硬拐点，训练更稳。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">SwiGLU</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">GLU 家族的变体，带门控机制。LLaMA、Qwen、DeepSeek 等现代大模型的标配。</p>
+            </div>
+          </div>
+
+          <p><strong>GELU</strong> 的定义是：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{GELU}(x) = x \cdot \Phi(x), \quad \Phi(x) = \frac{1}{2}\left[1 + \text{erf}\!\left(\frac{x}{\sqrt{2}}\right)\right]$$
+          </div>
+          <p>其中 $\Phi(x)$ 是标准正态分布的累积分布函数。直觉上，GELU 可以理解为"以 $x$ 的概率保留这个值"——$x$ 越大，越可能被保留；$x$ 很负时几乎被置零。和 ReLU 的"硬截断"不同，GELU 在 0 附近是平滑的，这意味着梯度处处存在，不会出现 ReLU 的死区问题。</p>
+
+          <p>实际实现中常用 $\tanh$ 近似来加速计算：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{GELU}(x) \approx 0.5x\left[1 + \tanh\!\left(\sqrt{2/\pi}\left(x + 0.044715x^3\right)\right)\right]$$
+          </div>
+
+          <h3>把三个激活函数代进数字看</h3>
+          <p>公式再多不如看输出值。下表是 ReLU、GELU、SiLU 在几个典型输入上的实际取值（GELU 用精确的 erf 定义，SiLU 即 $x\cdot\text{sigmoid}(x)$）：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>输入 $x$</th><th>ReLU</th><th>GELU</th><th>SiLU / Swish</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>-3</td><td>0</td><td>-0.004</td><td>-0.142</td><td>深负区都接近抑制</td></tr>
+                <tr><td>-1</td><td>0</td><td>-0.159</td><td>-0.269</td><td><strong>GELU/SiLU 允许小幅负输出</strong></td></tr>
+                <tr><td>-0.5</td><td>0</td><td>-0.154</td><td>-0.189</td><td>ReLU 在此已完全归零</td></tr>
+                <tr><td>0</td><td>0</td><td>0</td><td>0</td><td>三者一致</td></tr>
+                <tr><td>0.5</td><td>0.500</td><td>0.346</td><td>0.311</td><td>正区略作收缩</td></tr>
+                <tr><td>1</td><td>1.000</td><td>0.841</td><td>0.731</td><td>差异仍明显</td></tr>
+                <tr><td>3</td><td>3.000</td><td>2.996</td><td>2.858</td><td>大正区三者趋同</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>两个关键性质从表里就能读出来。<strong>其一，GELU 和 SiLU 都是非单调的</strong>：它们在负半轴有一个最小值（GELU 约 -0.170，出现在 $x\approx-0.75$；SiLU 约 -0.278，出现在 $x\approx-1.28$），之后再回升到 0。这个"小凹陷"让轻微为负的特征仍能传递一点信号，而不是像 ReLU 那样被一刀切死。<strong>其二，三者在 $x$ 较大时几乎重合</strong>——所以激活函数的差别主要发生在 0 附近的那一小段，恰恰是训练初期大量激活值所在的区间。</p>
+
+          <h3>手把手读 GELU 论文原图</h3>
+          <p>上面这些数值是「算好」的结论，而第一手证据长什么样？2016 年 Hendrycks 与 Gimpel 在提出 GELU 的论文里，把 GELU、ReLU、ELU 三条激活函数的曲线画在同一张图里对比。这张图被无数后续论文反复引用，是理解「平滑激活」与「硬截断激活」差异的经典教材，值得逐块读一遍。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/03-transformer/ffn-activation/fig1.png" alt="论文原图：GELU、ReLU 与 ELU 三种激活函数的输入-输出对比曲线" loading="lazy" style="max-width:520px">
+            <figcaption>
+              <span class="pf-title">图：GELU（深色曲线）与 ReLU、ELU 的对比——平滑过渡 vs 硬截断</span>
+              <span class="pf-src">论文原图 · Hendrycks &amp; Gimpel, <em>Gaussian Error Linear Units (GELUs)</em>, 2016, Figure 1 · <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">arXiv:1606.08415</a></span>
+            </figcaption>
+          </figure>
+
+          <p>读这张图，先看坐标系：<strong>横轴是输入 $x$，纵轴是输出 $y$</strong>，一条曲线就是一个函数。然后抓三个对比点。第一个，<strong>看 $x=0$ 附近</strong>：ReLU 在这里有个明显的硬拐点——左侧的曲线紧贴横轴（输出恒为 0），右侧变成一条斜率 1 的斜线。这个拐点意味着它在 0 处「断」了一下，导数不连续。ELU（Exponential Linear Unit，指数线性单元）在负半轴不再是平贴 0，而是缓缓回落、在 $x$ 很负时渐近到 $-1$ 附近，它保留了少量负信号，但拐点处的过渡仍然不是处处光滑的。GELU 则整条曲线圆润平滑，在 0 附近以「概率加权」的方式软化了截断——负的小输入会得到一个很小的负输出，而不是被直接清零。第二个，<strong>看负半轴的末段</strong>：GELU 与 ELU 都有一条微微下探再回升的弧线（这就是前面说的「非单调小凹陷」），而 ReLU 始终是直线 0。第三个，<strong>看 $x$ 较大的正半轴</strong>：三条曲线几乎重合，都趋近于直线 $y=x$——这说明激活函数的分歧只发生在 0 附近那一小段，而那恰恰是训练初期大量激活值聚集的区间，所以看似「只差一点」的曲线形状，实际效果差异是实实在在的。</p>
+
+          <p>还有一个细节值得注意：<strong>GELU 在 0 点既不等于 ReLU 那样直接归零，也没有 ELU 那种硬转折，它是用一个概率去「筛选」信号</strong>。这种处处有梯度、又带一点概率意味的性质，让它在 Transformer 这样需要几十上百层稳定回传梯度的结构里，比 ReLU 更不容易出现「死神经元」——这也是 GPT 系列与 BERT 放弃 ReLU 改选 GELU 的直观理由。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            把 GELU 说成「ReLU 的平滑版」只说对了一半：两者最大的行为差异在<strong>负半轴</strong>——ReLU 把一切负输入一刀切为零（梯度也随之消失），而 GELU 允许小幅负输出并保留小梯度。另一个高频误解是「position-wise（逐位置）等于每个 token 有自己的参数」——恰恰相反，<strong>同一层所有 token 共用同一套 $W_1$、$W_2$，只是各算各的互不干扰</strong>。记住了这一条，读源码时看到 FFN 是一块普通线性层就不会再犯迷糊。
+          </div>
+
+          <details class="deep">
+            <summary>踩坑实录：换了激活函数，参数预算悄悄涨了 50%</summary>
+            <div class="deep-body">
+              <p>一次真实的踩坑过程：某团队想把一个标准 FFN（ReLU、$d_{ff}=4d$）升级成 SwiGLU，直接把激活函数换掉、其余不动，结果模型显存比预期大了一截，卡上装不下。原因其实写在公式里——标准 FFN 是 $2 \times d \times d_{ff}$，SwiGLU 因为多了一个门控矩阵 $W_{gate}$，变成 $3 \times d \times d_{ff}$，<strong>参数量比原来多出 50%</strong>。</p>
+              <p>更隐蔽的是第二种情形：有些人记得「SwiGLU 要用 8/3 倍率」，但只把 $d_{ff}$ 从 $4d$ 改到 $8d/3$，<strong>忘了它还要再向上对齐到 256 的倍数</strong>。以 $d=4096$ 为例，$\frac{8}{3}\times4096 \approx 10923$，直接取整后是 10923，而实际模型用的是 11008（$=43\times256$）。如果只是粗略取整、不按 256 对齐，参数量差异不大但 GEMM 效率会掉，张量并行时也可能分不匀。</p>
+              <p style="margin-bottom:0">排查口诀就一条：<strong>凡是动了激活函数，先重新算一遍参数量，再对一遍 $d_{ff}$ 的对齐倍数</strong>。用本页后面那段纯 Python 脚本（<code>block_params</code>）把新旧配置各算一次，数字对不上就说明预算记错了。</p>
+            </div>
+          </details>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  subgraph ReLU["ReLU FFN（原版 Transformer）"]
+    R1["x"] --> R2["W1 升维"]
+    R2 --> R3["ReLU"]
+    R3 --> R4["W2 降维"]
+    R4 --> R5["输出"]
+  end
+  subgraph GELU_FFN["GELU FFN（GPT-2 / BERT）"]
+    G1["x"] --> G2["W1 升维"]
+    G2 --> G3["GELU"]
+    G3 --> G4["W2 降维"]
+    G4 --> G5["输出"]
+  end
+  subgraph SwiGLU_FFN["SwiGLU FFN（LLaMA / Qwen / DeepSeek）"]
+    S1["x"] --> S2["W_gate 升维"]
+    S1 --> S3["W_up 升维"]
+    S2 --> S4["SiLU 门控相乘"]
+    S3 --> S4
+    S4 --> S5["W_down 降维"]
+    S5 --> S6["输出"]
+  end
+  style R3 fill:#faeeda,stroke:#ba7517
+  style G3 fill:#e6f1fb,stroke:#185fa5
+  style S4 fill:#eaf3de,stroke:#639922
+            </div>
+            <figcaption>三代 FFN 结构对比：从单路 ReLU/GELU 到双路门控 SwiGLU，矩阵数量从 2 个变成 3 个，结构和参数预算都要跟着变。</figcaption>
+          </figure>
+
+          <h2>SwiGLU：门控激活的现代标配</h2>
+          <p><strong>GLU（Gated Linear Unit）</strong> 的核心思想是引入一个"门控"分支：不是对所有特征统一施加同一个非线性，而是让网络自己学习"哪些特征该通过、哪些该抑制"。GLU 的通用形式是：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{GLU}(\mathbf{x}) = (\mathbf{x} W_1 + b_1) \otimes \sigma(\mathbf{x} W_{gate} + b_{gate})$$
+          </div>
+          <p>其中 $\otimes$ 是逐元素乘法，$\sigma$ 是某个激活函数。<strong>SwiGLU</strong> 就是把 $\sigma$ 换成 <strong>SiLU</strong>（也叫 Swish，$\text{SiLU}(x) = x \cdot \sigma_{sigmoid}(x)$），因此得名 Swi-GLU：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{SwiGLU}(\mathbf{x}) = (\mathbf{x} W_1 + b_1) \otimes \text{SiLU}(\mathbf{x} W_{gate} + b_{gate})$$
+          </div>
+
+          <p>结构上，SwiGLU FFN 有<strong>三个</strong>权重矩阵而非两个：$W_{gate}$ 和 $W_1$ 都把 $d$ 维升到 $d_{ff}$ 维，它们的输出逐元素相乘（门控），再由 $W_2$ 降回 $d$ 维。这意味着同等中间维度下，SwiGLU 的参数量是标准 FFN 的 1.5 倍。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">参数量换算</span>
+            标准 FFN：参数量 $= 2 \times d \times d_{ff}$。<br>
+            SwiGLU FFN：参数量 $= 3 \times d \times d_{ff}$（多一个 $W_{gate}$）。<br>
+            为了让 SwiGLU 和标准 FFN 参数量持平，通常把 $d_{ff}$ 从 $4d$ 缩小到约 $\frac{8d}{3} \approx 2.67d$。LLaMA 就是这么做的——用更小的中间维度，但靠门控机制获得更强的表达能力。
+          </div>
+
+          <p>为什么 SwiGLU 效果更好？门控机制让网络可以<strong>动态选择</strong>哪些维度参与计算——不同 token 可以激活不同的特征子集，这比统一施加一个 ReLU/GELU 灵活得多。GLU Variants 那篇论文用同等参数预算做了系统对比，门控变体在多项下游任务上优于普通 FFN。自 LLaMA 之后，Qwen、DeepSeek、Mistral 等几乎所有主流开源模型都采用了 SwiGLU。</p>
+
+          <h3>为什么 Llama 的 11008 不是整数倍</h3>
+          <p>细心的人会发现一个奇怪的数字：Llama-2-7B 的 $d_{ff}$ 是 <strong>11008</strong>，而 $\frac{8}{3}\times 4096 \approx 10923$。差的这 85 是怎么来的？</p>
+          <p>答案是<strong>对齐</strong>。$11008 = 43 \times 256$，是 256 的整数倍。GPU 上的矩阵乘法在维度对齐到 128 或 256 的倍数时，Tensor Core 的利用率最高；同时张量并行要把 $d_{ff}$ 均分到多张卡上，也要求它能被并行度整除。所以真实工程里的流程是：<strong>先按 $8d/3$ 算出理论值，再向上取整到 256 的倍数</strong>。这条不起眼的规则解释了几乎所有开源模型里那些"看起来很随机"的中间维度。相关的硬件背景见 <a href="../05-systems/gpu-architecture.html">GPU 架构</a>。</p>
+
+          <details class="deep">
+            <summary>展开：SwiGLU FFN 的 PyTorch 实现</summary>
+            <div class="deep-body">
+              <pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SwiGLU_FFN(nn.Module):
+    def __init__(self, d, d_ff=None, multiple_of=256):
+        super().__init__()
+        # 默认中间维度取 8d/3，让参数量与标准 4d FFN 持平
+        if d_ff is None:
+            d_ff = int(8 * d / 3)
+            # 再向上对齐到 multiple_of 的倍数，提升 GEMM 效率
+            d_ff = multiple_of * ((d_ff + multiple_of - 1) // multiple_of)
+        # 三个矩阵：gate、up、down
+        self.w_gate = nn.Linear(d, d_ff, bias=False)
+        self.w_up   = nn.Linear(d, d_ff, bias=False)
+        self.w_down = nn.Linear(d_ff, d, bias=False)
+
+    def forward(self, x):
+        # x: (batch, seq_len, d)
+        gate = self.w_gate(x)              # (batch, seq, d_ff)
+        up   = self.w_up(x)                # (batch, seq, d_ff)
+        # SiLU(gate) * up  —— 门控相乘
+        activated = F.silu(gate) * up      # (batch, seq, d_ff)
+        return self.w_down(activated)      # (batch, seq, d)</code></pre>
+              <p style="margin-bottom:0">现代实现通常把 <code>w_gate</code> 和 <code>w_up</code> 合并成一个 <code>(d, 2*d_ff)</code> 的大矩阵做一次 GEMM，再 split 成两路，减少一次 kernel 启动开销。另外注意三个 Linear 都设了 <code>bias=False</code>——现代大模型普遍去掉了 FFN 的偏置项，实测影响极小却能省下参数和一次加法。</p>
+            </div>
+          </details>
+
+          <details class="deep">
+            <summary>展开：动手核对参数量与 FFN 占比</summary>
+            <div class="deep-body">
+              <p>下面这段纯 Python 脚本不依赖任何框架，把上文那张对照表复算一遍。改改参数就能算你手上任何一个模型的配置：</p>
+              <pre><code class="language-python">def block_params(d, d_ff, gated=True, kv_heads=None, head_dim=None):
+    """返回 (注意力参数, FFN 参数, FFN 占比%)"""
+    if kv_heads is None:                      # 标准 MHA：四个 d×d 方阵
+        attn = 4 * d * d
+    else:                                     # GQA：K/V 投影变窄
+        d_kv = kv_heads * head_dim
+        attn = 2 * d * d + 2 * d * d_kv
+    ffn = (3 if gated else 2) * d * d_ff
+    return attn, ffn, ffn / (attn + ffn) * 100
+
+configs = {
+    "Transformer base": dict(d=512,  d_ff=2048,  gated=False),
+    "GPT-2 small":      dict(d=768,  d_ff=3072,  gated=False),
+    "Llama-2-7B":       dict(d=4096, d_ff=11008, gated=True),
+    "Llama-2-70B":      dict(d=8192, d_ff=28672, gated=True,
+                             kv_heads=8, head_dim=128),
+}
+for name, cfg in configs.items():
+    a, f, r = block_params(**cfg)
+    print(f"{name:18s} attn={a/1e6:7.1f}M  ffn={f/1e6:7.1f}M  FFN占比={r:.1f}%")</code></pre>
+              <p style="margin-bottom:0">跑一遍你会发现前几行都稳定在 66.7% 上下，而带 GQA 的 70B 跳到 82% 左右。<strong>这个脚本最实用的地方是拿去读别人的 config.json</strong>：把 <code>hidden_size</code>、<code>intermediate_size</code>、<code>num_key_value_heads</code> 填进去，立刻知道这个模型的参数预算花在哪。</p>
+            </div>
+          </details>
+
+          <h2>激活函数的族谱与演进线</h2>
+          <p>激活函数看着零散，其实分成界限清晰的三族。理清族谱后，遇到新名字（GEGLU、ReGLU、Squared ReLU 之类）就能立刻归位。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+mindmap
+  root((激活函数))
+    硬截断族
+      ReLU
+        死神经元问题
+        计算最快
+      LeakyReLU
+        负半轴给小斜率
+      Squared ReLU
+        平方放大正区
+    平滑族
+      GELU
+        用正态CDF加权
+        BERT 与 GPT 系列
+      SiLU 又名 Swish
+        x 乘 sigmoid
+        非单调 有负凹陷
+    门控族 GLU
+      GLU
+        用 sigmoid 当门
+      GEGLU
+        用 GELU 当门
+      SwiGLU
+        用 SiLU 当门
+        现代大模型标配
+      特点
+        多一个权重矩阵
+        中间维度要缩到 8d/3
+            </div>
+            <figcaption>激活函数三族：硬截断（快但有死区）、平滑（处处可导）、门控（多一路参数换动态选择能力）。SwiGLU 属于门控族。</figcaption>
+          </figure>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+timeline
+  title FFN 与激活函数的演进
+  2017 : 原版 Transformer 用 ReLU 与 4 倍中间维度
+  2018 : BERT 与 GPT 采用 GELU 平滑激活成为主流
+  2020 : GLU Variants 论文系统对比门控变体 提出 SwiGLU
+  2023 : LLaMA 落地 SwiGLU 并把倍率降到 8/3 参数量持平
+  2024 : MoE 把单个 FFN 拆成多专家 稀疏激活成为扩容主路径
+            </div>
+            <figcaption>七年演进的主线只有两条：激活从"固定规则"走向"学习型门控"，FFN 从"单个稠密块"走向"多专家稀疏路由"。</figcaption>
+          </figure>
+
+          <h2>FFN 与 MoE 的天然亲缘</h2>
+          <p>FFN 是 Transformer 里参数最密集的部分，也是<strong>稀疏化</strong>最自然的切入点。MoE（混合专家）的核心想法就是：把一个大 FFN 拆成多个小 FFN（专家），每个 token 只激活其中 Top-K 个。这样总参数量可以做到极大，但单次计算量只和激活的专家数相关。</p>
+          <p>这解释了为什么 MoE 替换的总是 FFN 而不是注意力——注意力层的参数相对小（QKV 投影 + 输出投影），稀疏化收益有限；而 FFN 占了 2/3 参数量，是投入产出比最高的替换点。另一个原因是<strong>路由的语义合理性</strong>：FFN 是逐位置的独立计算，天然可以按 token 分派给不同专家；而注意力要跨位置交互，硬拆成多组会破坏信息流。详见 <a href="../04-modern-arch/moe.html">MoE 混合专家</a>。</p>
+
+          <h3>FFN 还是模型的"知识仓库"</h3>
+          <p>还有一个值得知道的视角：有研究把 FFN 类比成一个<strong>键值记忆（key-value memory）</strong>——$W_1$ 的每一行是一个"键"，负责检测输入里是否出现某种模式；$W_2$ 的对应列是"值"，一旦该模式被检测到就往残差流里写入相应内容。中间维度 $d_{ff}$ 就相当于"记忆槽位的数量"。</p>
+          <p>这个视角能解释不少现象：为什么模型的事实性知识主要存在 FFN 里（模型编辑类工作大多在改 FFN 权重）、为什么把 $d_{ff}$ 调大比把层数加深更能提升知识容量、以及为什么 MoE 扩容如此有效——它本质上就是在扩充记忆槽位的总数，同时保持每次只查其中一小部分。</p>
+
+          <h2>激活函数选择的实践总结</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>激活函数</th><th>公式核心</th><th>FFN 参数量</th><th>代表模型</th><th>特点</th></tr></thead>
+              <tbody>
+                <tr><td><strong>ReLU</strong></td><td>$\max(0, x)$</td><td>$2 \times d \times d_{ff}$</td><td>原版 Transformer</td><td>简单，有死区</td></tr>
+                <tr><td><strong>GELU</strong></td><td>$x \cdot \Phi(x)$</td><td>$2 \times d \times d_{ff}$</td><td>BERT、GPT-2/3</td><td>平滑，训练稳定</td></tr>
+                <tr><td><strong>SwiGLU</strong></td><td>$\text{SiLU}(xW_{gate}) \otimes xW_1$</td><td>$3 \times d \times d_{ff}$</td><td>LLaMA、Qwen、DeepSeek</td><td>门控，同等参数下效果最优</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>一个趋势性的观察：激活函数的演进方向是<strong>从"固定规则"走向"学习型门控"</strong>。ReLU 和 GELU 对所有输入施加同一个变换，而 SwiGLU 让网络自己决定每个维度的通过率。这种"让模型自己学"的思路，和注意力机制"让模型自己学该看哪里"一脉相承。</p>
+
+          <h3>实操中最容易踩的四个坑</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>坑</th><th>现象</th><th>正确做法</th></tr></thead>
+              <tbody>
+                <tr><td>换 SwiGLU 忘了调 $d_{ff}$</td><td>参数量比预期多 50%，显存爆掉</td><td>把倍率从 4 改成 8/3，再对齐到 256 的倍数</td></tr>
+                <tr><td>算参数量时漏掉 $W_{gate}$</td><td>估算值与实际权重文件对不上</td><td>门控 FFN 是三个矩阵，系数用 3 不是 2</td></tr>
+                <tr><td>混淆 SiLU / Swish / SwiGLU</td><td>看论文时对不上代码</td><td>SiLU 与 Swish 是同一个函数；SwiGLU 是"用 SiLU 做门"的整个 FFN 结构</td></tr>
+                <tr><td>GELU 精确版与 tanh 近似版混用</td><td>复现别人权重时输出有微小偏差</td><td>确认对方用的是 <code>erf</code> 版还是 <code>tanh</code> 近似版，保持一致</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">选型建议</span>
+            从零训练新模型，<strong>直接上 SwiGLU + 8/3 倍率 + 无 bias</strong>，这是当前被验证最充分的组合，没有理由再从 ReLU 起步。要复现或微调已有模型，则必须严格照抄原配置——激活函数不一致会让权重完全失效，而且这种错误在 loss 曲线上表现为"能训但训不好"，特别难排查。
+          </div>
+
+          <h2>梯度视角：激活函数如何影响反向传播</h2>
+          <p>激活函数不仅在决定前向输出，更在决定<strong>梯度能不能顺利流回浅层</strong>。深层网络训练困难，很大一部分是激活函数在反向路径上「截断」或「放大」造成的。上一节看了输出值，这一节看导数——三个激活函数在几个典型输入上的导数如下（GELU 按精确的 erf 定义求导，SiLU 按 $x \cdot \sigma(x)$ 求导）：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>输入 $x$</th><th>ReLU 导数</th><th>GELU 导数</th><th>SiLU 导数</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>-2</td><td>0</td><td>-0.085</td><td>-0.091</td><td>深负区：ReLU 已把梯度完全截断</td></tr>
+                <tr><td>-1</td><td>0</td><td>-0.083</td><td>0.072</td><td>负区：平滑族仍保留小幅梯度</td></tr>
+                <tr><td>0</td><td>0 或 1（不连续）</td><td>0.5</td><td>0.5</td><td>原点：平滑族连续过渡</td></tr>
+                <tr><td>1</td><td>1</td><td>1.083</td><td>0.928</td><td>正区：三者都接近 1</td></tr>
+                <tr><td>2</td><td>1</td><td>1.085</td><td>1.091</td><td>大正区：导数略超 1</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>读这张表，能看到三个关键现象。<strong>第一，ReLU 的负半轴导数恒为 0</strong>——一旦输入落进负区，该神经元的梯度就是 0，权重再也不更新。如果初始化不好、大量神经元长期落在负区，模型会出现大面积的「死神经元」，训练进度肉眼可见变慢。GELU 和 SiLU 在负区仍保留小梯度，甚至出现负梯度（相当于把梯度「往回推一点」），给了神经元重新翻身的可能。<strong>第二，ReLU 在原点处导数不连续</strong>（左 0 右 1），训练中 0 附近震荡时数值上更毛糙；平滑族的导数处处连续。<strong>第三，三者在大正区的导数都接近 1</strong>——所以激活函数的选择，实际影响的主要是「0 附近那一小段」的梯度行为，而训练初期的激活值恰恰大量聚集在 0 附近。</p>
+          <p>这也是现代模型宁可多花一点计算（GELU、SiLU 都涉及超越函数）也要换成平滑激活的原因：<strong>用一个处处有梯度的函数，换取更稳定的深层训练</strong>。几十上百层网络里，每层多保留一点梯度，传导到第一层时差异是指数级的。另外注意 GELU 的 tanh 近似在 $-3$ 到 $3$ 区间与原版误差在 $10^{-3}$ 量级，复现他人权重时两种版本必须保持一致，否则会引入难以察觉的微小差异。</p>
+          <p>再补充一个容易被忽略的细节：导数只是局部性质，前向输出的「数值范围」同样重要。ReLU 和 GELU 的正输出都随输入线性增长，而 SiLU 在大正输入时输出略小于 $x$（因为 $\sigma(x) < 1$），相当于一层隐式的温和缩放，会让激活值的总体方差略小一点。具体到某个架构该选谁，单靠理论说不死，但从 ReLU 到 GELU 到 SwiGLU 的演进路线已经用实验投票了——平滑、有门控、能自适应，是当前被验证最充分的组合。</p>
+
+          <h2>逐 token 的特征选择：门控为什么更灵活</h2>
+          <p>SwiGLU 相对 ReLU 的另一个优势，只有把「多个 token」放一起对比才能看清。设中间维度 $d_{ff} = 4$，两个 token 经过升维后的特征向量分别是：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>升维后的特征（up 分支）</th><th>维度 1</th><th>维度 2</th><th>维度 3</th><th>维度 4</th></tr></thead>
+              <tbody>
+                <tr><td>token A（示意：「银行」）</td><td>0.8</td><td>-1.5</td><td>2.0</td><td>0.3</td></tr>
+                <tr><td>token B（示意：「苹果」）</td><td>1.2</td><td>0.9</td><td>-0.6</td><td>1.8</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>如果激活是 ReLU，两个 token 面对的是同一个「阈值 0」：维度 2 上，token A 的 -1.5 被清零，token B 的 0.9 被保留。<strong>一个维度要么对谁都能开、要么对谁都被关，规则全局统一</strong>——模型想让「谁需要这个维度」就得靠别处的权重去绕，灵活性有限。</p>
+          <p>而 SwiGLU 多了一个 gate 分支，每个 token 的 gate 输出各不相同。假设两个 token 的 gate（已经过 SiLU）分别如下：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>gate 输出（SiLU 之后）</th><th>维度 1</th><th>维度 2</th><th>维度 3</th><th>维度 4</th></tr></thead>
+              <tbody>
+                <tr><td>token A 的 gate</td><td>0.6</td><td>0.1</td><td>0.9</td><td>0.2</td></tr>
+                <tr><td>token B 的 gate</td><td>0.3</td><td>0.8</td><td>0.4</td><td>0.7</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>于是 token A 的实际输出近似为 $[0.48, -0.15, 1.80, 0.06]$（up 特征逐元素乘 gate），token B 为 $[0.36, 0.72, -0.24, 1.26]$。注意维度 2：token A 的 gate 只有 0.1，几乎把这个维度的信号关掉；token B 的 gate 是 0.8，放行大半。<strong>同一个维度、两个 token、不同的通过率——门控让「哪个 token 走哪个维度」成为逐 token 的动态决策</strong>，而不是全局统一的阈值。这就是「让模型自己决定用什么特征」的微观含义，也是门控 FFN 在同等参数预算下效果更好的机制层面解释。</p>
+          <p>代价也很直白：多一个 $W_{gate}$ 矩阵，参数多 50%，所以倍率要从 4 降到 8/3 才能打平；同时多一次逐元素乘法。用可控的成本换来自适应能力，这正是 SwiGLU 能成为现代大模型标配的账。</p>
+
+          <h2>中间维度不是越大越好：容量与成本的账</h2>
+          <p>既然 FFN 是模型的「知识仓库」，那是不是 $d_{ff}$ 越大越好？不是。容量越大，代价也越大，关键是看值不值。</p>
+          <p>先算成本账。以 $d = 4096$ 为例，SwiGLU 的 FFN 参数是 $3 \times d \times d_{ff}$。$d_{ff}$ 取 $11008$（约 8/3 倍）时约 1.35 亿；取 $4d = 16384$ 时约 2.01 亿，<strong>中间维度放大 50%，FFN 参数直接多出 50%</strong>。参数变多的代价是全方位的：训练算力上升、激活值显存上升、推理带宽上升，而收益只在「能装下的知识」上。如果数据量不变，多出来的容量往往只能靠过度拟合去填，loss 不降反升。</p>
+          <p>再看质量账。已有的实验结论大致是：在参数量打平的条件下，SwiGLU 的 8/3 倍能追平甚至超过标准 FFN 的 4 倍——也就是说，<strong>门控带来的「动态选择」能力，大约值一个倍率差</strong>。再往上加 $d_{ff}$，收益呈边际递减。这也是为什么主流开源模型的 FFN 倍率都集中在 2.6 到 3.5 之间，而不是越拉越大。</p>
+          <p>那想要更多知识容量怎么办？答案是<strong>别在单个 FFN 里加维度，而是把 FFN 拆成多个专家（MoE）</strong>：总参数可以做得极大，但每个 token 只激活其中少数专家，单次计算量几乎不变。换句话说，<strong>「加宽度」买的是容量，「加专家」买的是容量但不买算力</strong>——这就是 MoE 能在同样推理预算下显著提升知识量的原因，详见 <a href="../04-modern-arch/moe.html">MoE 混合专家</a>。选型时记住这条主线：先确定预算，再决定把钱花在深度、宽度还是专家数上。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：FFN 是对每个 token 独立做的"升维-激活-降维"变换，负责深度特征加工，不涉及 token 间交互。打乱序列顺序不影响每个 token 自己的 FFN 输出。</li>
+            <li><strong>参数量占比</strong>：标准 Transformer 中 FFN 占每层参数的约 2/3；用了 GQA 的模型（如 Llama-2-70B）可升到 80% 以上。</li>
+            <li><strong>激活函数演进</strong>：ReLU → GELU（平滑、训练稳）→ SwiGLU（门控、同等参数下效果最优）。现代大模型几乎全用 SwiGLU。</li>
+            <li><strong>SwiGLU 参数量</strong>：三个矩阵（gate + up + down），为持平标准 FFN 参数量，中间维度取 $\frac{8d}{3}$ 而非 $4d$，再向上对齐到 256 的倍数（Llama-2-7B 因此得到 11008）。</li>
+            <li><strong>非单调性</strong>：GELU 最小值约 -0.170，SiLU 约 -0.278，都允许小幅负输出，避免 ReLU 的死区。</li>
+            <li><strong>与 MoE 的关系</strong>：FFN 是逐位置计算且参数占比最大，因此是稀疏化的天然切入点，MoE 拆的永远是 FFN。</li>
+            <li><strong>知识仓库视角</strong>：$W_1$ 的行像"键"、$W_2$ 的列像"值"，$d_{ff}$ 相当于记忆槽位数量——这解释了事实性知识为何主要存于 FFN。</li>
+            <li><strong>常见坑</strong>：换 SwiGLU 忘了调 $d_{ff}$ 导致参数量膨胀 1.5 倍；混淆 GLU 家族的 SiLU/Swish 命名；GELU 的 erf 版与 tanh 近似版混用。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Attention Is All You Need — Transformer 原始论文，FFN 使用 ReLU 且中间维度取 4 倍 · <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></li>
+            <li>Gaussian Error Linear Units (GELUs) — GELU 原始论文，论证平滑激活优于 ReLU · <a href="https://arxiv.org/abs/1606.08415" target="_blank" rel="noopener">arXiv:1606.08415</a></li>
+            <li>GLU Variants Improve Transformer — 提出 SwiGLU 等 GLU 变体，在同等参数预算下系统对比并胜出 · <a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noopener">arXiv:2002.05202</a></li>
+            <li>Searching for Activation Functions — Swish/SiLU 的提出，用搜索方法找到 $x\cdot\text{sigmoid}(x)$ 这一形式 · <a href="https://arxiv.org/abs/1710.05941" target="_blank" rel="noopener">arXiv:1710.05941</a></li>
+            <li>Language Models as Knowledge Bases? 与 Transformer Feed-Forward Layers Are Key-Value Memories — 支撑"FFN 是知识仓库"这一视角的代表性工作，建议按标题搜索获取原文</li>
+            <li>Llama 2: Open Foundation and Fine-Tuned Chat Models — 本页参数对照表所用的公开配置来源 · <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">arXiv:2307.09288</a></li>
+            <li>Gaussian Error Linear Units 论文 ar5iv 全文 — 本页 GELU 原图（Figure 1）的出处页面，可直接对照曲线 · <a href="https://ar5iv.labs.arxiv.org/html/1606.08415" target="_blank" rel="noopener">ar5iv 全文</a></li>
+            <li>Hugging Face Llama-2-7B 模型卡 — 用官方 config 核对 <code>intermediate_size</code> 与激活配置的参考入口 · <a href="https://huggingface.co/meta-llama/Llama-2-7b-hf" target="_blank" rel="noopener">huggingface.co</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            FFN 和注意力各自加工信息，但让它们能叠上百层而不崩的，是贯穿每一层的<a href="residual.html">残差连接</a>。它和<a href="normalization.html">归一化技术</a>一起，构成了深层 Transformer 的稳定地基。想看这些零件如何组装成完整模型，见 <a href="architecture.html">Transformer 完整架构</a>；想看 FFN 如何演化成稀疏专家，见 <a href="../04-modern-arch/moe.html">MoE 混合专家</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+  <script>
+  (function(){
+    if (typeof Chart === 'undefined') return;
+    var ctx = document.getElementById('chart-ffn-share');
+    if (!ctx) return;
+    var C = window.CB_COLORS || {};
+    var ch = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: ['Llama-2-7B', 'Llama-2-13B', 'Llama-2-70B'],
+        datasets: [
+          { label: '注意力参数 / 百万', data: [67.1, 104.9, 151.0],
+            backgroundColor: C.blueSoft, borderColor: C.blue, borderWidth: 1.5 },
+          { label: 'FFN 参数 / 百万', data: [135.3, 212.3, 704.6],
+            backgroundColor: C.greenSoft, borderColor: C.green, borderWidth: 1.5 }
+        ]
+      },
+      options: { responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: true } },
+        scales: { y: { beginAtZero: true, title: { display: true, text: '单层参数量（百万）' } } } }
+    });
+    if (window.CB_CHARTS) window.CB_CHARTS.push(ch);
+  })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>量化、剪枝与模型压缩 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="09-efficiency" data-topic="quantization">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>量化、剪枝与模型压缩</h1>
+            <p class="lead">7B 模型 FP16 权重约 14GB，INT4 量化后不到 4GB——同样的模型、同样的参数，显存直接砍掉四分之三。量化是 LLM 部署最常用的压缩手段，但「掉点」和「硬件支持」是两道绕不开的坎。本节讲清楚 PTQ/QAT 的分工、GPTQ/AWQ 的差异、1.58bit 的极限在哪里，以及为什么剪枝这条路在 LLM 时代基本没跑通。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+                       <p>量化的本质是把高精度浮点数（FP16/BF16）映射到低精度整数（INT8/INT4），用更少的 bit 存同样的信息。就像把 1080p 图片压成 720p——大部分细节还在，文件小了一大截，但极端情况下会糊。<strong>训练后量化（PTQ）</strong>不改训练流程、一条命令就能跑，是部署首选；<strong>量化感知训练（QAT）</strong>在训练时模拟量化误差，精度更好但要重新训练。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart TB
+  subgraph FP["FP16 原始模型<br/>7B ≈ 14GB"]
+    F1["权重: float16<br/>每参数 2 字节"]
+  end
+  subgraph PTQ["训练后量化 PTQ"]
+    P1["校准数据集<br/>~128-512 条样本"] --> P2["统计激活分布<br/>确定缩放因子"]
+    P2 --> P3["权重 → INT4/INT8"]
+  end
+  subgraph QAT["量化感知训练 QAT"]
+    Q1["插入伪量化节点"] --> Q2["继续训练微调"] --> Q3["权重 → INT4/INT8"]
+  end
+  FP --> PTQ
+  FP --> QAT
+  PTQ --> OUT["量化模型<br/>7B INT4 ≈ 3.5GB"]
+  QAT --> OUT
+  style FP fill:#e8f0fe,stroke:#185fa5
+  style OUT fill:#e8f5e9,stroke:#2e7d32
+  style PTQ fill:#fff3e0,stroke:#e65100
+  style QAT fill:#fce4ec,stroke:#c62828
+              </div>
+              <figcaption>两条量化路径：PTQ 无需训练、开箱即用；QAT 精度更高但需重新训练</figcaption>
+            </figure>
+          </div>
+
+          <h2>量化基础：从 FP16 到 INT4 到底发生了什么</h2>
+          <p>一个 FP16 的权重值（比如 <code>0.3147</code>）要变成 INT4，核心就三步：找范围、算缩放、做映射。</p>
+          <div class="figure" style="text-align:center">
+            $$x_{\text{quant}} = \text{round}\!\left(\frac{x_{\text{fp}}}{s}\right), \qquad s = \frac{\max(|x_{\text{fp}}|)}{2^{N-1}-1}$$
+          </div>
+          <p>其中 $s$ 是缩放因子（scale），$N$ 是目标比特数（如 INT4 时 $N=4$）。反量化时乘回 $s$ 即可。INT4 只有 16 个离散值（$-8$ 到 $+7$），所以量化误差不可避免——关键是怎么让误差落在「不影响输出质量」的区间。</p>
+
+          <p>用一组真实数字把这三步走一遍。假设一层里只有 4 个 FP16 权重：$[0.1,\ -0.7,\ 1.2,\ -0.3]$，要做对称 INT4 量化（$N=4$，那么 $q_{\max} = 2^{3}-1 = 7$）。<strong>第一步找范围</strong>：绝对值的最大值是 $1.2$；<strong>第二步算缩放</strong>：$s = 1.2 / 7 \approx 0.1714$；<strong>第三步做映射</strong>：每个权重除以 $s$ 再四舍五入——$0.1/0.1714 \approx 0.58 \to 1$，$-0.7/0.1714 \approx -4.08 \to -4$，$1.2/0.1714 = 7 \to 7$，$-0.3/0.1714 \approx -1.75 \to -2$。反量化回去：$1 \times 0.1714 = 0.171$、$-4 \times 0.1714 = -0.686$、$7 \times 0.1714 = 1.2$、$-2 \times 0.1714 = -0.343$。把原始值和还原值对比：$0.1 \to 0.171$、$-0.7 \to -0.686$、$1.2 \to 1.2$、$-0.3 \to -0.343$。注意两点：第一，<strong>恰好撞在格点上的值（1.2）零误差</strong>；第二，越靠近 0 的小权重，相对误差反而越大——$0.1$ 的误差是 $0.071$，相对误差高达 71%，但因为它绝对值小，对输出的绝对影响也小。这个「大权重误差小、小权重误差大但影响小」的不对称性，正是后面 INT8 章节里量化能保住精度的第一个原因。</p>
+
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">对称量化</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">零点固定为 0，正负范围对称。实现简单，硬件友好，但如果权重分布偏移（大部分为正或大部分为负），会浪费量化范围。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">非对称量化</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">引入零点（zero point），可以贴合偏移的分布，精度更好。但运算时要额外处理零点偏移，略微增加计算开销。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">分组量化</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">不是给整层一个 scale，而是按 group（如 128 个权重一组）各算各的。粒度越细、精度越高，但存储 scale 的元数据也越多。</p>
+            </div>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            量化就像用尺子量身高：FP16 是毫米刻度，INT4 是厘米刻度。大部分时候厘米够用，但如果你恰好站在 170.5cm 的位置，四舍五入就丢了 0.5cm——量化误差就是这么来的。
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            很多新手把「量化」理解成「把模型文件变小」，然后想当然地以为<strong>推理速度也会按同样的比例变快</strong>。实际上量化的主要收益分两笔账：<strong>省显存</strong>（权重从 2 字节/参数降到 0.5 字节/参数，能塞进更小的卡、跑更长的上下文）和<strong>省带宽</strong>（Decode 阶段每生成一个 token 都要把所有权重读一遍，权重小了每步搬得就快）。如果模型本来就没超出显存、而且你的场景是 Prefill 占主导的计算密集任务，量化带来的速度提升可能非常有限——所以「量化后变快」不是自动成立的，要看你卡在哪：卡在显存，量化立竿见影；卡在算力，量化帮助不大。
+          </div>
+
+          <h2>PTQ vs QAT：两条路的分工</h2>
+          <p>量化方法按「是否需要训练」分成两大阵营，部署时选哪条取决于你有没有训练资源和时间。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>训练后量化 PTQ</th><th>量化感知训练 QAT</th></tr></thead>
+              <tbody>
+                <tr><td>是否需要训练</td><td>不需要，只需少量校准数据</td><td>需要，完整训练或微调流程</td></tr>
+                <tr><td>校准数据量</td><td>128-512 条代表性样本</td><td>原始训练数据或高质量子集</td></tr>
+                <tr><td>精度损失</td><td>INT8 几乎无损；INT4 有 0.5-2 点掉点</td><td>INT4 可做到接近无损</td></tr>
+                <tr><td>耗时</td><td>分钟级</td><td>小时到天级</td></tr>
+                <tr><td>适用场景</td><td>快速部署、通用模型</td><td>精度敏感场景、极端比特率</td></tr>
+                <tr><td>代表方法</td><td>GPTQ、AWQ、SmoothQuant</td><td>LLM-QAT、BitNet 训练原生量化</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>实践中 90% 的部署场景用 PTQ 就够了。QAT 主要用在两个地方：一是要把模型压到 INT4 以下（如 3bit、2bit）且 PTQ 掉点太严重时；二是像 BitNet 那样从头用低精度训练的「原生量化」模型，权重在训练时就是三值（-1, 0, 1），不存在「量化后掉点」的问题。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  A["校准数据集<br/>128-512 条样本"] --> B["前向推理<br/>收集激活分布"]
+  B --> C["确定缩放因子 s<br/>per-channel / per-group"]
+  C --> D["权重映射到 INT4<br/>round(x/s)"]
+  D --> E["构造量化模型"]
+  E --> F["反量化验证<br/>在评测集上查精度回退"]
+  F -->|"掉点可接受"| G["部署"]
+  F -->|"掉点过大"| H["换 AWQ/GPTQ<br/>或上 QAT"]
+            </div>
+            <figcaption>PTQ 校准流程：用少量样本确定缩放因子，把权重压到 INT4，再验证精度回退是否在可接受范围</figcaption>
+          </figure>
+
+          <h2>GPTQ 与 AWQ：INT4 量化的两大主力</h2>
+          <p>GPTQ 和 AWQ 是 2024-2026 年 LLM 部署中最常用的两种 PTQ 方法，它们解决的问题一样（INT4 权重量化），但思路完全不同。</p>
+
+          <h3>GPTQ：基于二阶信息的逐层量化</h3>
+          <p>GPTQ 的核心思想来自 OBQ（Optimal Brain Quantization）：量化不是一个一个权重独立的，改了一个权重会影响其他权重的最优值。它利用 Hessian 矩阵的逆来捕捉权重之间的相互作用，逐列量化并在量化每一列后更新剩余权重来补偿误差。</p>
+          <div class="figure" style="text-align:center">
+            $$w_{\text{comp}} = w_{\text{orig}} - \frac{w_q - w_{\text{orig}}}{[H^{-1}]_{ii}} \cdot [H^{-1}]_{:,i}$$
+          </div>
+          <p>其中 $H$ 是 Hessian 矩阵（用校准数据计算），$w_q$ 是量化后的权重，$w_{\text{comp}}$ 是补偿后的剩余权重。GPTQ 量化一层通常只需几秒到几十秒，效果接近原始模型。</p>
+
+          <p>光看公式容易晕，下面这张 GPTQ 论文里的原图把整个量化流程画了出来。它是理解「为什么 GPTQ 比朴素量化准」的最直接证据——注意看图中那些<strong>从已量化列伸向未量化列的箭头</strong>：误差不是被忽略，而是被主动「推」给了后面的权重。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/09-efficiency/quantization/fig1.png" alt="论文原图：GPTQ 逐层量化流程——先一次性量化当前列，再利用 Hessian 信息把量化误差补偿到剩余权重上" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：GPTQ 的量化流程——逐列量化 + 基于 Hessian 的二阶误差补偿，把量化误差分摊到尚未量化的权重上</span>
+              <span class="pf-src">论文原图 · Frantar et al., <em>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</em>, 2022, Figure 2 · <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">arXiv:2210.17323</a></span>
+            </figcaption>
+          </figure>
+
+          <p>逐块读这张图，抓住三个要素。第一，<strong>图的输入是一整层权重矩阵</strong>（图中横向排列的大方块），量化是「逐列」（column-wise）进行的，而不是把整个矩阵当成一个整体统一缩放——逐列意味着每一列都有自己独立的 scale，能把量化范围留给「这一列自己的关键值」，这是分组量化思想的极致形态（每列一组）。第二，<strong>箭头表示误差补偿的方向</strong>：量化完第 $i$ 列后，算法不是直接进入第 $i+1$ 列，而是先计算「这一列量化造成了多大误差」，再利用 Hessian 矩阵的逆把这个误差「写回」到尚未量化的列上（图中从已处理列指向未处理列的箭头）。直观理解：就像往一堆秤好的米里少放了 2 克，接下来每袋米都补回 0.5 克，把总误差摊平。第三，<strong>图中括号标注的顺序</strong>体现了「先算好再替换」的两步式——先决定所有列的量化结果，再用补偿更新剩余权重，从而避免「边量边改」带来的漂移。</p>
+          <p>这张图还揭示了 GPTQ 与朴素量化的本质差异：朴素量化是「每个权重独立地四舍五入」，误差是散落的、不可控的；GPTQ 把量化当成一个<strong>带补偿的全局优化问题</strong>——它不在乎单个权重错多少，只在乎整层输出的误差能否被后续权重吸收。代价是它需要算 Hessian 矩阵的逆（这正是它比 AWQ 慢的原因，也是它需要校准数据的根本原因），收益是 INT4 下能把精度损失压到接近无损。读图时要记住一点：图中画的「误差传播」方向是<strong>从已量化列流向未量化列</strong>，这对应实现里「从前往后逐列处理、每次补偿剩余部分」的实际流程，理解了这条因果链，就理解了 GPTQ 的全部设计。</p>
+
+          <h3>AWQ：保护重要权重</h3>
+          <p>AWQ（Activation-aware Weight Quantization）的观察更直觉：不是所有权重都同等重要，那些被大激活值乘到的权重，量化误差会被放大。AWQ 通过校准数据找到这些「显著权重」（salient channels），对它们做等价缩放保护，而不需要做反向传播。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart LR
+  subgraph AWQ["AWQ 量化流程"]
+    A["校准数据<br/>前向推理"] --> B["识别显著通道<br/>激活值大的位置"]
+    B --> C["等价缩放<br/>保护重要权重"]
+    C --> D["INT4 量化<br/>不重要的正常量化"]
+  end
+  subgraph GPTQ["GPTQ 量化流程"]
+    E["校准数据<br/>算 Hessian"] --> F["逐列量化<br/>二阶补偿"]
+    F --> G["更新剩余权重<br/>抵消误差"]
+  end
+  style AWQ fill:#e8f5e9,stroke:#2e7d32
+  style GPTQ fill:#e8f0fe,stroke:#185fa5
+            </div>
+            <figcaption>AWQ 靠激活感知保护重要权重，GPTQ 靠二阶补偿逐列纠错</figcaption>
+          </figure>
+
+          <h2>量化与压缩方法全景</h2>
+          <p>把本节涉及的压缩手段放进一张图里，能看清它们的位置与关系——量化是主线，剪枝和蒸馏是旁支，BitNet 是另一条极端的训练范式路线：</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+mindmap
+  root((模型压缩))
+    量化 Quantization
+      PTQ
+      QAT
+      GPTQ
+      AWQ
+      KV 量化
+    极限压缩
+      BitNet 1.58bit
+    剪枝 Pruning
+      结构化剪枝
+      非结构化剪枝
+    蒸馏 Distillation
+      响应蒸馏
+      思维链蒸馏
+            </div>
+            <figcaption>模型压缩方法全景：量化是 LLM 部署主线，剪枝与蒸馏为旁支，BitNet 是训练范式层面的极端路线</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>GPTQ</th><th>AWQ</th></tr></thead>
+              <tbody>
+                <tr><td>核心思想</td><td>二阶信息逐列补偿</td><td>激活感知的等价缩放</td></tr>
+                <tr><td>是否需要反向传播</td><td>否</td><td>否</td></tr>
+                <tr><td>量化速度</td><td>较慢（需算 Hessian 逆）</td><td>较快</td></tr>
+                <tr><td>INT4 精度</td><td>优秀</td><td>优秀，通常略优于 GPTQ</td></tr>
+                <tr><td>INT3 表现</td><td>掉点明显</td><td>比 GPTQ 更稳健</td></tr>
+                <tr><td>社区支持</td><td>vLLM、AutoGPTQ</td><td>vLLM、llama.cpp、AutoAWQ</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            量化不是免费的午餐。INT4 量化在简单任务（MMLU、常识问答）上几乎无损，但在复杂推理（数学、代码、多步推理）上掉点可能达 2-5 个百分点。推理模型（如 R1 类）对量化更敏感，因为长思维链中的误差会累积放大。上线前务必在你的实际评测集上验证，不要只看通用 benchmark。
+          </div>
+
+          <h2>KV Cache 量化：被忽视的显存大户</h2>
+          <p>量化权重只是第一步。在长上下文推理中，KV Cache 的显存占用可能超过权重本身——7B 模型在 32K 上下文下，KV Cache 可达 4-8GB。KV Cache 量化是把 KV Cache 从 FP16 压到 INT8 或 INT4，直接减少推理时的显存峰值。</p>
+          <div class="figure" style="text-align:center">
+            $$\text{KV Cache 显存} = 2 \times n_{\text{layer}} \times n_{\text{kv-head}} \times d_{\text{head}} \times \text{seq\_len} \times \text{bytes\_per\_element}$$
+          </div>
+          <p>FP16 时 <code>bytes_per_element = 2</code>，INT8 时为 1，INT4 时为 0.5。KV Cache 量化通常比权重量化更安全，因为 Key 和 Value 是中间激活而非最终输出，量化误差的影响链更短。但要注意：Key 的量化比 Value 更敏感，因为注意力分数直接依赖 Key。</p>
+
+          <details class="deep">
+            <summary>展开：vLLM 中开启量化的实际配置</summary>
+            <div class="deep-body">
+              <pre><code class="language-bash"># INT4 权重量化（AWQ 格式）
+vllm serve --model Qwen/Qwen2.5-7B-Instruct-AWQ \
+  --quantization awq \
+  --dtype float16
+
+# INT4 权重量化（GPTQ 格式）
+vllm serve --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+  --quantization gptq \
+  --dtype float16
+
+# KV Cache INT8 量化（配合权重量化使用）
+vllm serve --model Qwen/Qwen2.5-7B-Instruct-AWQ \
+  --quantization awq \
+  --kv-cache-dtype fp8  # 或 int8，取决于硬件支持</code></pre>
+              <p style="margin-bottom:0">注意 FP8 KV Cache 需要 Ampere 架构以上的 GPU（A100/H100），INT8 KV Cache 的硬件兼容性更广。具体支持矩阵以 vLLM 官方文档为准。</p>
+            </div>
+          </details>
+
+          <h2>1.58bit 与极限压缩：BitNet 的路线</h2>
+          <p>INT4 已经是 4 bit，能不能更激进？BitNet 给出了一个大胆的答案：<strong>1.58 bit</strong>（即三值 $\\{-1, 0, 1\\}$，$\\log_2 3 \\approx 1.58$）。但 BitNet 不是对已有模型做量化，而是从头训练时就让权重只有三个值。</p>
+
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">BitNet b1.58 的核心</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">权重只有 $\\{-1, 0, 1\\}$ 三值，推理时矩阵乘法变成加减法，不需要浮点乘法。训练时用 STE（Straight-Through Estimator）绕过不可导的量化函数。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">为什么是 1.58 而不是 1</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">二值化（$\\{-1, 1\\}$）信息损失太大；加入 0 后表达能力显著提升，且 $\\log_2 3$ 这个比特数在信息论上刚好是三值编码的最优解。</p>
+            </div>
+          </div>
+
+          <p>BitNet 的意义在于它证明了「低精度不只是压缩手段，可以是训练范式」——权重在训练时就活在低精度空间里，不存在量化掉点的问题。代价是它不能用于已有模型（你没法把 Llama 的权重量化到三值而不崩溃），需要从头训练。目前 BitNet 主要在研究阶段，大规模商用部署还需等待硬件生态跟进。</p>
+
+          <h2>剪枝与稀疏化：为什么在 LLM 上没能跑通</h2>
+          <p>剪枝（Pruning）在 CNN 时代是经典压缩手段——去掉不重要的连接，让模型变稀疏，理论上可以大幅减少计算量。但在 LLM 时代，这条路基本没跑通。原因有三层：</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  subgraph WHY["剪枝在 LLM 上失效的三重困境"]
+    W1["精度掉点<br/>LLM 参数高度耦合<br/>剪掉任何一部分都会连锁影响"] --> R["剪枝路线<br/>在 LLM 上搁置"]
+    W2["恢复训练成本高<br/>剪枝后需要大量重新训练<br/>成本不亚于从头训"] --> R
+    W3["硬件加速缺位<br/>非结构化稀疏 GPU 不加速<br/>2:4 稀疏只加速矩阵乘<br/>不覆盖注意力与 FFN 全链路"] --> R
+  end
+  style W1 fill:#fce4ec,stroke:#c62828
+  style W2 fill:#fff3e0,stroke:#e65100
+  style W3 fill:#e3f2fd,stroke:#1565c0
+  style R fill:#f5f5f5,stroke:#999
+            </div>
+            <figcaption>剪枝在 LLM 上面临精度、恢复成本、硬件加速三重困境</figcaption>
+          </figure>
+
+          <h3>困境一：掉点严重，且不可预测</h3>
+          <p>CNN 的卷积核相对独立，剪掉一个 filter 影响有限。但 Transformer 的注意力机制让所有 token 之间产生全局交互，FFN 层的参数也高度耦合。非结构化剪枝（随机置零个别权重）在 50% 稀疏度下，LLM 在复杂任务上的掉点可达 5-15 个百分点，远超 INT4 量化的损失。</p>
+
+          <h3>困境二：恢复训练的成本不亚于重新训练</h3>
+          <p>剪枝后通常需要 fine-tune 恢复精度（称为「恢复训练」）。在 CNN 上几百步就能恢复，但在 LLM 上，因为参数耦合度高、知识密集度高，恢复训练需要的算力和数据量接近继续预训练——这意味着剪枝省下的推理成本可能还不如恢复训练花的训练成本。</p>
+
+          <h3>困境三：硬件加速基本不存在</h3>
+          <p>这是最致命的。剪枝的收益前提是「稀疏矩阵运算更快」，但主流 GPU 的矩阵乘单元（Tensor Core）是为稠密矩阵设计的：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>稀疏类型</th><th>硬件支持</th><th>实际加速</th></tr></thead>
+              <tbody>
+                <tr><td>非结构化稀疏（随机置零）</td><td>无原生支持，需特殊格式</td><td>不加速甚至更慢（稀疏格式有额外开销）</td></tr>
+                <tr><td>2:4 半结构化稀疏</td><td>NVIDIA Ampere+ 原生支持</td><td>仅矩阵乘 2x 理论加速，实际约 1.3-1.5x</td></tr>
+                <tr><td>结构化稀疏（整行/整列置零）</td><td>可通过减少维度实现</td><td>等价于缩小模型，不算真正的剪枝</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>2:4 稀疏（每 4 个连续元素中恰好 2 个为零）是唯一有硬件加速的方案，但它只加速 GEMM（通用矩阵乘），而 LLM 推理的瓶颈在 Decode 阶段是访存带宽受限而非计算受限——2:4 稀疏压缩了计算量却不能压缩访存，所以对推理延迟几乎没有改善。更关键的是，2:4 稀疏的 50% 稀疏度在 LLM 上的掉点仍然不可忽视。</p>
+
+          <div class="callout">
+            <span class="callout-t">结论</span>
+            在 LLM 时代，压缩的主流路线是<strong>量化</strong>（不改结构、不改训练、硬件友好）和<strong>蒸馏</strong>（换小模型继承大模型能力，见 <a href="../07-posttraining/distillation.html">知识蒸馏与能力迁移</a>）。剪枝和稀疏化在研究上仍有价值（特别是结构化稀疏与硬件协同设计），但在工程实践中几乎不在 LLM 部署的选项里。如果你看到「LLM 剪枝 50% 无损」的宣传，先问三件事：在什么 benchmark 上测的？恢复训练花了多少算力？推理时真的更快了吗？
+          </div>
+
+          <h2>量化选型决策树</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>你的场景</th><th>推荐方案</th><th>预期掉点</th></tr></thead>
+              <tbody>
+                <tr><td>快速部署、通用对话</td><td>AWQ INT4 或 GPTQ INT4</td><td>&lt;1 点（MMLU）</td></tr>
+                <tr><td>长上下文、显存紧张</td><td>INT4 权重 + INT8 KV Cache</td><td>1-2 点</td></tr>
+                <tr><td>推理模型（R1 类）</td><td>INT8 或 FP8，谨慎用 INT4</td><td>INT4 可能掉 3-5 点</td></tr>
+                <tr><td>极致压缩、可接受训练成本</td><td>QAT INT4 或更低</td><td>可接近无损</td></tr>
+                <tr><td>从头训练、追求极致</td><td>BitNet 1.58bit 原生量化</td><td>训练时即低精度</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <details class="deep">
+            <summary>展开：手动实现一个对称量化（理解 scale 怎么来）</summary>
+            <div class="deep-body">
+              <p>公式里那个缩放因子 $s$ 看似简单，但「按什么粒度算」直接决定精度。下面是一段对称量化的参考实现（示意，生产用 GPTQ/AWQ 工具链而非手搓）：</p>
+              <pre><code class="language-python">import numpy as np
+
+def symmetric_quantize(weight, bits=4, group_size=128):
+    """分组对称量化：每 group_size 个权重共享一个 scale
+
+    Args:
+        weight: 形状 (out_features, in_features) 的 FP16 权重
+        bits:   目标比特数（INT4 -&gt; 4）
+        group_size: 分组大小，越小精度越高、元数据越多
+    Returns:
+        q:   量化后的整数张量
+        scales: 每组的缩放因子
+    """
+    qmax = 2 ** (bits - 1) - 1          # INT4 对称: [-7, 7]
+    out, inp = weight.shape
+    weight = weight.reshape(out, inp // group_size, group_size)
+
+    # 每组按最大绝对值定 scale
+    amax = np.max(np.abs(weight), axis=-1, keepdims=True)
+    scale = amax / qmax
+    scale = np.where(scale == 0, 1.0, scale)   # 防除零
+
+    q = np.round(weight / scale).clip(-qmax, qmax)
+    return q.astype(np.int8), scale.astype(np.float16)
+
+def dequantize(q, scale, group_size=128):
+    """反量化还原近似权重"""
+    w = (q.astype(np.float32) * scale).reshape(q.shape[0], -1)
+    return w</code></pre>
+              <p style="margin-bottom:0">注意两个工程细节：第一，<strong>分组（group）越小精度越高</strong>，但每组的 scale 也要存下来，group_size=128 是精度与开销的常见折中；第二，<strong>零点（zero-point）对 LLM 权重收益不大</strong>，所以对称量化（zero=0）是主流，省掉零点运算也更硬件友好。真正的 GPTQ/AWQ 还会在量化过程中做误差补偿或通道保护，比这段手搓版稳得多。</p>
+            </div>
+          </details>
+
+          <h2>INT8 量化误差的数学直觉：为什么看相对误差</h2>
+          <p>很多人对量化的第一个疑问是「INT8 只有 256 个取值，为什么掉点能控制在 1% 以内？」这需要从数值角度建立直觉：量化的误差度量不是绝对误差，而是<strong>相对误差</strong>，而且它随权重幅度自适应。</p>
+          <p>对称量化把 $[-a_{\max}, a_{\max}]$ 的权重范围映射到 $[-127, 127]$ 的整数格点，缩放因子 $s = a_{\max}/127$。任何一个权重 $x$ 量化后反量化得到 $\hat{x}$，其绝对误差 $|x - \hat{x}| \le s/2$——但注意，$s$ 是按整层的最大绝对值定的。如果一个权重恰好是 $0.9 \times a_{\max}$，它的相对误差只有 $0.5/127 \approx 0.4\%$；而一个只有 $0.01 \times a_{\max}$ 的小权重，相对误差可能高达几十%。换句话说，<strong>量化对大权重是温和的、对小权重是残酷的</strong>——这正好和神经网络的性质互补：大权重对输出影响大、误差小；小权重本就可有可无、误差大也影响有限。这是量化能保住精度的第一个原因。</p>
+          <p>第二个原因是<strong>误差的统计平均与抵消</strong>。Transformer 的线性层是几千甚至上万维的向量点积，量化误差在每个维度上是近似独立的随机变量，点积求和时它们按 $\sqrt{d}$ 增长而信号按 $d$ 增长，信噪比随维度数提升。所以越宽的层（$d$ 越大），量化越安全——这也是为什么 7B 以上模型量化掉点普遍比小模型小：层更宽、分布更集中。</p>
+          <p>第三个原因是<strong>权重的分布形状</strong>。LLM 权重近似拉普拉斯分布，绝大多数权重集中在小幅值区，少量是「尾巴」上的大值。按最大绝对值定 scale 意味着大量小权重被压缩到很少几个整数格点上，浪费了量化范围。AWQ 的「按激活感知挑选显著通道」、GPTQ 的「按 Hessian 二阶补偿」，本质上都在对付同一个问题：让有限的量化范围尽量覆盖「对输出真正重要」的那部分权重。理解这一点，就能看懂为什么「无校准的朴素量化」和「AWQ/GPTQ 量化」的差距可以高达好几个点——前者把精度浪费在均值上，后者把精度留给关键值。</p>
+          <p>最后要提醒：相对误差直觉只适用于<strong>权重</strong>。激活（activation）的量化是另一回事——激活的分布随输入变化、范围更宽、且常有少数极端值（outlier）拉大 scale，导致大部分正常激活被压进几个格点。这正是 INT8 激活量化远比权重量化难、需要 SmoothQuant 这类「把激活的峰值削平、转移到权重」技巧的原因。</p>
+
+          <h2>逐层量化 vs 全模型量化：误差累积与校准</h2>
+          <p>量化策略上，一个常被忽略的差异是「逐层（layer-wise）」和「全模型（end-to-end）」两种校准方式。它们不是实现细节，而是直接决定了量化误差的形态。</p>
+          <p><strong>逐层量化</strong>：逐层地用校准数据跑前向，收集每一层的权重/激活分布，单独确定该层的 scale。优点是每层的误差是「局部的」，不依赖其他层的量化结果；缺点是它假设「各层独立」，忽略了层与层之间的误差传导——前一层量化引入的误差，会被后一层放大或抑制，逐层校准无法感知这一点。</p>
+          <p><strong>全模型量化</strong>：一次把整个模型量化，用校准数据端到端地跑，观察最终输出的误差，再据此调整各层 scale。理论上更优（直接优化全局误差），但实践中因为需要反向传播或多次迭代，计算成本高。GPTQ 实际上走的是「逐层 + 残差补偿」的折中——每层量化时把误差「注入」下一层的输入，模拟全局传导，再用 Hessian 做二阶补偿，从而在逐层的成本下逼近全模型的精度。AWQ 则是「逐层校准 + 激活感知」，用激活分布而不是权重分布来定保护策略。</p>
+          <p>校准数据的选择对两种方式都至关重要。校准集必须<strong>代表真实推理时的输入分布</strong>：如果模型部署后主要处理中文代码、而校准用的是英文对话，量化的 scale 就会偏向错误的分布，上线后掉点可能比校准集上多出一大截。实践上选 128-512 条来自真实流量采样的样本，比用通用 benchmark 数据更可靠。还有一个隐蔽问题：校准集越小，scale 越容易过拟合到少数样本的极端值；校准集越大，时间越长（校准要走前向）。所以「校准集大小」也是精度与成本之间的一个权衡，不是越大越好。</p>
+          <p>对推理模型（R1 类）还有一个额外提醒：这类模型生成的是长思维链，量化误差会在几百上千步的生成中<strong>逐步累积放大</strong>——校准集上掉 1 个点，长链推理任务上可能掉 3-5 个点。对这类模型，优先选 INT8/FP8 而不是 INT4，并把校准集换成推理任务特有的「思维链样本」，而不是通用问答样本。</p>
+
+          <h2>FP8 与硬件代次：量化不是纯软件问题</h2>
+          <p>量化还有一个容易被忽视的约束：<strong>它绑定了硬件能力</strong>。INT4 权重量化把权重存成 4 bit，但 GPU 执行时通常还是要反量化成 FP16/BF16 再算（除非有专门的低精度 Tensor Core 路径）；而 FP8 是 Hopper 及以上架构<strong>原生支持</strong>的计算格式——H100 有专门的 FP8 Tensor Core，可以在不反量化的前提下直接做矩阵乘，速度和内存占用同时受益。</p>
+          <p>这带来一个现实的选择：在 H100 集群上，FP8 往往是比 INT4 更好的选择——FP8 有 Hopper 原生加速，INT4 却要反量化回高精度计算，两者的端到端收益可能反转。在 A100（Ampere）上则相反：Ampere 没有 FP8 Tensor Core，FP8 输入会被软件模拟或转成其他格式，效率大打折扣，此时 INT4/INT8 反而是更稳的选择。所以在选量化位宽之前，先查硬件的原生支持矩阵，否则「看起来更小的位宽」未必「更快」。</p>
+          <p>KV Cache 量化也有同样的硬件依赖：FP8 KV Cache 需要 Ampere+ 架构的相应支持，INT8 的兼容性更广。这解释了为什么量化方案的文档里总有一张「硬件支持矩阵」——它不只是市场宣传，而是决定了同一份量化模型在不同代 GPU 上会不会触发静默回退（见 <a href="../05-systems/flash-attention.html">FlashAttention</a> 一节的讨论：同样的回退机制在量化后端的兼容性上同样存在）。部署前用目标硬件的真实 profiling 验证一次，比翻遍文档更可靠。</p>
+          <p>最后把量化的选型思路收束成一句话：先确定部署硬件与推理引擎（决定位宽可选项），再用真实流量校准并量化（决定精度），最后在目标硬件上 profiling（决定是否触发回退）。三个环节顺序不能乱——先选位宽再校准，等于用错误的约束做优化。量化不是「把文件变小」这么简单，它是一套和硬件、引擎、数据分布深度绑定的系统工程，值得花时间把每一环都验证到位。只有三个环节全部跑通，量化的收益才算真正落地。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：量化是「不改能力只改表示」的压缩路线，用更少 bit 表示同样的权重值，显存和带宽直接按比例下降。</li>
+            <li><strong>PTQ vs QAT</strong>：PTQ（GPTQ/AWQ）分钟级完成、90% 场景够用；QAT 需训练但精度更好，用于极端比特率或精度敏感场景。</li>
+            <li><strong>GPTQ vs AWQ</strong>：GPTQ 靠二阶信息逐列补偿，AWQ 靠激活感知保护重要权重。INT4 下 AWQ 通常略优，但差异不大，选哪个看生态支持。</li>
+            <li><strong>KV Cache 量化</strong>：长上下文下 KV Cache 可能比权重还大，量化 KV Cache 是显存优化的必选项。</li>
+            <li><strong>1.58bit</strong>：BitNet 的三值训练范式，不是量化已有模型而是从头训练，目前研究阶段为主。</li>
+            <li><strong>剪枝没跑通</strong>：掉点严重、恢复训练贵、硬件不加速——三重困境让剪枝在 LLM 上基本搁置，压缩首选量化和蒸馏。</li>
+            <li><strong>常见坑</strong>：推理模型对量化更敏感（长链误差累积）；Key 的量化比 Value 敏感；2:4 稀疏只加速计算不加速访存，对 Decode 无帮助。</li>
+            <li><strong>手算心法</strong>：量化三步「找范围→算 scale→round」；撞在格点上的值零误差，靠近 0 的小权重相对误差大但绝对影响小——量化对大权重温和、对小权重残酷，恰好与神经网络「大权重更重要」的性质互补。</li>
+          </ul>
+
+          <section class="interview-box">
+            <h2>面试高频问题</h2>
+
+            <div class="interview-q">
+              <h3>Q1：PTQ 和 QAT 的区别是什么？</h3>
+              <p><span class="answer-label">标准回答：</span>PTQ 在训练完成后直接量化，成本低、部署快，但依赖校准数据并可能掉点；QAT 在训练或微调过程中模拟量化误差，让模型提前适应低比特表示，通常精度更好，但训练成本更高。</p>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q2：GPTQ 和 AWQ 的核心思路有什么不同？</h3>
+              <p><span class="answer-label">标准回答：</span>GPTQ 使用近似二阶信息逐层量化并补偿误差，重点是让权重重构误差较小；AWQ 根据激活统计识别重要通道，对相关权重进行保护，强调权重对真实激活分布的敏感性。两者都依赖具体 kernel 和硬件，不能只凭 bit 数判断最终速度。</p>
+              <details class="deep">
+                <summary>追问：为什么 INT4 不一定比 FP16 快四倍？</summary>
+                <div class="deep-body">
+                  <p>位宽下降首先减少的是权重存储和搬运量，端到端速度还受反量化、矩阵乘 kernel、batch、序列长度、KV Cache 和内存访问模式影响。如果硬件没有高效 INT4 Tensor Core，量化甚至可能只省显存而不提速。</p>
+                </div>
+              </details>
+            </div>
+
+            <div class="interview-q">
+              <h3>Q3：权重量化和 KV Cache 量化解决的是同一个问题吗？</h3>
+              <p><span class="answer-label">标准回答：</span>不是。权重量化主要降低模型常驻权重显存和 Decode 阶段的权重搬运；KV Cache 量化主要降低随上下文长度和并发增长的缓存显存。长上下文服务可能更受 KV Cache 约束，不能只量化权重。</p>
+              <p><span class="pitfall-label">常见误区：</span>BitNet 1.58bit 是从头训练的三值权重路线，不是把一个已有 FP16 模型简单转换成 1.58 bit。</p>
+            </div>
+          </section>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers — 逐层二阶补偿量化，本页论文原图来源 · <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">arXiv:2210.17323</a></li>
+            <li>AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration — 激活感知的权重保护 · <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">arXiv:2306.00978</a></li>
+            <li>BitNet: Scaling 1-bit Transformers for Large Language Models — 1.58bit 原生低精度训练 · <a href="https://arxiv.org/abs/2310.11453" target="_blank" rel="noopener">arXiv:2310.11453</a></li>
+            <li>SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models — 激活平滑的 INT8 量化 · <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">arXiv:2211.10438</a></li>
+            <li>LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale — 不掉点的 INT8 推理 · <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">arXiv:2208.07339</a></li>
+            <li>NVIDIA 2:4 Structured Sparsity 文档 — 硬件支持的稀疏格式说明 · <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-load-instruction-using-sparse-matrix" target="_blank" rel="noopener">NVIDIA PTX 文档</a></li>
+            <li>AutoGPTQ 官方仓库 — GPTQ 量化与推理的主流实现 · <a href="https://github.com/AutoGPTQ/AutoGPTQ" target="_blank" rel="noopener">github.com/AutoGPTQ/AutoGPTQ</a></li>
+            <li>llama.cpp 官方仓库 — GGUF 量化格式与 llama.cpp 生态的起点 · <a href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noopener">github.com/ggml-org/llama.cpp</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            量化解决了「模型怎么变小」的问题，但「模型怎么跑得快」是另一回事——推理引擎的连续批处理和 KV Cache 调度才是吞吐的关键，见 <a href="inference-engines.html">推理引擎</a>。服务化部署的 SLO 设计和成本三角见 <a href="serving-cost.html">服务化与推理经济学</a>。压缩的另一条路——换小模型继承大模型能力——见 <a href="../07-posttraining/distillation.html">知识蒸馏与能力迁移</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

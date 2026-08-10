@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>线性与混合注意力 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="04-modern-arch" data-topic="linear-attention">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+              <span class="tag-frontier">2026 前沿</span>
+            </div>
+            <h1>线性与混合注意力</h1>
+            <p class="lead">标准 Softmax 注意力每加一个 token 都要和前面所有 token 算一遍相似度，复杂度是 $O(n^2)$——上下文翻倍，计算量翻四倍。线性注意力把 Softmax 拆掉，用一个固定大小的「记忆状态」替代历史 KV，复杂度降到 $O(n)$，但记忆容量有限、长程召回差。2024-2026 的主线就是：怎么把线性层的便宜和 Softmax 层的精准结合起来，造出「又快又准」的混合架构。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>把注意力想象成「<strong>翻笔记本找信息</strong>」。Softmax 注意力是每次都把整本笔记本从头翻到尾——精准但越翻越慢。线性注意力则把笔记本压缩成一张固定大小的「记忆卡片」，每来一个新词就往卡片上叠加信息——快但记不下太多东西。混合架构则是在一摞层里大部分用「卡片」，只留少数几层翻「完整笔记本」，兼顾速度和精准。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  subgraph SA["Softmax 注意力"]
+    Q1["Q"] --> K1["所有 K<br/>逐个算相似度"]
+    K1 --> SM["Softmax 归一化"]
+    SM --> V1["加权求和 V"]
+    V1 --> O1["输出<br/>复杂度 O of n squared"]
+  end
+  subgraph LA["线性注意力 / SSM"]
+    X["输入 x_t"] --> UP["更新固定状态 S<br/>S_t = f of S_t-1, x_t"]
+    UP --> READ["从 S 读取 o_t"]
+    READ --> O2["输出<br/>复杂度 O of n"]
+  end
+  subgraph HY["混合架构"]
+    L1["线性层"] --> L2["线性层"]
+    L2 --> A1["少量 Softmax 层"]
+    A1 --> L3["线性层"]
+    L3 --> O3["输出<br/>快且准"]
+  end
+  style SM fill:#fde8e8,stroke:#c0392b
+  style UP fill:#e8f5e9,stroke:#27ae60
+  style A1 fill:#fff3cd,stroke:#f39c12
+              </div>
+              <figcaption>三种注意力范式的核心区别：Softmax 精准但贵，线性快但容量有限，混合兼取两者</figcaption>
+            </figure>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+mindmap
+  root((线性 / 混合注意力))
+    纯线性路线
+      线性注意力(固定状态 S)
+      SSM / Mamba(选择性遗忘)
+      Delta 家族(精准更新 + 门控)
+    混合路线
+      线性层为主
+      少量 Softmax 补召回
+    工程支柱
+      分块并行算法
+      硬件感知扫描
+    核心权衡
+      快 O of n
+      vs 长程召回
+              </div>
+              <figcaption>线性与混合注意力的技术谱系：纯线性（状态压缩）与混合（线性为主 + 少量全局）两条路线，工程上都依赖分块并行</figcaption>
+            </figure>
+          </div>
+
+          <h2>为什么需要线性注意力</h2>
+          <p>标准 Transformer 的注意力层在处理长度为 $n$ 的序列时，需要计算一个 $n \times n$ 的注意力矩阵——每个 token 都要和其他所有 token 算一次相似度。这意味着计算量和<strong>显存</strong>都随长度<strong>平方增长</strong>：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V, \quad \text{计算量} = O(n^2 \cdot d)$$
+          </div>
+          <p>上下文从 4K 涨到 32K，注意力计算量就涨 64 倍。更关键的是 KV Cache 的<strong>线性增长</strong>——每多一个 token，就要多存一份 K 和 V，长文本场景下缓存占用甚至超过模型权重本身（详见 <a href="kv-cache.html">KV Cache 原理与优化</a>）。</p>
+          <p>线性注意力的核心思路是：能不能<strong>不保留所有历史</strong>，而是把它们压缩成一个固定大小的「状态矩阵」$S$？每来一个新 token，只需要更新这个状态、再从状态里读出结果，计算量就变成了 $O(n)$：</p>
+          <div class="figure" style="text-align:center">
+            $$S_t = S_{t-1} + v_t k_t^\top, \qquad o_t = S_t q_t$$
+          </div>
+          <p>这里去掉了 Softmax，直接用外积 $v_t k_t^\top$ 累加到状态上。由于矩阵乘法的结合律，$S_t$ 可以递推更新，不需要回看历史——这就是<strong>线性复杂度</strong>的来源。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">常见误区</span>
+            线性注意力不是「免费的午餐」。状态 $S$ 的大小是 $d_v \times d_k$，是<strong>固定的</strong>——无论序列多长，记忆容量不变。这就好比你只有一张固定大小的卡片，信息一多就会互相覆盖，导致<strong>长程召回能力差</strong>：让它复述文档开头的关键信息，它往往答不上来。
+          </div>
+
+          <p>把两者的取舍放在一张表里，能更清楚地看到为什么"混合"成为共识：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>Softmax 注意力</th><th>线性注意力 / SSM</th></tr></thead>
+              <tbody>
+                <tr><td>单步复杂度</td><td>$O(n\cdot d)$（Decode 阶段）</td><td>$O(d^2)$（固定状态读写）</td></tr>
+                <tr><td>全序列复杂度</td><td>$O(n^2\cdot d)$</td><td>$O(n\cdot d^2)$</td></tr>
+                <tr><td>显存占用</td><td>随上下文线性增长（KV Cache）</td><td>固定大小的状态，与长度无关</td></tr>
+                <tr><td>长程召回</td><td>精确（直接 attend 任意历史）</td><td>近似（受固定状态容量限制）</td></tr>
+                <tr><td>训练并行性</td><td>天然高度并行（$n\times n$ 矩阵）</td><td>需分块并行 / 并行扫描才能并行</td></tr>
+                <tr><td>适合场景</td><td>需精确长程依赖、检索</td><td>超长序列、低延迟流式解码</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>线性注意力的递推形式 $S_t = S_{t-1} + v_t k_t^\top$ 也可以写成"整段一次算"的矩阵形式（利用结合律），下面这段 PyTorch 展示了这两种视角其实是同一个东西——整段版本适合训练，递推版本适合流式推理：</p>
+          <pre><code class="language-python">import torch
+
+def linear_attention_full(Q, K, V):
+    # 整段矩阵形式：S = sum_t v_t k_t^T，再 S q_t
+    # Q,K,V: [B, n, d]，这里用特征维度 d 当作 k/v 维
+    S = torch.einsum('bnd,bnm->bdm', V, K)      # S = sum_t v_t k_t^T  -> [B, d, d]
+    O = torch.einsum('bnd,bdm->bnm', Q, S)       # O_t = S q_t          -> [B, n, d]
+    return O
+
+def linear_attention_recurrent(x, W_k, W_v, W_q):
+    # 流式递推版本：每来一个 token 只更新固定状态 S
+    d = W_q.shape[0]
+    S = torch.zeros(d, d)                         # 固定大小记忆状态
+    outs = []
+    for t in range(x.shape[0]):
+        k = W_k @ x[t]; v = W_v @ x[t]; q = W_q @ x[t]
+        S = S + torch.outer(v, k)                # 累加，不回看历史
+        outs.append(S @ q)
+    return torch.stack(outs)</code></pre>
+
+          <h2>把 Softmax 拿掉之后，归一化去哪儿了</h2>
+          <p>上一节我们把注意力改写成 $S_t = S_{t-1} + v_t k_t^\top$、$o_t = S_t q_t$，一句话带过了「去掉 Softmax」。但删掉 Softmax 绝不只是一个操作——<strong>Softmax 身上的「归一化」职责也一并被删掉了</strong>，而这个职责必须有人顶上。</p>
+          <p>先回忆 Softmax 在标准注意力里做了什么：它把一行分数变成和为 1 的非负权重。两个性质缺一不可——<strong>非负</strong>（注意力权重不会互相抵消）和<strong>和为 1</strong>（输出是与序列长度无关的加权平均）。线性注意力里，$o_t = \sum_i (q_t \cdot k_i)\, v_i$，权重就是 $q_t \cdot k_i$：</p>
+          <ul>
+            <li><strong>非负没了</strong>：$q_t \cdot k_i$ 可以是负数，正负权重会互相抵消，模型输出的「方向感」可能被破坏。</li>
+            <li><strong>和为 1 没了</strong>：权重总和 $\sum_i q_t \cdot k_i$ 随序列长度增长——同样一个 token，放在 10 词里和放在 10000 词里，输出尺度完全不同。</li>
+          </ul>
+          <p>后者是最致命的问题。算一笔账：设每个 $q_t \cdot k_i \approx 0.5$（示意值），4 个 token 时权重和为 2.0，输出被放大 2 倍；100 个 token 时权重和为 50，放大 50 倍；序列到 4096 时放大约 2000 倍。不处理的话，<strong>输出尺度随长度线性暴涨，几层之后数值直接溢出</strong>。</p>
+          <p>标准修法是<strong>除一个动态归一化因子</strong>：把权重和也算出来，然后除以它。注意这个权重和可以写成：</p>
+          <div class="figure" style="text-align:center">
+            $$\sum_i q_t \cdot k_i = q_t \cdot \Big(\sum_i k_i\Big) = q_t \cdot z_t, \quad z_t = \sum_{i \le t} k_i$$
+          </div>
+          <p>也就是说，归一化分母只需要维护一个 $d$ 维的「键累加向量」$z_t$，随序列一起递推更新。于是完整的归一化线性注意力变成：</p>
+          <div class="figure" style="text-align:center">
+            $$S_t = S_{t-1} + v_t k_t^\top, \qquad z_t = z_{t-1} + k_t, \qquad o_t = \frac{S_t q_t}{z_t \cdot q_t}$$
+          </div>
+          <p>两个状态对象——$S$（$d\times d$，存「值乘键」）和 $z$（$d$，存「键」）——配合一个标量除法，就把 Softmax 的两条职责都补了回来。<strong>这正是 Katharopoulos 等人在 2020 年的论文里提出的归一化形式</strong>，也是绝大多数后续线性注意力工作的起点。</p>
+          <p>但除法也引入了新的不稳定性，见下一节的数值账。这里先记住结论：<strong>线性注意力不是「删掉 Softmax」，而是「拆掉 Softmax 并手工重造它的归一化」</strong>——多维护一个 $z_t$，多一次除法，数学上才站得住。</p>
+
+          <h2>负权重与无界状态：线性注意力的数值账</h2>
+          <p>归一化补上了「和为 1」，但「非负」这条仍然补不上——除非对特征做特殊处理。这一节算两笔具体的数值账，看清线性注意力的两个隐性雷区。</p>
+          <h3>雷区一：正负权重抵消，分母可能趋近 0</h3>
+          <p>假设当前 Query 与 10 个历史 Key 的点积分别是 $0.4$（5 个）和 $-0.4$（5 个）。标准 Softmax 注意力里，这 10 个权重都是正数，输出稳稳落在各 Value 之间；而线性注意力里：</p>
+          <div class="figure" style="text-align:center">
+            $$\text{分子} = 5 \times 0.4 \cdot v_{+} + 5 \times (-0.4) \cdot v_{-} \approx 0, \qquad \text{分母} = 5 \times 0.4 + 5 \times (-0.4) = 0$$
+          </div>
+          <p>分子分母同时趋近 0，$0/0$ 在浮点里直接得到 <code>NaN</code>。即使不到 0，分母很小也会把输出放大到天文数字。修法有两个：一是用<strong>正特征映射</strong>把 $q,k$ 变成非负（如 $\text{elu}(x)+1$，保证内积恒正）；二是像 Mamba 那样给状态加<strong>衰减门控</strong>，让负相关被时间冲淡。前者从源头保证分母有下界，后者靠遗忘控制尺度。</p>
+          <h3>雷区二：状态矩阵无界增长</h3>
+          <p>没有门控时，$S_t = S_{t-1} + v_t k_t^\top$ 是一个永不停歇的累加。若 $v$、$k$ 的分量大致在 1 附近，$n$ 个 token 之后 $S$ 的元素量级约 $\sqrt{n}$ 到 $n$——序列到 32K 时，状态范数可以比刚初始化时大 100 倍以上。这带来两个后果：</p>
+          <ul>
+            <li><strong>数值溢出</strong>：FP16 的表示范围有限，状态累加一段时间后可能溢出，必须做周期性缩放（类似梯度裁剪，但作用在状态上）。</li>
+            <li><strong>旧信息被「洗掉」</strong>：$S$ 只有 $d\times d$ 个槽位，新写入的 $v_t k_t^\top$ 叠加在旧信息之上，秩有限，能承载的「独立记忆」就这么多。距离越远的 token，其信号在状态里被稀释得越厉害——这是「长程召回差」的数学根源，也解释了为什么后来所有方法都在给状态加衰减（门控）。</li>
+          </ul>
+          <p>把这两笔账放在一起，结论很清晰：<strong>朴素线性注意力是一个「数学上漂亮、数值上脆弱」的构造</strong>——正向推导（结合律）给了它 $O(n)$ 的速度，但 Softmax 留下的归一化和非负性缺口，必须在特征映射、门控衰减、状态缩放三者里至少选一样补齐，才能稳定训练。这也是从 Mamba 到 Gated DeltaNet 到 KDA 一路演进的大背景：每一代都在修补这两笔账中的某一笔，同时尽量保住 $O(n)$ 的便宜和固定显存。</p>
+
+          <h2>状态空间模型与 Mamba</h2>
+          <p>状态空间模型（SSM）是线性注意力的「近亲」，起源于控制论中的连续时间状态空间方程。Mamba 把它变成了语言建模的有力竞争者，核心创新是<strong>选择性机制</strong>。</p>
+
+          <p>Mamba 论文的第一张图（Figure 1）是理解「选择性」为什么必要的最快入口。这张图把 SSM 的内部运作拆成三块：输入 $x$ 的每个通道（channel，图上画了 5 个）、更高维的隐状态 $h$（图上画了 4 维）、以及输出 $y$。它的核心信息是：<strong>SSM 要在一个隐状态里同时承载「很多通道 × 每个通道的高维状态」</strong>——如果老老实实把全部状态物化出来，显存直接爆炸；早期的 SSM 靠「参数不随时间变」这个约束，用数学技巧绕开物化。Mamba 的关键改动就是图里那句「our selection mechanism adds back input-dependent dynamics」——让参数随输入变化，重新引入了输入依赖的动态，代价是必须设计硬件感知算法，只在 GPU 内存层级的高效层里物化扩展后的状态。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/04-modern-arch/linear-attention/fig1.png" alt="论文原图：Mamba 论文 Figure 1——结构化 SSM 概览，输入 x 的每个通道经高维隐状态 h 映射到输出 y，右图展示选择性机制如何带来输入相关的动态" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：Mamba 的 Figure 1——结构化 SSM 概览。每个输入通道独立经过高维隐状态映射到输出；选择机制给状态加了「输入相关的动态」，并要求硬件感知算法来控制显存物化</span>
+              <span class="pf-src">论文原图 · Gu &amp; Dao, <em>Mamba: Linear-Time Sequence Modeling with Selective State Spaces</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener">arXiv:2312.00752</a></span>
+            </figcaption>
+          </figure>
+
+          <h3>从 S4 到 Mamba：让状态「会遗忘」</h3>
+          <p>早期的 SSM（如 S4）是<strong>时不变的</strong>——状态转移矩阵 $A$ 不随输入变化，模型无法根据内容决定记住什么、忘掉什么。这就像一张只能匀速褪色的卡片，重要信息和无关信息以同样的速度消退。</p>
+          <p>Mamba（arXiv:2312.00752）的关键突破是<strong>选择性 SSM</strong>：让参数 $B$、$C$ 和门控 $\Delta$ 成为输入的函数，使模型能<strong>根据当前 token 决定记住或遗忘什么</strong>：</p>
+          <div class="figure" style="text-align:center">
+            $$h_t = \bar{A}_t h_{t-1} + \bar{B}_t x_t, \qquad y_t = C_t h_t$$
+          </div>
+          <p>其中 $\bar{A}_t, \bar{B}_t$ 是通过离散化从连续参数导出的，且都依赖于输入 $x_t$。当模型遇到重要信息时，可以选择「大门打开」快速写入；遇到无关内容时，「大门关闭」保持状态不变。这直接对标了 Softmax 注意力的<strong>内容寻址</strong>能力。</p>
+          <p>但选择性带来了工程难题：参数变成输入相关的后，就不能再用高效的卷积模式了。Mamba 的解法是设计了一套<strong>硬件感知的并行扫描算法</strong>，在 GPU 上高效地递推计算。最终 Mamba-3B 在语言建模上超越了同规模的 Transformer，推理吞吐量比 Transformer 高 5 倍。</p>
+
+          <p>Mamba 论文的另一张图（Figure 3）展示的是「Mamba 块」长什么样——它是理解「Mamba 到底替换了什么」的关键。图里比较了三条路：H3 块（早期 SSM 架构的基座）、现代网络的 MLP 块、以及 Mamba 块。结论是：<strong>Mamba 块不是发明新结构，而是把「SSM 主分支 + 门控激活」和「MLP 块」合并成一个均匀重复的块</strong>——它不像 H3 那样把两个块交错堆叠，而是同构地重复同一种块，因此工程实现更简单。相比 MLP 块，它只是在主分支上加了一个选择性 SSM。</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/04-modern-arch/linear-attention/fig3.png" alt="论文原图：Mamba 论文 Figure 3——简化块设计，把 H3 块与 MLP 块合并成均匀重复的 Mamba 块" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：Mamba 的 Figure 3——块设计。相比 H3 块，Mamba 把第一个乘法门换成激活函数；相比 MLP 块，它在主分支上加了一个 SSM；整个网络均匀重复同一种 Mamba 块</span>
+              <span class="pf-src">论文原图 · Gu &amp; Dao, <em>Mamba: Linear-Time Sequence Modeling with Selective State Spaces</em>, 2023, Figure 3 · <a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener">arXiv:2312.00752</a></span>
+            </figcaption>
+          </figure>
+
+          <p>新手读这张图抓住一条主线即可：<strong>「Mamba 块 = 一条主分支（输入 → SSM → 线性变换 → 输出）+ 一条旁路（输入 → 激活函数 → 门控乘回主分支）</strong>。主分支上的 SSM 就是前面讲的状态递推 $h_t = \bar{A}_t h_{t-1} + \bar{B}_t x_t$；旁路的激活函数用 SiLU（也叫 Swish），它替代了 H3 块里的乘法门。整体看，Mamba 块做的还是「把输入变换成输出」这件事，只是这个变换里藏着一个会选择性记忆和遗忘的线性递归状态——这就是它能在保持线性复杂度的同时做内容感知推理的架构基础。</p>
+
+          <h3>Mamba-2 与状态空间对偶</h3>
+          <p>Mamba-2（arXiv:2405.21060）的最大贡献是理论层面的——它揭示了 SSM 和注意力之间的<strong>数学对偶关系</strong>（State Space Duality, SSD）：</p>
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">SSM 视角</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">序列变换可视为与一个结构化半可分矩阵相乘，天然有 $O(n)$ 的递推算法——快但无法并行。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">Attention 视角</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">同一个矩阵也能用 $O(n^2)$ 的密集注意力算法计算——慢但高度并行，适合 GPU。</p>
+            </div>
+          </div>
+          <p>SSD 框架说明两者不是对立的范式，而是<strong>同一个数学结构的两种算法</strong>。Mamba-2 据此设计了分块算法，在保持递推性质的同时利用更大的状态维度（从 16 扩展到 256），核心层比 Mamba-1 快 2-8 倍。更重要的是，这个对偶框架把线性注意力、门控卷积、SSM 统一到了同一面旗帜下。</p>
+
+          <details class="deep">
+            <summary>展开：SSM 的递推形式与线性注意力的等价性</summary>
+            <div class="deep-body">
+              <p>线性注意力（Katharopoulos et al., 2020）的递推形式为：</p>
+              <div class="figure" style="text-align:center">
+                $$S_t = S_{t-1} + v_t k_t^\top, \quad o_t = S_t q_t$$
+              </div>
+              <p>而 SSM 的递推形式为：</p>
+              <div class="figure" style="text-align:center">
+                $$h_t = A_t h_{t-1} + B_t x_t, \quad y_t = C_t^\top h_t$$
+              </div>
+              <p>当 $A_t = I$（单位矩阵）时，SSM 退化为线性注意力的直接累加。Mamba 引入的 $A_t \neq I$ 相当于在累加时加了一个<strong>衰减因子</strong>——让旧信息逐渐淡出，为新信息腾出空间。这就是 SSM 比朴素线性注意力召回更好的关键：它不是「永远记住」，而是「有策略地遗忘」。</p>
+              <p style="margin-bottom:0">Gated DeltaNet 和 KDA 在此基础上进一步细化了遗忘的粒度，从「整体遗忘」（Mamba 的头级门控）走向「逐通道遗忘」（KDA 的通道级门控），让记忆管理越来越精细。</p>
+            </div>
+          </details>
+
+          <h2>Delta 规则家族：DeltaNet、GDN 与 KDA</h2>
+          <p>朴素线性注意力只会「累加」，信息越堆越多直到溢出。Delta 规则家族的核心改进是：新信息进来时，<strong>先擦掉状态里和新 key 重叠的旧内容，再写入</strong>——就像在笔记本上先擦掉要修改的那行，再写新内容，而不是在旧字上面叠着写。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TD
+  subgraph LA["朴素线性注意力"]
+    LA1["S_t = S_t-1 + v_t k_t_t"] --> LA2["只累加不擦除<br/>信息逐渐饱和"]
+  end
+  subgraph DN["DeltaNet"]
+    DN1["先减去旧重叠项<br/>S_t = S_t-1 + v_t k_t_t<br/>减去 beta k_t k_t_t S_t-1"] --> DN2["精准更新<br/>但无法主动遗忘"]
+  end
+  subgraph GDN["Gated DeltaNet"]
+    GDN1["在 DeltaNet 基础上<br/>加头级门控 alpha_t"] --> GDN2["粗粒度遗忘<br/>按头决定保留或清除"]
+  end
+  subgraph KDA["Kimi Delta Attention"]
+    KDA1["在 GDN 基础上<br/>门控细化到通道级"] --> KDA2["细粒度遗忘<br/>每个特征维度独立遗忘率"]
+  end
+  LA2 --> DN1
+  DN2 --> GDN1
+  GDN2 --> KDA1
+  style LA2 fill:#fde8e8,stroke:#c0392b
+  style DN2 fill:#fff3cd,stroke:#f39c12
+  style GDN2 fill:#d4ecf7,stroke:#2980b9
+  style KDA2 fill:#d5f5e3,stroke:#27ae60
+            </div>
+            <figcaption>Delta 规则家族的演进：从只累加到精准更新到分层遗忘，记忆管理越来越精细</figcaption>
+          </figure>
+
+          <h3>DeltaNet：用 Delta 规则做精准更新</h3>
+          <p>DeltaNet 把朴素累加改成了<strong>Delta 规则更新</strong>：</p>
+          <div class="figure" style="text-align:center">
+            $$S_t = S_{t-1} + \beta_t v_t k_t^\top \quad\text{（Delta 规则：先用 } \beta_t k_t \text{ 擦除旧内容，再加新内容）}$$
+          </div>
+          <p>这就像在一个关联记忆网络里做在线学习——新 key 进来时，先把状态里和它重叠的部分减掉，再写入新的 key-value 关联。更新更精准，但 DeltaNet <strong>没有主动遗忘机制</strong>——一旦信息写入，只能被新信息覆盖，无法主动清空。</p>
+
+          <h3>Gated DeltaNet：门控 + Delta 双剑合璧</h3>
+          <p>Gated DeltaNet（GDN，arXiv:2412.06464）发现<strong>门控和 Delta 规则是互补的</strong>：</p>
+          <ul>
+            <li><strong>门控</strong>（类似 Mamba 的选择性遗忘）：粗粒度，决定「整个头的记忆要不要保留」——快速、战略性遗忘。</li>
+            <li><strong>Delta 规则</strong>：细粒度，决定「新信息如何精准叠加到旧记忆上」——精准、战术性更新。</li>
+          </ul>
+          <p>GDN 把两者结合，用一个头级的遗忘门 $\alpha_t$ 控制状态的保留比例：</p>
+          <div class="figure" style="text-align:center">
+            $$S_t = \alpha_t S_{t-1} + \beta_t v_t k_t^\top \quad\text{（先按 } \alpha_t \text{ 衰减整体状态，再做 Delta 更新）}$$
+          </div>
+          <p>把这条递推写成可运行的 PyTorch，能看清"门控衰减"和"Delta 精准更新"是怎么在同一行里配合的（这里用标量 $\alpha_t, \beta_t$ 做示意，实际是头级/通道级的向量）：</p>
+          <pre><code class="language-python">import torch
+
+def gated_delta_step(S, k, v, q, alpha, beta):
+    # S: [d, d] 记忆状态；k,v,q: [d]；alpha,beta: 标量门控
+    kv = torch.outer(v, k)                 # 新关联 v k^T
+    delta = beta * kv                      # Delta 规则：待写入量
+    S = alpha * S + delta                 # 先按 alpha 衰减，再精准更新
+    return S, S @ q                        # 返回新状态与本步输出
+
+# 流式调用：每来一个 token 只做一次 O(d^2) 的状态更新
+S = torch.zeros(d, d)
+for t in range(seq_len):
+    S, o_t = gated_delta_step(S, k[t], v[t], q[t], alpha_t[t], beta_t[t])</code></pre>
+          <p>实验上，GDN 在语言建模、常识推理、上下文检索、长度外推和长上下文理解等多个基准上<strong>全面超越 Mamba-2 和 DeltaNet</strong>。NVIDIA/MIT 团队还开发了分块并行算法，让 GDN 在保持递推性质的同时能 GPU 友好地并行训练。</p>
+
+          <h3>KDA：通道级门控的极致细化</h3>
+          <p>Kimi Delta Attention（KDA，arXiv:2510.26692）是 Kimi Linear 架构的核心模块，在 GDN 基础上把遗忘门从<strong>头级细化到通道级</strong>：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>机制</th><th>遗忘粒度</th><th>类比</th></tr></thead>
+              <tbody>
+                <tr><td>Mamba-2</td><td>头级（整个头一个门控）</td><td>「整本书留着或扔掉」</td></tr>
+                <tr><td>Gated DeltaNet</td><td>头级（同上）</td><td>「整页留着或撕掉」</td></tr>
+                <tr><td><strong>KDA</strong></td><td><strong>通道级</strong>（每个特征维度独立遗忘率）</td><td>「每个知识点单独决定留不留」</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>更精细的门控让模型能更有效地利用有限的固定状态内存——重要的特征维度可以长久保留，不重要的快速遗忘。Kimi Linear 用 KDA + MLA（Multi-Head Latent Attention，见 <a href="attention-variants.html">注意力变体全景</a>）的逐层混合，训了一个 3B 激活 / 48B 总参数的模型，结果在相同训练配方下<strong>全面超越纯 MLA 架构</strong>，KV Cache 减少高达 75%，1M 上下文解码吞吐量提升最高 6 倍。</p>
+
+          <h2>固定状态到底能装多少：一张秩的账</h2>
+          <p>「状态容量有限」这句话经常出现，但到底「有限」到什么程度？把状态矩阵当键值记忆来算一笔账，会得到非常直观的结论。</p>
+          <p>线性注意力的状态 $S$ 是 $d_v \times d_k$ 的矩阵，它通过累加 $v_t k_t^\top$ 写入信息。矩阵论里有个基本事实：$n$ 个秩 1 矩阵的和，其秩最多是 $\min(n, d)$，而实际有效秩通常远小于这个上界。换句话说，<strong>要可靠地记住 $M$ 条互不相关的事实，状态的有效秩大致要 ≥ $M$</strong>。</p>
+          <p>把数字代进去。设 $d_k = d_v = 256$，状态矩阵有 65536 个浮点数。如果一篇文档里有 100 条值得记住的事实，它们被压缩进这 65536 个数里；而一条 1M token 的上下文，包含的「关键事实」可能数以千计——远远超出状态有效秩能支撑的量级。于是不可避免的结果是：<strong>新写入的事实会覆盖旧事实，越早的信息越先被「洗掉」</strong>。这和人的记忆很像：固定容量的记忆，塞的东西越多，忘得越快；区别只在于模型没有「复习」这一说，只能靠门控和更新规则来做有限的取舍。</p>
+          <p>对比一下标准 Softmax 注意力：它的 KV Cache 大小随序列线性增长，1M token 就存 1M 组 K/V——记忆容量跟着上下文走，理论上没有上限（只是显存很贵）。线性注意力的状态则是「无论多长都只有一张卡片」。<strong>这是两种架构最本质的差别：一个是记忆随输入增长，一个是记忆固定、靠调度复用</strong>。</p>
+          <p>明白了这一点，你就能理解为什么 2024 年后的混合架构要用「线性层为主 + 少量 Softmax 层」：线性层负责处理海量但低价值的局部信息（便宜），Softmax 层负责保留需要精确召回的关键信息（精准）。把「记忆容量」这个维度加进选型，比单纯比较速度更有指导意义——毕竟一个「很快但记不住东西」的模型，在检索类任务上价值有限，而这类任务恰恰是大模型最常被派上的用场。</p>
+
+          <h2>混合架构：线性 + Softmax 的折中之道</h2>
+          <p>纯线性架构虽然快，但<strong>有限状态容量</strong>是根本瓶颈——无论门控多精细，固定大小的状态在理论上就难以做到像 Softmax 那样的精确长程召回。2024-2026 的共识是：<strong>不要全用线性，也不要全用 Softmax，而是混合</strong>。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            混合架构就像一栋大楼——大部分楼层用便宜的线性层「打杂」，只留几层关键的用 Softmax 层「开全局会议」。大部分 token 只需要在局部处理，少数需要全局信息时才动用昂贵的 Softmax 层。
+          </div>
+
+          <h3>主流混合策略</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模型</th><th>混合方式</th><th>特点</th></tr></thead>
+              <tbody>
+                <tr><td>Jamba（AI21）</td><td>Mamba 与 Transformer 层交替 + MoE</td><td>首个大规模混合架构，52B 总参数 / 12B 激活，256K 上下文</td></tr>
+                <tr><td>GDN-Hybrid</td><td>Gated DeltaNet + 少量滑动窗口注意力</td><td>GDN 论文提出的混合方案，兼顾训练效率与性能</td></tr>
+                <tr><td>Kimi Linear</td><td>KDA 为主 + 少量 MLA 层</td><td>首次在公平对比下全面超越全 Softmax 架构</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>关键经验是<strong>Softmax 层不需要太多</strong>——在 30-60 层的网络里，通常只需 3-5 层全局 Softmax 注意力就能补上线性层缺失的长程召回能力，其余层全部用线性层省算力和显存。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart TB
+  subgraph FULL["全 Softmax 架构"]
+    F1["Softmax 层"] --> F2["Softmax 层"] --> F3["Softmax 层"] --> F4["Softmax 层"] --> F5["Softmax 层"]
+  end
+  subgraph HYBRID["混合架构（典型）"]
+    H1["线性层 KDA"] --> H2["线性层 KDA"] --> H3["Softmax 层<br/>全局召回"] --> H4["线性层 KDA"] --> H5["线性层 KDA"] --> H6["Softmax 层<br/>全局召回"] --> H7["线性层 KDA"]
+  end
+  style F1 fill:#fde8e8,stroke:#c0392b
+  style F2 fill:#fde8e8,stroke:#c0392b
+  style F3 fill:#fde8e8,stroke:#c0392b
+  style F4 fill:#fde8e8,stroke:#c0392b
+  style F5 fill:#fde8e8,stroke:#c0392b
+  style H1 fill:#d5f5e3,stroke:#27ae60
+  style H2 fill:#d5f5e3,stroke:#27ae60
+  style H3 fill:#fde8e8,stroke:#c0392b
+  style H4 fill:#d5f5e3,stroke:#27ae60
+  style H5 fill:#d5f5e3,stroke:#27ae60
+  style H6 fill:#fde8e8,stroke:#c0392b
+  style H7 fill:#d5f5e3,stroke:#27ae60
+            </div>
+            <figcaption>全 Softmax 架构 vs 混合架构：少量 Softmax 层即可补上线性层的召回短板</figcaption>
+          </figure>
+
+          <h3>训练效率：分块并行算法</h3>
+          <p>线性层最大的工程挑战是：递推形式天然串行，怎么在 GPU 上高效并行训练？答案是<strong>分块并行</strong>（chunkwise parallel form）——把序列切成大小为 $C$ 的块，块内用矩阵乘法并行计算，块间用递推传递状态：</p>
+          <div class="grid g2">
+            <div class="card">
+              <div class="card-title">块内</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">用密集矩阵乘法并行算出块内所有 token 的输出，充分利用 GPU 算力。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">块间</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">只递推传递每块的最终状态，串行开销从 $O(n)$ 降到 $O(n/C)$。</p>
+            </div>
+          </div>
+          <p>把"分块"的时序画出来：序列先按块切分，块内用大矩阵乘并行算，只在块与块之间串行传递一个状态向量——这一步串行的开销被块大小 $C$ 摊薄了。</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant B0 as 块 0 (token 0..C-1)
+  participant B1 as 块 1 (token C..2C-1)
+  participant B2 as 块 2 (token 2C..3C-1)
+  B0->>B0: 块内并行矩阵乘<br/>得到本块所有输出
+  B0->>B1: 传递末态 s_C
+  B1->>B1: 以 s_C 为初值<br/>块内并行计算
+  B1->>B2: 传递末态 s_2C
+  B2->>B2: 以 s_2C 为初值<br/>块内并行计算
+            </div>
+            <figcaption>分块并行：块内高度并行、块间只传一个状态。串行开销从 O(n) 降到 O(n/C)</figcaption>
+          </figure>
+
+          <details class="deep">
+            <summary>展开：分块并行算法的状态递推推导</summary>
+            <div class="deep-body">
+              <p>设线性递推为 $s_t = A_t s_{t-1} + B_t x_t$（对角/结构化 $A_t$ 时成立）。把序列切成大小为 $C$ 的块，对第 $c$ 块，块首状态为 $s_{cC}$。块内第 $i$ 个位置（$0\le i < C$）的状态可由关联累加得到：</p>
+              <div class="figure" style="text-align:center">
+                $$s_{cC+i} = \Big(\prod_{j=1}^{i} A_{cC+j}\Big) s_{cC} + \sum_{j=1}^{i} \Big(\prod_{k=j+1}^{i} A_{cC+k}\Big) B_{cC+j} x_{cC+j}$$
+              </div>
+              <p>关键是乘积 $\prod A$ 和求和项都<strong>满足结合律</strong>，因此块内所有位置可以用一次 GPU 友好的关联扫描（prefix scan / 矩阵多项式）并行算出，块与块之间只需传递块末状态 $s_{(c+1)C}$。当块内用大矩阵乘、块间只传一个 $d\times d$ 状态时，硬件利用率接近 Softmax 层，而推理仍保持 $O(1)$ 单步延迟。</p>
+              <p style="margin-bottom:0">Mamba-2 的 SSD 框架正是把这个思想系统化：把 SSM 写成"结构化半可分矩阵"，块内用稠密矩阵、块间用低秩递推，从而同时拿到线性层的 $O(n)$ 与 GPU 的并行度。</p>
+            </div>
+          </details>
+
+          <p>这套方案让 GDN、KDA 等线性层在训练时接近 Softmax 的硬件利用率，推理时则保持 $O(1)$ 的单步延迟和固定显存——这是混合架构能落地的工程基础。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            一个流传很广的误解是「Mamba 没有注意力所以不能做长程依赖」——实际上 Mamba 的隐状态就是它的「记忆」，它在每个时间步都对<strong>全部历史</strong>做加权读取，只是这个加权由固定大小的状态承载、且带衰减门控。它和注意力的差别不是「有没有长程依赖」，而是「记忆容量固定 vs 记忆随序列增长」。另一个常见误解是把「线性注意力」和「FlashAttention」混为一谈：<strong>FlashAttention 是精确等价的计算加速（IO 重排），线性注意力是算法近似（改写了注意力公式本身）</strong>——一个结果和标准注意力完全一致，一个不一致。最后提醒：SSM 的单步推理复杂度 $O(d^2)$ 确实不随序列长度增长，但<strong>训练时的分块并行才是它的工程难点</strong>，别只盯着推理侧的好处。
+          </div>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：线性注意力用固定大小的状态替代历史 KV，把 $O(n^2)$ 降到 $O(n)$，代价是记忆容量有限。</li>
+            <li><strong>SSM/Mamba</strong>：选择性 SSM 让状态能根据内容决定记忆/遗忘，Mamba-2 的 SSD 框架揭示了 SSM 与注意力的数学对偶。</li>
+            <li><strong>Delta 家族</strong>：DeltaNet 做精准更新，Gated DeltaNet 加门控遗忘，KDA 把门控细化到通道级——记忆管理越来越精细。</li>
+            <li><strong>混合架构</strong>：大部分层用线性（快且省显存），少数层用 Softmax（补长程召回），是 2024-2026 的主流路线。</li>
+            <li><strong>关键指标</strong>：Kimi Linear（KDA + MLA 混合）在公平对比下全面超越全 Softmax，KV Cache 减少 75%，1M 上下文解码吞吐量提升 6 倍。</li>
+            <li><strong>工程关键</strong>：分块并行算法是线性层能在 GPU 上高效训练的基础。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>Mamba: Linear-Time Sequence Modeling with Selective State Spaces（Gu &amp; Dao, 2023）— 选择性 SSM 的奠基论文 · <a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener">arXiv:2312.00752</a></li>
+            <li>Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality（Dao &amp; Gu, 2024）— SSM 与注意力的对偶框架，Mamba-2 · <a href="https://arxiv.org/abs/2405.21060" target="_blank" rel="noopener">arXiv:2405.21060</a></li>
+            <li>Gated Delta Networks: Improving Mamba2 with Delta Rule（Yang et al., 2024）— 门控 + Delta 规则互补，GDN · <a href="https://arxiv.org/abs/2412.06464" target="_blank" rel="noopener">arXiv:2412.06464</a></li>
+            <li>Kimi Linear: An Expressive, Efficient Attention Architecture（Kimi Team, 2025）— KDA 通道级门控，首次全面超越全注意力 · <a href="https://arxiv.org/abs/2510.26692" target="_blank" rel="noopener">arXiv:2510.26692</a></li>
+            <li>Linear Transformers Are Secretly Fast Weight Programmers（Katharopoulos et al., 2020）— 线性注意力的早期奠基 · <a href="https://arxiv.org/abs/2006.16236" target="_blank" rel="noopener">arXiv:2006.16236</a></li>
+            <li>Efficiently Modeling Long Sequences with Structured State Spaces（S4, Gu et al., 2021）— SSM 路线在语言建模上被正视的起点 · <a href="https://arxiv.org/abs/2111.00396" target="_blank" rel="noopener">arXiv:2111.00396</a></li>
+            <li>Jamba: A Hybrid Transformer-Mamba Language Model — 首个大规模「Mamba 层 + Transformer 层交替 + MoE」混合架构 · <a href="https://arxiv.org/abs/2403.19887" target="_blank" rel="noopener">arXiv:2403.19887</a></li>
+            <li>DeltaNet: Efficient Fine-Grained Mixed Linear Attention — Delta 规则记忆更新的原始设计 · <a href="https://arxiv.org/abs/2406.06484" target="_blank" rel="noopener">arXiv:2406.06484</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            线性注意力是对标准 Softmax 注意力的替代路线，想系统了解 Softmax 家族的变体（MQA / GQA / MLA 等）见 <a href="attention-variants.html">注意力变体全景</a>；混合架构常与 <a href="moe.html">MoE 混合专家</a> 搭配使用，长文本场景的 KV Cache 管理见 <a href="kv-cache.html">KV Cache 原理与优化</a>。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

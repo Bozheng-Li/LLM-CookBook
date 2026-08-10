@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多模态架构 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="04-modern-arch" data-topic="multimodal">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level inter">进阶</span>
+            </div>
+            <h1>多模态架构</h1>
+            <p class="lead">让语言模型"看懂"图片，不是把像素直接喂进模型那么简单。当前主流的视觉语言模型（VLM）几乎都遵循一个三段式结构：视觉编码器 → 连接器 → LLM。但 2024 年起，"原生多模态预训练"路线开始挑战这套"后接式对齐"的老路。这一节拆解两条路线的分野，以及 ViT、CLIP 这两个奠基性工作如何塑造了今天的多模态格局。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>后接式 VLM 做的事一句话：<strong>用一个预训练好的视觉编码器把图片变成向量，用一个连接器把视觉向量"翻译"成 LLM 能理解的 token，然后 LLM 照常处理</strong>。就像给一个只会读文字的人配了一副"图片转文字"的眼镜——他的大脑（LLM）没变，只是输入端多了一层转换。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  IMG["图片"] --> VE["视觉编码器<br/>ViT / CLIP"]
+  VE --> PV["视觉向量序列<br/>(patch embeddings)"]
+  PV --> CONN{"连接器<br/>Connector"}
+  CONN --> VT["视觉 token<br/>与文本 token 对齐"]
+  TXT["文本输入"] --> TT["文本 token"]
+  VT --> LLM["LLM<br/>语言模型"]
+  TT --> LLM
+  LLM --> OUT["文本输出"]
+  style VE fill:#e3f2fd,stroke:#1565c0
+  style CONN fill:#fff3e0,stroke:#e65100
+  style LLM fill:#e8f5e9,stroke:#2e7d32
+              </div>
+              <figcaption>VLM 三段式架构：视觉编码器把图片变向量，连接器翻译成 token，LLM 统一处理</figcaption>
+            </figure>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+mindmap
+  root((多模态架构))
+    视觉编码器
+      ViT(patch 当 token)
+      CLIP(图文对齐空间)
+    连接器
+      线性投影
+      MLP
+      Q-Former/Resampler
+    整合路线
+      后接式对齐
+      原生多模态
+    关键权衡
+      视觉 token 数量
+      分辨率 vs 算力
+              </div>
+              <figcaption>多模态架构谱系：视觉编码器与连接器是通用组件，是否"原生多模态"是整合路线的分野</figcaption>
+            </figure>
+          </div>
+
+          <h2>ViT：把图片切成 patch 当 token</h2>
+          <p><strong>Vision Transformer（ViT）</strong> 是把 Transformer 从文本搬到视觉的关键一步。它的思路极其直接：<strong>把图片切成固定大小的 patch，每个 patch 当作一个 token，过线性投影变成向量，再喂进标准 Transformer 编码器</strong>。</p>
+          <p>具体来说，一张 $224 \times 224$ 的图片，切成 $16 \times 16$ 的 patch，得到 $14 \times 14 = 196$ 个 patch。每个 patch 展平后做线性投影（等价于一个卷积层），得到 196 个 $d$ 维向量。加上一个可学习的 [CLS] token（用于汇总全局信息），再加上位置编码，就构成了 ViT 的输入——和 BERT 的输入结构几乎一模一样。</p>
+
+          <div class="callout tip">
+            <span class="callout-t">一句话直觉</span>
+            ViT 把图片"看作"一篇由 196 个"小图块"组成的"文档"，每个小图块就是一个"词"。然后用处理文档的同一套 Transformer 来处理它——视觉和文本在架构层面统一了。
+          </div>
+
+          <p>ViT 的关键优势在于：和 CNN 不同，它没有卷积的局部归纳偏置，注意力可以让任意两个 patch 互相"看到"——哪怕一个在左上角、一个在右下角。代价是需要更多数据来学习这种全局关系（ViT 在大数据集上才超越 CNN），但一旦预训练充分，ViT 的表示能力通常优于同等规模的 CNN。这也是为什么今天主流 VLM 的视觉编码器几乎都是 ViT 的变体。</p>
+
+          <p>patch 大小直接决定视觉 token 数量——也决定了喂进 LLM 的序列长度。下面这张表给出常见配置下的 token 数：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>图片尺寸</th><th>patch 大小</th><th>网格</th><th>视觉 token 数</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>224×224</td><td>16</td><td>14×14</td><td>196</td><td>经典 ViT-B 配置</td></tr>
+                <tr><td>336×336</td><td>14</td><td>24×24</td><td>576</td><td>高分辨率编码器常见</td></tr>
+                <tr><td>448×448</td><td>14</td><td>32×32</td><td>1024</td><td>已逼近文本上下文压力</td></tr>
+                <tr><td>1024×1024（分块）</td><td>14</td><td>多 tile</td><td>可达数千</td><td>需动态分辨率/tiling 控制</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>注意：这些视觉 token 会和文本 token 拼在一起送进 LLM，所以视觉 token 数越多，LLM 的上下文越长、注意力计算量越大。这正是 <a href="long-context.html">长上下文技术</a> 在多模态场景里变得重要的原因。</p>
+
+          <p>把"图片切块"这一步写成代码，核心就是 <code>unfold</code> 滑窗 + 一次线性投影：</p>
+          <pre><code class="language-python">import torch
+import torch.nn as nn
+
+def image_to_patches(img, patch_size=16):
+    # img: [B, 3, H, W]；切成 (H/p, W/p) 个 patch，每个展平成向量
+    b, c, h, w = img.shape
+    patches = img.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
+    patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+    patches = patches.view(b, -1, c * patch_size * patch_size)   # [B, num_patch, 3*p*p]
+    return patches
+
+proj = nn.Linear(3 * 16 * 16, 768)          # 投影到 d=768
+tokens = proj(image_to_patches(img))         # [B, num_patch, 768]，即可作为 Transformer 输入</code></pre>
+
+          <h2>CLIP：让视觉和语言在同一个空间对齐</h2>
+          <p>ViT 解决了"怎么用 Transformer 编码图片"的问题，但 ViT 输出的视觉向量是"视觉空间"的，和 LLM 的"语言空间"不在同一个坐标系里。<strong>CLIP（Contrastive Language-Image Pre-training）</strong> 解决的正是这个问题——<strong>让视觉编码器和文本编码器输出到同一个向量空间</strong>。</p>
+          <p>CLIP 的训练方式是对比学习：给一批"图片-文本"对，让图片编码器和文本编码器分别编码，然后计算所有图片和所有文本之间的相似度矩阵。目标是让<strong>匹配的图文对相似度高，不匹配的低</strong>。训练完成后，"一只猫的图片"和"一只猫的照片"这两个向量在空间中会很接近，而"一只猫的图片"和"一辆汽车的描述"会很远。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  subgraph CLIP_Train["CLIP 对比学习训练"]
+    I1["图片 A"] --> IV1["视觉编码器"]
+    T1["文本 A: 一只猫"] --> TV1["文本编码器"]
+    I2["图片 B"] --> IV2["视觉编码器"]
+    T2["文本 B: 一辆车"] --> TV2["文本编码器"]
+    IV1 --> M["相似度矩阵<br/>对角线=正样本<br/>其余=负样本"]
+    TV1 --> M
+    IV2 --> M
+    TV2 --> M
+    M --> L["对比损失<br/>拉近正样本、推开负样本"]
+  end
+  style M fill:#fff3e0,stroke:#e65100
+  style L fill:#ffebee,stroke:#c62828
+            </div>
+            <figcaption>CLIP 训练：图文对分别编码后算相似度矩阵，拉近匹配对、推开不匹配对，最终视觉和语言对齐到同一空间</figcaption>
+          </figure>
+
+          <p>CLIP 的意义不仅是训练了一个好的图像分类器——更重要的是它产出了一个<strong>视觉编码器，其输出向量和自然语言在同一空间对齐</strong>。这意味着 LLM 可以直接"读懂"CLIP 视觉编码器的输出，不需要从零学习视觉-语言的映射关系。LLaVA、Qwen-VL、InternVL 等主流 VLM 都使用 CLIP（或其变体如 SigLIP）的视觉编码器作为视觉前端。</p>
+
+          <details class="deep">
+            <summary>展开：CLIP 的对比损失，以及 SigLIP 为什么把 softmax 换成 sigmoid</summary>
+            <div class="deep-body">
+              <p>CLIP 的损失是典型的 <strong>InfoNCE</strong>：一个 batch 有 $B$ 个图文对，编码后得到 $B$ 个图像向量和 $B$ 个文本向量，两两算相似度得到 $B \times B$ 的矩阵。对每一行（每张图）做 softmax，把对角线那一项当作正确答案算交叉熵；对每一列（每段文本）再做一次。也就是说，<strong>每个正样本的损失都依赖同一 batch 里的所有负样本</strong>。</p>
+              <p>这带来一个很现实的工程后果：<strong>batch 越大，负样本越多，学到的空间越好</strong>。所以 CLIP 类训练普遍追求超大 batch。但 softmax 要在整个 batch 上归一化，多卡训练时必须把所有卡上的向量 all-gather 到一起才能算，通信量随卡数增长，且每张卡都要存下完整的 $B \times B$ 相似度矩阵——batch 一大就撞显存和带宽墙。</p>
+              <p><strong>SigLIP 的改动很朴素：把 softmax 换成 sigmoid。</strong>不再问「这张图对应 batch 里哪段文本」，而是对每一个「图-文」组合独立地问「这一对是不是匹配的」，做二分类。损失变成逐元素可加，<strong>不需要全局归一化</strong>——每张卡只算自己那一块，通信和显存压力都大幅下降，小 batch 下也能训得动。这就是为什么 2023 年之后不少 VLM 把视觉前端从 CLIP 换成了 SigLIP：不是因为它「更聪明」，而是因为它<strong>更好训</strong>。</p>
+              <p style="margin-bottom:0">选型时的实用判断：如果你只是拿现成权重当视觉前端，CLIP 和 SigLIP 差别主要体现在具体任务分数上，需要实测；如果你要<strong>自己训</strong>一个视觉编码器，sigmoid 路线的工程门槛明显更低。</p>
+            </div>
+          </details>
+
+          <p>再退一步看，给 VLM 挑视觉前端时，本质上是在三条预训练路线里选：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>预训练路线</th><th>监督信号来自哪里</th><th>输出空间的性质</th><th>接进 LLM 的难易</th><th>代表</th></tr></thead>
+              <tbody>
+                <tr><td><strong>图文对比学习</strong></td><td>互联网上的图文配对</td><td>已与自然语言对齐</td><td><strong>最容易</strong>，连接器可以很轻</td><td>CLIP、SigLIP</td></tr>
+                <tr><td><strong>纯视觉自监督</strong></td><td>图像自身（不同视角/遮挡的一致性）</td><td>视觉特征强，但与语言无关</td><td>较难，连接器要承担更多对齐工作</td><td>DINO 系列、MAE</td></tr>
+                <tr><td><strong>有监督分类预训练</strong></td><td>人工标注的类别标签</td><td>偏向类别判别，细节信息可能被丢弃</td><td>一般，且受限于标签体系</td><td>传统 ImageNet 预训练骨干</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这张表解释了一个常被问到的问题：<strong>为什么主流 VLM 几乎都用 CLIP 系而不是 DINO 系？</strong>因为 CLIP 的输出<strong>已经在语言空间里了</strong>，连接器只需要做维度和分布上的微调；而纯视觉自监督特征虽然在检测、分割这类任务上更强，但它和语言之间隔着一整层未对齐的鸿沟，连接器要从零学会这个映射，训练成本高得多。也有工作把两类特征拼接起来用，试图兼顾「语义对齐」和「细节保真」——代价是视觉 token 数量翻倍。</p>
+
+          <h2>连接器：视觉和语言之间的"翻译器"</h2>
+          <p>有了视觉编码器（ViT/CLIP）和 LLM，还差一个关键组件——<strong>连接器（Connector）</strong>。视觉编码器输出的向量维度和 LLM 期望的 token embedding 维度不一定一致，而且视觉向量携带着和文本 token 不同的信息结构，需要"翻译"。</p>
+          <div class="grid g3">
+            <div class="card">
+              <div class="card-title">线性投影</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">最简单：一个线性层把视觉向量映射到 LLM 的 embedding 空间。LLaVA 最初版本就是这么做——简单有效。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">MLP 投影</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">两三层 MLP，比线性投影多一点非线性。LLaVA-1.5 等采用，效果通常优于纯线性。</p>
+            </div>
+            <div class="card">
+              <div class="card-title">Q-Former / Resampler</div>
+              <p style="font-size:13.5px;margin:0;color:var(--text-2)">用一组可学习的 query 去从视觉向量中"提取"固定数量的 token。BLIP-2 的 Q-Former、Qwen-VL 的 Resampler 属于此类。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>连接器</th><th>是否压缩 token 数</th><th>参数量</th><th>细节保留</th><th>代表模型</th></tr></thead>
+              <tbody>
+                <tr><td><strong>线性投影</strong></td><td>否</td><td>极少（一个矩阵）</td><td>完整</td><td>LLaVA-1.0</td></tr>
+                <tr><td><strong>MLP 投影</strong></td><td>否</td><td>小（2~3 层）</td><td>完整</td><td>LLaVA-1.5、Qwen-VL</td></tr>
+                <tr><td><strong>Q-Former</strong></td><td>是（压到固定 query 数）</td><td>中</td><td>可能丢细节</td><td>BLIP-2、InstructBLIP</td></tr>
+                <tr><td><strong>Resampler</strong></td><td>是（压到固定 token 数）</td><td>中</td><td>可能丢细节</td><td>Qwen-VL、Flamingo</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>连接器的设计影响一个关键指标——<strong>视觉 token 数量</strong>。ViT 输出的 patch token 数量可能多达几百甚至上千（高分辨率图片更多），全部喂进 LLM 会大幅增加上下文长度和计算量。Q-Former / Resampler 类连接器可以把几百个视觉 token 压缩成几十个，代价是可能丢失细节信息。线性/MLP 投影不压缩 token 数量，但保留了全部视觉信息——这通常在高分辨率场景下更优，但需要配合 <a href="long-context.html">长上下文技术</a> 来管理增加的 token。</p>
+
+          <p>连接器本身的代码往往短得让人意外——真正的复杂度在「把视觉 token 塞进文本序列的哪个位置」。下面这段展示了后接式 VLM 最核心的一步：把视觉向量投影后，替换掉输入序列里预留的图像占位符：</p>
+          <pre><code class="language-python">import torch
+import torch.nn as nn
+
+class MLPConnector(nn.Module):
+    """最常见的连接器：两层 MLP，把视觉维度映射到 LLM 的 embedding 维度"""
+    def __init__(self, d_vision=1024, d_llm=4096):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(d_vision, d_llm),
+            nn.GELU(),
+            nn.Linear(d_llm, d_llm),
+        )
+
+    def forward(self, vis_feats):
+        # vis_feats: [B, num_patch, d_vision]
+        return self.proj(vis_feats)      # [B, num_patch, d_llm]
+
+
+def build_inputs(llm, connector, vis_feats, input_ids, image_token_id):
+    """把视觉 token 插进文本序列：替换掉占位符 &lt;image&gt; 对应的位置
+
+    关键点：LLM 收到的始终是一串 embedding，它并不知道
+    某些位置来自图片——这正是「后接式」能工作的原因。
+    """
+    text_embeds = llm.get_input_embeddings()(input_ids)   # [B, L, d_llm]
+    vis_embeds = connector(vis_feats)                      # [B, P, d_llm]
+
+    # 找到占位符位置，用视觉 embedding 逐个替换
+    mask = (input_ids == image_token_id)                   # [B, L]
+    text_embeds[mask] = vis_embeds.reshape(-1, vis_embeds.size(-1))
+    return text_embeds        # 直接作为 inputs_embeds 喂给 LLM</code></pre>
+          <p>注意最后那句注释：<strong>LLM 完全不知道哪些 embedding 来自图片</strong>。它只是在处理一串向量，视觉信息之所以能被理解，靠的是连接器把它们投影到了「看起来像文本 embedding」的位置上。这也解释了为什么阶段一的连接器对齐训练如此关键——一旦这层翻译没训好，视觉 token 对 LLM 来说就是噪声。</p>
+
+          <details class="deep">
+            <summary>展开：高分辨率与动态分辨率（Dynamic Resolution / Tiling）</summary>
+            <div class="deep-body">
+              <p>原生 ViT 把整张图切成固定 patch，token 数由分辨率平方决定。一张 1024×1024 的图按 patch 14 切出约 $(1024/14)^2 \approx 5300$ 个 token——直接灌进 LLM 既撑爆上下文、又让注意力计算量爆炸。于是高分辨率 VLM 普遍采用<strong>切 tile</strong> 策略：把大图按固定大小的块（如 336×336）切成若干 tile，每个 tile 独立过 ViT 得到一组 patch token，再把所有 tile 的 token 拼成一个长序列；同时保留一个"缩略整图"tile 以维持全局布局。</p>
+              <p>更进一步是<strong>动态分辨率</strong>：不再固定 tile 数，而是根据图片原始宽高比和分辨率，选择最合适的 tile 排布（例如宽图用 1×2、方图用 2×2），让 token 数随内容自适应，而非一律拉满。Qwen2-VL 还用 <strong>MRoPE（多模态 RoPE）</strong> 给每个视觉 token 标注它在原图中的二维/时间坐标，弥补"切块打乱空间关系"的损失。无论哪种方案，切得越细 token 越多，最终都要落到 <a href="long-context.html">长上下文技术</a> 和 <a href="attention-variants.html">注意力变体</a> 上去解决显存与算力——这是多模态模型"看清楚"和"算得动"之间的核心权衡。</p>
+              <p style="margin-bottom:0">实现上的坑：切块后必须补回空间位置信息（否则模型不知道哪块在哪个位置）；tile 之间最好不要共享位置编码而要区分边界；动态分辨率的 tile 数要设上限，否则极端长宽比图片仍会撑爆上下文。</p>
+            </div>
+          </details>
+
+          <h2>后接式对齐：主流 VLM 的标准路线</h2>
+          <p>把以上三个组件拼起来，就是当前大多数 VLM 的标准架构：<strong>预训练 ViT/CLIP 视觉编码器 + 连接器 + 预训练 LLM</strong>。这条路线最经典的原图来自提出 LLaVA 的论文《Visual Instruction Tuning》——它把「视觉编码器 → 连接器 → LLM」三段式画成了教科书级的图。训练时通常分阶段进行：</p>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/04-modern-arch/multimodal/fig1.png" alt="论文原图：LLaVA 论文 Figure 1——LLaVA 网络架构，视觉编码器（CLIP ViT）输出视觉 token，经投影矩阵 W 映射后与语言 token 一起进入 LLM" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：LLaVA 的网络架构——一张图概括「后接式」VLM 的全部结构：CLIP 视觉编码器把图片变成视觉 token，投影矩阵 W 把它们映射到语言 token 空间，然后与文本一起喂进 LLM</span>
+              <span class="pf-src">论文原图 · Liu et al., <em>Visual Instruction Tuning</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2304.08485" target="_blank" rel="noopener">arXiv:2304.08485</a></span>
+            </figcaption>
+          </figure>
+
+          <p>这张图值得逐块读，因为整页的架构知识都能从图里「反推」出来。图从左到右有四段：<strong>① 最左边是输入图片</strong>，被切成网格状的 patch——一个 patch 就是前面 ViT 讲的「一个 token」；<strong>② 中间是 CLIP 视觉编码器</strong>，它输出一串视觉特征向量，图上把它们画成「视觉 token」（图里最长的那个词条）；<strong>③ 是投影矩阵 W</strong>——这是 LLaVA 最初的连接器，只有一个线性层，把视觉 token 的维度映射成 LLM 的 embedding 维度；<strong>④ 最右边是 LLM</strong>，它同时接收「视觉 token」和「语言 token」（图上把 X_v、H_q 画成两路输入），自回归地生成回答。</p>
+          <p>这张图最革命性的一点是<strong>「连接器只是一层 W」</strong>——在它之前，Flamingo 用门控交叉注意力、BLIP-2 用 Q-Former 来桥接视觉和语言，都复杂得多；LLaVA 证明只要视觉编码器已经和语言对齐（CLIP 做到了），一个线性层 + 高质量的视觉指令数据就够用。图上没有画出而正文里明确的关键事实是：LLaVA 最初用 CLIP 视觉编码器（冻结）+ 一个随机初始化的线性投影 W，配合 GPT-4 生成的视觉指令数据做指令微调，就达到了「相对 GPT-4 85.1%」的合成指令跟随分数。</p>
+          <ol>
+            <li><strong>阶段一：连接器对齐训练</strong>。冻结视觉编码器和 LLM，只训练连接器。用图文对数据让连接器学会把视觉向量翻译成 LLM 能理解的 token。</li>
+            <li><strong>阶段二：指令微调</strong>。解冻 LLM（或部分解冻），用视觉指令数据（如"看图回答问题"）训练整个系统，让模型学会遵循多模态指令。</li>
+          </ol>
+          <p>这两个阶段的关键差异不在数据，而在<strong>谁被冻结</strong>。冻结策略选错是新手训 VLM 最常见的翻车点：阶段一就解冻 LLM，会让还没对齐好的视觉噪声直接污染语言能力，表现为「图倒是看了，中文说得却退步了」——这正是多模态版本的灾难性遗忘。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>阶段</th><th>视觉编码器</th><th>连接器</th><th>LLM</th><th>数据类型</th><th>目的</th></tr></thead>
+              <tbody>
+                <tr><td><strong>阶段一：对齐</strong></td><td>冻结</td><td><strong>训练</strong></td><td>冻结</td><td>大量图文描述对（caption）</td><td>只教连接器「怎么把视觉向量翻译成 LLM 听得懂的话」</td></tr>
+                <tr><td><strong>阶段二：指令微调</strong></td><td>冻结或小学习率</td><td><strong>训练</strong></td><td><strong>训练</strong>（全参或 LoRA）</td><td>视觉问答、图文推理、OCR 等指令数据</td><td>教模型遵循多模态指令，形成可用的对话能力</td></tr>
+                <tr><td><strong>可选：视觉端解冻</strong></td><td>小学习率微调</td><td>训练</td><td>训练</td><td>高分辨率、细粒度任务数据</td><td>提升 OCR、图表、细节识别，但风险最高、最容易掉通用能力</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>实践经验：<strong>阶段一宁可训久一点</strong>，它便宜（只有连接器有梯度）且直接决定上限；阶段二如果显存吃紧，用 <a href="../07-posttraining/peft-lora.html">LoRA</a> 只微调 LLM 的注意力投影层通常就够，全参微调的收益未必抵得上它带来的遗忘风险。视觉编码器要不要解冻是个见仁见智的问题：解冻能显著提升 OCR 和细粒度识别，但也最容易把 CLIP 好不容易学到的对齐空间搞坏，建议只在有充足数据和评测集时才动。</p>
+          <p>把"一张图如何流过后接式 VLM 并产出回答"画成时序图，能看清连接器在哪一步起作用：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+sequenceDiagram
+  participant I as 输入图片
+  participant V as ViT/CLIP 编码器
+  participant C as 连接器
+  participant L as LLM
+  participant O as 文本输出
+  I->>V: 编码成 patch 向量序列
+  V->>C: 视觉向量（视觉空间）
+  C->>C: 线性/MLP/Q-Former 翻译
+  C->>L: 视觉 token（对齐语言空间）
+  L->>L: 与文本 token 一起做注意力
+  L->>O: 自回归生成回答
+            </div>
+            <figcaption>图片经编码器→连接器→LLM 的端到端流程：连接器是视觉空间与语言空间的"翻译"边界</figcaption>
+          </figure>
+          <p>这条路线的优势是<strong>工程友好</strong>——视觉编码器和 LLM 各自预训练好后拼接，不需要从头联合训练。可以复用已有的强大 LLM（如 LLaMA、Qwen），多模态能力通过连接器"嫁接"上去。LLaVA、Qwen-VL、InternVL、GPT-4V 的公开部分都采用了这条路线的变体。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">后接式的天花板</span>
+            后接式对齐的 LLM 在预训练时只见过文本，它的内部表示空间是"纯语言"的。视觉信息通过连接器翻译后"挤进"这个语言空间，但 LLM 的底层能力（如推理、生成）始终是以语言为中心训练的。这意味着模型擅长"用语言描述图片"，但在需要深度跨模态推理的任务上（如看图做数学题、理解空间关系）可能有天花板。
+          </div>
+
+          <h2>原生多模态预训练：从第一天就混合模态</h2>
+          <p><strong>原生多模态预训练（Native Multimodal Pre-training）</strong> 是 2024 年开始兴起的不同路线。核心区别是：<strong>不先训练纯文本 LLM 再接视觉，而是从一开始预训练就把视觉和文本数据混合在一起</strong>，让模型的内部表示从底层就同时容纳两种模态。</p>
+
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+flowchart TB
+  subgraph PostAlign["后接式对齐路线"]
+    PA1["阶段 1: 纯文本预训练<br/>训练 LLM"] --> PA2["阶段 2: 接入视觉编码器<br/>训练连接器"]
+    PA2 --> PA3["阶段 3: 多模态指令微调"]
+    PA3 --> PA4["输出: LLM 核心 + 视觉外挂"]
+  end
+  subgraph Native["原生多模态路线"]
+    NA1["从头预训练<br/>视觉 + 文本混合数据"] --> NA2["统一 token 空间<br/>视觉和文本同等对待"]
+    NA2 --> NA3["多模态指令微调"]
+    NA3 --> NA4["输出: 原生多模态模型"]
+  end
+  style PA1 fill:#e3f2fd,stroke:#1565c0
+  style NA1 fill:#e8f5e9,stroke:#2e7d32
+  style PA4 fill:#fff3e0,stroke:#e65100
+  style NA4 fill:#e8f5e9,stroke:#2e7d32
+            </div>
+            <figcaption>两条路线对比：后接式先训文本再接视觉，原生式从第一天就混合模态训练</figcaption>
+          </figure>
+
+          <p>原生路线的关键特征：</p>
+          <ul>
+            <li><strong>统一的 token 空间</strong>：视觉 patch token 和文本 token 从预训练第一步就进入同一个 Transformer，共享同一套 embedding 空间和注意力机制。没有"翻译"步骤。</li>
+            <li><strong>混合数据课程</strong>：预训练数据里同时包含纯文本、图文交错、纯图片等多种形式。模型从底层学会在同一个表示空间里处理所有模态。</li>
+            <li><strong>模态融合更深入</strong>：不是"看图+读字"的拼接，而是视觉和语言信息在每一层注意力中都自由交互。跨模态推理能力理论上更强。</li>
+          </ul>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>后接式对齐</th><th>原生多模态预训练</th></tr></thead>
+              <tbody>
+                <tr><td><strong>LLM 预训练</strong></td><td>纯文本，视觉后接入</td><td>从头就混合视觉+文本</td></tr>
+                <tr><td><strong>视觉信息路径</strong></td><td>编码器 → 连接器 → LLM（翻译后进入）</td><td>patch token 直接进入（无翻译层）</td></tr>
+                <tr><td><strong>跨模态推理</strong></td><td>受限于 LLM 的语言中心表示</td><td>底层表示即多模态，理论上更强</td></tr>
+                <tr><td><strong>工程成本</strong></td><td>低（复用已有 LLM）</td><td>高（需从头联合训练）</td></tr>
+                <tr><td><strong>数据需求</strong></td><td>连接器对齐数据量小</td><td>大量高质量多模态预训练数据</td></tr>
+                <tr><td><strong>代表模型</strong></td><td>LLaVA、Qwen-VL、InternVL</td><td>GPT-4o、Gemini、Qwen2-VL（部分）</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <span class="callout-t">2026 年的趋势判断</span>
+            原生多模态是明确方向——顶级模型（GPT-4o、Gemini）都在走这条路。但它对数据和算力的要求远高于后接式，短期内后接式仍是开源社区的主流（因为可以在已有 LLM 上"嫁接"）。分水岭在于：如果你的 LLM 已经很强、只想加视觉能力，后接式够用且便宜；如果你从零训练一个模型、目标是多模态原生能力，走原生路线。
+          </div>
+
+          <h3>一条时间线看清这套架构是怎么长出来的</h3>
+          <p>今天这套「视觉编码器 + 连接器 + LLM」的结构不是设计出来的，是一步步长出来的。理解每一步解决了什么问题，比记住结构本身更有用：</p>
+          <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+            <div class="mermaid">
+timeline
+  title 多模态架构的演进主线
+  ViT 时代 : 图片切 patch 当 token
+           : 视觉与文本在架构上统一
+  CLIP 时代 : 图文对比学习
+            : 视觉输出落到语言空间
+  桥接期 : Flamingo 用交叉注意力接入冻结 LLM
+         : BLIP-2 用 Q-Former 压缩视觉 token
+  LLaVA 时代 : 一个线性层就够
+             : 视觉指令微调数据成为关键
+  高分辨率期 : 动态分辨率与 tiling
+             : 多模态位置编码补回空间信息
+  原生多模态 : 预训练第一天就混合模态
+             : 视觉与文本共享同一表示空间
+            </div>
+            <figcaption>五个阶段各解决一个问题：怎么编码图片 → 怎么和语言对齐 → 怎么接进 LLM → 怎么看清细节 → 怎么从底层就是多模态</figcaption>
+          </figure>
+          <p>值得注意的是「桥接期」到「LLaVA 时代」的这次简化。Flamingo 用的是<strong>门控交叉注意力</strong>——在 LLM 的若干层里插入专门的交叉注意力模块去「看」视觉特征；BLIP-2 用的是 Q-Former，一个专门训练的小 Transformer。两者都不便宜。而 LLaVA 证明了一件事：<strong>只要视觉编码器已经和语言对齐得足够好（CLIP 做到了），一个线性层加上高质量的视觉指令数据就够了</strong>。这个「够用就好」的发现，是后接式路线能在开源社区迅速铺开的直接原因。</p>
+
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            视觉 token 不是「把图片压缩成一个向量」，而是<strong>一张图可能产生上百个 token</strong>——每个 patch 一个。新手最容易犯的错是把 VLM 想成「LLM 加一个图像分类器」：图像分类器输出的是一个标签/向量，而 VLM 输入 LLM 的是一整串视觉 token，它们和文本 token 拼在同一个序列里，共享同一个上下文窗口和注意力计算。所以「放一张 1024×1024 的图」对 LLM 来说等于「瞬间灌进几千个 token」——上下文预算被视觉 token 吃掉大半。理解了这一点，就理解了为什么高分辨率多模态模型必须做 tiling 和动态分辨率、为什么 <a href="long-context.html">长上下文技术</a> 在多模态场景里格外重要。
+          </div>
+
+          <h2>常见失效模式：VLM 会在哪些地方翻车</h2>
+          <p>把 VLM 接上线之后，最有价值的知识不是「它能做什么」，而是「它会在哪儿出错、错的时候长什么样」。下面这几类失效模式几乎每个做过多模态应用的人都会撞上，而且大多数都能从前面讲过的架构原理里找到解释。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>失效模式</th><th>典型表现</th><th>架构层面的原因</th><th>缓解方向</th></tr></thead>
+              <tbody>
+                <tr><td><strong>小字 / OCR 失败</strong></td><td>看不清票据、表格、界面上的小号文字</td><td>patch 粒度太粗，一个 16×16 的 patch 里塞了好几个字符</td><td>提高输入分辨率、启用动态分辨率与 tiling、用 OCR 数据微调</td></tr>
+                <tr><td><strong>物体幻觉</strong></td><td>描述里出现图中根本不存在的东西</td><td>LLM 的语言先验太强，「厨房场景通常有冰箱」压过了实际视觉证据</td><td>加入负样本与「图中没有」类训练数据、提示词要求逐项核对</td></tr>
+                <tr><td><strong>空间关系错乱</strong></td><td>左右、上下、前后判断出错</td><td>patch 序列化打散了二维空间结构，普通一维位置编码补不回来</td><td>使用多模态位置编码（如二维/时间维 RoPE）、增加空间关系训练数据</td></tr>
+                <tr><td><strong>计数不准</strong></td><td>「图里有几个人」经常数错，尤其超过五六个时</td><td>注意力做的是加权汇总，本质上不擅长精确计数这种离散累加</td><td>拆解任务（先定位再计数）、外接检测工具、降低对精确计数的依赖</td></tr>
+                <tr><td><strong>多图混淆</strong></td><td>输入多张图时，把 A 图的内容说成 B 图的</td><td>多张图的视觉 token 拼在同一序列里，缺乏清晰的图片边界标记</td><td>显式加入「第 1 张图 / 第 2 张图」的文本分隔标记、限制单次输入图数</td></tr>
+                <tr><td><strong>上下文被视觉 token 挤爆</strong></td><td>高分辨率图输入后，可用的文本上下文骤减甚至报错</td><td>视觉 token 数随分辨率平方增长，与文本共享同一个上下文预算</td><td>限制 tile 数上限、用压缩型连接器、参考 <a href="../10-applications/context-engineering.html">上下文工程</a> 做预算分配</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout warn">
+            <span class="callout-t">最容易误判的一条</span>
+            物体幻觉常被当成「模型不够聪明」，其实它多半是<strong>视觉信号被语言先验压过去了</strong>。一个判断方法：把同一张图配上不同的提问方式，如果问「图里有冰箱吗」会答「有」、但问「请逐个列出你实际看到的电器」时反而不提冰箱，那就基本可以确认是语言先验在作祟，而不是视觉编码器没看见。这类问题靠加分辨率是治不好的，得从训练数据和提示词两端下手。相关的通用讨论见 <a href="../13-evaluation/hallucination.html">幻觉与事实性</a>。
+          </div>
+
+          <h2>训练目标与预训练目标的关联</h2>
+          <p>多模态模型的训练目标和纯文本 LLM 有继承也有变化。后接式 VLM 的阶段一（连接器训练）通常用图文对比或图文匹配损失；阶段二（指令微调）则用标准的下一个 token 预测（CLM）目标——和纯文本 LLM 一样，只是输入多了视觉 token。原生多模态路线的预训练目标也是以 CLM 为核心，只是序列里混合了视觉和文本 token。</p>
+          <p>更深入的理解预训练目标的设计——CLM、MLM、MTP 等不同目标的取舍——见 <a href="../06-pretraining/objectives.html">预训练目标</a>。多模态训练本质上是在这些目标的基础上扩展了输入模态，核心的"预测下一个 token"范式并没有变。</p>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>三段式架构</strong>：视觉编码器（ViT/CLIP）→ 连接器（线性/MLP/Q-Former）→ LLM。当前主流 VLM 的标准结构。</li>
+            <li><strong>ViT</strong>：把图片切成 patch 当 token，用标准 Transformer 编码。视觉版 BERT。</li>
+            <li><strong>CLIP</strong>：对比学习让视觉和文本对齐到同一向量空间。CLIP 视觉编码器是大多数 VLM 的视觉前端。</li>
+            <li><strong>连接器</strong>：把视觉向量翻译成 LLM 可理解的 token。线性投影最简单，Q-Former 可压缩 token 数量。</li>
+            <li><strong>两条路线</strong>：后接式对齐（先训 LLM 再接视觉，工程友好）vs 原生多模态预训练（从头混合训练，跨模态推理更强）。</li>
+            <li><strong>常见坑</strong>：视觉 token 过多撑爆上下文；连接器训练不充分导致视觉信息"翻译"失败；高分辨率图片的 patch 数量爆炸需要分块处理或动态分辨率。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale — ViT 原始论文，把图片切成 patch 用 Transformer 编码 · <a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener">arXiv:2010.11929</a></li>
+            <li>Learning Transferable Visual Models From Natural Language Supervision — CLIP 原始论文，对比学习对齐视觉和语言 · <a href="https://arxiv.org/abs/2103.00020" target="_blank" rel="noopener">arXiv:2103.00020</a></li>
+            <li>Visual Instruction Tuning — LLaVA 论文，后接式 VLM 的代表性工作，用线性连接器嫁接视觉到 LLM · <a href="https://arxiv.org/abs/2304.08485" target="_blank" rel="noopener">arXiv:2304.08485</a></li>
+            <li>BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models — 用 Q-Former 桥接冻结视觉编码器与 LLM 的代表作 · <a href="https://arxiv.org/abs/2301.12597" target="_blank" rel="noopener">arXiv:2301.12597</a></li>
+            <li>Sigmoid Loss for Language Image Pre-training — SigLIP，把 CLIP 的 softmax 对比损失换成逐元素 sigmoid，显著降低训练工程门槛 · <a href="https://arxiv.org/abs/2303.15343" target="_blank" rel="noopener">arXiv:2303.15343</a></li>
+            <li>Flamingo: a Visual Language Model for Few-Shot Learning — 门控交叉注意力桥接视觉与冻结 LLM 的开创性工作 · <a href="https://arxiv.org/abs/2204.14198" target="_blank" rel="noopener">arXiv:2204.14198</a></li>
+            <li>Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution — 动态分辨率与 MRoPE 的工业实现参考 · <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">arXiv:2409.12191</a></li>
+            <li>Hugging Face 多模态文档 — transformers 中 VLM 组件的官方说明 · <a href="https://huggingface.co/docs/transformers/multimodal" target="_blank" rel="noopener">huggingface.co/docs/transformers</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            多模态架构的核心是"视觉信息怎么进入 LLM"，而 LLM 内部的训练目标设计见 <a href="../06-pretraining/objectives.html">预训练目标</a>。如果想看多模态能力在应用层的落地，<a href="../10-applications/rag.html">RAG</a> 可以扩展到多模态检索，<a href="../11-agents/computer-use.html">Computer Use</a> 则是视觉理解在 GUI 交互中的直接应用。
+          </div>
+
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>实战：手写 FlashAttention Kernel · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+</head>
+<body data-part="15-practice" data-topic="build-flashattention">
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <div class="page-head">
+            <div class="meta">
+              <span class="level adv">高级</span>
+            </div>
+            <h1>实战：手写 FlashAttention Kernel</h1>
+            <p class="lead">理论讲得再清楚，不如亲手写一个 kernel。这一页用 Triton 实现分块注意力（FlashAttention 的核心思想），与标准实现对齐精度，再对比速度——你会发现「IO 感知」四个字从纸上落到了 GPU 上。</p>
+          </div>
+
+          <div class="overview-card">
+            <div class="card-title">一图看懂</div>
+            <p>FlashAttention 的思想只有一句：<strong>别把完整的注意力矩阵写进 HBM，分块算、分块用</strong>。标准注意力要先算 $QK^\top$（N×N 矩阵）存显存再读回来；FlashAttention 把 Q、K 切成小块，在片上把「算分 + softmax + 加权求和」一气呵成，靠 online softmax 的增量技巧保证结果精确等价。</p>
+            <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
+              <div class="mermaid">
+flowchart LR
+  subgraph STD["标准注意力"]
+    direction TB
+    S1["算完整 QK^T<br/>写入 HBM"] --> S2["读回做 softmax"] --> S3["再写再读<br/>乘 V"]
+  end
+  subgraph FA["FlashAttention"]
+    direction TB
+    F1["分块加载 Q K"] --> F2["片上算分块分数"] --> F3["online softmax<br/>增量更新 O"] --> F4["无需写完整矩阵"]
+  end
+  STD -->|"访存 O(N²)"| R1
+  FA -->|"访存 O(N)"| R2
+              </div>
+              <figcaption>标准注意力反复读写 N×N 矩阵；FlashAttention 分块片上计算，访存降一个量级</figcaption>
+            </figure>
+          </div>
+
+          <h2>一、为什么访存是瓶颈：先算一笔账</h2>
+          <p>在写代码之前，先理解「为什么 FlashAttention 能快这么多」。GPU 上注意力不是「算不动」，而是「等内存」：</p>
+          <p>「等内存」不是一个模糊的说法，它有一个精确的工程定义：当一个 kernel 的耗时主要取决于数据进出内存的时间，而不是在计算单元上做运算的时间时，就称它是 memory-bound（访存受限）。标准注意力实现就是典型的访存受限——矩阵乘法本身算得极快，瓶颈几乎全在 HBM 读写。理解「访存受限 vs 计算受限」这对概念，是读所有 GPU 优化文章的前提：如果是访存受限，优化方向是「少搬数据」（分块、融合、缓存复用）；如果是计算受限，优化方向才是「少算」（稀疏、量化、低精度）。FlashAttention 的目标非常明确：把注意力从访存受限拉回计算受限，然后再考虑如何降低计算量。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Compute["计算"]
+    C1["FLOPs（算力）<br/>~19 TFLOPs（A100）"]
+    C2["矩阵乘法<br/>算得很快"]
+  end
+  subgraph Memory["访存"]
+    M1["HBM 带宽<br/>~2 TB/s（A100）"]
+    M2["N×N 矩阵读写<br/>是瓶颈"]
+  end
+  Compute --> Bottle{"谁更慢?"}
+  Memory --> Bottle
+  Bottle --> Ans["长序列时<br/>访存 >> 计算"]
+  Ans --> Key["关键：减少 HBM 往返"]
+            </div>
+            <figcaption>注意力瓶颈分析：长序列下访存主导，减少 HBM 读写是优化核心</figcaption>
+          </figure>
+
+          <p>标准注意力对一个长度为 N 的序列：计算 $QK^\top$ 得到 N×N 矩阵 → 写入 HBM → 读回做 softmax → 写回 → 读回乘 V。每次写读都是 N² 量级的数据搬运。FlashAttention 把 N×N 的中间矩阵「困在片上 SRAM」里，只对输入 Q、K、V 和输出 O 做 N 量级的 HBM 访问——这就是「IO 感知」（IO-aware）的含义。</p>
+          <p>用一组具体数字把「一笔账」算清楚。假设序列长度 N=2048、头维度 d=64、fp16（每元素 2 字节）。标准注意力中间的分数矩阵 S 是 N×N=4M 个元素，占 8MB 显存；它要被写入 HBM 一次、读回做 softmax 一次、把归一化后的概率矩阵 P 再写入一次、读回乘 V 一次——光是这个中间矩阵，就有约 32MB 的额外读写流量。而 FlashAttention 不写中间矩阵，只把输出 O（N×d×2 字节，约 256KB）写回，输入 Q、K、V 各读一次。两者在「中间矩阵」上的访存差距超过一百倍。以约 2TB/s 的 HBM 带宽估算，32MB 的搬运耗时约 16 微秒，而对应规模的分块矩阵乘法只需微秒量级——内存搬运明显是大头。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>序列长度 N</th><th>头维度 d</th><th>S 矩阵元素数</th><th>fp16 占内存</th><th>中间矩阵读写流量（约）</th></tr></thead>
+              <tbody>
+                <tr><td>1024</td><td>64</td><td>1M</td><td>2MB</td><td>8MB</td></tr>
+                <tr><td>2048</td><td>64</td><td>4M</td><td>8MB</td><td>32MB</td></tr>
+                <tr><td>8192</td><td>64</td><td>64M</td><td>128MB</td><td>512MB</td></tr>
+                <tr><td>32768</td><td>64</td><td>1B</td><td>2GB</td><td>8GB</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这张表的含义很直白：序列长度翻一倍，中间矩阵的显存和访存就翻四倍（N² 增长），而输入和输出（N×d）只翻一倍。当 N 到 32768 时，标准实现光是中间矩阵就要 2GB 显存，几乎撑爆一整张 A100 的显存预算——这也是为什么在 FlashAttention 出现之前，长上下文训练和推理的代价高到难以接受。</p>
+
+          <h2>为什么自己写：一次「IO 感知」的完整体验</h2>
+          <p>调用 <code>torch.nn.functional.scaled_dot_product_attention</code> 一行代码就能用上 FlashAttention，那为什么还要手写一遍？因为这页的目标不是「产出一个可用的 kernel」，而是「把 IO 感知这四个字变成肌肉记忆」。很多人在优化大模型时遇到瓶颈——训练慢、显存爆、长上下文 OOM——第一反应是换更大的机器，而不是先数一数数据被搬了多少次。手写一遍 kernel，你会建立三个反射：看到 N×N 中间矩阵先想「能不能不进 HBM」；看到长序列先想「访存与计算谁是大头」；看到重复读写先想「能不能合并成一趟」。这些反射在排查生产系统的性能问题时，比背十条优化口诀都管用。</p>
+          <p>另一个现实动机是：PyTorch 的内建实现虽然快，但它是个「黑盒」，你无法控制块大小、无法加自定义 mask、无法针对特定硬件调优。当你需要稀疏注意力、需要把注意力分数导出做可视化、需要在自定义硬件上部署时，理解 kernel 的每一行就是解锁这些能力的钥匙。所以这页的代码故意保持「教学清晰」优先于「极致性能」——先看懂，再谈优化。</p>
+
+          <h2>二、Online Softmax：等价性的关键</h2>
+          <p>分块处理的最大障碍是 softmax 的分母依赖「全部行」，而分块只能看到一部分。Online softmax 的解法是增量维护：</p>
+          <p>也许你会问：既然分块后需要「重加权」这么麻烦，为什么不能先算完所有分数再统一 softmax？因为那就回到了「先把 N×N 分数矩阵写进 HBM」的老路，违背了分块的初衷。online softmax 的全部意义在于：它让「算分 → softmax → 加权求和」三个步骤可以逐块融合，每处理一块就推进一点，不需要任何中间结果落盘。代价是多了重加权这步逐元素运算，但它发生在片上、速度极快，相比省下的 HBM 读写完全可以忽略。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+stateDiagram-v2
+  [*] --> 初始化
+  初始化: m = -∞，l = 0，O = 0
+  初始化 --> 处理K块: 载入一块 K/V
+  处理K块 --> 更新状态: 算局部分数 s
+  更新状态: m ← max(m, max(s))
+  更新状态: l ← l·α + Σexp(s − m_new)
+  更新状态: O ← O·α + p·V
+  更新状态 --> 处理K块: 还有 K 块
+  更新状态 --> 最终归一化: 全部块已处理
+  最终归一化: O = O / l
+  最终归一化 --> 输出: 写回 HBM
+            </div>
+            <figcaption>Online softmax 状态机：每块更新 m/l/O 三个状态量，最后统一除 l</figcaption>
+          </figure>
+
+          <ul>
+            <li>每处理一个 K 块，先算「上一轮最大值 $m_{prev}$ 与当前块最大值 $m_{cur}$」，再更新全局最大值 $m$；</li>
+            <li>用 $e^{m_{prev} - m}$ 给旧累加结果重新加权，把新块并入；</li>
+            <li>整个过程数值上等价于「先看全行再算 softmax」——输出与标准实现逐位一致（浮点舍入级别）。</li>
+          </ul>
+          <p>把这三条翻译成公式。标准 softmax 是 $p_i = \exp(s_i - m) / \sum_j \exp(s_j - m)$，其中 $m = \max_j s_j$。分块时，假设已处理完一部分块，维护着 $m_{prev}$ 和 $l_{prev} = \sum \exp(s_j - m_{prev})$；现在来了一个新块，局部最大值为 $m_{cur}$，新的全局最大值 $m_{new} = \max(m_{prev}, m_{cur})$。由于减数变了，旧块的每一项都要乘一个「重加权系数」$\alpha = e^{m_{prev} - m_{new}}$ 才能和新块对齐到同一个参考系，于是 $l_{new} = l_{prev} \cdot \alpha + \sum_{j \in \text{new}} \exp(s_j - m_{new})$；输出同理 $O_{new} = O_{prev} \cdot \alpha + P_{new} V_{new}$。</p>
+          <p>用一个三元素的小例子验证这个递推是对的。设某行在第一个块里的分数是 $[1, 2, 3]$，标准做法：$m=3$，$l=\exp(1-3)+\exp(2-3)+\exp(3-3)=0.135+0.368+1=1.503$。现在来了第二个块，分数是 $[4, 1]$：$m_{new}=\max(3,4)=4$，$\alpha=e^{3-4}=0.368$，$l_{new}=1.503 \times 0.368 + (\exp(4-4)+\exp(1-4)) = 0.553 + 1.050 = 1.603$。再一次性对全部五个分数 $[1,2,3,4,1]$ 直接算：$m=4$，$l=\exp(1-4)+\exp(2-4)+\exp(3-4)+\exp(4-4)+\exp(1-4)=0.050+0.135+0.368+1+0.050=1.603$。两者完全一致——这就是「分块处理」与「全行处理」数值等价性的来源。O 的更新也是同一套重加权逻辑，只是把 $\exp$ 替换成概率对 V 的加权求和。</p>
+          <p>这个例子还解释了为什么 online softmax 不会引入额外误差：重加权系数 α 是精确的指数运算，唯一的区别只是运算顺序不同导致的浮点舍入差异，而 fp32 的舍入误差在 1e-7 量级，相对 fp16 量化本身的误差（约 1e-3）可以忽略。所以「FlashAttention 是精确算法」这句话的准确含义是：它和标准实现共享同一套数学公式，只在浮点运算顺序上有细微差别——这比任何「近似注意力」（线性注意力、稀疏注意力）都更让人放心，也是它能无痛替换标准实现的原因。</p>
+
+          <h2>三、Triton 实现：分块 FlashAttention</h2>
+          <p>现在动手。用 Triton 写一个分块注意力 kernel：外层循环遍历 K、V 块，内层做「算分数 → online softmax → 更新输出」。先看 kernel 的数据流：</p>
+          <p>选择 Triton 而不是 CUDA 的原因很实际：Triton 用 Python 编写、自动处理线程分配和数据搬运，写一个分块 kernel 只需几十分钟；手写 CUDA 则需要管理共享内存、同步屏障、线程块布局，复杂度高一个数量级。本页的目标是理解 FlashAttention 的算法骨架，Triton 恰好把这个骨架暴露得足够清晰，又不让底层细节淹没主线。等你在 Triton 里调通之后，如果还想追求极致性能，再考虑用 CUDA 重写同款逻辑。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+flowchart LR
+  subgraph Inputs["输入（HBM）"]
+    Q1["Q 块<br/>[BLOCK_N, D]"]
+    K1["K 块<br/>[BLOCK_K, D]"]
+    V1["V 块<br/>[BLOCK_K, D]"]
+  end
+  subgraph SRAM["片上计算（SRAM）"]
+    S1["s = Q·Kᵀ·scale<br/>[BLOCK_N, BLOCK_K]"]
+    S2["online softmax<br/>m, l, acc 增量"]
+    S3["acc += p·V<br/>[BLOCK_N, D]"]
+  end
+  Q1 --> S1
+  K1 --> S1
+  S1 --> S2 --> S3
+  V1 --> S3
+  S3 --> Out["输出 O（HBM）<br/>[BLOCK_N, D]"]
+            </div>
+            <figcaption>Kernel 数据流：Q/K/V 分块载入 SRAM，片上完成分数与 softmax，只把最终 O 写回 HBM</figcaption>
+          </figure>
+
+          <p>写代码前先想清楚「为什么一定要按块切分」。GPU 的片上 SRAM（也叫共享内存）很小，通常只有几十到一百多 KB：A100 每个 SM 约 192KB，H100 约 228KB。要算一行 softmax，理想情况是整行分数都在 SRAM 里——但 N=8192 时一行分数就有 8192 个元素、fp16 下 16KB，而一个 kernel 往往同时要算 BLOCK_N 行，直接爆掉 SRAM。所以只能折中：每次从 HBM 加载一小块 K/V 到 SRAM，算完这一块对输出的贡献，更新状态量，再加载下一块。块的大小 BLOCK_N 和 BLOCK_K 就是「SRAM 容量、并行度、重加权频率」三者之间的权衡旋钮。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>参数</th><th>典型值</th><th>作用</th><th>调大的影响</th></tr></thead>
+              <tbody>
+                <tr><td>BLOCK_N</td><td>64–128</td><td>Q 块的行数，决定每个程序处理多少行</td><td>并行度更高，但占更多 SRAM</td></tr>
+                <tr><td>BLOCK_K</td><td>32–64</td><td>K/V 块的长度，决定重加权的频率</td><td>块越大重加权次数越少，SRAM 占用越大</td></tr>
+                <tr><td>head_dim</td><td>64–128</td><td>单头维度，通常由模型结构决定</td><td>不可自由调，与模型绑定</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>关于块大小的取舍，有一个实用的经验：<strong>先让 BLOCK_N × BLOCK_K 的分数块加两个 K/V 块的总字节数，明显小于 SRAM 容量</strong>，再在这个约束下尽量取大。块太小（如 16×16）时，重加权的开销和循环开销占比过高，访存省了但计算效率差；块太大（如 256×256）则会爆 SRAM 或者让单个程序占用过多片上资源、降低 SM 上的并发度。64×64 是大多数 GPU 上都安全且体面的起点。</p>
+
+          <pre><code class="language-python">import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def flashattention_kernel(
+    Q, K, V, O,
+    stride_qn, stride_qd,
+    stride_kn, stride_kd,
+    stride_vn, stride_vd,
+    stride_on, stride_od,
+    N, D,          # 序列长度, 头维度
+    scale,         # 1/sqrt(D)
+    BLOCK_N: tl.constexpr,   # Q 块大小
+    BLOCK_K: tl.constexpr,   # K/V 块大小
+):
+    """FlashAttention 前向（分块版）
+
+    思路：
+      1. 外层循环遍历 K/V 块
+      2. 每块内：算 QK^T 分数 → online softmax → 更新 O
+      3. 全程不写完整 N×N 矩阵
+    """
+    pid_m = tl.program_id(0)   # Q 块的索引
+    pid_h = tl.program_id(1)   # head 索引
+
+    # Q 块的行范围
+    offs_m = pid_m * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D)
+
+    # 加载当前 Q 块
+    q_ptrs = Q + pid_h * 0 + offs_m[:, None] * stride_qn + offs_d[None, :]
+    q = tl.load(q_ptrs)  # [BLOCK_N, D]
+
+    # 初始化 online softmax 状态
+    m_i = tl.full([BLOCK_N], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_N], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_N, D], dtype=tl.float32)
+
+    # 外层循环：遍历 K/V 块
+    for k in range(0, tl.cdiv(N, BLOCK_K)):
+        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+        # 加载 K、V 块
+        k_ptrs = K + offs_k[:, None] * stride_kn + offs_d[None, :]
+        v_ptrs = V + offs_k[:, None] * stride_vn + offs_d[None, :]
+        k_block = tl.load(k_ptrs)  # [BLOCK_K, D]
+        v_block = tl.load(v_ptrs)  # [BLOCK_K, D]
+
+        # 计算分数：Q @ K^T * scale
+        s = tl.dot(q, tl.trans(k_block)) * scale  # [BLOCK_N, BLOCK_K]
+
+        # Online softmax 增量更新
+        m_cur = tl.max(s, axis=1)                # 本块每行最大值
+        m_new = tl.maximum(m_i, m_cur)           # 全局最大值
+        p = tl.exp(s - m_new[:, None])           # 重缩放的概率
+        alpha = tl.exp(m_i - m_new)              # 旧结果的重加权系数
+        l_i = l_i * alpha + tl.sum(p, axis=1)    # 更新归一化因子
+        acc = acc * alpha[:, None] + tl.dot(p, v_block)  # 更新输出
+        m_i = m_new
+
+    # 最终归一化
+    acc = acc / l_i[:, None]
+
+    # 写回输出
+    o_ptrs = O + offs_m[:, None] * stride_on + offs_d[None, :]
+    tl.store(o_ptrs, acc.to(O.dtype.element_ty))</code></pre>
+
+          <p>这个 kernel 已经实现了 FlashAttention 的核心：<strong>外层循环 + online softmax + 增量加权</strong>。完整版本还需要处理：mask（padding）、多 head 的 stride、更优的块大小选择（如 BLOCK_N=128、BLOCK_K=64）。</p>
+          <p>把 kernel 逐段拆开读一遍。第一段，<code>pid_m = tl.program_id(0)</code> 和 <code>pid_h = tl.program_id(1)</code>：kernel 被启动成二维网格，第一维是 Q 块的行索引，第二维是 head 索引，每个程序负责「若干 Q 行 × 一个 head」的输出，天然并行。第二段，<code>offs_m</code> 和 <code>offs_d</code> 用 <code>tl.arange</code> 生成索引范围，再通过指针算术把 Q 块加载进来——这是 Triton 与 PyTorch 最大的不同：你得手动管理「数据在哪、怎么取」，而不是把张量丢给框架。第三段初始化三个状态量：<code>m_i = -∞</code>、<code>l_i = 0</code>、<code>acc = 0</code>，分别对应公式里的最大值、归一化因子和累加输出。第四段，外层 <code>for k in range(...)</code> 遍历 K/V 块，内层四行就是前面推导的 online softmax 更新：先算当前块每行最大值 <code>m_cur</code>，再取全局最大值 <code>m_new = maximum(m_i, m_cur)</code>，用 <code>alpha = exp(m_i - m_new)</code> 给旧结果重加权，然后同步更新 <code>l_i</code> 和 <code>acc</code>。循环结束后 <code>acc / l_i</code> 就是最终输出，写回 HBM。</p>
+          <p>理解这段代码的关键在于：<code>tl.dot</code> 的两处调用（分数和加权求和）是整段 kernel 里唯一的矩阵乘法，其余全是逐元素操作。这正是 FlashAttention 的另一个设计取向——把计算集中在 tensor core 擅长的矩阵乘上，让 softmax 等「非矩阵乘」操作占比降到最低。FlashAttention-2 的一个重要改进就是进一步压缩非矩阵乘操作的时间占比，让 SM 尽可能处在「在算矩阵乘」的状态而不是「在等数据」的状态。</p>
+
+          <h3>3.1 causal mask 与 padding 怎么处理</h3>
+          <p>真实场景里的注意力几乎都带 causal mask（解码器只允许看到当前位置及之前），batch 里还可能存在 padding。这两个都会让上面的「裸分块」版本输出错误结果，是完整版 kernel 必须处理的。causal mask 的常见做法是给 mask 区域的分数赋一个绝对值很大的负数（如 −1e9），这样 softmax 之后它们趋近于 0；由于块遍历是递增的，一个位置 j>i 的分数永远不在合法的「前缀」里，可以直接在算分阶段按 (i, j) 坐标过滤，甚至利用对角线优化——每个 Q 块只需要遍历到与自己行号对齐的 K 块为止，能省掉近一半的块遍历。padding mask 的做法类似：给 padding 位置对应的行/列分数打上负无穷。这些处理只影响分数矩阵的元素值，不影响 online softmax 的更新逻辑本身——m、l、O 的递推照常进行，被 mask 掉的分数自然会被排除在归一化之外。</p>
+
+          <h2>四、封装与精度验证</h2>
+          <p>kernel 写完后，需要封装成 Python 可调用的函数，并与 PyTorch 标准注意力做精度对齐——这是「手写 kernel 能不能用」的验证门槛。</p>
+
+          <pre><code class="language-python">def flash_attention(Q, K, V):
+    """封装 Triton kernel：单头注意力
+
+    Args:
+        Q, K, V: [N, D] 张量（单 head）
+    """
+    N, D = Q.shape
+    O = torch.empty_like(Q)
+
+    BLOCK_N = 64
+    BLOCK_K = 64
+
+    grid = (triton.cdiv(N, BLOCK_N), 1)
+    flashattention_kernel[grid](
+        Q, K, V, O,
+        Q.stride(0), Q.stride(1),
+        K.stride(0), K.stride(1),
+        V.stride(0), V.stride(1),
+        O.stride(0), O.stride(1),
+        N, D, 1.0 / (D ** 0.5),
+        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+    )
+    return O
+
+
+def reference_attention(Q, K, V):
+    """标准注意力（PyTorch 参考实现）"""
+    scores = Q @ K.transpose(-2, -1) / (Q.shape[-1] ** 0.5)
+    probs = torch.softmax(scores, dim=-1)
+    return probs @ V
+
+
+# 精度验证：随机数据对比
+torch.manual_seed(0)
+N, D = 1024, 64
+Q = torch.randn(N, D, device="cuda", dtype=torch.float32)
+K = torch.randn(N, D, device="cuda", dtype=torch.float32)
+V = torch.randn(N, D, device="cuda", dtype=torch.float32)
+
+out_fa = flash_attention(Q, K, V)
+out_ref = reference_attention(Q, K, V)
+err = (out_fa - out_ref).abs().max().item()
+print(f"最大绝对误差: {err:.6f}")
+# 期望输出 ~1e-5 量级（浮点舍入差异）
+
+# 速度对比
+import time
+def bench(fn, n_iter=20):
+    for _ in range(3): fn()  # warmup
+    t0 = time.time()
+    for _ in range(n_iter): fn()
+    return (time.time() - t0) / n_iter * 1000
+
+fa_ms = bench(lambda: flash_attention(Q, K, V))
+ref_ms = bench(lambda: reference_attention(Q, K, V))
+print(f"FlashAttention: {fa_ms:.2f} ms")
+print(f"标准注意力:    {ref_ms:.2f} ms")
+print(f"加速比:        {ref_ms / fa_ms:.2f}x")</code></pre>
+
+          <p>这段封装代码里有三个工程细节值得说。第一，grid 只设了两维——<code>(triton.cdiv(N, BLOCK_N), 1)</code>，第二维填 1 是因为这里是单 head 版本；多 head 时第二维填 head 数量，kernel 里通过 <code>pid_h</code> 去索引不同 head 的 Q/K/V，注意所有 stride 的计算都要把 head 维加进去。第二，<code>BLOCK_N=64</code>、<code>BLOCK_K=64</code> 是最保守的选择——64×64 的分数块在 fp16 下只有 8KB，任何 GPU 的 SRAM 都放得下；想要性能上限可以试 128×64 或 128×128，但必须先验证精度仍对齐。第三，<code>scale = 1.0 / (D ** 0.5)</code> 在 host 侧就算好传进去，而不是在 kernel 里算——把能预计算的都预计算，是 kernel 编程的基本素养。</p>
+          <p>精度验证用 <code>torch.manual_seed(0)</code> 固定随机种子，保证每次跑的输入一致、结果可复现；<code>(out_fa - out_ref).abs().max()</code> 取最大绝对误差，是核验精度的标准口径——误差在 1e-5 量级，说明 online softmax 的重加权逻辑正确；如果误差到 1e-3 以上，几乎可以断定是 <code>alpha</code> 那个系数写错了（把 m_new 和 m_i 的先后搞反是最常见的 bug）。速度对比要在 warmup 之后计时，因为第一次调用要触发 Triton 编译 kernel，花几秒到几十秒，不能计入基准。</p>
+          <p>顺带一提，上面的 reference_attention 用 <code>scores = Q @ K.transpose(-2, -1)</code> 会显式构造 N×N 矩阵——N=1024 时只有约 4MB，没有问题；但如果直接拿它去跑 N=32768 的基准，参考实现会先 OOM。这个细节正好再次印证了第一节的账：标准实现的 N×N 中间矩阵在长序列下是显存和访存的双重杀手，而 kernel 版因为不构造中间矩阵，天然没有这个问题。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant D as 随机数据
+  participant T as Triton 实现
+  participant R as PyTorch 参考
+  participant C as 误差对比
+  D->>T: Q, K, V
+  D->>R: Q, K, V
+  T-->>C: out_fa
+  R-->>C: out_ref
+  C->>C: 计算最大绝对误差
+  alt 误差 < 1e-5
+    C-->>T: 精度通过，进入速度对比
+  else 误差大
+    C-->>T: 排查 online softmax bug
+  end
+            </div>
+            <figcaption>验证流程：随机数据对比精度 → 通过后测速度，两步缺一不可</figcaption>
+          </figure>
+
+          <h2>五、为什么长序列加速更明显</h2>
+          <p>FlashAttention 的加速比随序列长度增大而增大——这正是「IO 感知」的体现：序列越长，标准实现的 N×N 中间矩阵越大，HBM 读写开销越惊人。</p>
+
+          <figure class="figure">
+            <div class="mermaid">
+timeline
+  title 加速比随序列长度增长
+  N=512 : 中间矩阵 1M 元素 : 加速 1.5-2x
+  N=2048 : 中间矩阵 4M 元素 : 加速 2-4x
+  N=8192 : 中间矩阵 64M 元素 : 加速 4-8x
+  N=32768 : 中间矩阵 1B 元素 : 加速 8-15x
+            </div>
+            <figcaption>加速比随序列长度增长：N×N 矩阵越大，访存节省越显著</figcaption>
+          </figure>
+
+          <p>为什么加速比不是「线性增长」而是「越来越陡」？因为标准实现的开销中，中间矩阵是 N² 项，FlashAttention 省掉的就是它；而 FlashAttention 的开销主要是加载 K/V 块（N×d 项）。两者的比值随 N 增长近似正比于 N/d——N 越大，省得越多。这也是为什么同样的优化在短序列上「没什么感觉」，一旦进入 4K、8K 甚至 32K 上下文，就是数量级的差距。下图把两种实现按「哪些数据进出 HBM」摆在一起对比，能更清楚地看到差异点在哪。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>环节</th><th>标准注意力</th><th>FlashAttention</th></tr></thead>
+              <tbody>
+                <tr><td>分数矩阵 S</td><td>完整 N×N 写入 HBM</td><td>分块，始终在 SRAM 内</td></tr>
+                <tr><td>访存复杂度</td><td>O(N²)（中间矩阵多次读写）</td><td>O(N)（只读写输入输出）</td></tr>
+                <tr><td>softmax 计算</td><td>全行一次性（需整行在内存）</td><td>online 增量（逐块合并）</td></tr>
+                <tr><td>峰值显存</td><td>需容纳 N×N 矩阵</td><td>只需输出 O 与当前块</td></tr>
+                <tr><td>数值结果</td><td>—</td><td>与标准实现一致（舍入级别）</td></tr>
+                <tr><td>适用场景</td><td>短序列、原型验证</td><td>长序列、训练与推理</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>工程直觉：<strong>短序列（N < 512）用标准实现就够</strong>，FlashAttention 的收益不明显甚至可能更慢（kernel 启动开销）；长序列（N > 2048）才是 FlashAttention 的主场。生产系统（vLLM、SGLang）在长上下文场景全面使用它。</p>
+          <p>块大小的最终答案不能靠推理，要靠实测。一个可复现的调参流程是：固定 N=4096、d=64，把 (BLOCK_N, BLOCK_K) 依次扫过 (32,32)、(64,32)、(64,64)、(128,64)、(128,128)、(256,128)，记录每个组合的耗时，找出当前硬件上的最优配置；再在 N=1024 和 N=8192 上复核一次，确认最优块大小对序列长度不敏感。这个过程通常只要几分钟，却能换来 20% 到 40% 的性能差。注意对比基线要固定在同一套精度（fp16 或 bf16）和同一块 GPU 上，跨卡对比没有意义。</p>
+
+          <h2>六、进阶：向后传播与其他变体</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>变体</th><th>改进</th><th>适用</th></tr></thead>
+              <tbody>
+                <tr><td>FlashAttention-2</td><td>减少非矩阵乘运算、更好的并行</td><td>训练 + 推理通用</td></tr>
+                <tr><td>FlashAttention-3</td><td>利用 Hopper 异步特性</td><td>H100 等新硬件</td></tr>
+                <tr><td>分块反向</td><td>反向时重算而非存储</td><td>训练省显存</td></tr>
+                <tr><td>稀疏 FlashAttention</td><td>只算非零块</td><td>稀疏注意力</td></tr>
+                <tr><td>MQA/GQA 支持</td><td>共享 KV 的块处理</td><td>推理加速</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这些变体的演进方向是一致的：要么让「非矩阵乘」时间更短（FA-2 的并行策略），要么利用新硬件的特性（FA-3 的 Hopper 异步执行），要么减少要算的内容（稀疏化、GQA 的共享 KV）。如果你在读它们的源码或论文时能认出「分块 + online softmax + 重计算」这三件套，就抓住了大半的架构脉络。对绝大多数应用而言，你不需要自己实现这些变体——PyTorch 的 SDPA 和各类推理引擎会替你选择，但理解它们共同的内核，能帮你在「换引擎、调显存、加自定义 mask」时做出正确的判断。</p>
+
+          <p>反向传播实现的核心：把前向的块遍历「重放」一遍，每块重新计算分数（而非存储 N×N 矩阵），从而反向也保持 O(N) 访存。这正是 FlashAttention 在训练中省显存的来源。把「重放」的过程画成时序图更直观：前向只保存每块的统计量，反向按相同的块遍历顺序重新加载 K/V、重新计算分数，再结合已保存的梯度更新权重。</p>
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant F as 前向
+  participant S as 片上状态
+  participant B as 反向
+  F->>F: 逐块遍历 K/V，更新 m/l/O
+  F->>S: 保存每块统计量（O(N) 量级）
+  Note over S: 不保存 N×N 分数矩阵
+  B->>B: 按相同顺序重放块遍历
+  B->>B: 每块重算分数（不存储）
+  B->>B: 计算 dQ/dK/dV 与梯度更新
+  Note over F,B: 反向同样保持 O(N) 访存
+            </div>
+            <figcaption>分块反向：前向只存 O(N) 统计量，反向重放块遍历并重算分数</figcaption>
+          </figure>
+          <p>这里有一个 trade-off 值得说透：重放能省显存，代价是反向多算一遍矩阵乘法（约 1.33 倍的前向计算量，业界称「重计算」）。对显存极度紧张的训练场景，这个代价通常值得——毕竟省下来的可能是整张卡。实际工程里，<code>torch.nn.functional.scaled_dot_product_attention</code> 已经内建了 FlashAttention 的前向和反向，多数时候不需要手写反向，但理解「为什么它能省显存」依然是排查显存问题时的重要基本功。</p>
+
+          <details class="deep">
+            <summary>深入：重加权系数 α 的数学直觉</summary>
+            <div class="deep-body">
+              <p>online softmax 里最反直觉的一步是 $O_{new} = O_{prev} \cdot \alpha + P_{new} V_{new}$：为什么旧输出要乘一个系数 α？因为 softmax 的归一化分母是「以当前最大值为基准」的，当全局最大值从 $m_{prev}$ 涨到 $m_{new}$ 时，旧块每一项 $\exp(s - m_{prev})$ 都需要换算成 $\exp(s - m_{new}) = \exp(s - m_{prev}) \cdot e^{m_{prev} - m_{new}}$，多出来的那个 $e^{m_{prev} - m_{new}}$ 就是 α。所以旧输出按 α 缩一缩，就能和新块「对齐到同一个参考系」再相加。</p>
+              <p>一个容易忽视的点：α 一定小于等于 1（因为 $m_{new} \ge m_{prev}$），所以旧数据的贡献只会被「压缩」而不会被「放大」。这意味着如果某一轮算出的最大值偏大（比如块里混进一个异常大的分数），后面所有旧数据都会被压得很小——数值上没有问题，但这属于数据层面的异常而不是算法 bug。这是在线算法与离线算法的一个微妙行为差异：离线算法对「先看到哪块」不敏感，在线算法则隐式地受块顺序影响。</p>
+              <p style="margin-bottom:0">另外值得注意，整个递推过程在 kernel 里用 fp32 累加而不是 fp16：因为 $l$ 和 $O$ 是逐步累加的量，fp16 只有约 3 位十进制有效数字，在长序列的多次累加中会放大舍入误差。这也是前面 kernel 代码里把状态量声明成 <code>tl.float32</code>、只在最后写回时转回输出精度（fp16/bf16）的原因。</p>
+            </div>
+          </details>
+
+          <figure class="paper-figure">
+            <img src="../../assets/figures/05-systems/flash-attention/fig1.png" alt="论文原图：FlashAttention 将 Q、K、V 分块并在片上 SRAM 中完成注意力计算" loading="lazy" style="max-width:560px">
+            <figcaption>
+              <span class="pf-title">图：FlashAttention 的分块（tiling）——Q、K、V 从 HBM 分块加载，在 SRAM 中完成分数、softmax 与输出累积</span>
+              <span class="pf-src">论文原图 · Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></span>
+            </figcaption>
+          </figure>
+          <p>读图先找两层存储：外层的大矩形代表 GPU 的 HBM，里面较小的区域代表片上 SRAM。Q、K、V 被切成块后，不是把完整的 N×N 分数矩阵写回 HBM，而是在 SRAM 中完成当前块的矩阵乘、online softmax 和 V 的加权累积；因此图中反复移动的是输入块，最终写回的是 O，而不是 S/P。</p>
+          <p>再沿着 Q 块和 K/V 块的交叉方向看：每一个块对都贡献一部分输出，行方向维护最大值与归一化因子，列方向逐块扫描键和值。这个布局解释了为什么算法仍然精确——它改变的是数据搬运顺序，不是注意力公式；同时也解释了为什么块大小、dtype、mask 和硬件后端会直接影响是否能落在快速路径上。</p>
+          <div class="callout warn">
+            <span class="callout-t">新手最容易搞错</span>
+            FlashAttention 不是把注意力近似成线性注意力，也不是“只计算一小部分 token”。它仍然计算完整的精确注意力，只是不把完整的中间矩阵落到 HBM；若看到显存或速度异常，先检查是否静默回退，而不是先改数学公式。
+          </div>
+          <details class="deep">
+            <summary>展开：最小可运行版本、验证步骤与排查清单</summary>
+            <div class="deep-body">
+              <p>最小实验可以先用 PyTorch 的 SDPA：创建同形状的 CUDA Q/K/V，使用 <code>sdpa_kernel(SDPBackend.FLASH_ATTENTION)</code> 强制后端，随后与 math 后端输出比较最大绝对误差。输入从 <code>N=128、head_dim=64、float16</code> 开始，确认结果有限且误差在可接受范围后，再逐步增加到 1024、4096，并记录峰值显存和 kernel 名。</p>
+              <p>排查顺序是：设备是否为 CUDA，dtype 是否为 fp16/bf16，head_dim 是否被后端支持，Q/K/V 是否 contiguous，mask 是否使用标准 causal 形式，最后用 profiler 确认实际 kernel。若强制后端直接报错，这是好事，说明你没有把回退误当成成功；替代方案是先用 math 后端保证正确性，或直接使用 PyTorch SDPA 让框架自动选择。</p>
+            </div>
+          </details>
+
+          <h2>要点速查</h2>
+          <ul>
+            <li><strong>本质</strong>：FlashAttention = IO 感知的分块注意力，把 N×N 中间矩阵困在片上 SRAM，访存从 O(N²) 降到 O(N)。</li>
+            <li><strong>关键技巧</strong>：online softmax 增量维护最大值 m、归一化因子 l、输出 O，数值等价标准实现。</li>
+            <li><strong>kernel 骨架</strong>：外层循环遍历 K/V 块 → 算分数 → online softmax 更新 → 最后除 l 归一化。</li>
+            <li><strong>验证门槛</strong>：与 PyTorch 参考对比，最大绝对误差应 < 1e-5。</li>
+            <li><strong>加速规律</strong>：序列越长加速越明显（N=512 约 2x，N=32768 可达 8-15x）；短序列收益小。</li>
+            <li><strong>生产使用</strong>：vLLM、SGLang 等推理引擎在长上下文全面使用；短序列可退回标准实现。</li>
+            <li><strong>常见坑</strong>：online softmax 的重加权系数写错导致精度不符；忽略 padding mask；短序列硬上 kernel 反而更慢。</li>
+          </ul>
+
+          <h2>参考文献与延伸阅读</h2>
+          <ul class="refs">
+            <li>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness — 原始论文 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></li>
+            <li>FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning — 第二版 · <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">arXiv:2307.08691</a></li>
+            <li>Triton 官方教程 — Triton 语言与 kernel 编写 · <a href="https://triton-lang.org" target="_blank" rel="noopener">triton-lang.org</a></li>
+            <li>在线 softmax 数值技巧 — Online normalizer calculation for softmax（Rabe & Staats）· <a href="https://arxiv.org/abs/2112.05682" target="_blank" rel="noopener">arXiv:2112.05682</a></li>
+          </ul>
+
+          <div class="callout">
+            <span class="callout-t">接下来</span>
+            FlashAttention 是注意力优化的核心，理论见 <a href="../03-transformer/attention.html">注意力机制</a> 与 <a href="../05-systems/flash-attention.html">FlashAttention</a>；写 kernel 的语言基础见 <a href="../05-systems/triton-kernel.html">Triton 编程</a>；GPU 硬件背景见 <a href="../05-systems/gpu-architecture.html">GPU 架构</a>。
+          </div>
+
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>
