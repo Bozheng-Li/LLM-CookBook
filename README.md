@@ -79,6 +79,7 @@ python -m http.server 8000
 ```text
 .
 ├── index.html                 # 站点首页与学习入口
+├── references.html            # 独立的论文、教程与规范资源中心
 ├── glossary.html              # 全站术语表
 ├── dependency.html            # 知识依赖图
 ├── pages/                     # 00–15 章节与主题页
