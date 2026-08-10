@@ -387,6 +387,15 @@
     document.head.appendChild(script);
   }
 
+  function loadTechnicalDepth() {
+    if (!CUR_TOPIC || document.querySelector('.technical-deepening')) return;
+    var script = document.createElement('script');
+    script.src = url('assets/js/depth.js');
+    script.async = true;
+    script.onload = function () { if (typeof window.CB_RENDER_DEPTH === 'function') window.CB_RENDER_DEPTH(); };
+    document.head.appendChild(script);
+  }
+
   /* ---------------- 启动 ---------------- */
   function init() {
     initTheme();
@@ -398,6 +407,7 @@
     buildDeepTools();
     buildPageToc();
     markCurrentRead();
+    loadTechnicalDepth();
     loadResourceCards();
   }
 
