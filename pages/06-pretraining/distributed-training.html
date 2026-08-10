@@ -4,16 +4,28 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="一个万亿参数模型单机放不下，一次前向的激活值也单机放不下。把训练拆到成百上千张卡上，不是一个选项，而是唯一出路。但「拆」的方式有五种，每种有不同的通信代价和显存收益。这一页讲清五种并行各自的原理、通信模式、显存账本，以及它们如何叠加成一个等效并行度——框架的具体实现和配置项见 训练框架与工程实现 。">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="并行策略：5D 并行的原理与组合 · 大模型技术 Cookbook">
+  <meta property="og:description" content="一个万亿参数模型单机放不下，一次前向的激活值也单机放不下。把训练拆到成百上千张卡上，不是一个选项，而是唯一出路。但「拆」的方式有五种，每种有不同的通信代价和显存收益。这一页讲清五种并行各自的原理、通信模式、显存账本，以及它们如何叠加成一个等效并行度——框架的具体实现和配置项见 训练框架与工程实现 。">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/06-pretraining/distributed-training.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/06-pretraining/distributed-training.html">
   <title>并行策略：5D 并行的原理与组合 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="06-pretraining" data-topic="distributed-training">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -31,21 +43,7 @@
             <p>五种并行的本质都是<strong>把一个大的计算任务切成多份，分给不同 GPU</strong>，区别只在于「切哪个维度」。数据并行切 batch，流水线并行切层，张量并行切层内矩阵，序列并行切序列长度，专家并行切 FFN 的专家。它们可以叠加，最终等效并行度等于各维度并行度的乘积。</p>
             <p>换个生活化的类比：一本厚书要抄完。数据并行是「找 8 个人各抄一本不同的书，抄完对一下笔记」；流水线并行是「8 个人排队，第一个人抄第 1 章，抄完传给第二个人抄第 2 章」；张量并行是「8 个人同时抄同一页，每人抄一竖列，抄完拼起来」；序列并行是「一段超长的句子拆成 8 截，每人抄一截」；专家并行是「8 个人各自擅长不同学科，来什么内容就转给对应的专家抄」。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart TB
-  M["模型训练任务"] --> DP["数据并行 DP<br/>切 batch 维度"]
-  M --> PP["流水线并行 PP<br/>切层维度"]
-  M --> TP["张量并行 TP<br/>切层内矩阵"]
-  M --> SP["序列并行 SP<br/>切序列长度"]
-  M --> EP["专家并行 EP<br/>切 FFN 专家"]
-  DP --> DP1["每卡完整模型<br/>不同数据<br/>AllReduce 通信"]
-  PP --> PP1["层分配到不同卡<br/>流水线传递激活<br/>气泡开销"]
-  TP --> TP1["矩阵分块到不同卡<br/>AllReduce / AllGather"]
-  SP --> SP1["序列分段到不同卡<br/>AllGather + ReduceScatter"]
-  EP --> EP1["专家分配到不同卡<br/>All-to-All 通信"]
-  style DP fill:#e6f1fb,stroke:#185fa5
-  style EP fill:#f0f7e8,stroke:#4a8a2a
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="11" data-edge-count="10" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="M"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">模型训练任务</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="DP"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">数据并行 DP</span><span>切 batch 维度</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型训练任务</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="PP"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">流水线并行 PP</span><span>切层维度</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型训练任务</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="TP"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">张量并行 TP</span><span>切层内矩阵</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型训练任务</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="SP"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">序列并行 SP</span><span>切序列长度</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型训练任务</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="EP"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">专家并行 EP</span><span>切 FFN 专家</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型训练任务</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="DP1"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">每卡完整模型</span><span>不同数据</span><span>AllReduce 通信</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">数据并行 DP / 切 batch 维度</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="PP1"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">层分配到不同卡</span><span>流水线传递激活</span><span>气泡开销</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">流水线并行 PP / 切层维度</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="TP1"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">矩阵分块到不同卡</span><span>AllReduce / AllGather</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">张量并行 TP / 切层内矩阵</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="SP1"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">序列分段到不同卡</span><span>AllGather + ReduceScatter</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">序列并行 SP / 切序列长度</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="EP1"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">专家分配到不同卡</span><span>All-to-All 通信</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">专家并行 EP / 切 FFN 专家</span></li></ul></article></div></li></ol></div>
               <figcaption>五种并行各自切一个不同的维度，通信模式和显存收益各不相同。切法不同，代价也不同——这是全篇的主线。</figcaption>
             </figure>
           </div>
@@ -79,33 +77,7 @@ flowchart TB
           <p>五种并行分别针对账单里的不同项目下刀。下面这张思维导图先把全局关系摆出来，后面逐个展开：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root(("5D 并行"))
-    数据并行 DP
-      切 batch
-      AllReduce 每步一次
-      单独用不省显存
-      配 ZeRO 后切三件套
-    张量并行 TP
-      切层内矩阵
-      每层多次 AllReduce
-      省参数与激活
-      只适合节点内
-    流水线并行 PP
-      切层
-      点对点 send recv
-      通信量最小
-      气泡是主要损耗
-    序列并行 SP
-      切序列长度
-      AllGather 与 ReduceScatter
-      专治长上下文激活值
-    专家并行 EP
-      切 MoE 专家
-      All-to-All
-      负载均衡是命门
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：5D 并行" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>5D 并行</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>数据并行 DP</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">切 batch</span></li><li><span class="html-mindmap-leaf">AllReduce 每步一次</span></li><li><span class="html-mindmap-leaf">单独用不省显存</span></li><li><span class="html-mindmap-leaf">配 ZeRO 后切三件套</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>张量并行 TP</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">切层内矩阵</span></li><li><span class="html-mindmap-leaf">每层多次 AllReduce</span></li><li><span class="html-mindmap-leaf">省参数与激活</span></li><li><span class="html-mindmap-leaf">只适合节点内</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>流水线并行 PP</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">切层</span></li><li><span class="html-mindmap-leaf">点对点 send recv</span></li><li><span class="html-mindmap-leaf">通信量最小</span></li><li><span class="html-mindmap-leaf">气泡是主要损耗</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>序列并行 SP</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">切序列长度</span></li><li><span class="html-mindmap-leaf">AllGather 与 ReduceScatter</span></li><li><span class="html-mindmap-leaf">专治长上下文激活值</span></li></ul></section><section class="html-mindmap-branch tone-5" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">05</span><strong>专家并行 EP</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">切 MoE 专家</span></li><li><span class="html-mindmap-leaf">All-to-All</span></li><li><span class="html-mindmap-leaf">负载均衡是命门</span></li></ul></section></div></div>
             <figcaption>五种并行的能力地图：各自切什么、用什么通信原语、省的是哪一部分显存、最大的坑在哪。建议读完全文后回头再看一遍这张图。</figcaption>
           </figure>
 
@@ -141,11 +113,11 @@ mindmap
           <h2>张量并行（TP）：切层内矩阵</h2>
           <p>在讲切法之前，先看一张来自 Megatron-LM 论文的原图——它把「朴素模型并行」和「模型并行 + 数据并行」的差别一次讲清楚。这是理解 TP 为什么出现的起点。</p>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/06-pretraining/distributed-training/fig1.png" alt="论文原图：Megatron-LM 提出的模型并行 vs 模型+数据并行对比——左图只把模型切到两卡（每卡只算一半层但整批数据），右图在切模型的同时每个副本处理不同的 batch，两卡各持一层并各算不同数据" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：朴素模型并行（左）与「模型并行 + 数据并行」组合（右）——把层切到不同卡的同时，让每组卡处理不同的数据，显存与吞吐同时受益</span>
-              <span class="pf-src">论文原图 · Shoeybi et al., <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>, 2019, Figure 1 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">arXiv:1909.08053</a></span>
+              <span class="pf-src">论文原图 · Shoeybi et al., <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>, 2019, Figure 1 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">arXiv:1909.08053</a></span>
             </figcaption>
           </figure>
 
@@ -154,28 +126,18 @@ mindmap
 
           <p>张量并行把<strong>单个层内的矩阵乘法</strong>拆到多张卡上。以一个线性层 $Y = XW$ 为例，可以把权重矩阵 $W$ 按列切分（Column Parallel），每张卡持有 $W$ 的一部分列，各自算出 $Y$ 的一部分，然后通过 AllGather 拼成完整的 $Y$。也可以按行切分（Row Parallel），每张卡算出部分结果后通过 AllReduce 求和。</p>
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-flowchart LR
-  X["输入 X"] --> G1["GPU 1<br/>W 的前半列"]
-  X --> G2["GPU 2<br/>W 的后半列"]
-  G1 --> Y1["Y 的前半"]
-  G2 --> Y2["Y 的后半"]
-  Y1 --> AG["AllGather"]
-  Y2 --> AG
-  AG --> Y["完整输出 Y"]
-  style AG fill:#fff3e0,stroke:#e65100
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="7" data-edge-count="7" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="X"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">输入 X</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="G1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 1</span><span>W 的前半列</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">输入 X</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 2</span><span>W 的后半列</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">输入 X</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Y1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Y 的前半</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU 1 / W 的前半列</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Y2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Y 的后半</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU 2 / W 的后半列</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="AG"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">AllGather</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Y 的前半</span></li><li><span class="html-flow-source">Y 的后半</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Y"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">完整输出 Y</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">AllGather</span></li></ul></article></div></li></ol></div>
             <figcaption>张量并行 Column Parallel：权重按列切分，每卡算出输出的一部分列，最后通过 AllGather 拼接成完整输出。</figcaption>
           </figure>
 
           <h3>Megatron 的巧妙之处：让两次通信变成一次</h3>
           <p>先看论文里的第二张原图。它把「一个 Transformer 层在 Megatron 式张量并行下怎么切分、哪里需要通信」画得明明白白——这张图是理解 TP 在 Transformer 上具体落法的关键。</p>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/06-pretraining/distributed-training/fig2.png" alt="论文原图：Megatron-LM 的 Transformer 层切分方案——f 与 g 标记通信点，注意力块的 QKV 与输出投影、MLP 块的两个线性层分别按列/按行切分，每块只在边界做一次通信" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：Megatron-LM 的 Transformer 层张量并行方案——f 和 g 是两个「配对通信点」，注意力与 MLP 两块内部零通信，整层前向只需两次 AllReduce</span>
-              <span class="pf-src">论文原图 · Shoeybi et al., <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>, 2019, Figure 2 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">arXiv:1909.08053</a></span>
+              <span class="pf-src">论文原图 · Shoeybi et al., <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>, 2019, Figure 2 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">arXiv:1909.08053</a></span>
             </figcaption>
           </figure>
 
@@ -209,20 +171,7 @@ flowchart LR
           <h2>流水线并行（PP）：切层</h2>
           <p>流水线并行把<strong>不同的层分配到不同的卡上</strong>。GPU 1 处理第 1-10 层，GPU 2 处理第 11-20 层，以此类推。数据像流水线上的产品一样从第一组层流到最后一组层。</p>
           <p>朴素流水线的问题是<strong>气泡</strong>（bubble）：当 GPU 1 在处理第一个 micro-batch 时，GPU 2 到 GPU N 都在空等。为了压缩气泡，实际做法是把一个 mini-batch 切成多个 micro-batch，让不同 GPU 同时处理不同的 micro-batch，这就是 GPipe 和 1F1B（one-forward-one-backward）调度策略。</p>
-          <div class="mermaid">
-flowchart LR
-  subgraph "朴素流水线（气泡大）"
-    G1A["GPU1: F1"] --> G2A["GPU2: F1"]
-    G2A --> G3A["GPU3: F1"]
-    G3A --> G4A["GPU4: F1"]
-    G1A -.-> G1B["GPU1: 空闲..."]
-  end
-  subgraph "1F1B 调度（气泡小）"
-    G1C["GPU1: F1 F2 F3 F4"] --> G2C["GPU2: F1 F2 F3 F4"]
-    G2C --> G3C["GPU3: F1 F2 F3 F4"]
-    G3C --> G4C["GPU4: F1 F2 F3 F4"]
-  end
-          </div>
+          <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="9" data-edge-count="7" data-instance="2" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="G1A"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">朴素流水线（气泡大）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU1: F1</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G1C"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">1F1B 调度（气泡小）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU1: F1 F2 F3 F4</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="G2A"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">朴素流水线（气泡大）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU2: F1</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU1: F1</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G1B"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">朴素流水线（气泡大）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU1: 空闲...</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">GPU1: F1</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G2C"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">1F1B 调度（气泡小）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU2: F1 F2 F3 F4</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU1: F1 F2 F3 F4</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="G3A"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">朴素流水线（气泡大）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU3: F1</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU2: F1</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G3C"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">1F1B 调度（气泡小）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU3: F1 F2 F3 F4</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU2: F1 F2 F3 F4</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="G4A"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">朴素流水线（气泡大）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU4: F1</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU3: F1</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G4C"><div class="html-flow-node-meta"><span class="html-flow-index">09</span><span class="html-flow-group-label">1F1B 调度（气泡小）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU4: F1 F2 F3 F4</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU3: F1 F2 F3 F4</span></li></ul></article></div></li></ol></div>
 
           <p>把时间轴摊开看会更清楚。下面这张时序图展示 4 个流水线阶段在 1F1B 调度下的行为：先是一段「填充期」让流水线灌满，然后进入稳态——<strong>每个阶段交替做一次前向和一次反向</strong>，最后是一段「排空期」。</p>
 
@@ -298,21 +247,7 @@ sequenceDiagram
           <!-- ============ Section 5: EP ============ -->
           <h2>专家并行（EP）：切 FFN 专家</h2>
           <p>专家并行专门为 <a href="../04-modern-arch/moe.html">MoE 混合专家</a> 架构设计。它把不同的专家分配到不同 GPU 上——每张卡只存放和计算一部分专家。路由器决定每个 token 去哪张卡，于是需要一个 All-to-All 通信：先把 token 发到目标专家所在的卡，算完后再把结果发回来。</p>
-          <div class="mermaid">
-flowchart LR
-  T1["GPU 1 的 token"] -->|路由分发| R1["All-to-All"]
-  T2["GPU 2 的 token"] -->|路由分发| R2["All-to-All"]
-  R1 --> E1["GPU1: 专家 A B"]
-  R1 --> E2["GPU2: 专家 C D"]
-  R2 --> E1
-  R2 --> E2
-  E1 -->|结果回收| R3["All-to-All"]
-  E2 -->|结果回收| R4["All-to-All"]
-  R3 --> O1["GPU 1 的输出"]
-  R4 --> O2["GPU 2 的输出"]
-  style R1 fill:#fff3e0,stroke:#e65100
-  style R2 fill:#fff3e0,stroke:#e65100
-          </div>
+          <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="10" data-edge-count="10" data-instance="3" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="T1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 1 的 token</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 2 的 token</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="R1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">All-to-All</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU 1 的 token</span><span class="html-flow-condition">路由分发</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="R2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">All-to-All</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU 2 的 token</span><span class="html-flow-condition">路由分发</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="E1"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU1: 专家 A B</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">All-to-All</span></li><li><span class="html-flow-source">All-to-All</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="E2"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU2: 专家 C D</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">All-to-All</span></li><li><span class="html-flow-source">All-to-All</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="R3"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">All-to-All</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU1: 专家 A B</span><span class="html-flow-condition">结果回收</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="R4"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">All-to-All</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU2: 专家 C D</span><span class="html-flow-condition">结果回收</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="O1"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 1 的输出</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">All-to-All</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="O2"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 2 的输出</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">All-to-All</span></li></ul></article></div></li></ol></div>
           <p>All-to-All 是五种并行里<strong>最难受的通信原语</strong>：它不像 AllReduce 那样可以用环形算法把带宽需求摊平，而是每张卡都要给其他所有卡发一份不同的数据。通信量正比于「本卡 token 数 × top-k × 隐层维度」，且对<strong>全互联拓扑</strong>要求很高。在一个 MoE 层里要做两次（分发一次、回收一次），一个 60 层的 MoE 模型一步前向就是 120 次 All-to-All。</p>
           <p>专家并行的关键挑战是<strong>负载均衡</strong>：如果路由器倾向于把大部分 token 都发给少数几个「明星专家」，这些专家所在的卡会成为瓶颈，其他卡空转。而且 All-to-All 是<strong>同步</strong>的——所有卡必须等最慢的那张卡算完才能进入下一步，所以负载不均的惩罚是全局性的，不是局部的。解决方案包括辅助负载均衡损失、容量因子限制以及无辅助损失均衡方案（详见 <a href="../04-modern-arch/moe.html">MoE 混合专家</a>）。</p>
           <p>专家并行与数据并行可以叠加：同一组专家复制到多个副本（数据并行维度），每个副本内部用 EP 分布专家。注意此时<strong>注意力层走 DP/TP、FFN 层走 EP</strong>，同一个模型的不同部分用了不同的并行拓扑，这是 MoE 训练配置里最容易搞错的地方。</p>
@@ -367,22 +302,8 @@ print(group_members(11, mesh, "pp"))            # [3, 11, 19, 27] 跨节点
           <p>这段代码里最重要的一行是坐标分解的<strong>顺序</strong>。让 <code>tp</code> 变化最快，意味着同一个 TP 组的 8 张卡 rank 连续（如 8~15），而集群里连续的 rank 通常就在同一台机器上、由 NVLink 互联。反过来，如果把 <code>dp</code> 放在最内层，TP 组就会跨节点——配置一字之差，训练速度可能差三倍。真实框架的 device mesh 抽象做的就是这件事，具体 API 以官方文档为准。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  subgraph Node1["节点 1 · NVLink 约 900 GB/s"]
-    direction LR
-    N1G1["rank 0<br/>tp=0"] --- N1G2["rank 1<br/>tp=1"] --- N1G3["rank 2<br/>tp=2"] --- N1G4["rank 3<br/>tp=3"]
-  end
-  subgraph Node2["节点 2 · NVLink 约 900 GB/s"]
-    direction LR
-    N2G1["rank 4<br/>tp=0"] --- N2G2["rank 5<br/>tp=1"] --- N2G3["rank 6<br/>tp=2"] --- N2G4["rank 7<br/>tp=3"]
-  end
-  Node1 <-->|"InfiniBand 约 50-100 GB/s<br/>走 PP 的点对点 与 DP 的 AllReduce"| Node2
-  TPnote["TP 与 SP 放这里<br/>每层多次通信 延迟敏感"] -.-> Node1
-  PPnote["PP 与 DP 放这里<br/>通信量小 或频率低"] -.-> Node2
-  style Node1 fill:#e6f1fb,stroke:#185fa5
-  style Node2 fill:#eaf3de,stroke:#639922
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="12" data-edge-count="9" data-instance="4" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="N1G1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">节点 1 · NVLink 约 900 GB/s</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">rank 0</span><span>tp=0</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="N2G1"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">节点 2 · NVLink 约 900 GB/s</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">rank 4</span><span>tp=0</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="TPnote"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">TP 与 SP 放这里</span><span>每层多次通信 延迟敏感</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="PPnote"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">PP 与 DP 放这里</span><span>通信量小 或频率低</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="N1G2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">节点 1 · NVLink 约 900 GB/s</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">rank 1</span><span>tp=1</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">rank 0 / tp=0</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="N2G2"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">节点 2 · NVLink 约 900 GB/s</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">rank 5</span><span>tp=1</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">rank 4 / tp=0</span></li></ul></article><article class="html-flow-node is-group-node tone-info shape-step" data-node-id="Node1" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">节点 1 · NVLink 约 900 GB/s</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">TP 与 SP 放这里 / 每层多次通信 延迟敏感</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="N1G3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">节点 1 · NVLink 约 900 GB/s</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">rank 2</span><span>tp=2</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">rank 1 / tp=1</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="N2G3"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">节点 2 · NVLink 约 900 GB/s</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">rank 6</span><span>tp=2</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">rank 5 / tp=1</span></li></ul></article><article class="html-flow-node is-group-node tone-success shape-step" data-node-id="Node2" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">节点 2 · NVLink 约 900 GB/s</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">节点 1 · NVLink 约 900 GB/s</span><span class="html-flow-condition">InfiniBand 约 50-100 GB/s
+走 PP 的点对点 与 DP 的 AllReduce</span></li><li data-kind="feedback"><span class="html-flow-source">PP 与 DP 放这里 / 通信量小 或频率低</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="N1G4"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">节点 1 · NVLink 约 900 GB/s</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">rank 3</span><span>tp=3</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">rank 2 / tp=2</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="N2G4"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">节点 2 · NVLink 约 900 GB/s</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">rank 7</span><span>tp=3</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">rank 6 / tp=2</span></li></ul></article></div></li></ol></div>
             <figcaption>拓扑映射的黄金法则：<strong>通信频率高的并行放高带宽链路，通信频率低的放低带宽链路</strong>。TP/SP 每层都要通信，必须待在节点内；PP 每个阶段边界才通信一次，DP 每步才通信一次，都能容忍跨节点。</figcaption>
           </figure>
 
@@ -409,29 +330,7 @@ flowchart TB
           <p>面对五个旋钮，实践中的调法是有顺序的。下面这条决策路径来自「先保证放得下，再追求跑得快」的基本原则：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  Start(["开始配置"]) --> Q1{"单卡能放下<br/>完整训练状态吗"}
-  Q1 -->|"能"| DPonly["纯 DP<br/>再加梯度累积凑 batch"]
-  Q1 -->|"不能"| Q2{"是 MoE 模型吗"}
-  Q2 -->|"是"| SetEP["先定 EP<br/>按专家数与卡数整除关系"]
-  Q2 -->|"否"| Q3
-  SetEP --> Q3{"节点内还放不下吗"}
-  Q3 -->|"是"| SetTP["开 TP<br/>取值 2 4 8 不超过单节点卡数"]
-  Q3 -->|"否"| Q4
-  SetTP --> SetSP["顺手开 Megatron 式 SP<br/>几乎零成本省激活"]
-  SetSP --> Q4{"序列超过 32K 吗"}
-  Q4 -->|"是"| SetCP["再开上下文并行<br/>Ring Attention"]
-  Q4 -->|"否"| Q5
-  SetCP --> Q5{"还是放不下吗"}
-  Q5 -->|"是"| SetPP["开 PP<br/>阶段数尽量小 micro-batch 尽量多"]
-  Q5 -->|"否"| Rest
-  SetPP --> Rest["剩余卡数全给 DP<br/>配 ZeRO 或 FSDP 分片"]
-  DPonly --> Tune["实测 MFU 并回头调参"]
-  Rest --> Tune
-  style Q1 fill:#faeeda,stroke:#ba7517
-  style Tune fill:#eaf3de,stroke:#639922
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="14" data-edge-count="18" data-instance="5" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-terminal" data-node-id="Start"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">开始配置</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单卡能放下</span><span>完整训练状态吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">开始配置</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="DPonly"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">纯 DP</span><span>再加梯度累积凑 batch</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单卡能放下 / 完整训练状态吗</span><span class="html-flow-condition">能</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="Q2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">是 MoE 模型吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单卡能放下 / 完整训练状态吗</span><span class="html-flow-condition">不能</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SetEP"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">先定 EP</span><span>按专家数与卡数整除关系</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是 MoE 模型吗</span><span class="html-flow-condition">是</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">节点内还放不下吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是 MoE 模型吗</span><span class="html-flow-condition">否</span></li><li><span class="html-flow-source">先定 EP / 按专家数与卡数整除关系</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SetTP"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">开 TP</span><span>取值 2 4 8 不超过单节点卡数</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">节点内还放不下吗</span><span class="html-flow-condition">是</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">07</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SetSP"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">顺手开 Megatron 式 SP</span><span>几乎零成本省激活</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">开 TP / 取值 2 4 8 不超过单节点卡数</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">08</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q4"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">序列超过 32K 吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">节点内还放不下吗</span><span class="html-flow-condition">否</span></li><li><span class="html-flow-source">顺手开 Megatron 式 SP / 几乎零成本省激活</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">09</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SetCP"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">再开上下文并行</span><span>Ring Attention</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">序列超过 32K 吗</span><span class="html-flow-condition">是</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">10</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q5"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">还是放不下吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">序列超过 32K 吗</span><span class="html-flow-condition">否</span></li><li><span class="html-flow-source">再开上下文并行 / Ring Attention</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">11</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SetPP"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">开 PP</span><span>阶段数尽量小 micro-batch 尽量多</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">还是放不下吗</span><span class="html-flow-condition">是</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">12</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Rest"><div class="html-flow-node-meta"><span class="html-flow-index">13</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">剩余卡数全给 DP</span><span>配 ZeRO 或 FSDP 分片</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">还是放不下吗</span><span class="html-flow-condition">否</span></li><li><span class="html-flow-source">开 PP / 阶段数尽量小 micro-batch 尽量多</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">13</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="Tune"><div class="html-flow-node-meta"><span class="html-flow-index">14</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">实测 MFU 并回头调参</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">纯 DP / 再加梯度累积凑 batch</span></li><li><span class="html-flow-source">剩余卡数全给 DP / 配 ZeRO 或 FSDP 分片</span></li></ul></article></div></li></ol></div>
             <figcaption>并行配置的决策路径：显存约束优先，通信开销次之。每一步都是「不得不加」才加，因为每加一维都会带来额外的通信和实现复杂度。</figcaption>
           </figure>
 
@@ -518,7 +417,7 @@ for tp, pp, z in [(1, 1, 0), (8, 1, 0), (8, 4, 1), (8, 4, 3)]:
               </tbody>
             </table>
           </div>
-          <p>面试时不要只背「ZeRO-3 = FSDP」。两者的<strong>状态切分目标相近</strong>，但抽象层不同：DeepSpeed ZeRO 常以优化器/训练引擎为中心，FSDP 以模块 wrapping 为边界，在进入模块前聚合参数、离开后释放。FSDP 的 SHARD_GRAD_OP、HYBRID_SHARD 等模式还允许只在节点内分片、节点间做复制或较少通信；选择时应同时看模型状态、wrap 粒度和网络拓扑。参见 <a href="https://www.deepspeed.ai/tutorials/zero/" target="_blank" rel="noopener">DeepSpeed ZeRO 官方教程</a> 与 <a href="https://pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener">PyTorch FSDP 文档</a>。</p>
+          <p>面试时不要只背「ZeRO-3 = FSDP」。两者的<strong>状态切分目标相近</strong>，但抽象层不同：DeepSpeed ZeRO 常以优化器/训练引擎为中心，FSDP 以模块 wrapping 为边界，在进入模块前聚合参数、离开后释放。FSDP 的 SHARD_GRAD_OP、HYBRID_SHARD 等模式还允许只在节点内分片、节点间做复制或较少通信；选择时应同时看模型状态、wrap 粒度和网络拓扑。参见 <a href="https://www.deepspeed.ai/tutorials/zero/" target="_blank" rel="noopener noreferrer">DeepSpeed ZeRO 官方教程</a> 与 <a href="https://pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener noreferrer">PyTorch FSDP 文档</a>。</p>
           <div class="callout tip">
             <span class="callout-t">面试回答模板</span>
             「先按 $W/G/O$ 三类状态说清楚：ZeRO-1 切 $O$，ZeRO-2 再切 $G$，ZeRO-3 连 $W$ 也切；切得越彻底，常驻显存越低，但参数 AllGather/梯度 ReduceScatter 越频繁。FSDP FULL_SHARD 是模块级的全分片实现，工程上重点调 wrapping、prefetch、通信重叠和 CPU/NVMe offload，而不是只看一个 stage 名字。」
@@ -527,29 +426,7 @@ for tp, pp, z in [(1, 1, 0), (8, 1, 0), (8, 4, 1), (8, 4, 3)]:
           <h2>DP/TP/PP/EP 怎么组合：先问带宽，再问显存</h2>
           <p>一个可迁移的选型顺序是：<strong>先用 TP/PP/EP 解决「单副本放不下」的问题，再用 DP 扩吞吐，最后用 ZeRO/FSDP 压状态显存</strong>。并行维度不是简单相乘：MoE 的 EP 通常复用 TP 或 DP 的设备组，不能把 EP 盲目再乘一次。</p>
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  A([输入模型与集群]) --> B{单卡能放下训练状态?}
-  B -->|能| C[DP + 梯度累积]
-  B -->|不能| D{MoE 专家数/路由容量需要分布?}
-  D -->|是| E[先定 EP<br/>专家数可被 EP 整除]
-  D -->|否| F[跳过 EP]
-  E --> G{TP 组能完全放入节点内?}
-  F --> G
-  G -->|否| H[减小 TP 或改用 PP/ZeRO]
-  G -->|是| I[TP=2/4/8 + SP<br/>高频集合通信留在 NVLink]
-  I --> J{序列/激活仍放不下?}
-  H --> J
-  J -->|是| K[加 CP/Ring Attention 或 PP]
-  J -->|否| L[保留当前 TP/PP]
-  K --> M[剩余设备给 DP + ZeRO/FSDP]
-  L --> M
-  C --> N[测 MFU、通信占比、阶段空泡]
-  M --> N
-  N --> O([用 2/8/32 卡逐级放大验证])
-  style I fill:#e6f1fb,stroke:#185fa5
-  style M fill:#eaf3de,stroke:#4a8a2a
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="15" data-edge-count="18" data-instance="6" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-terminal" data-node-id="A"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">输入模型与集群</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="B"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单卡能放下训练状态?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">输入模型与集群</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">DP + 梯度累积</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单卡能放下训练状态?</span><span class="html-flow-condition">能</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="D"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">MoE 专家数/路由容量需要分布?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单卡能放下训练状态?</span><span class="html-flow-condition">不能</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="E"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">先定 EP</span><span>专家数可被 EP 整除</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">MoE 专家数/路由容量需要分布?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">跳过 EP</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">MoE 专家数/路由容量需要分布?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="G"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">TP 组能完全放入节点内?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">先定 EP / 专家数可被 EP 整除</span></li><li><span class="html-flow-source">跳过 EP</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="H"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">减小 TP 或改用 PP/ZeRO</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">TP 组能完全放入节点内?</span><span class="html-flow-condition">否</span></li></ul></article><article class="html-flow-node tone-info shape-step" data-node-id="I"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">TP=2/4/8 + SP</span><span>高频集合通信留在 NVLink</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">TP 组能完全放入节点内?</span><span class="html-flow-condition">是</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">07</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="J"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">序列/激活仍放不下?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">TP=2/4/8 + SP / 高频集合通信留在 NVLink</span></li><li><span class="html-flow-source">减小 TP 或改用 PP/ZeRO</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">08</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="K"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">加 CP/Ring Attention 或 PP</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">序列/激活仍放不下?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="L"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">保留当前 TP/PP</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">序列/激活仍放不下?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">09</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="M"><div class="html-flow-node-meta"><span class="html-flow-index">13</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">剩余设备给 DP + ZeRO/FSDP</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">加 CP/Ring Attention 或 PP</span></li><li><span class="html-flow-source">保留当前 TP/PP</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">10</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="N"><div class="html-flow-node-meta"><span class="html-flow-index">14</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">测 MFU、通信占比、阶段空泡</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">DP + 梯度累积</span></li><li><span class="html-flow-source">剩余设备给 DP + ZeRO/FSDP</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">11</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-terminal" data-node-id="O"><div class="html-flow-node-meta"><span class="html-flow-index">15</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">用 2/8/32 卡逐级放大验证</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">测 MFU、通信占比、阶段空泡</span></li></ul></article></div></li></ol></div>
             <figcaption>决策树的硬约束：TP/SP 的每层集合通信优先落在节点内；PP 的点对点和 DP 的低频同步可以跨节点；EP 的 All-to-All 只有在拓扑和负载均衡都可控时才扩大。</figcaption>
           </figure>
           <div class="table-wrap">
@@ -563,7 +440,7 @@ flowchart TB
               </tbody>
             </table>
           </div>
-          <p>粗略判断通信是否会成为瓶颈，可用「通信时间 ÷ 计算时间」做第一版筛选：$t_{comm}\approx V/B_{eff}+n_{collective}L$。其中 $V$ 是本步通信字节数，$B_{eff}$ 是实测有效带宽，$L$ 是单次集合通信延迟。TP 的 $n_{collective}$ 随层数增长，PP 的 $V$ 较小且可流水，DP 则通常只在同步点出现。正式结论应来自 NCCL profiler 与实测，而不是只看标称带宽；集合通信语义和调优入口见 <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html" target="_blank" rel="noopener">NCCL Collectives 文档</a>。</p>
+          <p>粗略判断通信是否会成为瓶颈，可用「通信时间 ÷ 计算时间」做第一版筛选：$t_{comm}\approx V/B_{eff}+n_{collective}L$。其中 $V$ 是本步通信字节数，$B_{eff}$ 是实测有效带宽，$L$ 是单次集合通信延迟。TP 的 $n_{collective}$ 随层数增长，PP 的 $V$ 较小且可流水，DP 则通常只在同步点出现。正式结论应来自 NCCL profiler 与实测，而不是只看标称带宽；集合通信语义和调优入口见 <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html" target="_blank" rel="noopener noreferrer">NCCL Collectives 文档</a>。</p>
 
           <h2>Pipeline bubble 与 batch：四个名词必须分清</h2>
           <div class="table-wrap">
@@ -577,14 +454,14 @@ flowchart TB
               </tbody>
             </table>
           </div>
-          <p>算例：$DP=8$，每卡每次处理 $B_{micro}=2$ 条、每条 $8192$ token，梯度累积 $A=16$，则一次更新的全局 token 数为 $2\times8192\times16\times8=2{,}097{,}152$（约 2.1M tokens）。若再使用 $PP=P=8$，选择一次 flush 的 $M=64$ 个 micro-batch，则 bubble 近似为 $(8-1)/64=10.94\%$；此时每个 DP 副本在一个 update 内需安排的 micro-batch 数、梯度累积语义和框架的 virtual pipeline 配置必须对齐，不能只把 $M$ 当成「随便加大的 batch」。当目标 global batch 固定时，增大 DP 或 $B_{micro}$ 会反向压缩可用的 $A/M$，因此<strong>气泡、激活显存和收敛 batch 是同一个约束系统</strong>。GPipe 对 micro-batch/流水线的原始定义见 <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener">GPipe 论文</a>。</p>
+          <p>算例：$DP=8$，每卡每次处理 $B_{micro}=2$ 条、每条 $8192$ token，梯度累积 $A=16$，则一次更新的全局 token 数为 $2\times8192\times16\times8=2{,}097{,}152$（约 2.1M tokens）。若再使用 $PP=P=8$，选择一次 flush 的 $M=64$ 个 micro-batch，则 bubble 近似为 $(8-1)/64=10.94\%$；此时每个 DP 副本在一个 update 内需安排的 micro-batch 数、梯度累积语义和框架的 virtual pipeline 配置必须对齐，不能只把 $M$ 当成「随便加大的 batch」。当目标 global batch 固定时，增大 DP 或 $B_{micro}$ 会反向压缩可用的 $A/M$，因此<strong>气泡、激活显存和收敛 batch 是同一个约束系统</strong>。GPipe 对 micro-batch/流水线的原始定义见 <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener noreferrer">GPipe 论文</a>。</p>
           <div class="callout warn">
             <span class="callout-t">对拍检查</span>
             多卡 loss 不一致时，先检查梯度是按 token 数做平均还是按 micro-batch 数做平均；再核对最后一个 accumulation window 是否被错误地当成完整窗口。将 $B_{global}$、有效 token 数、学习率 schedule 和 warmup step 全部打印出来，避免「卡数变了但训练语义也悄悄变了」。
           </div>
 
           <h2>MoE 的 All-to-All：capacity factor 不只是一个旋钮</h2>
-          <p>设本地输入 token 数为 $T$、专家数为 $E$、路由 top-$k$、容量因子为 $c$。常见实现按每个专家预留容量槽，单专家容量可粗略写为 $C=\lceil c\cdot T\cdot k/E\rceil$；$c$ 越小显存和通信 buffer 越省，但越容易出现 token 超出容量。超出的 token 可能被丢弃、走 residual，或在实现允许时 reroute；三者对训练行为不同，必须查框架语义，不能把「capacity factor=1」理解成没有损失。Switch Transformer 对 capacity factor、token dropping 与 top-1 路由有清晰讨论，见 <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">Switch Transformers 论文</a>。</p>
+          <p>设本地输入 token 数为 $T$、专家数为 $E$、路由 top-$k$、容量因子为 $c$。常见实现按每个专家预留容量槽，单专家容量可粗略写为 $C=\lceil c\cdot T\cdot k/E\rceil$；$c$ 越小显存和通信 buffer 越省，但越容易出现 token 超出容量。超出的 token 可能被丢弃、走 residual，或在实现允许时 reroute；三者对训练行为不同，必须查框架语义，不能把「capacity factor=1」理解成没有损失。Switch Transformer 对 capacity factor、token dropping 与 top-1 路由有清晰讨论，见 <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener noreferrer">Switch Transformers 论文</a>。</p>
           <div class="table-wrap">
             <table>
               <thead><tr><th>现象</th><th>根因</th><th>观测指标</th><th>处理顺序</th></tr></thead>
@@ -596,7 +473,7 @@ flowchart TB
               </tbody>
             </table>
           </div>
-          <p>All-to-All 需要同时看<strong>平均负载和最慢专家</strong>：同步 MoE 层的 step 时间近似由最慢 rank 决定。一个简单的健康指标是 $\text{imbalance}=\max_e(load_e)/(\operatorname{mean}_e load_e+\epsilon)$；它不是统一标准，但能快速定位「平均吞吐正常、尾部 rank 已拖垮全局」的问题。GShard 对自动分片和专家路由的系统设计可参见 <a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener">GShard 论文</a>。</p>
+          <p>All-to-All 需要同时看<strong>平均负载和最慢专家</strong>：同步 MoE 层的 step 时间近似由最慢 rank 决定。一个简单的健康指标是 $\text{imbalance}=\max_e(load_e)/(\operatorname{mean}_e load_e+\epsilon)$；它不是统一标准，但能快速定位「平均吞吐正常、尾部 rank 已拖垮全局」的问题。GShard 对自动分片和专家路由的系统设计可参见 <a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener noreferrer">GShard 论文</a>。</p>
 
           <h2>故障排查 Checklist：吞吐、通信占比与 OOM</h2>
           <ol>
@@ -608,7 +485,7 @@ flowchart TB
             <li><strong>MoE 异常：</strong>每层记录 capacity、token drop、专家 load 方差、dispatch/combine 时间；drop rate 为零也不代表均衡，可能只是容量因子过大把浪费隐藏了。</li>
             <li><strong>结果不一致或卡死：</strong>核对 loss scaling、梯度平均语义、collective 调用顺序和所有 rank 的条件分支；用最小模型做单卡/多卡数值对拍。</li>
           </ol>
-          <p>推荐把这些指标写进每一步或每 N 步的结构化日志，而不是只依赖 nvidia-smi。PyTorch profiler 的通信与算子分析入口见 <a href="https://pytorch.org/docs/stable/profiler.html" target="_blank" rel="noopener">PyTorch Profiler 文档</a>；NCCL 调试变量与诊断方式见 <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener">NCCL Environment Variables</a>。</p>
+          <p>推荐把这些指标写进每一步或每 N 步的结构化日志，而不是只依赖 nvidia-smi。PyTorch profiler 的通信与算子分析入口见 <a href="https://pytorch.org/docs/stable/profiler.html" target="_blank" rel="noopener noreferrer">PyTorch Profiler 文档</a>；NCCL 调试变量与诊断方式见 <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html" target="_blank" rel="noopener noreferrer">NCCL Environment Variables</a>。</p>
           <pre><code class="language-python"># 伪代码：先定位单卡峰值，再判断是哪一类并行拖慢了训练
 for step in train_steps:
     stats = profiler.snapshot()  # peak_allocated、reserved、通信与 kernel 时间
@@ -708,14 +585,14 @@ timeline
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism (Shoeybi et al., 2019) — 张量并行在 Transformer 层上的高效切分方案，Column/Row Parallel 配对的出处 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">arXiv:1909.08053</a></li>
-            <li>Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (Narayanan et al., 2021) — 引入 1F1B 与 Interleaved 调度，系统分析 DP+TP+PP 三维并行的组合与 MFU · <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">arXiv:2104.04473</a></li>
-            <li>GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism (Huang et al., 2019) — 流水线并行与 micro-batch 调度的奠基工作 · <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener">arXiv:1811.06965</a></li>
-            <li>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (Rajbhandari et al., 2019) — 把优化器状态、梯度、参数沿数据并行维分片的三个阶段 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">arXiv:1910.02054</a></li>
-            <li>Reducing Activation Recomputation in Large Transformer Models (Korthikanti et al., 2022) — Megatron 式序列并行与选择性重计算，激活值显存优化的关键文献 · <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">arXiv:2205.05198</a></li>
-            <li>Ring Attention with Blockwise Transformers for Near-Infinite Context (Liu et al., 2023) — 环形传递 K/V 分块实现上下文并行 · <a href="https://arxiv.org/abs/2310.01889" target="_blank" rel="noopener">arXiv:2310.01889</a></li>
-            <li>GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding (Lepikhin et al., 2020) — 专家并行与 All-to-All 分发的早期系统化方案 · <a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener">arXiv:2006.16668</a></li>
-            <li>DeepSpeed 官方教程 — Microsoft DeepSpeed 关于 ZeRO、3D 并行与 MoE 专家并行的工程文档，配置项含义以官方文档为准 · <a href="https://www.deepspeed.ai/tutorials/" target="_blank" rel="noopener">deepspeed.ai/tutorials</a></li>
+            <li>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism (Shoeybi et al., 2019) — 张量并行在 Transformer 层上的高效切分方案，Column/Row Parallel 配对的出处 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">arXiv:1909.08053</a></li>
+            <li>Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (Narayanan et al., 2021) — 引入 1F1B 与 Interleaved 调度，系统分析 DP+TP+PP 三维并行的组合与 MFU · <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener noreferrer">arXiv:2104.04473</a></li>
+            <li>GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism (Huang et al., 2019) — 流水线并行与 micro-batch 调度的奠基工作 · <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener noreferrer">arXiv:1811.06965</a></li>
+            <li>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (Rajbhandari et al., 2019) — 把优化器状态、梯度、参数沿数据并行维分片的三个阶段 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener noreferrer">arXiv:1910.02054</a></li>
+            <li>Reducing Activation Recomputation in Large Transformer Models (Korthikanti et al., 2022) — Megatron 式序列并行与选择性重计算，激活值显存优化的关键文献 · <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener noreferrer">arXiv:2205.05198</a></li>
+            <li>Ring Attention with Blockwise Transformers for Near-Infinite Context (Liu et al., 2023) — 环形传递 K/V 分块实现上下文并行 · <a href="https://arxiv.org/abs/2310.01889" target="_blank" rel="noopener noreferrer">arXiv:2310.01889</a></li>
+            <li>GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding (Lepikhin et al., 2020) — 专家并行与 All-to-All 分发的早期系统化方案 · <a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener noreferrer">arXiv:2006.16668</a></li>
+            <li>DeepSpeed 官方教程 — Microsoft DeepSpeed 关于 ZeRO、3D 并行与 MoE 专家并行的工程文档，配置项含义以官方文档为准 · <a href="https://www.deepspeed.ai/tutorials/" target="_blank" rel="noopener noreferrer">deepspeed.ai/tutorials</a></li>
             <li>Zero Bubble Pipeline Parallelism — 通过把反向拆成「算输入梯度」与「算权重梯度」两步来填补流水线气泡的方案，论文名可搜索获取。</li>
           </ul>
 
@@ -724,6 +601,8 @@ timeline
             并行原理清楚了，下一个问题是<strong>用哪个框架把这些策略跑起来</strong>——ZeRO、FSDP、Megatron-LM、torchtitan 各自封装了哪些并行、怎么配置、怎么避坑，见 <a href="training-frameworks.html">训练框架与工程实现</a>。训练起来后怎么压显存、用 BF16/FP8 提速，见 <a href="mixed-precision.html">混合精度与显存优化</a>；训练炸了怎么排查，见 <a href="stability-optimizer.html">训练稳定性与优化器</a>。想先补硬件侧的基本功（SM、HBM、带宽墙从何而来），见 <a href="../05-systems/gpu-architecture.html">GPU 执行模型与显存层级</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“并行策略：5D 并行的原理与组合”继续深入</h2></div></div><p class="rd-summary">本章覆盖从数据到训练集群的完整预训练链路：目标函数、语料清洗与合成、Scaling Laws、并行策略、混合精度和稳定性。</p><p class="rd-takeaway"><strong>阅读提示：</strong>预训练效果不是参数量单变量函数；数据质量、token 数、优化稳定性和通信效率共同决定最终结果。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Kaplan et al. · 2020</span></div><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener noreferrer">Scaling Laws for Neural Language Models ↗</a><p class="rd-note">最早系统刻画模型规模、数据量、计算量和损失之间幂律关系的工作。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Hoffmann et al. · 2022</span></div><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener noreferrer">Training Compute-Optimal Large Language Models ↗</a><p class="rd-note">Chinchilla 结论：固定算力下模型参数和训练 token 应共同增长，纠正只堆参数的直觉。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Gao et al. · 2020</span></div><a href="https://arxiv.org/abs/2101.00027" target="_blank" rel="noopener noreferrer">The Pile: An 800GB Dataset of Diverse Text ↗</a><p class="rd-note">公开语料混合、来源比例和去重处理的代表性数据集论文。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Shoeybi et al. · 2019</span></div><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">Megatron-LM: Training Multi-Billion Parameter Language Models ↗</a><p class="rd-note">张量并行、流水线并行和大规模 Transformer 训练工程的经典来源。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">PyTorch</span></div><a href="https://pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener noreferrer">Fully Sharded Data Parallel ↗</a><p class="rd-note">FSDP 的参数、梯度和优化器状态分片语义，适合将并行原理落到可运行配置。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“并行策略：5D 并行的原理与组合”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>预训练从 CLM/MLM 目标扩展到多 token 预测、课程数据和合成数据，训练规模则由 Kaplan 经验律推进到 Chinchilla 的计算最优配比。</p></article><article><h3>机制抓手</h3><p>把数据去重、混合比例、token 预算、并行策略、checkpoint 和验证集视为同一个实验设计，而不是互相独立的脚本参数。</p></article><article><h3>工程权衡</h3><p>更多数据、更多参数和更长训练之间需要按计算预算平衡；数据污染、重复和合成数据坍缩会让离线 loss 失真。</p></article><article><h3>前沿观察</h3><p>持续预训练、数据飞轮、MTP、FP8 和新优化器仍在发展，必须报告数据谱系和消融实验。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能从 token 预算估算训练 FLOP、显存和并行策略，并设计 loss spike、数据泄漏和 checkpoint 恢复的排查流程。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener noreferrer">Scaling Laws ↗</a><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener noreferrer">Chinchilla ↗</a><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">Megatron-LM ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能按张量维度解释 DP、TP、PP、SP 与 ZeRO/FSDP 的切分、通信量和适用边界，并设计可恢复的组合方案。</p></article><article><h3>先修关系</h3><p>先修语言模型目标、反向传播和优化器；把 token 预算、数据版本和 checkpoint 视为实验输入。</p></article><article><h3>最小实验</h3><p>对一个两层 Transformer 写出每种并行策略的参数/激活/优化器分片表；可用两卡时运行 torchrun 单步对照，否则用张量切片模拟 all-reduce 与 all-gather。</p></article><article><h3>验收标准</h3><p>分片重组后的参数和 logits 与单进程基线在 atol=1e-6 下相同；通信账单位完整，并验证一次保存、重启和重新分片后的 loss 连续性。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -734,11 +613,10 @@ timeline
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

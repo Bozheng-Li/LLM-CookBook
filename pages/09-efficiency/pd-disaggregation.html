@@ -4,16 +4,28 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="一次 LLM 推理分为 Prefill（首 token 前的上下文计算）和 Decode（逐 token 生成）两阶段。它们一个吃算力、一个吃带宽，混在同一批 GPU 上会互相拖累。PD 分离把两者拆到不同 GPU 池各自优化；再叠加专家并行（EP）与 EPLB 负载均衡，让 DeepSeek-V3 这类千亿">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="PD 分离与大规模专家并行部署 · 大模型技术 Cookbook">
+  <meta property="og:description" content="一次 LLM 推理分为 Prefill（首 token 前的上下文计算）和 Decode（逐 token 生成）两阶段。它们一个吃算力、一个吃带宽，混在同一批 GPU 上会互相拖累。PD 分离把两者拆到不同 GPU 池各自优化；再叠加专家并行（EP）与 EPLB 负载均衡，让 DeepSeek-V3 这类千亿">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/09-efficiency/pd-disaggregation.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/09-efficiency/pd-disaggregation.html">
   <title>PD 分离与大规模专家并行部署 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="09-efficiency" data-topic="pd-disaggregation">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -30,16 +42,7 @@
             <div class="card-title">一图看懂</div>
             <p>把 LLM 推理想象成<strong>餐厅出菜</strong>：Prefill 是「备料」——一次性把整桌菜单的食材切好算清楚，吃算力；Decode 是「上菜」——一道一道端出来，吃的是搬运效率（访存带宽）。传统部署像让一个厨师既备料又上菜，两边互相打断。PD 分离则是把<strong>备料厨师和上菜服务员分开</strong>，各自按自己的节奏排班，中间用传菜窗口（KV Cache 传输）衔接。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart LR
-  REQ["请求到达"] --> PG["Prefill GPU 池<br/>算力密集型<br/>优化 TTFT"]
-  PG -->|"生成 KV Cache"| TRANS["KV Cache 传输<br/>RDMA 跨节点"]
-  TRANS --> DG["Decode GPU 池<br/>访存密集型<br/>优化 TPOT"]
-  DG --> OUT["逐 token 输出"]
-  style PG fill:#fde8e8,stroke:#c0392b
-  style TRANS fill:#fff3cd,stroke:#f39c12
-  style DG fill:#d4ecf7,stroke:#2980b9
-              </div>
+              <div class="html-flowchart is-linear" data-diagram="flowchart-html" data-direction="LR" data-node-count="5" data-edge-count="4" data-instance="0" role="group" aria-label="HTML 流程图"><ol class="html-flow-linear"><li><article class="html-flow-node tone-neutral shape-step" data-node-id="REQ"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">请求到达</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="PG"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Prefill GPU 池</span><span>算力密集型</span><span>优化 TTFT</span></div></article><div class="html-flow-connector"><span>生成 KV Cache</span></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="TRANS"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV Cache 传输</span><span>RDMA 跨节点</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="DG"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Decode GPU 池</span><span>访存密集型</span><span>优化 TPOT</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="OUT"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">逐 token 输出</span></div></article></li></ol></div>
               <figcaption>PD 分离：Prefill 和 Decode 分到不同 GPU 池，KV Cache 跨池传输衔接两阶段</figcaption>
             </figure>
           </div>
@@ -100,11 +103,11 @@ stateDiagram-v2
 
           <p>下面这张是 DistServe 论文里的系统架构原图——它是「PD 分离」这个理念第一次被完整画成生产系统的样子，读懂它，就基本读懂了今天所有分离式推理服务的骨架。</p>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/09-efficiency/pd-disaggregation/fig6.png" alt="论文原图：DistServe 运行时系统架构——请求调度器、Prefill 工作节点池、Decode 工作节点池与 KV Cache 传输链路" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：DistServe 系统架构——调度器把请求派发到 Prefill/Decode 分离的节点池，KV Cache 通过高速链路在两池之间流转</span>
-              <span class="pf-src">论文原图 · Zhong et al., <em>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</em>, 2024, Figure 6 · <a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener">arXiv:2401.09670</a></span>
+              <span class="pf-src">论文原图 · Zhong et al., <em>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</em>, 2024, Figure 6 · <a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener noreferrer">arXiv:2401.09670</a></span>
             </figcaption>
           </figure>
 
@@ -112,20 +115,8 @@ stateDiagram-v2
           <p>这张图最值得新手记住的一个细节是：<strong>图中没有「一个请求从头到尾只走一条线」的路径</strong>。请求的生命周期被拆成了「调度 → Prefill → 传 KV → Decode」四个环节，每个环节都可能发生在不同的物理节点上。这意味着系统里的「状态」不再绑定在某一个 GPU 上，而是跟着 KV Cache 走——这正是 PD 分离架构与生俱来的灵活性，也是它相对混合部署复杂的根源：<em>多出来的 KV 传输环节，需要调度器、网络、缓存三层的协同才能不成为瓶颈</em>。理解这条数据流，后面所有小节（Mooncake、KV 传输账、容量规划）都在给这条流上补细节。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  subgraph CO["传统混合部署"]
-    CG["GPU 池<br/>Prefill 和 Decode 混批"] --> CI["TTFT 与 TPOT 耦合<br/>需过度配置资源"]
-  end
-  subgraph DIS["PD 分离部署"]
-    DP["Prefill 池<br/>高算力配比<br/>优化 TTFT"] -->|"KV Cache<br/>跨池传输"| DD["Decode 池<br/>高带宽配比<br/>优化 TPOT"]
-  end
-  CI -->|"对比"| DIS
-  style CG fill:#fde8e8,stroke:#c0392b
-  style CI fill:#fde8e8,stroke:#c0392b
-  style DP fill:#fff3cd,stroke:#f39c12
-  style DD fill:#d4ecf7,stroke:#2980b9
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="5" data-edge-count="3" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="CG"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">传统混合部署</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 池</span><span>Prefill 和 Decode 混批</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="DP"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">PD 分离部署</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Prefill 池</span><span>高算力配比</span><span>优化 TTFT</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="CI"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">传统混合部署</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">TTFT 与 TPOT 耦合</span><span>需过度配置资源</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU 池 / Prefill 和 Decode 混批</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="DD"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">PD 分离部署</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Decode 池</span><span>高带宽配比</span><span>优化 TPOT</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Prefill 池 / 高算力配比 / 优化 TTFT</span><span class="html-flow-condition">KV Cache
+跨池传输</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="DIS" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">PD 分离部署</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">TTFT 与 TPOT 耦合 / 需过度配置资源</span><span class="html-flow-condition">对比</span></li></ul></article></div></li></ol></div>
             <figcaption>传统混合部署 vs PD 分离部署：分离后两阶段可各自优化资源配比和并行策略</figcaption>
           </figure>
 
@@ -254,30 +245,7 @@ sequenceDiagram
           <p>把 PD 分离和专家并行放回整个部署技术栈里看，它们只是其中两层。下面这张图标出了从流量入口到 GPU 计算之间，工程师实际要搭的模块：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root((大规模部署))
-    PD 分离
-      Prefill 池
-      Decode 池
-      KV 传输
-    专家并行
-      EP 分组
-      EPLB 均衡
-      all-to-all
-    缓存层
-      分级 KV 存储
-      前缀复用
-      缓存感知路由
-    调度层
-      早期拒绝
-      缓存亲和
-      负载均衡
-    推理引擎
-      vLLM
-      SGLang
-      TensorRT-LLM
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：大规模部署" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>大规模部署</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>PD 分离</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">Prefill 池</span></li><li><span class="html-mindmap-leaf">Decode 池</span></li><li><span class="html-mindmap-leaf">KV 传输</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>专家并行</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">EP 分组</span></li><li><span class="html-mindmap-leaf">EPLB 均衡</span></li><li><span class="html-mindmap-leaf">all-to-all</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>缓存层</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">分级 KV 存储</span></li><li><span class="html-mindmap-leaf">前缀复用</span></li><li><span class="html-mindmap-leaf">缓存感知路由</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>调度层</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">早期拒绝</span></li><li><span class="html-mindmap-leaf">缓存亲和</span></li><li><span class="html-mindmap-leaf">负载均衡</span></li></ul></section><section class="html-mindmap-branch tone-5" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">05</span><strong>推理引擎</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">vLLM</span></li><li><span class="html-mindmap-leaf">SGLang</span></li><li><span class="html-mindmap-leaf">TensorRT-LLM</span></li></ul></section></div></div>
             <figcaption>大规模 LLM 部署技术栈：PD 分离与专家并行只是其中两层，要和缓存、调度、引擎协同才能跑通</figcaption>
           </figure>
 
@@ -381,13 +349,13 @@ mindmap
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving（Zhong et al., OSDI 2024）— PD 分离的奠基论文，本页论文原图来源 · <a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener">arXiv:2401.09670</a></li>
-            <li>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving（Qin et al., FAST 2025 最佳论文）— Kimi 线上推理平台，分级 KVCache 分离架构 · <a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener">arXiv:2407.00079</a></li>
-            <li>DeepSeek EPLB（Expert Parallelism Load Balancer）— DeepSeek 开源的专家并行负载均衡算法 · <a href="https://github.com/deepseek-ai/eplb" target="_blank" rel="noopener">github.com/deepseek-ai/eplb</a></li>
-            <li>DeepSeek-V3 Technical Report — 671B MoE 的 PD 分离 + EP 部署配置来源 · <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arXiv:2412.19437</a></li>
-            <li>DeepSeek DualPipe — 双向流水线并行实现，计算与通信重叠的参考实现 · <a href="https://github.com/deepseek-ai/DualPipe" target="_blank" rel="noopener">github.com/deepseek-ai/DualPipe</a></li>
-            <li>Splitwise: Efficient Generative LLM Inference Using Phase Splitting — 另一条 Prefill/Decode 分离的工程路径 · <a href="https://arxiv.org/abs/2311.18677" target="_blank" rel="noopener">arXiv:2311.18677</a></li>
-            <li>vLLM 官方文档 — 大规模服务中的调度与并行配置 · <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">docs.vllm.ai</a></li>
+            <li>DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving（Zhong et al., OSDI 2024）— PD 分离的奠基论文，本页论文原图来源 · <a href="https://arxiv.org/abs/2401.09670" target="_blank" rel="noopener noreferrer">arXiv:2401.09670</a></li>
+            <li>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving（Qin et al., FAST 2025 最佳论文）— Kimi 线上推理平台，分级 KVCache 分离架构 · <a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener noreferrer">arXiv:2407.00079</a></li>
+            <li>DeepSeek EPLB（Expert Parallelism Load Balancer）— DeepSeek 开源的专家并行负载均衡算法 · <a href="https://github.com/deepseek-ai/eplb" target="_blank" rel="noopener noreferrer">github.com/deepseek-ai/eplb</a></li>
+            <li>DeepSeek-V3 Technical Report — 671B MoE 的 PD 分离 + EP 部署配置来源 · <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener noreferrer">arXiv:2412.19437</a></li>
+            <li>DeepSeek DualPipe — 双向流水线并行实现，计算与通信重叠的参考实现 · <a href="https://github.com/deepseek-ai/DualPipe" target="_blank" rel="noopener noreferrer">github.com/deepseek-ai/DualPipe</a></li>
+            <li>Splitwise: Efficient Generative LLM Inference Using Phase Splitting — 另一条 Prefill/Decode 分离的工程路径 · <a href="https://arxiv.org/abs/2311.18677" target="_blank" rel="noopener noreferrer">arXiv:2311.18677</a></li>
+            <li>vLLM 官方文档 — 大规模服务中的调度与并行配置 · <a href="https://docs.vllm.ai/" target="_blank" rel="noopener noreferrer">docs.vllm.ai</a></li>
           </ul>
 
           <div class="callout">
@@ -395,6 +363,8 @@ mindmap
             PD 分离的基础是 <a href="../04-modern-arch/kv-cache.html">KV Cache 原理与优化</a>——理解了缓存机制才懂为什么要跨池传输；具体的推理引擎实现（vLLM / SGLang / TensorRT-LLM 的调度与批处理）见 <a href="inference-engines.html">推理引擎</a>；缓存放不下时的分级存储见 <a href="kv-offload.html">KV 分级存储与卸载</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“PD 分离与大规模专家并行部署”继续深入</h2></div></div><p class="rd-summary">本章从模型压缩、KV Cache、推理引擎、投机解码和端侧部署几个角度回答同一个问题：怎样以更少显存和更低延迟提供可接受的能力。</p><p class="rd-takeaway"><strong>阅读提示：</strong>先定义服务约束（质量、TTFT、吞吐、显存和成本），再选量化、批处理、缓存或硬件方案，避免只比较单一速度数字。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Frantar et al. · 2022</span></div><a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener noreferrer">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers ↗</a><p class="rd-note">基于近似二阶信息的后训练量化代表作，解释 4-bit 权重量化的误差补偿。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Lin et al. · MLSys 2024</span></div><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener noreferrer">AWQ: Activation-aware Weight Quantization ↗</a><p class="rd-note">保护激活显著权重的量化方法，适合比较 GPTQ、AWQ 与不同推理后端。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Xiao et al. · 2022</span></div><a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener noreferrer">SmoothQuant: Accurate and Efficient Post-Training Quantization ↗</a><p class="rd-note">将量化难度从激活迁移到权重，为 W8A8 推理提供工程路径。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">vLLM Project · UC Berkeley 起源</span></div><a href="https://docs.vllm.ai/en/latest/" target="_blank" rel="noopener noreferrer">vLLM Documentation ↗</a><p class="rd-note">连续批处理、PagedAttention、量化和 OpenAI-compatible server 的实践入口。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Sheng et al. · 2023</span></div><a href="https://arxiv.org/abs/2303.06865" target="_blank" rel="noopener noreferrer">FlexGen: High-Throughput Generative Inference of Large Language Models ↗</a><p class="rd-note">在 GPU、CPU 和磁盘之间进行 offload 的系统设计，适合理解端侧与低显存部署。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“PD 分离与大规模专家并行部署”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>效率优化从权重量化和 KV Cache，发展到 paged serving、推测解码、Prefill/Decode 分离和端到端成本工程。</p></article><article><h3>机制抓手</h3><p>把 TTFT、TPOT、吞吐、显存占用、并发和质量损失分开测量，避免用单一 tokens/s 掩盖服务瓶颈。</p></article><article><h3>工程权衡</h3><p>压缩、批处理和 offload 会在精度、尾延迟、带宽和实现复杂度之间重新分配成本。</p></article><article><h3>前沿观察</h3><p>FP8/FP4、异构缓存、连续批处理和 disaggregated serving 正在成为规模化部署的基础设施。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能根据 SLA 和 GPU 预算选择量化、并行和缓存方案，并给出可回归的基准表。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">vLLM / PagedAttention ↗</a><a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener noreferrer">SmoothQuant ↗</a><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener noreferrer">AWQ ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能解释 Prefill/Decode 资源差异、KV 传输和专家负载均衡，并判断 PD 分离在何种流量下抵消网络成本。</p></article><article><h3>先修关系</h3><p>先修 Prefill/Decode、KV Cache 和 GPU 带宽；任何结论都要附吞吐、尾延迟和显存测量。</p></article><article><h3>最小实验</h3><p>用两个进程或离散事件模拟器重放 100 个长短混合请求，比较共置与 PD 分离；扫描 KV 传输带宽和 prefill/decode 副本比，记录队列与 P95。</p></article><article><h3>验收标准</h3><p>请求级 trace 能关联 prefill、KV transfer 和 decode，且无 KV 错配；找到分离优于共置的交叉点，并给出带宽不足时的合并回退。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -405,11 +375,10 @@ mindmap
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

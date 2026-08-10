@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="KV Cache 是推理的「隐形显存黑洞」：上下文越长占得越多，并发一高就 OOM。分级存储的思路很直白—— 不常用的数据搬到便宜的地方 。把 KV 从 HBM 挪到 DRAM 甚至 SSD，配合前缀复用，是长上下文与高并发推理绕不开的工程。本节从 KV 的显存公式出发，拆解三级存储、前缀复用、量化压缩、淘汰">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="KV 分级存储与卸载 · 大模型技术 Cookbook">
+  <meta property="og:description" content="KV Cache 是推理的「隐形显存黑洞」：上下文越长占得越多，并发一高就 OOM。分级存储的思路很直白—— 不常用的数据搬到便宜的地方 。把 KV 从 HBM 挪到 DRAM 甚至 SSD，配合前缀复用，是长上下文与高并发推理绕不开的工程。本节从 KV 的显存公式出发，拆解三级存储、前缀复用、量化压缩、淘汰">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/09-efficiency/kv-offload.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/09-efficiency/kv-offload.html">
   <title>KV 分级存储与卸载 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="09-efficiency" data-topic="kv-offload">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -29,22 +42,7 @@
             <div class="card-title">一图看懂</div>
             <p>KV 缓存按「被再次访问的可能性」分层：热数据留在最快但最贵的 HBM，温数据放 DRAM，冷数据落 SSD。访问时先查 HBM，未命中再逐级向上取——本质上就是给 KV 做了一层「内存换页」。加上前缀复用和量化，整个系统的目标是在有限显存下服务更多并发、更长的上下文。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart LR
-  subgraph HBM["HBM 最快 · 最贵"]
-    H1["热 KV<br/>正在解码的序列"]
-  end
-  subgraph DRAM["DRAM 中等"]
-    D1["温 KV<br/>活跃前缀 / 最近请求"]
-  end
-  subgraph SSD["SSD 最慢 · 最便宜"]
-    S1["冷 KV<br/>历史对话 / 长尾请求"]
-  end
-  H1 -->|"换出"| D1
-  D1 -->|"换出"| S1
-  S1 -->|"按需换入"| D1
-  D1 -->|"命中回读"| H1
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="3" data-edge-count="4" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="H1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">HBM 最快 · 最贵</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">热 KV</span><span>正在解码的序列</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">温 KV / 活跃前缀 / 最近请求</span><span class="html-flow-condition">命中回读</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">DRAM 中等</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">温 KV</span><span>活跃前缀 / 最近请求</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">热 KV / 正在解码的序列</span><span class="html-flow-condition">换出</span></li><li><span class="html-flow-source">冷 KV / 历史对话 / 长尾请求</span><span class="html-flow-condition">按需换入</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S1"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">SSD 最慢 · 最便宜</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">冷 KV</span><span>历史对话 / 长尾请求</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">温 KV / 活跃前缀 / 最近请求</span><span class="html-flow-condition">换出</span></li></ul></article></div></li></ol></div>
               <figcaption>KV 三级存储：热数据驻留 HBM，冷数据落 SSD，按需换入</figcaption>
             </figure>
           </div>
@@ -60,11 +58,11 @@ flowchart LR
 
           <p>「KV 到底占了多少」这个问题，与其空想，不如直接看论文里的实证数据。下面这张图来自专门做 KV 卸载的 InfiniGen（OSDI 2024），它把 KV Cache 和模型权重的体积画在同一张图上，一眼就能看出「KV 什么时候反超权重」。</p>
 
-          <figure class="paper-figure">
-            <img src="https://arxiv.org/html/2406.19707v1/x2.png" alt="论文原图：OPT-30B 的 KV Cache 与模型权重体积随序列长度与 batch 大小增长的对比——虚线为权重体积，KV 增长远超权重" loading="lazy" style="max-width:560px">
+          <figure class="paper-figure image-figure source-figure">
+            <img src="../../assets/figures/external/938c9bbe2c4f.png" alt="论文原图：OPT-30B 的 KV Cache 与模型权重体积随序列长度与 batch 大小增长的对比——虚线为权重体积，KV 增长远超权重" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：KV Cache 与权重的体积赛跑——横轴分别取序列长度与 batch 大小，虚线标出模型权重体积，KV Cache 的增长曲线很快越过了虚线</span>
-              <span class="pf-src">论文原图 · Lee et al., <em>InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management</em>, 2024, Figure 2 · <a href="https://arxiv.org/abs/2406.19707" target="_blank" rel="noopener">arXiv:2406.19707</a></span>
+              <span class="pf-src">论文原图 · Lee et al., <em>InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management</em>, 2024, Figure 2 · <a href="https://arxiv.org/abs/2406.19707" target="_blank" rel="noopener noreferrer">arXiv:2406.19707</a></span>
             </figcaption>
           </figure>
 
@@ -72,25 +70,7 @@ flowchart LR
           <p>第二，注意两个子图分别证明了什么。<strong>子图 (a) 证明「长度维度」</strong>：固定 batch=16，序列长度从几千涨到几万，KV 线性上升，越过权重虚线；<strong>子图 (b) 证明「并发维度」</strong>：固定序列长度=2048，batch 从 1 涨到几十，KV 同样线性上升。两条增长曲线意味着：无论你是「一个超长请求」还是「一批普通请求」，KV 都会成为瓶颈——这解释了为什么 KV 管理是推理系统绕不开的工程问题，而不是某个特定场景的偶发困难。第三，结合本页主题看：<strong>图里 KV 曲线越过虚线的那个「交叉点」位置，就是分级存储应该开始发力的位置</strong>——在交叉点之前权重是显存大头（量化权重更划算），交叉点之后 KV 才是大头（量化 KV、分级卸载更划算）。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TD
-  subgraph Weights["权重显存（固定）"]
-    W1["70B × FP16 ≈ 140 GB<br/>INT4 ≈ 35 GB"]
-  end
-  subgraph KV["KV Cache 显存（随上下文增长）"]
-    K1["单条 4K 上下文 ≈ 10 GB"]
-    K2["单条 32K 上下文 ≈ 80 GB"]
-    K3["单条 128K 上下文 ≈ 320 GB"]
-    K4["10 条并发 × 4K ≈ 100 GB"]
-  end
-  subgraph Activ["激活显存（随 batch 增长）"]
-    A1["通常较小<br/>但 batch 大时不可忽视"]
-  end
-  Weights --> Total["总显存需求"]
-  KV --> Total
-  Activ --> Total
-  Total --> OOM["单卡 80GB HBM<br/>→ 必须分级"]
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="11" data-edge-count="4" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="W1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">权重显存（固定）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">70B × FP16 ≈ 140 GB</span><span>INT4 ≈ 35 GB</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="K1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">KV Cache 显存（随上下文增长）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单条 4K 上下文 ≈ 10 GB</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="K2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">KV Cache 显存（随上下文增长）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单条 32K 上下文 ≈ 80 GB</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="K3"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">KV Cache 显存（随上下文增长）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单条 128K 上下文 ≈ 320 GB</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="K4"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">KV Cache 显存（随上下文增长）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">10 条并发 × 4K ≈ 100 GB</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="A1"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">激活显存（随 batch 增长）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">通常较小</span><span>但 batch 大时不可忽视</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Weights" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">权重显存（固定）</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="KV" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV Cache 显存（随上下文增长）</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Activ" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">激活显存（随 batch 增长）</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Total"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">总显存需求</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">权重显存（固定）</span></li><li><span class="html-flow-source">KV Cache 显存（随上下文增长）</span></li><li><span class="html-flow-source">激活显存（随 batch 增长）</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="OOM"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单卡 80GB HBM</span><span>→ 必须分级</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">总显存需求</span></li></ul></article></div></li></ol></div>
             <figcaption>显存构成拆解：权重是固定的，但 KV Cache 随上下文和并发线性增长，是 OOM 的主要来源</figcaption>
           </figure>
 
@@ -105,24 +85,7 @@ flowchart TD
           <p>分级存储的核心原理与操作系统的虚拟内存如出一辙：CPU cache → DRAM → swap 的层级结构，对应到 GPU 推理就是 HBM → DRAM → SSD。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  subgraph OS["操作系统虚拟内存"]
-    direction TB
-    C1["L1/L2 Cache<br/>KB 级 · ns 级"]
-    C2["DRAM<br/>GB 级 · 100ns"]
-    C3["Swap / SSD<br/>TB 级 · 10μs"]
-    C1 --> C2 --> C3
-  end
-  subgraph GPU["GPU 推理 KV 存储"]
-    direction TB
-    G1["HBM<br/>数十 GB · 数百 ns"]
-    G2["Host DRAM<br/>数百 GB · μs 级"]
-    G3["NVMe SSD<br/>数 TB · 数十 μs"]
-    G1 --> G2 --> G3
-  end
-  OS -.->|"类比"| GPU
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="8" data-edge-count="5" data-instance="2" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">操作系统虚拟内存</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">L1/L2 Cache</span><span>KB 级 · ns 级</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">GPU 推理 KV 存储</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM</span><span>数十 GB · 数百 ns</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="OS" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">操作系统虚拟内存</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">操作系统虚拟内存</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">DRAM</span><span>GB 级 · 100ns</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">L1/L2 Cache / KB 级 · ns 级</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">GPU 推理 KV 存储</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Host DRAM</span><span>数百 GB · μs 级</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">HBM / 数十 GB · 数百 ns</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="GPU" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 推理 KV 存储</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">操作系统虚拟内存</span><span class="html-flow-condition">类比</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">操作系统虚拟内存</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Swap / SSD</span><span>TB 级 · 10μs</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">DRAM / GB 级 · 100ns</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">GPU 推理 KV 存储</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">NVMe SSD</span><span>数 TB · 数十 μs</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Host DRAM / 数百 GB · μs 级</span></li></ul></article></div></li></ol></div>
             <figcaption>操作系统虚拟内存与 GPU KV 分级存储的类比：同样的金字塔结构，不同的物理介质</figcaption>
           </figure>
 
@@ -145,20 +108,7 @@ flowchart LR
           </div>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TD
-  Req["新请求到达"] --> Q1{"前缀 KV<br/>是否在 HBM?"}
-  Q1 -->|"是"| Fast["直接续算<br/>延迟最低"]
-  Q1 -->|"否"| Q2{"是否在<br/>Host DRAM?"}
-  Q2 -->|"是"| Read1["从 DRAM 读回 HBM<br/>~μs 级延迟"]
-  Q2 -->|"否"| Q3{"是否在<br/>SSD?"}
-  Q3 -->|"是"| Read2["从 SSD 读到 DRAM<br/>再搬到 HBM<br/>~数十 μs 延迟"]
-  Q3 -->|"否"| Compute["全量重新计算<br/>最慢但最省存储"]
-  Fast --> Decode["开始解码"]
-  Read1 --> Decode
-  Read2 --> Decode
-  Compute --> Decode
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="9" data-edge-count="11" data-instance="3" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Req"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">新请求到达</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">前缀 KV</span><span>是否在 HBM?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">新请求到达</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Fast"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">直接续算</span><span>延迟最低</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">前缀 KV / 是否在 HBM?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="Q2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">是否在</span><span>Host DRAM?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">前缀 KV / 是否在 HBM?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Read1"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">从 DRAM 读回 HBM</span><span>~μs 级延迟</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否在 / Host DRAM?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="Q3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">是否在</span><span>SSD?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否在 / Host DRAM?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Read2"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">从 SSD 读到 DRAM</span><span>再搬到 HBM</span><span>~数十 μs 延迟</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否在 / SSD?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Compute"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">全量重新计算</span><span>最慢但最省存储</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否在 / SSD?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Decode"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">开始解码</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">直接续算 / 延迟最低</span></li><li><span class="html-flow-source">从 DRAM 读回 HBM / ~μs 级延迟</span></li><li><span class="html-flow-source">从 SSD 读到 DRAM / 再搬到 HBM / ~数十 μs 延迟</span></li><li><span class="html-flow-source">全量重新计算 / 最慢但最省存储</span></li></ul></article></div></li></ol></div>
             <figcaption>KV 缓存查找的四级路径：HBM 命中 → DRAM 回读 → SSD 回读 → 全量重算，延迟逐级升高</figcaption>
           </figure>
 
@@ -166,25 +116,7 @@ flowchart TD
           <p>KV 分级存储真正的价值杠杆是<strong>前缀复用</strong>：多个请求共享同一段前缀（系统提示词、文档上下文、Agent 的固定历史），这段前缀的 KV 只需算一次，之后所有请求直接命中。在 RAG 和 Agent 场景中，前缀复用可以把 prefill 阶段的计算量砍掉 60-90%。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  subgraph R1["请求 1"]
-    direction LR
-    R1A["系统提示 + 文档 + Q1"]
-  end
-  subgraph R2["请求 2"]
-    direction LR
-    R2A["系统提示 + 文档 + Q2"]
-  end
-  subgraph R3["请求 3"]
-    direction LR
-    R3A["系统提示 + 文档 + Q3"]
-  end
-  R1A -.->|"相同前缀"| C["共享 KV 缓存<br/>只算一次"]
-  R2A -.-> C
-  R3A -.-> C
-  C --> O["只算增量部分<br/>命中率 ↑ 延迟 ↓"]
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="5" data-edge-count="4" data-instance="4" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="R1A"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">请求 1</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">系统提示 + 文档 + Q1</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="R2A"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">请求 2</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">系统提示 + 文档 + Q2</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="R3A"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">请求 3</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">系统提示 + 文档 + Q3</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">共享 KV 缓存</span><span>只算一次</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">系统提示 + 文档 + Q1</span><span class="html-flow-condition">相同前缀</span></li><li data-kind="feedback"><span class="html-flow-source">系统提示 + 文档 + Q2</span></li><li data-kind="feedback"><span class="html-flow-source">系统提示 + 文档 + Q3</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="O"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">只算增量部分</span><span>命中率 ↑ 延迟 ↓</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">共享 KV 缓存 / 只算一次</span></li></ul></article></div></li></ol></div>
             <figcaption>共享前缀复用：公共部分只算一次，后续请求只算差异部分</figcaption>
           </figure>
 
@@ -305,22 +237,7 @@ class PrefixKVCache:
           <p>除了搬位置，另一个直接手段是<strong>压缩 KV 本身</strong>。KV 量化把 FP16 的 K 和 V 压到 INT8 甚至 INT4，直接砍掉 2-4 倍空间。与权重量化不同，KV 量化对精度的影响更小——因为 KV 是中间状态而非最终输出，误差不会像权重那样累积放大。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  subgraph Before["量化前：FP16"]
-    B1["KV Cache: 320 GB<br/>（128K 上下文 · 70B 模型）"]
-  end
-  subgraph INT8["INT8 量化"]
-    I1["KV Cache: 160 GB<br/>精度损失 <1%"]
-  end
-  subgraph INT4["INT4 量化"]
-    I2["KV Cache: 80 GB<br/>精度损失 1-3%"]
-  end
-  Before -->|"×0.5"| INT8
-  Before -->|"×0.25"| INT4
-  INT8 --> Benefit1["并发数翻倍"]
-  INT4 --> Benefit2["并发数 ×4<br/>或支持更长上下文"]
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="8" data-edge-count="4" data-instance="5" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="B1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">量化前：FP16</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV Cache: 320 GB</span><span>（128K 上下文 · 70B 模型）</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="I1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">INT8 量化</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV Cache: 160 GB</span><span>精度损失 &lt;1%</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="I2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">INT4 量化</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV Cache: 80 GB</span><span>精度损失 1-3%</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Before" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">量化前：FP16</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="INT8" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">INT8 量化</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">量化前：FP16</span><span class="html-flow-condition">×0.5</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="INT4" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">INT4 量化</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">量化前：FP16</span><span class="html-flow-condition">×0.25</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Benefit1"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">并发数翻倍</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">INT8 量化</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Benefit2"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">并发数 ×4</span><span>或支持更长上下文</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">INT4 量化</span></li></ul></article></div></li></ol></div>
             <figcaption>KV 量化的效果：从 FP16 到 INT4，KV 占用减少 75%，精度损失可控</figcaption>
           </figure>
 
@@ -375,25 +292,7 @@ def dequantize_kv_int8(kv_int8, scale, zero=0.0):
           <p>Mooncake 是 Kimi（月之暗面）的推理架构，把「以 KV 为中心的推理」推到极致。传统推理中，KV 是每个 GPU 节点的私有数据；Mooncake 把 KV 变成<strong>集群级共享资源</strong>，通过分布式缓存层让任意节点都能访问任意请求的 KV。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  subgraph Traditional["传统架构：节点私有 KV"]
-    direction LR
-    T1["GPU 节点 1<br/>KV = 私有"] 
-    T2["GPU 节点 2<br/>KV = 私有"]
-    T1 x--x T2
-    T_Note["请求只能路由到<br/>持有 KV 的节点"]
-  end
-  subgraph Mooncake["Mooncake：集群级 KV"]
-    direction LR
-    M_KV["分布式 KV 缓存池<br/>（DRAM + SSD）"]
-    M1["GPU 节点 1"] <--> M_KV
-    M2["GPU 节点 2"] <--> M_KV
-    M3["GPU 节点 N"] <--> M_KV
-    M_Note["任意节点可访问任意 KV<br/>请求路由更灵活"]
-  end
-  Traditional -->|"演进"| Mooncake
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="10" data-edge-count="5" data-instance="6" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="T1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">传统架构：节点私有 KV</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 节点 1</span><span>KV = 私有</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T_Note"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">传统架构：节点私有 KV</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">请求只能路由到</span><span>持有 KV 的节点</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M1"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">Mooncake：集群级 KV</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 节点 1</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M2"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">Mooncake：集群级 KV</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 节点 2</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M3"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">Mooncake：集群级 KV</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 节点 N</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M_Note"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">Mooncake：集群级 KV</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">任意节点可访问任意 KV</span><span>请求路由更灵活</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Traditional" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">传统架构：节点私有 KV</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="T2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">传统架构：节点私有 KV</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU 节点 2</span><span>KV = 私有</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU 节点 1 / KV = 私有</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M_KV"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">Mooncake：集群级 KV</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">分布式 KV 缓存池</span><span>（DRAM + SSD）</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU 节点 1</span></li><li><span class="html-flow-source">GPU 节点 2</span></li><li><span class="html-flow-source">GPU 节点 N</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Mooncake" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Mooncake：集群级 KV</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">传统架构：节点私有 KV</span><span class="html-flow-condition">演进</span></li></ul></article></div></li></ol></div>
             <figcaption>Mooncake 的核心创新：KV 从节点私有变为集群级共享资源，打破数据局部性约束</figcaption>
           </figure>
 
@@ -409,26 +308,7 @@ flowchart TB
           <p>LMCache 聚焦「模型无关的 KV 缓存层」：提供统一 API 把 KV 存到 GPU/DRAM/远端，支持前缀复用、块级存储与跨请求共享，已适配多种推理引擎。它的设计哲学是「缓存逻辑从引擎里抽出来，变成独立基础设施」。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  subgraph Engine["推理引擎层"]
-    E1["vLLM"]
-    E2["SGLang"]
-    E3["TGI"]
-    E4["其他引擎"]
-  end
-  subgraph LMCache["LMCache 中间层"]
-    L1["统一 KV API"]
-    L2["前缀匹配引擎"]
-    L3["多级存储管理器"]
-  end
-  subgraph Storage["存储后端"]
-    S1["GPU HBM"]
-    S2["Host DRAM"]
-    S3["远端 Redis / SSD"]
-  end
-  Engine --> LMCache --> Storage
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="13" data-edge-count="2" data-instance="7" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="E1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">推理引擎层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">vLLM</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="E2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">推理引擎层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SGLang</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="E3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">推理引擎层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">TGI</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="E4"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">推理引擎层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">其他引擎</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="L1"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">LMCache 中间层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">统一 KV API</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="L2"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">LMCache 中间层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">前缀匹配引擎</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="L3"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">LMCache 中间层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">多级存储管理器</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S1"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">存储后端</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU HBM</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S2"><div class="html-flow-node-meta"><span class="html-flow-index">09</span><span class="html-flow-group-label">存储后端</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Host DRAM</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S3"><div class="html-flow-node-meta"><span class="html-flow-index">10</span><span class="html-flow-group-label">存储后端</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">远端 Redis / SSD</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Engine" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">推理引擎层</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="LMCache" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">LMCache 中间层</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">推理引擎层</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Storage" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">13</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">存储后端</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">LMCache 中间层</span></li></ul></article></div></li></ol></div>
             <figcaption>LMCache 架构：作为推理引擎和存储之间的中间层，提供统一的多级缓存能力</figcaption>
           </figure>
 
@@ -451,19 +331,7 @@ flowchart TB
           <p>当缓存满了，必须淘汰一部分 KV block。淘汰策略直接影响命中率和性能，是分级存储系统最微妙的设计点。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TD
-  Full["缓存已满"] --> Q1{"淘汰策略"}
-  Q1 --> LRU["LRU<br/>最近最少使用"]
-  Q1 --> LFU["LFU<br/>最不常用"]
-  Q1 --> Priority["优先级淘汰<br/>按业务规则"]
-  Q1 --> Token["Token 重要性<br/>按注意力分数"]
-  
-  LRU --> LRU_D["淘汰 last_access 最早的<br/>简单 · 适合通用场景"]
-  LFU --> LFU_D["淘汰 access_count 最低的<br/>适合热点集中的场景"]
-  Priority --> P_D["按业务规则淘汰<br/>如：免费用户先淘汰"]
-  Token --> T_D["淘汰注意力权重低的 token<br/>精度最高 · 计算开销大"]
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="10" data-edge-count="9" data-instance="8" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Full"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">缓存已满</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">淘汰策略</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">缓存已满</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="LRU"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">LRU</span><span>最近最少使用</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">淘汰策略</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="LFU"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">LFU</span><span>最不常用</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">淘汰策略</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Priority"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">优先级淘汰</span><span>按业务规则</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">淘汰策略</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Token"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Token 重要性</span><span>按注意力分数</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">淘汰策略</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="LRU_D"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">淘汰 last_access 最早的</span><span>简单 · 适合通用场景</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">LRU / 最近最少使用</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="LFU_D"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">淘汰 access_count 最低的</span><span>适合热点集中的场景</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">LFU / 最不常用</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P_D"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">按业务规则淘汰</span><span>如：免费用户先淘汰</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">优先级淘汰 / 按业务规则</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T_D"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">淘汰注意力权重低的 token</span><span>精度最高 · 计算开销大</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Token 重要性 / 按注意力分数</span></li></ul></article></div></li></ol></div>
             <figcaption>四种 KV 淘汰策略：LRU 最通用，Token 重要性最精确但最贵</figcaption>
           </figure>
 
@@ -483,25 +351,7 @@ flowchart TD
           <p>KV 分级存储与 PD 分离（Prefill-Decode Disaggregation）是天然搭档。PD 分离把 prefill 和 decode 分到不同节点，中间通过 KV 传输衔接。KV 分级存储正好解决「KV 在节点间怎么传、怎么存」的问题。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  subgraph P["Prefill 节点"]
-    P1["处理新请求<br/>计算完整 KV"]
-    P2["KV 写入<br/>全局缓存池"]
-  end
-  subgraph KVPool["KV 缓存池"]
-    K1["HBM（热）"]
-    K2["DRAM（温）"]
-    K3["SSD（冷）"]
-  end
-  subgraph D["Decode 节点"]
-    D1["从缓存池<br/>读取 KV"]
-    D2["逐 token 解码<br/>追加新 KV"]
-  end
-  P1 --> P2 --> KVPool
-  KVPool --> D1 --> D2
-  D2 -.->|"新 KV 回写"| KVPool
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="8" data-edge-count="5" data-instance="9" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="P1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">Prefill 节点</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">处理新请求</span><span>计算完整 KV</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="K1"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">KV 缓存池</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM（热）</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="K2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">KV 缓存池</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">DRAM（温）</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="K3"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">KV 缓存池</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SSD（冷）</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="P2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">Prefill 节点</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV 写入</span><span>全局缓存池</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">处理新请求 / 计算完整 KV</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="D1"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">Decode 节点</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">从缓存池</span><span>读取 KV</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">KV 缓存池</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D2"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">Decode 节点</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">逐 token 解码</span><span>追加新 KV</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">从缓存池 / 读取 KV</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="KVPool" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV 缓存池</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">KV 写入 / 全局缓存池</span></li><li data-kind="feedback"><span class="html-flow-source">逐 token 解码 / 追加新 KV</span><span class="html-flow-condition">新 KV 回写</span></li></ul></article></div></li></ol></div>
             <figcaption>KV 分级存储与 PD 分离的协同：Prefill 节点算完 KV 写入缓存池，Decode 节点从池中读取</figcaption>
           </figure>
 
@@ -528,28 +378,7 @@ sequenceDiagram
 
           <h2>八、工程决策清单</h2>
           <figure class="figure">
-            <div class="mermaid">
-flowchart TD
-  Start["KV 管理决策"] --> Q1{"KV 是否<br/>量化?"}
-  Q1 -->|"是"| Q1a["INT8 默认<br/>INT4 激进"]
-  Q1 -->|"否"| Q1b["FP16 精度优先<br/>需更多介质"]
-  Q1a --> Q2
-  Q1b --> Q2
-  
-  Q2{"是否有<br/>共享前缀?"} -->|"是"| Q2a["启用前缀哈希<br/>最大化命中"]
-  Q2 -->|"否"| Q2b["跳过前缀复用<br/>关注淘汰策略"]
-  Q2a --> Q3
-  Q2b --> Q3
-  
-  Q3{"是否需要<br/>跨节点共享?"} -->|"是"| Q3a["部署分布式 KV 池<br/>如 Mooncake"]
-  Q3 -->|"否"| Q3b["单机多级缓存<br/>如 LMCache"]
-  Q3a --> Q4
-  Q3b --> Q4
-  
-  Q4{"监控<br/>三个核心指标"} --> M1["前缀命中率 >80%"]
-  Q4 --> M2["HBM 命中率 >95%"]
-  Q4 --> M3["换入延迟 <5ms"]
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="14" data-edge-count="16" data-instance="10" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Start"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV 管理决策</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV 是否</span><span>量化?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">KV 管理决策</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Q1a"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">INT8 默认</span><span>INT4 激进</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">KV 是否 / 量化?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Q1b"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">FP16 精度优先</span><span>需更多介质</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">KV 是否 / 量化?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">是否有</span><span>共享前缀?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">INT8 默认 / INT4 激进</span></li><li><span class="html-flow-source">FP16 精度优先 / 需更多介质</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Q2a"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">启用前缀哈希</span><span>最大化命中</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否有 / 共享前缀?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Q2b"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">跳过前缀复用</span><span>关注淘汰策略</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否有 / 共享前缀?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q3"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">是否需要</span><span>跨节点共享?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">启用前缀哈希 / 最大化命中</span></li><li><span class="html-flow-source">跳过前缀复用 / 关注淘汰策略</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">07</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Q3a"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">部署分布式 KV 池</span><span>如 Mooncake</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否需要 / 跨节点共享?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Q3b"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单机多级缓存</span><span>如 LMCache</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否需要 / 跨节点共享?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">08</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q4"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">监控</span><span>三个核心指标</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">部署分布式 KV 池 / 如 Mooncake</span></li><li><span class="html-flow-source">单机多级缓存 / 如 LMCache</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">09</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="M1"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">前缀命中率 &gt;80%</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">监控 / 三个核心指标</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M2"><div class="html-flow-node-meta"><span class="html-flow-index">13</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM 命中率 &gt;95%</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">监控 / 三个核心指标</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M3"><div class="html-flow-node-meta"><span class="html-flow-index">14</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">换入延迟 &lt;5ms</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">监控 / 三个核心指标</span></li></ul></article></div></li></ol></div>
             <figcaption>KV 管理的工程决策树：量化 → 前缀复用 → 跨节点共享 → 监控指标</figcaption>
           </figure>
 
@@ -612,14 +441,14 @@ flowchart TD
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management — KV 卸载与按需预取的专门研究，本页论文原图来源 · <a href="https://arxiv.org/abs/2406.19707" target="_blank" rel="noopener">arXiv:2406.19707</a></li>
-            <li>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving — 以 KV 为中心的推理架构论文 · <a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener">arXiv:2407.00079</a></li>
-            <li>LLM in a flash: Efficient Large Language Model Inference with Limited Memory — 把模型按需加载进 DRAM 的苹果端侧研究，理解「卸载」机制的起点 · <a href="https://arxiv.org/abs/2312.11514" target="_blank" rel="noopener">arXiv:2312.11514</a></li>
-            <li>Efficient Streaming Language Models with Attention Sinks — StreamingLLM，KV 窗口管理与注意力汇 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></li>
-            <li>LMCache 官方仓库 — 模型无关的 KV 缓存层实现 · <a href="https://github.com/LMCache/LMCache" target="_blank" rel="noopener">GitHub</a></li>
-            <li>Attention Store: Cost-effective Attention Reuse — 注意力缓存复用的研究 · <a href="https://arxiv.org/abs/2403.19708" target="_blank" rel="noopener">arXiv:2403.19708</a></li>
-            <li>vLLM PagedAttention — 最早的 KV 内存管理创新 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a></li>
-            <li>KVQuant: Towards 10-bit KV Cache — KV 量化方法 · <a href="https://arxiv.org/abs/2310.06224" target="_blank" rel="noopener">arXiv:2310.06224</a></li>
+            <li>InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management — KV 卸载与按需预取的专门研究，本页论文原图来源 · <a href="https://arxiv.org/abs/2406.19707" target="_blank" rel="noopener noreferrer">arXiv:2406.19707</a></li>
+            <li>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving — 以 KV 为中心的推理架构论文 · <a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener noreferrer">arXiv:2407.00079</a></li>
+            <li>LLM in a flash: Efficient Large Language Model Inference with Limited Memory — 把模型按需加载进 DRAM 的苹果端侧研究，理解「卸载」机制的起点 · <a href="https://arxiv.org/abs/2312.11514" target="_blank" rel="noopener noreferrer">arXiv:2312.11514</a></li>
+            <li>Efficient Streaming Language Models with Attention Sinks — StreamingLLM，KV 窗口管理与注意力汇 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener noreferrer">arXiv:2309.17453</a></li>
+            <li>LMCache 官方仓库 — 模型无关的 KV 缓存层实现 · <a href="https://github.com/LMCache/LMCache" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+            <li>Attention Store: Cost-effective Attention Reuse — 注意力缓存复用的研究 · <a href="https://arxiv.org/abs/2403.19708" target="_blank" rel="noopener noreferrer">arXiv:2403.19708</a></li>
+            <li>vLLM PagedAttention — 最早的 KV 内存管理创新 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">arXiv:2309.06180</a></li>
+            <li>KVQuant: Towards 10-bit KV Cache — KV 量化方法 · <a href="https://arxiv.org/abs/2310.06224" target="_blank" rel="noopener noreferrer">arXiv:2310.06224</a></li>
           </ul>
 
           <div class="callout">
@@ -627,6 +456,8 @@ flowchart TD
             先搞懂 KV 是怎么产生和增长的：<a href="../04-modern-arch/kv-cache.html">KV Cache</a>；分级存储常与推理引擎配合，看 <a href="pd-disaggregation.html">PD 分离</a> 和 <a href="inference-engines.html">推理引擎</a>；KV 量化相关技术见 <a href="quantization.html">量化 Quantization</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“KV 分级存储与卸载”继续深入</h2></div></div><p class="rd-summary">本章从模型压缩、KV Cache、推理引擎、投机解码和端侧部署几个角度回答同一个问题：怎样以更少显存和更低延迟提供可接受的能力。</p><p class="rd-takeaway"><strong>阅读提示：</strong>先定义服务约束（质量、TTFT、吞吐、显存和成本），再选量化、批处理、缓存或硬件方案，避免只比较单一速度数字。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Frantar et al. · 2022</span></div><a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener noreferrer">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers ↗</a><p class="rd-note">基于近似二阶信息的后训练量化代表作，解释 4-bit 权重量化的误差补偿。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Lin et al. · MLSys 2024</span></div><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener noreferrer">AWQ: Activation-aware Weight Quantization ↗</a><p class="rd-note">保护激活显著权重的量化方法，适合比较 GPTQ、AWQ 与不同推理后端。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Xiao et al. · 2022</span></div><a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener noreferrer">SmoothQuant: Accurate and Efficient Post-Training Quantization ↗</a><p class="rd-note">将量化难度从激活迁移到权重，为 W8A8 推理提供工程路径。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">vLLM Project · UC Berkeley 起源</span></div><a href="https://docs.vllm.ai/en/latest/" target="_blank" rel="noopener noreferrer">vLLM Documentation ↗</a><p class="rd-note">连续批处理、PagedAttention、量化和 OpenAI-compatible server 的实践入口。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Sheng et al. · 2023</span></div><a href="https://arxiv.org/abs/2303.06865" target="_blank" rel="noopener noreferrer">FlexGen: High-Throughput Generative Inference of Large Language Models ↗</a><p class="rd-note">在 GPU、CPU 和磁盘之间进行 offload 的系统设计，适合理解端侧与低显存部署。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“KV 分级存储与卸载”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>效率优化从权重量化和 KV Cache，发展到 paged serving、推测解码、Prefill/Decode 分离和端到端成本工程。</p></article><article><h3>机制抓手</h3><p>把 TTFT、TPOT、吞吐、显存占用、并发和质量损失分开测量，避免用单一 tokens/s 掩盖服务瓶颈。</p></article><article><h3>工程权衡</h3><p>压缩、批处理和 offload 会在精度、尾延迟、带宽和实现复杂度之间重新分配成本。</p></article><article><h3>前沿观察</h3><p>FP8/FP4、异构缓存、连续批处理和 disaggregated serving 正在成为规模化部署的基础设施。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能根据 SLA 和 GPU 预算选择量化、并行和缓存方案，并给出可回归的基准表。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">vLLM / PagedAttention ↗</a><a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener noreferrer">SmoothQuant ↗</a><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener noreferrer">AWQ ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能计算 KV 随层数、头数、长度和 dtype 的增长，并设计 GPU/CPU/NVMe 分级、前缀复用与量化回退。</p></article><article><h3>先修关系</h3><p>先修 Prefill/Decode、KV Cache 和 GPU 带宽；任何结论都要附吞吐、尾延迟和显存测量。</p></article><article><h3>最小实验</h3><p>建立 1000 请求的合成 trace，扫描前缀命中率 0/30/60%、FP16/INT8 KV 与三档带宽；用模拟器或真实引擎记录传输字节、命中率和 TPOT。</p></article><article><h3>验收标准</h3><p>理论 KV 字节与观测/模拟误差不超过 10%，无命中污染或跨会话复用；明确 P95 超限时的淘汰、回迁和禁用量化条件。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -637,11 +468,14 @@ flowchart TD
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

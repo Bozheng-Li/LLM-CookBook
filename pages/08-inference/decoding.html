@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="模型每一步真正吐出来的，是词表上几万个 token 的一整张概率分布。从这张分布里挑出一个词，才是你看到的那个字。挑法不同，同一个模型可以严谨得像法条，也可以放飞得像散文——而这一步全靠你在 API 里设的那几个参数决定。这一节把这几个参数从数学、工程、调参三个角度讲透，并给出可以直接抄的场景对照表。">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="解码策略 · 大模型技术 Cookbook">
+  <meta property="og:description" content="模型每一步真正吐出来的，是词表上几万个 token 的一整张概率分布。从这张分布里挑出一个词，才是你看到的那个字。挑法不同，同一个模型可以严谨得像法条，也可以放飞得像散文——而这一步全靠你在 API 里设的那几个参数决定。这一节把这几个参数从数学、工程、调参三个角度讲透，并给出可以直接抄的场景对照表。">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/08-inference/decoding.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/08-inference/decoding.html">
   <title>解码策略 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="08-inference" data-topic="decoding">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -29,20 +42,7 @@
             <div class="card-title">一图看懂</div>
             <p>解码就是<strong>「模型给了一张选票统计，你按什么规则宣布当选者」</strong>。温度决定这张选票是「一家独大」还是「势均力敌」，Top-k / Top-p 决定谁有资格进入候选名单，最后才是唱票——要么直接选票王（贪心），要么按得票比例抽签（采样）。整条流水线不改一个模型参数，却能让同一个模型呈现出完全不同的「性格」。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart LR
-  H["最后一层隐状态"] --> L["logits<br/>词表上每个 token 一个分数"]
-  L --> R["重复惩罚<br/>压低已出现过的 token"]
-  R --> T["温度缩放<br/>logit 除以 T"]
-  T --> SM["Softmax<br/>转成概率分布"]
-  SM --> C["候选裁剪<br/>Top-k / Top-p / min-p"]
-  C --> N["重新归一化"]
-  N --> D{"选一个"}
-  D -->|取最大值| G["贪心 / 束搜索"]
-  D -->|按概率抽签| S["随机采样"]
-  style T fill:#faeeda,stroke:#ba7517
-  style C fill:#e6f1fb,stroke:#185fa5
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="10" data-edge-count="9" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="H"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">最后一层隐状态</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="L"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">logits</span><span>词表上每个 token 一个分数</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">最后一层隐状态</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="R"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">重复惩罚</span><span>压低已出现过的 token</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">logits / 词表上每个 token 一个分数</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-step" data-node-id="T"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">温度缩放</span><span>logit 除以 T</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">重复惩罚 / 压低已出现过的 token</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SM"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Softmax</span><span>转成概率分布</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">温度缩放 / logit 除以 T</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">候选裁剪</span><span>Top-k / Top-p / min-p</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Softmax / 转成概率分布</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">07</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="N"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">重新归一化</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">候选裁剪 / Top-k / Top-p / min-p</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">08</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="D"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">选一个</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">重新归一化</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">09</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="G"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">贪心 / 束搜索</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">选一个</span><span class="html-flow-condition">取最大值</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">随机采样</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">选一个</span><span class="html-flow-condition">按概率抽签</span></li></ul></article></div></li></ol></div>
               <figcaption>一步解码的完整流水线：惩罚 → 温度 → 归一 → 裁剪 → 选词。注意这条流水线每生成一个 token 就完整跑一遍，一段 500 token 的回答就要跑 500 次。</figcaption>
             </figure>
           </div>
@@ -214,11 +214,11 @@ stateDiagram-v2
           <p>妙处在于候选集<strong>自动随分布形状伸缩</strong>：分布尖锐时可能只留 1～2 个词（该确定的地方就确定），分布平坦时可能留几百个词（该发散的地方就发散）。这正是 Top-p 取代 Top-k 成为默认策略的原因，也是今天几乎所有厂商 API 都提供 <code>top_p</code> 的原因。</p>
           <p>提出 Top-p 的那篇论文（Holtzman 等人的《The Curious Case of Neural Text Degeneration》）给出了一个很有说服力的观察：人类真实文本的 token 概率是<strong>上下起伏</strong>的，有大量「低概率但合理」的用词；而束搜索生成的文本，概率曲线是一条几乎贴着顶的平线。这从量化角度说明了「概率最高 ≠ 最像人写的」。这个观察的原始证据就在下面这张论文原图里，值得花一分钟把它读懂。</p>
 
-          <figure class="paper-figure">
-            <img src="https://ar5iv.labs.arxiv.org/html/1904.09751/assets/x2.png" alt="论文原图：同一上下文下，人类文本与束搜索生成文本的 token 概率对比——人类文本概率起伏大，束搜索文本几乎恒为最高概率" loading="lazy" style="max-width:560px">
+          <figure class="paper-figure image-figure source-figure">
+            <img src="../../assets/figures/external/0506241d201e.png" alt="论文原图：同一上下文下，人类文本与束搜索生成文本的 token 概率对比——人类文本概率起伏大，束搜索文本几乎恒为最高概率" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：Top-p 论文的经典证据——左边人类写的词概率明显上下起伏，右边 Beam Search 生成的词概率几乎贴着顶、毫无起伏</span>
-              <span class="pf-src">论文原图 · Holtzman et al., <em>The Curious Case of Neural Text Degeneration</em>, 2019, Figure 2 · <a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noopener">arXiv:1904.09751</a></span>
+              <span class="pf-src">论文原图 · Holtzman et al., <em>The Curious Case of Neural Text Degeneration</em>, 2019, Figure 2 · <a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noopener noreferrer">arXiv:1904.09751</a></span>
             </figcaption>
           </figure>
 
@@ -234,35 +234,7 @@ stateDiagram-v2
           </div>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root(("解码参数家族"))
-    分布整形
-      温度 temperature
-        小于 1 变尖
-        大于 1 变平
-        等于 0 退化为贪心
-    候选裁剪
-      top_k 固定个数
-      top_p 固定概率质量
-      min_p 相对阈值
-    重复抑制
-      presence_penalty 只看有没有出现
-      frequency_penalty 按次数递增
-      repetition_penalty 乘性缩放
-      no_repeat_ngram 硬性禁止
-    停止与长度
-      max_tokens 上限
-      stop 停止字符串
-      EOS 结束符
-    确定性控制
-      seed 随机种子
-      n 一次返回几条
-      logprobs 返回概率明细
-    强制干预
-      logit_bias 手动加减分
-      约束解码 语法掩码
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：解码参数家族" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>解码参数家族</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>分布整形</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">温度 temperature</span><ul class="html-mindmap-tree" data-depth="1"><li><span class="html-mindmap-leaf">小于 1 变尖</span></li><li><span class="html-mindmap-leaf">大于 1 变平</span></li><li><span class="html-mindmap-leaf">等于 0 退化为贪心</span></li></ul></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>候选裁剪</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">top_k 固定个数</span></li><li><span class="html-mindmap-leaf">top_p 固定概率质量</span></li><li><span class="html-mindmap-leaf">min_p 相对阈值</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>重复抑制</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">presence_penalty 只看有没有出现</span></li><li><span class="html-mindmap-leaf">frequency_penalty 按次数递增</span></li><li><span class="html-mindmap-leaf">repetition_penalty 乘性缩放</span></li><li><span class="html-mindmap-leaf">no_repeat_ngram 硬性禁止</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>停止与长度</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">max_tokens 上限</span></li><li><span class="html-mindmap-leaf">stop 停止字符串</span></li><li><span class="html-mindmap-leaf">EOS 结束符</span></li></ul></section><section class="html-mindmap-branch tone-5" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">05</span><strong>确定性控制</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">seed 随机种子</span></li><li><span class="html-mindmap-leaf">n 一次返回几条</span></li><li><span class="html-mindmap-leaf">logprobs 返回概率明细</span></li></ul></section><section class="html-mindmap-branch tone-6" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">06</span><strong>强制干预</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">logit_bias 手动加减分</span></li><li><span class="html-mindmap-leaf">约束解码 语法掩码</span></li></ul></section></div></div>
             <figcaption>解码参数的完整家族图谱。真正影响「文风」的只有前三组，后三组影响的是长度、可复现性和格式约束——排查问题时先分清自己动的是哪一组。</figcaption>
           </figure>
 
@@ -532,11 +504,11 @@ timeline
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>The Curious Case of Neural Text Degeneration — Top-p / 核采样的原始论文，用「人类文本的概率曲线是起伏的」这一观察说明了为什么最大化概率会产出乏味文本 · <a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noopener">arXiv:1904.09751</a></li>
-            <li>Hierarchical Neural Story Generation — 提出 Top-k 采样并用于故事生成，是采样类解码的早期代表工作 · <a href="https://arxiv.org/abs/1805.04833" target="_blank" rel="noopener">arXiv:1805.04833</a></li>
-            <li>Fast Inference from Transformers via Speculative Decoding — 投机解码的代表性工作，证明了可以在保持输出分布不变的前提下加速生成 · <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">arXiv:2211.17192</a></li>
-            <li>OpenAI Chat Completions API 参考 — temperature / top_p / presence_penalty / frequency_penalty / logit_bias / seed 等参数的权威定义，取值范围与默认值以此为准 · <a href="https://platform.openai.com/docs/api-reference/chat" target="_blank" rel="noopener">链接</a></li>
-            <li>Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs — min-p 采样的原始论文，提出以「最高概率的相对比例」作为裁剪阈值，在高温场景下比 top-p 更稳 · <a href="https://arxiv.org/abs/2407.01082" target="_blank" rel="noopener">arXiv:2407.01082</a></li>
+            <li>The Curious Case of Neural Text Degeneration — Top-p / 核采样的原始论文，用「人类文本的概率曲线是起伏的」这一观察说明了为什么最大化概率会产出乏味文本 · <a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noopener noreferrer">arXiv:1904.09751</a></li>
+            <li>Hierarchical Neural Story Generation — 提出 Top-k 采样并用于故事生成，是采样类解码的早期代表工作 · <a href="https://arxiv.org/abs/1805.04833" target="_blank" rel="noopener noreferrer">arXiv:1805.04833</a></li>
+            <li>Fast Inference from Transformers via Speculative Decoding — 投机解码的代表性工作，证明了可以在保持输出分布不变的前提下加速生成 · <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener noreferrer">arXiv:2211.17192</a></li>
+            <li>OpenAI Chat Completions API 参考 — temperature / top_p / presence_penalty / frequency_penalty / logit_bias / seed 等参数的权威定义，取值范围与默认值以此为准 · <a href="https://platform.openai.com/docs/api-reference/chat" target="_blank" rel="noopener noreferrer">链接</a></li>
+            <li>Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs — min-p 采样的原始论文，提出以「最高概率的相对比例」作为裁剪阈值，在高温场景下比 top-p 更稳 · <a href="https://arxiv.org/abs/2407.01082" target="_blank" rel="noopener noreferrer">arXiv:2407.01082</a></li>
           </ul>
 
           <div class="callout">
@@ -548,6 +520,8 @@ timeline
             想知道这条流水线在真实服务里是怎么被批处理和调度的，见 <a href="../09-efficiency/inference-engines.html">推理引擎</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“解码策略”继续深入</h2></div></div><p class="rd-summary">本章聚焦生成阶段的决策：采样和解码、Self-Consistency、Best-of-N、树搜索、验证器，以及 test-time scaling 的成本边界。</p><p class="rd-takeaway"><strong>阅读提示：</strong>推理时扩展不是无条件增加采样次数；先确认任务是否可验证，再把额外计算预算放到候选生成、验证或搜索中的瓶颈。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Holtzman et al. · 2020</span></div><a href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noopener noreferrer">The Curious Case of Neural Text Degeneration ↗</a><p class="rd-note">Nucleus sampling 的原始论文，解释贪心/beam search 为什么会导致重复和退化。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Wang et al. · 2022</span></div><a href="https://arxiv.org/abs/2203.11171" target="_blank" rel="noopener noreferrer">Self-Consistency Improves Chain of Thought Reasoning ↗</a><p class="rd-note">通过多条推理路径投票提高可验证任务准确率，是 test-time scaling 的基础范式。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Lightman et al. · 2023</span></div><a href="https://arxiv.org/abs/2305.20050" target="_blank" rel="noopener noreferrer">Let&#39;s Verify Step by Step ↗</a><p class="rd-note">过程奖励模型和逐步验证的代表作，说明“答案对不对”和“推理过程是否可靠”是不同信号。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Yao et al. · NeurIPS 2023</span></div><a href="https://arxiv.org/abs/2305.10601" target="_blank" rel="noopener noreferrer">Tree of Thoughts ↗</a><p class="rd-note">把语言模型生成组织成可回溯的搜索树，适合和页面中的 beam、Best-of-N 对照。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">技术报告</span><span class="rd-source">DeepSeek-AI · 2025</span></div><a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener noreferrer">DeepSeek-R1 ↗</a><p class="rd-note">大规模推理强化的公开技术报告，适合观察奖励设计、冷启动和蒸馏的组合方式。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“解码策略”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>推理由一次前向生成发展为带搜索、验证器和自适应预算的测试时计算，推理质量与计算量开始显式交换。</p></article><article><h3>机制抓手</h3><p>区分采样、束搜索、树搜索、验证器和思维长度；记录 token、并行分支、停止条件和最终选择规则。</p></article><article><h3>工程权衡</h3><p>更长的推理链不必然更准确，延迟、显存、重复率和错误传播都需要纳入预算。</p></article><article><h3>前沿观察</h3><p>混合推理、过程奖励、草稿-验证解码和自适应思考预算是当前主线，仍需任务级而非单一榜单评估。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能设计一个带预算上限和失败回退的推理服务，并解释 verifier 错误如何影响最终答案。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2201.11903" target="_blank" rel="noopener noreferrer">Chain-of-Thought ↗</a><a href="https://arxiv.org/abs/2305.20050" target="_blank" rel="noopener noreferrer">Let’s Verify Step by Step ↗</a><a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener noreferrer">Speculative Sampling ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能从条件分布解释 greedy、beam、temperature、top-k/top-p、重复惩罚和停止条件，并为任务选出可复现策略。</p></article><article><h3>先修关系</h3><p>先修 Transformer decode、概率分布和 KV Cache；同时记录质量、token、延迟和停止条件。</p></article><article><h3>最小实验</h3><p>对固定 logits 手算 greedy、temperature、top-k 与 top-p 后的分布；程序采样 10000 次核对频率，再对 10 个 prompt 比较确定性、重复率、长度和停止原因。</p></article><article><h3>验收标准</h3><p>经验频率与理论概率最大绝对差小于 0.02；temperature=0 路径完全可复现，且停止 token、最大长度和异常空输出都有测试。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -559,11 +533,16 @@ timeline
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+  <script src="../../assets/vendor/chartjs/chart.umd.js"></script>
+
+
+
+
+
   <script src="../../assets/js/render.js"></script>
   <script>
   (function () {

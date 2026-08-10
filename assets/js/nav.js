@@ -52,9 +52,8 @@
     try { localStorage.setItem(THEME_KEY, theme); } catch (e) {}
     var hl = document.getElementById('hljs-theme');
     if (hl) {
-      hl.href = theme === 'dark'
-        ? 'https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css'
-        : 'https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css';
+      var themeHref = theme === 'dark' ? hl.dataset.darkHref : hl.dataset.lightHref;
+      if (themeHref) hl.href = themeHref;
     }
     if (typeof window.CB_SET_THEME === 'function') window.CB_SET_THEME(theme);
   }
@@ -93,7 +92,7 @@
     host.className = 'topbar';
     var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
     host.innerHTML =
-      '<button class="menu-btn" id="menuBtn" aria-label="菜单">' +
+      '<button class="menu-btn" id="menuBtn" aria-label="打开目录" aria-controls="sidebar" aria-expanded="false">' +
         '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 4h12M2 8h12M2 12h12"/></svg>' +
       '</button>' +
       '<a class="brand" href="' + url('index.html') + '">' +
@@ -103,10 +102,10 @@
       '</a>' +
       '<div class="search-box">' +
         '<span class="icon"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14" stroke-linecap="round"/></svg></span>' +
-        '<input type="text" id="searchInput" placeholder="搜索知识点、关键词、正文…  (按 /)" autocomplete="off">' +
-        '<div class="search-results" id="searchResults"></div>' +
+        '<input type="text" id="searchInput" role="combobox" aria-label="站内搜索" aria-controls="searchResults" aria-expanded="false" aria-autocomplete="list" placeholder="搜索知识点、关键词、正文…  (按 /)" autocomplete="off">' +
+        '<div class="search-results" id="searchResults" role="listbox" aria-label="搜索结果"></div>' +
       '</div>' +
-      '<button class="theme-toggle" id="themeBtn" aria-label="切换主题" title="切换浅色/暗色">' +
+      '<button class="theme-toggle" id="themeBtn" aria-label="切换主题" aria-pressed="' + isDark + '" title="切换浅色/暗色">' +
         (isDark
           ? '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="3.2"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1" stroke-linecap="round"/></svg>'
           : '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13.5 9.2A5.3 5.3 0 0 1 6.8 2.5a5.3 5.3 0 1 0 6.7 6.7Z" stroke-linejoin="round"/></svg>') +
@@ -115,6 +114,7 @@
     btn.addEventListener('click', function () {
       var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
       applyTheme(next);
+      btn.setAttribute('aria-pressed', String(next === 'dark'));
       btn.innerHTML = next === 'dark'
         ? '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="3.2"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M12.6 3.4l-1.1 1.1M4.5 11.5l-1.1 1.1" stroke-linecap="round"/></svg>'
         : '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13.5 9.2A5.3 5.3 0 0 1 6.8 2.5a5.3 5.3 0 1 0 6.7 6.7Z" stroke-linejoin="round"/></svg>';
@@ -132,21 +132,26 @@
 
     var filter = el('div', 'filter-row');
     filter.innerHTML =
-      '<span class="filter-chip active" data-lv="all">全部</span>' +
-      '<span class="filter-chip" data-lv="basic">入门</span>' +
-      '<span class="filter-chip" data-lv="inter">进阶</span>' +
-      '<span class="filter-chip" data-lv="adv">高级</span>';
+      '<button type="button" class="filter-chip active" data-lv="all" aria-pressed="true">全部</button>' +
+      '<button type="button" class="filter-chip" data-lv="basic" aria-pressed="false">入门</button>' +
+      '<button type="button" class="filter-chip" data-lv="inter" aria-pressed="false">进阶</button>' +
+      '<button type="button" class="filter-chip" data-lv="adv" aria-pressed="false">高级</button>';
     host.appendChild(filter);
 
     TOC.parts.forEach(function (part) {
       var wrap = el('div', 'nav-part' + (part.id === CUR_PART ? ' open' : ''));
-      var head = el('div', 'nav-part-head');
+      var head = el('button', 'nav-part-head');
+      head.type = 'button';
+      head.setAttribute('aria-expanded', String(part.id === CUR_PART));
       head.innerHTML =
         '<svg class="caret" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5L10.5 8L6 12.5"/></svg>' +
         '<span class="pnum">' + part.num + '</span>' +
         '<span>' + part.title + '</span>' +
         (part.frontier ? '<span class="fire">前沿</span>' : '');
-      head.addEventListener('click', function () { wrap.classList.toggle('open'); });
+      head.addEventListener('click', function () {
+        var open = wrap.classList.toggle('open');
+        head.setAttribute('aria-expanded', String(open));
+      });
       wrap.appendChild(head);
 
       var list = el('div', 'nav-topics');
@@ -188,8 +193,12 @@
     filter.addEventListener('click', function (e) {
       var chip = e.target.closest('.filter-chip');
       if (!chip) return;
-      filter.querySelectorAll('.filter-chip').forEach(function (c) { c.classList.remove('active'); });
+      filter.querySelectorAll('.filter-chip').forEach(function (c) {
+        c.classList.remove('active');
+        c.setAttribute('aria-pressed', 'false');
+      });
       chip.classList.add('active');
+      chip.setAttribute('aria-pressed', 'true');
       var lv = chip.getAttribute('data-lv');
       document.querySelectorAll('.nav-topic[data-lv], .topic-item[data-lv]').forEach(function (n) {
         n.classList.toggle('filtered-out', lv !== 'all' && n.getAttribute('data-lv') !== lv);
@@ -283,16 +292,20 @@
         }).join('');
       }
       box.classList.add('show');
+      input.setAttribute('aria-expanded', 'true');
     }
 
     input.addEventListener('input', function () { render(this.value); });
     input.addEventListener('focus', function () { if (this.value.trim()) render(this.value); });
     document.addEventListener('click', function (e) {
-      if (!e.target.closest('.search-box')) box.classList.remove('show');
+      if (!e.target.closest('.search-box')) {
+        box.classList.remove('show');
+        input.setAttribute('aria-expanded', 'false');
+      }
     });
     document.addEventListener('keydown', function (e) {
       if (e.key === '/' && document.activeElement !== input) { e.preventDefault(); input.focus(); }
-      if (e.key === 'Escape') { box.classList.remove('show'); input.blur(); }
+      if (e.key === 'Escape') { box.classList.remove('show'); input.setAttribute('aria-expanded', 'false'); input.blur(); }
     });
   }
 
@@ -303,9 +316,20 @@
     if (!btn || !sb) return;
     var ov = el('div', 'overlay');
     document.body.appendChild(ov);
-    function toggle(on) { sb.classList.toggle('open', on); ov.classList.toggle('show', on); }
+    function toggle(on) {
+      sb.classList.toggle('open', on);
+      ov.classList.toggle('show', on);
+      btn.setAttribute('aria-expanded', String(on));
+      btn.setAttribute('aria-label', on ? '关闭目录' : '打开目录');
+    }
     btn.addEventListener('click', function () { toggle(!sb.classList.contains('open')); });
     ov.addEventListener('click', function () { toggle(false); });
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape' && sb.classList.contains('open')) {
+        toggle(false);
+        btn.focus();
+      }
+    });
   }
 
   /* ---------------- 面包屑 + 上下页 ---------------- */

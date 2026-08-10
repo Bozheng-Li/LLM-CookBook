@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="为什么同样的矩阵乘法，在 CPU 上跑是「算」，到 GPU 上就变成了「搬数据」？为什么把 batch 从 1 加到 32，耗时几乎不变？为什么两个数学上等价的写法，性能能差 5 倍？这些问题的答案，全都藏在 GPU 的执行模型和显存层级里。理解它，是理解一切性能优化——从 FlashAttention 到 ">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="GPU 执行模型与显存层级 · 大模型技术 Cookbook">
+  <meta property="og:description" content="为什么同样的矩阵乘法，在 CPU 上跑是「算」，到 GPU 上就变成了「搬数据」？为什么把 batch 从 1 加到 32，耗时几乎不变？为什么两个数学上等价的写法，性能能差 5 倍？这些问题的答案，全都藏在 GPU 的执行模型和显存层级里。理解它，是理解一切性能优化——从 FlashAttention 到 ">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/05-systems/gpu-architecture.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/05-systems/gpu-architecture.html">
   <title>GPU 执行模型与显存层级 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="05-systems" data-topic="gpu-architecture">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -29,32 +42,7 @@
             <div class="card-title">一图看懂</div>
             <p>GPU 不是「很多核的 CPU」，而是一台<strong>以数据搬运为核心矛盾的流水线机器</strong>：成千上万个线程同时跑，但它们的计算速度远快于喂数据的速度。GPU 的显存像一座图书馆，分好几层——HBM 是地下大书库（80 GB 但慢），SRAM 是你桌上的书架（每个 SM 只有几百 KB 但快），寄存器是你手里正翻着的那一页。算力墙是你「算得不够快」，带宽墙是你「搬得不够快」，而大模型训练的大部分时间，卡在后者。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart TB
-  subgraph GPU["GPU 芯片"]
-    subgraph SMCluster["SM 阵列 如 108-132 个"]
-      SM1["SM #0<br/>含 Tensor Core"]
-      SM2["SM #1<br/>含 Tensor Core"]
-      SMN["SM #N<br/>含 Tensor Core"]
-    end
-    subgraph MemTree["显存层级 由大到小"]
-      HBM["HBM<br/>80 GB<br/>约 3 TB/s"]
-      L2["L2 Cache<br/>约 50 MB<br/>约 12 TB/s"]
-      SRAM["SRAM / Shared Memory<br/>每 SM 约 228 KB<br/>约 19 TB/s"]
-      REG["寄存器 Register<br/>每 SM 约 256 KB<br/>即时访问"]
-    end
-  end
-  SM1 --> REG
-  SM2 --> REG
-  SMN --> REG
-  REG --> SRAM
-  SRAM --> L2
-  L2 --> HBM
-  style HBM fill:#fcebeb,stroke:#a32d2d
-  style L2 fill:#faeeda,stroke:#ba7517
-  style SRAM fill:#eaf3de,stroke:#639922
-  style REG fill:#e6f1fb,stroke:#185fa5
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="7" data-edge-count="6" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SM1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">SM 阵列 如 108-132 个</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SM #0</span><span>含 Tensor Core</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="SM2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">SM 阵列 如 108-132 个</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SM #1</span><span>含 Tensor Core</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="SMN"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">SM 阵列 如 108-132 个</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SM #N</span><span>含 Tensor Core</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="REG"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">显存层级 由大到小</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">寄存器 Register</span><span>每 SM 约 256 KB</span><span>即时访问</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">SM #0 / 含 Tensor Core</span></li><li><span class="html-flow-source">SM #1 / 含 Tensor Core</span></li><li><span class="html-flow-source">SM #N / 含 Tensor Core</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="SRAM"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">显存层级 由大到小</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SRAM / Shared Memory</span><span>每 SM 约 228 KB</span><span>约 19 TB/s</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">寄存器 Register / 每 SM 约 256 KB / 即时访问</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-step" data-node-id="L2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">显存层级 由大到小</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">L2 Cache</span><span>约 50 MB</span><span>约 12 TB/s</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">SRAM / Shared Memory / 每 SM 约 228 KB...</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-danger shape-step" data-node-id="HBM"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">显存层级 由大到小</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM</span><span>80 GB</span><span>约 3 TB/s</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">L2 Cache / 约 50 MB / 约 12 TB/s</span></li></ul></article></div></li></ol></div>
               <figcaption>GPU 显存层级：从 HBM 到寄存器，容量递减、带宽递增、延迟递减。性能优化的核心只有一句话——让数据尽量留在靠近计算单元的那一层。</figcaption>
             </figure>
           </div>
@@ -146,29 +134,7 @@ classDiagram
           </div>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  subgraph Grid["Grid 整个 kernel 的线程网格"]
-    subgraph B0["Block 0 如 256 线程"]
-      W0["Warp 0<br/>线程 0-31"]
-      W1["Warp 7<br/>线程 224-255"]
-    end
-    subgraph B1["Block 1 如 256 线程"]
-      W2["Warp 0<br/>线程 0-31"]
-      W3["Warp 7<br/>线程 224-255"]
-    end
-  end
-  B0 -->|"整块调度到"| SM0["SM #0<br/>Block 不跨 SM"]
-  B1 -->|"整块调度到"| SM1["SM #1"]
-  SM0 --> TC0["4 个 Warp Scheduler<br/>轮流发射指令"]
-  SM1 --> TC1["4 个 Warp Scheduler"]
-  TC0 --> EX0["Tensor Core / CUDA Core"]
-  TC1 --> EX1["Tensor Core / CUDA Core"]
-  style W0 fill:#e6f1fb,stroke:#185fa5
-  style W1 fill:#e6f1fb,stroke:#185fa5
-  style W2 fill:#eaf3de,stroke:#639922
-  style W3 fill:#eaf3de,stroke:#639922
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="12" data-edge-count="6" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="W0"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">Block 0 如 256 线程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Warp 0</span><span>线程 0-31</span></div></article><article class="html-flow-node tone-info shape-step" data-node-id="W1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">Block 0 如 256 线程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Warp 7</span><span>线程 224-255</span></div></article><article class="html-flow-node tone-success shape-step" data-node-id="W2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">Block 1 如 256 线程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Warp 0</span><span>线程 0-31</span></div></article><article class="html-flow-node tone-success shape-step" data-node-id="W3"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">Block 1 如 256 线程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Warp 7</span><span>线程 224-255</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B0"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">Grid 整个 kernel 的线程网格</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">B0</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B1"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">Grid 整个 kernel 的线程网格</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">B1</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SM0"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SM #0</span><span>Block 不跨 SM</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">B0</span><span class="html-flow-condition">整块调度到</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="SM1"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SM #1</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">B1</span><span class="html-flow-condition">整块调度到</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="TC0"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">4 个 Warp Scheduler</span><span>轮流发射指令</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">SM #0 / Block 不跨 SM</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="TC1"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">4 个 Warp Scheduler</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">SM #1</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="EX0"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Tensor Core / CUDA Core</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">4 个 Warp Scheduler / 轮流发射指令</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="EX1"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Tensor Core / CUDA Core</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">4 个 Warp Scheduler</span></li></ul></article></div></li></ol></div>
             <figcaption>GPU 线程层级：Grid → Block → Warp（32 线程锁步）→ Thread。关键约束是「一个 Block 必须完整调度到同一个 SM 上」——所以 Block 内可以用 Shared Memory 通信和同步，Block 之间不行。</figcaption>
           </figure>
 
@@ -237,21 +203,21 @@ stateDiagram-v2
           <h3>论文原图：SRAM 与 HBM 到底差多少</h3>
           <p>上面那张金字塔表是「数据」，下面这两张「图」把同一件事画得更直观——它们分别来自 FlashAttention 论文和 NVIDIA 官方 CUDA 文档。先看论文原图：<strong>FlashAttention 论文的 Figure 1 画的就是 GPU 的两层显存：SRAM 与 HBM。</strong>图上左半边是标准 Attention 的流程：注意力分数矩阵 S 和归一化矩阵 P 都要被写回 HBM 再读回来（每个箭头都是一次慢速搬运）；右半边是 FlashAttention 的做法：把 Q、K、V 切成小块（tile），让 S 和 P 只活在被色块框住的小 SRAM 里，只有最终的输出 O 才写回 HBM。</p>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/05-systems/flash-attention/fig1.png" alt="论文原图：FlashAttention 论文 Figure 1——SRAM/HBM 两层显存，标准 Attention 反复读写 HBM，FlashAttention 让中间矩阵留在 SRAM" loading="lazy" style="max-width:480px">
             <figcaption>
               <span class="pf-title">图：FlashAttention 论文里的显存层级——SRAM（小方块，快）与 HBM（大方块，慢），中间矩阵不落 HBM 是提速关键</span>
-              <span class="pf-src">论文原图 · Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></span>
+              <span class="pf-src">论文原图 · Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">arXiv:2205.14135</a></span>
             </figcaption>
           </figure>
 
           <p>新手读这张图抓三个信息：<strong>① 上下的两个色块是两层存储</strong>，小的是 SRAM、大的是 HBM，容量和速度都差一个数量级以上；<strong>② 标准 Attention 的箭头在两层之间来回穿梭</strong>，每穿一次都要付一次「走窄带宽管道」的代价；<strong>③ FlashAttention 的箭头几乎全部收在小盒子里</strong>，只保留最开始把 Q/K/V 读进 SRAM、最后把 O 写回 HBM 两条。你可以把 SRAM 想成厨师的操作台、HBM 想成仓库——标准做法是每做一道菜都跑一趟仓库，FlashAttention 是一次性把本周食材搬上操作台。这正是 <a href="flash-attention.html">FlashAttention 与 IO 感知注意力</a> 那一页的核心图，本页借用它来说明「数据留在哪一层」这件事有多重要。</p>
 
-          <figure class="paper-figure">
-            <img src="https://docs.nvidia.com/cuda/cuda-c-programming-guide/_images/memory-hierarchy.png" alt="NVIDIA 官方文档图：CUDA 编程指南的内存层级——寄存器、局部内存、共享内存、全局内存、常量内存、纹理内存的金字塔结构" loading="lazy" style="max-width:520px">
+          <figure class="paper-figure image-figure source-figure">
+            <img src="../../assets/figures/external/57b5b60463d4.png" alt="NVIDIA 官方文档图：CUDA 编程指南的内存层级——寄存器、局部内存、共享内存、全局内存、常量内存、纹理内存的金字塔结构" loading="lazy" style="max-width:520px">
             <figcaption>
               <span class="pf-title">图：NVIDIA CUDA 官方文档里的完整内存层级金字塔——寄存器最快，全局内存（HBM）最慢，中间是共享内存与 L2</span>
-              <span class="pf-src">权威文档图 · NVIDIA, <em>CUDA C++ Programming Guide</em>, "Memory Hierarchy" 图 · <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">docs.nvidia.com</a></span>
+              <span class="pf-src">权威文档图 · NVIDIA, <em>CUDA C++ Programming Guide</em>, "Memory Hierarchy" 图 · <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener noreferrer">docs.nvidia.com</a></span>
             </figcaption>
           </figure>
 
@@ -478,42 +444,7 @@ print("→ 算术强度低于这个值的算子, 一定是带宽受限")</code><
           <p>理解了 GPU 的执行模型和显存层级，很多「经验法则」就有了物理依据。下面这张思维导图把常见优化手段挂回它们对应的硬件约束：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root(("GPU 性能优化"))
-    带宽墙
-      算子融合
-        torch.compile
-        手写 Triton kernel
-        FlashAttention
-      降低精度
-        BF16 减半流量
-        FP8 再减半
-        权重量化
-      提高数据复用
-        分块 tiling
-        数据留在 SRAM
-        KV Cache 复用
-    算力墙
-      用 Tensor Core
-        混合精度
-        维度对齐到 16 的倍数
-      减少无效计算
-        变长序列去 padding
-        MoE 稀疏激活
-    并行度不足
-      加大 batch
-      加大 tile 让 SM 满载
-      多流并发
-    启动与调度开销
-      CUDA Graph
-      减少小 kernel 数量
-      异步 H2D 拷贝
-    通信瓶颈
-      TP 限制在 NVLink 域内
-      梯度累积减少同步频率
-      计算与通信重叠
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：GPU 性能优化" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>GPU 性能优化</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>带宽墙</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">算子融合</span><ul class="html-mindmap-tree" data-depth="1"><li><span class="html-mindmap-leaf">torch.compile</span></li><li><span class="html-mindmap-leaf">手写 Triton kernel</span></li><li><span class="html-mindmap-leaf">FlashAttention</span></li></ul></li><li><span class="html-mindmap-leaf">降低精度</span><ul class="html-mindmap-tree" data-depth="1"><li><span class="html-mindmap-leaf">BF16 减半流量</span></li><li><span class="html-mindmap-leaf">FP8 再减半</span></li><li><span class="html-mindmap-leaf">权重量化</span></li></ul></li><li><span class="html-mindmap-leaf">提高数据复用</span><ul class="html-mindmap-tree" data-depth="1"><li><span class="html-mindmap-leaf">分块 tiling</span></li><li><span class="html-mindmap-leaf">数据留在 SRAM</span></li><li><span class="html-mindmap-leaf">KV Cache 复用</span></li></ul></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>算力墙</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">用 Tensor Core</span><ul class="html-mindmap-tree" data-depth="1"><li><span class="html-mindmap-leaf">混合精度</span></li><li><span class="html-mindmap-leaf">维度对齐到 16 的倍数</span></li></ul></li><li><span class="html-mindmap-leaf">减少无效计算</span><ul class="html-mindmap-tree" data-depth="1"><li><span class="html-mindmap-leaf">变长序列去 padding</span></li><li><span class="html-mindmap-leaf">MoE 稀疏激活</span></li></ul></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>并行度不足</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">加大 batch</span></li><li><span class="html-mindmap-leaf">加大 tile 让 SM 满载</span></li><li><span class="html-mindmap-leaf">多流并发</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>启动与调度开销</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">CUDA Graph</span></li><li><span class="html-mindmap-leaf">减少小 kernel 数量</span></li><li><span class="html-mindmap-leaf">异步 H2D 拷贝</span></li></ul></section><section class="html-mindmap-branch tone-5" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">05</span><strong>通信瓶颈</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">TP 限制在 NVLink 域内</span></li><li><span class="html-mindmap-leaf">梯度累积减少同步频率</span></li><li><span class="html-mindmap-leaf">计算与通信重叠</span></li></ul></section></div></div>
             <figcaption>性能优化手段的分类地图：先用 profiler 判断瓶颈属于哪一类，再从对应分支挑手段。不要凭感觉优化——瓶颈判断错，做再多优化也是白费。</figcaption>
           </figure>
 
@@ -575,13 +506,13 @@ mindmap
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>NVIDIA H100 Tensor Core GPU Architecture Whitepaper — GPU 微架构的官方参考，含 SM 组成、Tensor Core、TMA、Thread Block Cluster 与 HBM 的详细规格 · <a href="https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-architecture-whitepaper" target="_blank" rel="noopener">NVIDIA 官方白皮书</a></li>
-            <li>CUDA C++ Programming Guide — warp 调度模型、Shared Memory 与 bank、合并访问、Compute Capability 各代次上限的权威文档，本页金字塔图即出自此 · <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">NVIDIA CUDA 文档</a></li>
-            <li>CUDA C++ Best Practices Guide — 合并访问、occupancy、bank conflict 等优化项的官方实践清单 · <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/" target="_blank" rel="noopener">NVIDIA 官方指南</a></li>
-            <li>NVIDIA A100/Ampere 架构白皮书 — Ampere 一代 SM、Tensor Core 与 40/80 GB HBM 规格的权威来源 · <a href="https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/nvidia-ampere-architecture-whitepaper.pdf" target="_blank" rel="noopener">NVIDIA 官方 PDF</a></li>
-            <li>Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (2022) — 本页论文原图（Figure 1：SRAM/HBM 层级）的出处，也是「IO 感知」优化的源头 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></li>
-            <li>Ivanov et al., "Data Movement Is All You Need: A Case Study on Optimizing Transformers" (2021) — 从数据搬运视角量化 Transformer 的性能瓶颈，与本文的带宽墙视角完全一致 · <a href="https://arxiv.org/abs/2107.02039" target="_blank" rel="noopener">arXiv:2107.02039</a></li>
-            <li>Williams et al., "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (2009) — 算术强度与平衡点这套分析框架的原始出处 · <a href="https://dl.acm.org/doi/10.1145/1498765.1498785" target="_blank" rel="noopener">ACM Digital Library</a></li>
+            <li>NVIDIA H100 Tensor Core GPU Architecture Whitepaper — GPU 微架构的官方参考，含 SM 组成、Tensor Core、TMA、Thread Block Cluster 与 HBM 的详细规格 · <a href="https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-architecture-whitepaper" target="_blank" rel="noopener noreferrer">NVIDIA 官方白皮书</a></li>
+            <li>CUDA C++ Programming Guide — warp 调度模型、Shared Memory 与 bank、合并访问、Compute Capability 各代次上限的权威文档，本页金字塔图即出自此 · <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener noreferrer">NVIDIA CUDA 文档</a></li>
+            <li>CUDA C++ Best Practices Guide — 合并访问、occupancy、bank conflict 等优化项的官方实践清单 · <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/" target="_blank" rel="noopener noreferrer">NVIDIA 官方指南</a></li>
+            <li>NVIDIA A100/Ampere 架构白皮书 — Ampere 一代 SM、Tensor Core 与 40/80 GB HBM 规格的权威来源 · <a href="https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/nvidia-ampere-architecture-whitepaper.pdf" target="_blank" rel="noopener noreferrer">NVIDIA 官方 PDF</a></li>
+            <li>Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (2022) — 本页论文原图（Figure 1：SRAM/HBM 层级）的出处，也是「IO 感知」优化的源头 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">arXiv:2205.14135</a></li>
+            <li>Ivanov et al., "Data Movement Is All You Need: A Case Study on Optimizing Transformers" (2021) — 从数据搬运视角量化 Transformer 的性能瓶颈，与本文的带宽墙视角完全一致 · <a href="https://arxiv.org/abs/2107.02039" target="_blank" rel="noopener noreferrer">arXiv:2107.02039</a></li>
+            <li>Williams et al., "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (2009) — 算术强度与平衡点这套分析框架的原始出处 · <a href="https://dl.acm.org/doi/10.1145/1498765.1498785" target="_blank" rel="noopener noreferrer">ACM Digital Library</a></li>
           </ul>
 
           <div class="callout">
@@ -589,6 +520,8 @@ mindmap
             理解了 GPU 的硬件结构，下一步是学会<strong>手算</strong>一个模型需要多少算力和显存：<a href="compute-budget.html">FLOP、显存核算与性能剖析</a>。如果想直接看如何把「数据留在 SRAM」这条原则用到极致，跳转 <a href="flash-attention.html">FlashAttention 与 IO 感知注意力</a>；想亲手写一个融合算子，看 <a href="triton-kernel.html">Triton Kernel 与编译优化</a>；想把这些数字换算成并行策略，见 <a href="../06-pretraining/distributed-training.html">分布式训练与并行策略</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“GPU 执行模型与显存层级”继续深入</h2></div></div><p class="rd-summary">本章把模型公式连接到真实硬件：GPU 的执行和内存层级、FLOP 与带宽核算、FlashAttention 的 IO 优化，以及 Triton kernel 的工程方法。</p><p class="rd-takeaway"><strong>阅读提示：</strong>性能问题先判断是算力受限还是访存受限，再用 profiler 和小规模 benchmark 验证；不要把峰值 FLOP 当成实际吞吐。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Dao et al. · NeurIPS 2022</span></div><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">FlashAttention: Fast and Memory-Efficient Exact Attention ↗</a><p class="rd-note">分块、online softmax 和重计算的原始论文，完整解释“IO 感知”为什么能在不近似的情况下加速。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">NVIDIA</span></div><a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener noreferrer">CUDA C++ Programming Guide ↗</a><p class="rd-note">warp、线程块、共享内存、全局内存和同步语义的权威参考，核对 GPU 章节中的硬件事实。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方指南</span><span class="rd-source">NVIDIA</span></div><a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/" target="_blank" rel="noopener noreferrer">CUDA C++ Best Practices Guide ↗</a><p class="rd-note">合并访存、occupancy、bank conflict 和性能分析的工程清单，适合配合 profiler 使用。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方教程</span><span class="rd-source">OpenAI Triton</span></div><a href="https://triton-lang.org/main/getting-started/tutorials/" target="_blank" rel="noopener noreferrer">Triton Tutorials ↗</a><p class="rd-note">从向量加法、矩阵乘法到融合 kernel 的渐进式教程，是实战页面的直接延伸。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Williams et al. · CACM 2009</span></div><a href="https://doi.org/10.1145/1498765.1498785" target="_blank" rel="noopener noreferrer">Roofline: An Insightful Visual Performance Model ↗</a><p class="rd-note">用算术强度把计算瓶颈和带宽瓶颈放在同一张图上，是性能剖析的经典框架。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“GPU 执行模型与显存层级”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>系统优化从 GPU 层次结构、Roofline 和通信原语出发，逐步发展到 FlashAttention、算子融合、编译器和端到端 profiling。</p></article><article><h3>机制抓手</h3><p>先判断瓶颈属于计算、HBM/SRAM 访问、kernel 启动还是跨卡通信，再选择 tile、融合、重计算、并行或布局优化。</p></article><article><h3>工程权衡</h3><p>理论 FLOP、峰值带宽和实际吞吐常常不同；任何优化都必须同时报告精度、形状覆盖、显存和回退路径。</p></article><article><h3>前沿观察</h3><p>FP8、异步执行、编译期融合、推理/训练解耦和新一代互联正在改变系统边界，基准应固定硬件、batch、长度和版本。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能够用 profiler 找到一个端到端热点，并解释优化前后算术强度、显存流量和延迟变化。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener noreferrer">FlashAttention-2 ↗</a><a href="https://triton-lang.org/main/getting-started/tutorials/" target="_blank" rel="noopener noreferrer">Triton tutorials ↗</a><a href="https://crd.lbl.gov/divisions/computer-science/par/research/roofline/" target="_blank" rel="noopener noreferrer">Roofline model ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能把 warp、SM、寄存器、共享内存、HBM 和 Tensor Core 映射到 kernel 的占用率、访存合并与 Roofline 位置。</p></article><article><h3>先修关系</h3><p>先修矩阵乘法、Transformer 前向过程和 GPU 的线程/显存层级；实验需固定硬件与 batch。</p></article><article><h3>最小实验</h3><p>在同一 GPU 上剖析向量加法、转置和矩阵乘三类 workload；每类固定 shape 与 dtype，采集带宽、算力、occupancy 和 kernel 时间，并改变一次访问步长。</p></article><article><h3>验收标准</h3><p>能依据测量把三个 workload 分为带宽受限或计算受限；报告设备型号和理论峰值，且对非合并访问造成的带宽下降给出 profiler 证据。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -599,11 +532,16 @@ mindmap
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+  <script src="../../assets/vendor/chartjs/chart.umd.js"></script>
+
+
+
+
+
   <script src="../../assets/js/render.js"></script>
   <script>
   (function(){

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<!-- cookbook:handcrafted -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="从模型接入、SSE 流式后端和 React 前端，到文档入库、检索引用、评测与生产替换边界，完成一个可运行的大模型全栈应用。">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="实战：构建全栈大模型应用 · 大模型技术 Cookbook">
+  <meta property="og:description" content="用 FastAPI、React 和 OpenAI-compatible 接口构建带流式输出、RAG 与引用的完整大模型应用。">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/15-practice/fullstack-llm-app.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/15-practice/fullstack-llm-app.html">
+  <title>实战：构建全栈大模型应用 · 大模型技术 Cookbook</title>
+  <link rel="stylesheet" href="../../assets/css/theme.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
+</head>
+<body data-part="15-practice" data-topic="fullstack-llm-app">
+  <a class="skip-link" href="#main-content">跳到正文</a>
+  <header id="topbar"></header>
+  <div class="layout">
+    <nav id="sidebar"></nav>
+    <main class="main" id="main-content" tabindex="-1">
+      <div class="with-toc">
+        <div class="container">
+          <div id="breadcrumb"></div>
+          <header class="page-head">
+            <div class="meta"><span class="level inter">进阶</span><span class="tag-frontier">端到端项目</span></div>
+            <h1>实战：构建全栈大模型应用</h1>
+            <p class="lead">这一章不再实现孤立算法，而是把模型、后端、前端、知识库、引用和测试连成一个可以交付的产品闭环。项目默认无密钥也能运行；接入任意 OpenAI-compatible 服务后，同一套接口即可切到真实模型。</p>
+          </header>
+
+          <section class="overview-card" aria-labelledby="outcomes">
+            <h2 id="outcomes">完成标准</h2>
+            <ul>
+              <li>能解释浏览器、应用后端、模型服务和知识库之间的数据边界。</li>
+              <li>能用 SSE 将模型 token 增量传到前端，并正确处理完成、引用和错误事件。</li>
+              <li>能写入文档、检索证据、把引用与回答分开传输，避免模型伪造来源。</li>
+              <li>能在不修改前端契约的情况下，将演示检索替换为 Embedding 与 pgvector。</li>
+              <li>能通过健康检查、API 测试和人工验收确认项目达到最小交付标准。</li>
+            </ul>
+            <p><strong>先修：</strong><a href="../10-applications/rag.html">RAG</a>、<a href="../10-applications/structured-output.html">结构化输出</a>、<a href="../12-llmops/observability.html">可观测性</a>。预计 2–4 小时。</p>
+          </section>
+
+          <h2 id="architecture">一、先固定系统边界</h2>
+          <p>生产系统不应让浏览器直接持有模型密钥。浏览器只认识你的业务 API；应用后端负责鉴权、模型路由、检索、日志和错误收敛；模型服务只是可替换依赖。这个边界决定了后续能否更换供应商、增加缓存或接入私有模型。</p>
+          <figure class="figure">
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="5" data-edge-count="7" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="UI"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">React 前端</span><span>消息与引用</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FastAPI 后端 / 校验与编排</span><span class="html-flow-condition">SSE: citations/token/done</span></li></ul></article><article class="html-flow-node tone-success shape-step" data-node-id="API"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">FastAPI 后端</span><span>校验与编排</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">React 前端 / 消息与引用</span><span class="html-flow-condition">POST /api/chat</span></li><li><span class="html-flow-source">检索边界 / demo / pgvector</span></li><li><span class="html-flow-source">模型服务</span><span class="html-flow-condition">token stream</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="RET"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">检索边界</span><span>demo / pgvector</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FastAPI 后端 / 校验与编排</span></li></ul></article><article class="html-flow-node tone-warn shape-step" data-node-id="LLM"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">模型服务</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FastAPI 后端 / 校验与编排</span><span class="html-flow-condition">OpenAI-compatible</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="OBS"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">日志、指标、trace</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FastAPI 后端 / 校验与编排</span></li></ul></article></div></li></ol></div>
+            <figcaption>全栈数据流：密钥和模型调用停留在后端；引用由检索层产生，与生成文本使用不同 SSE 事件传输。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层</th><th>本项目实现</th><th>生产替换点</th><th>必须观测</th></tr></thead>
+              <tbody>
+                <tr><td>前端</td><td>React + TypeScript + Vite</td><td>登录、会话持久化、文件上传</td><td>首 token 时间、失败率、取消率</td></tr>
+                <tr><td>应用 API</td><td>FastAPI + Pydantic</td><td>鉴权、限流、队列、供应商路由</td><td>状态码、模型耗时、token、成本</td></tr>
+                <tr><td>检索</td><td>内存词法重叠</td><td>Embedding + pgvector / 向量库</td><td>Recall@k、空召回、索引新鲜度</td></tr>
+                <tr><td>模型</td><td>demo 或 OpenAI-compatible</td><td>云 API、本地 vLLM、模型网关</td><td>TTFT、TPOT、超时、限流</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="run">二、先跑通无密钥闭环</h2>
+          <p>参考项目位于 <a href="../../examples/fullstack-llm/README.md"><code>examples/fullstack-llm/</code></a>。demo 模式不是一个假的静态页面：文档写入、检索、引用事件、SSE 分片和前端增量渲染全部走真实链路，只有模型 token 使用本地生成器。</p>
+          <pre><code class="language-bash">cd examples/fullstack-llm/backend
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+uvicorn app.main:app --reload --port 8000
+
+# 新终端
+cd examples/fullstack-llm/frontend
+npm install
+npm run dev</code></pre>
+          <div class="callout tip"><span class="callout-t">第一验收点</span>访问 <code>http://localhost:5173</code>，左侧状态应显示 <code>demo</code>。写入一段至少 20 字的文档，再询问文档中的关键词；回答下方必须出现可展开引用。</div>
+
+          <h2 id="contract">三、把 SSE 当成正式接口契约</h2>
+          <p>不要把模型供应商的原始数据流直接透传给前端。参考项目将其归一化为四类事件；前端只依赖这些稳定事件，后端可以自由更换模型 SDK。</p>
+          <pre><code class="language-text">event: citations
+data: {"items":[{"id":"...","title":"部署说明","excerpt":"...","score":0.67}]}
+
+event: token
+data: {"text":"第一段增量文本"}
+
+event: done
+data: {"ok":true}
+
+event: error
+data: {"message":"模型服务暂时不可用，请稍后重试。"}</code></pre>
+          <p>这里有三个容易忽略的工程点：错误事件不能泄露密钥和上游响应体；代理层要关闭缓冲，否则 token 会攒成整段才到浏览器；客户端解析器必须保留不完整的最后一个 SSE block，等下一批字节到达后再解析。</p>
+
+          <h2 id="rag">四、让检索证据独立于回答</h2>
+          <p><a href="../../examples/fullstack-llm/backend/app/main.py">后端实现</a>把文档切成约 700 字的片段，演示检索使用中英文 token 重叠率排序。这个算法只用于验证数据流，但接口已经固定为 <code>Citation</code>：<code>id</code>、<code>title</code>、<code>excerpt</code>、<code>score</code>。升级到向量检索时只替换 <code>search_documents</code>，无需修改聊天接口和前端。</p>
+          <figure class="figure">
+            <div class="mermaid">
+sequenceDiagram
+  participant U as 用户
+  participant F as 前端
+  participant A as 应用后端
+  participant R as 检索器
+  participant M as 模型
+  U->>F: 提问
+  F->>A: messages + use_rag
+  A->>R: query, top_k
+  R-->>A: citations
+  A-->>F: citations 事件
+  A->>M: 问题 + 证据
+  loop 流式生成
+    M-->>A: token
+    A-->>F: token 事件
+  end
+  A-->>F: done 事件
+            </div>
+            <figcaption>引用先于回答到达，并由检索层生成。模型只使用证据，不负责决定引用对象，从协议层减少伪造来源。</figcaption>
+          </figure>
+
+          <h3>升级到 Embedding + pgvector</h3>
+          <ol>
+            <li>入库时保存 <code>document_id</code>、版本、chunk 顺序、权限标签和 embedding。</li>
+            <li>查询时先执行租户/权限过滤，再做向量或混合检索，最后重排。</li>
+            <li>引用对象返回稳定文档 ID 和片段 ID，不把数据库主键直接暴露给用户。</li>
+            <li>用带 gold evidence 的问题集测 Recall@k，而不是只看最终回答是否“像对的”。</li>
+          </ol>
+
+          <h2 id="provider">五、接入真实模型服务</h2>
+          <p>复制 <code>.env.example</code> 为 <code>.env</code>，设置端点、密钥和模型。后端只在服务器进程中读取密钥；前端、日志和 SSE 错误事件都不应出现密钥。</p>
+          <pre><code class="language-bash">LLM_API_BASE=https://your-provider.example/v1
+LLM_API_KEY=replace-me
+LLM_MODEL=your-model
+ALLOWED_ORIGINS=http://localhost:5173</code></pre>
+          <div class="callout warn"><span class="callout-t">不要照抄到生产</span>示例为了可读性使用进程内文档存储，没有用户身份、持久化、限流和多租户隔离。它是端到端契约基线，不是生产部署模板。</div>
+
+          <h2 id="failure">六、按边界排查失败</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>现象</th><th>优先检查</th><th>不要先做</th></tr></thead>
+              <tbody>
+                <tr><td>页面显示后端未连接</td><td><code>/api/health</code>、Vite proxy、端口</td><td>更换模型或 prompt</td></tr>
+                <tr><td>回答一次性出现</td><td>代理缓冲、SSE 空行、流式读取</td><td>增加前端动画</td></tr>
+                <tr><td>没有引用</td><td>文档是否入库、query token、top_k</td><td>让模型自己编引用</td></tr>
+                <tr><td>有引用但答错</td><td>引用是否真正支持答案、上下文拼接</td><td>只增加召回数量</td></tr>
+                <tr><td>真实模型报错</td><td>base URL、鉴权头、模型名、超时</td><td>把上游完整错误返回浏览器</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="acceptance">七、验收与扩展练习</h2>
+          <pre><code class="language-bash">cd examples/fullstack-llm/backend
+pytest
+curl http://localhost:8000/api/health
+
+cd ../frontend
+npm run build</code></pre>
+          <ol>
+            <li><strong>基础：</strong>连续提交两次问题，确认第二次请求包含必要历史，但不包含欢迎消息。</li>
+            <li><strong>检索：</strong>构造一个完全无关的问题，要求系统无引用时明确说证据不足。</li>
+            <li><strong>可靠性：</strong>把模型端点改成无效地址，确认前端只显示可操作错误，不出现堆栈和密钥。</li>
+            <li><strong>生产化：</strong>将 <code>search_documents</code> 替换为 pgvector，并用同一组 API 测试保证契约不变。</li>
+            <li><strong>观测：</strong>为每次请求记录 request ID、检索耗时、TTFT、完成状态和估算 token 成本。</li>
+          </ol>
+          <div class="callout"><span class="callout-t">最终验收</span>一个新开发者从干净 checkout 出发，能够在 20 分钟内启动 demo，写入文档、获得带引用的流式回答、运行后端测试和前端构建，并能指出四个生产替换边界。</div>
+
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title">
+            <div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕全栈大模型应用继续深入</h2></div></div>
+            <p class="rd-summary">本章的重点是把浏览器、应用 API、检索器和模型服务连接成稳定契约，再按真实约束替换每个边界。</p>
+            <p class="rd-takeaway"><strong>阅读提示：</strong>先逐条复现协议和失败路径，再引入向量库、鉴权、持久化与观测，不要一开始就堆生产组件。</p>
+            <ul class="rd-list">
+              <li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">FastAPI</span></div><a href="https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse" target="_blank" rel="noopener noreferrer">StreamingResponse ↗</a><p class="rd-note">理解异步生成器、响应头和流式响应生命周期，核对本项目的 SSE 实现边界。</p></li>
+              <li class="rd-item"><div class="rd-meta"><span class="rd-type">Web 标准</span><span class="rd-source">MDN</span></div><a href="https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events" target="_blank" rel="noopener noreferrer">Server-sent events ↗</a><p class="rd-note">掌握事件名、data 行、空行分隔和浏览器端连接语义，避免把 SSE 当成普通 JSON 响应。</p></li>
+              <li class="rd-item"><div class="rd-meta"><span class="rd-type">Web 标准</span><span class="rd-source">MDN</span></div><a href="https://developer.mozilla.org/en-US/docs/Web/API/Streams_API/Using_readable_streams" target="_blank" rel="noopener noreferrer">ReadableStream 消费模式 ↗</a><p class="rd-note">对照前端逐字节读取、缓冲不完整 block 和 AbortController 取消的实现。</p></li>
+              <li class="rd-item"><div class="rd-meta"><span class="rd-type">开源项目</span><span class="rd-source">pgvector</span></div><a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener noreferrer">pgvector ↗</a><p class="rd-note">从内存词法检索迁移到向量检索时，重点查看索引、距离度量和过滤条件的组合方式。</p></li>
+              <li class="rd-item"><div class="rd-meta"><span class="rd-type">安全基线</span><span class="rd-source">OWASP</span></div><a href="https://owasp.org/www-project-top-10-for-large-language-model-applications/" target="_blank" rel="noopener noreferrer">OWASP LLM Top 10 ↗</a><p class="rd-note">把提示注入、敏感信息泄露、不安全输出处理和过度代理权限纳入上线前检查。</p></li>
+            </ul>
+            <p class="rd-foot">资料优先选用标准、官方文档和维护中的开源项目；链接按 2026-08-10 检索，具体版本以来源页面为准。</p>
+          </section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="topic" aria-labelledby="technical-deepening-title"><div class="td-kicker">主题级技术深化</div><h2 id="technical-deepening-title">围绕“实战：构建全栈大模型应用”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>大模型应用从浏览器直连模型的 demo，演进为前端、业务 API、检索、模型网关、评测和观测分层的可交付系统。</p></article><article><h3>机制抓手</h3><p>浏览器只依赖业务 SSE 契约；后端负责输入校验、检索引用、模型路由和错误收敛，citation/token/done/error 事件相互独立。</p></article><article><h3>工程权衡</h3><p>demo 内存检索便于理解链路，却不提供持久化、权限和语义召回；生产替换必须保持 API 契约并补齐限流、超时和审计。</p></article><article><h3>前沿观察</h3><p>模型路由、Agent 工作流、在线评测和 OpenTelemetry 正在进入统一应用平台，核心仍是每个边界可替换、可回放、可降级。</p></article></div><div class="td-check"><strong>实践检查</strong><span>从干净环境启动项目，写入文档并获得带引用流式回答；再注入空召回、上游超时和用户取消，验证事件与 UI 状态。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener noreferrer">nanoGPT ↗</a><a href="https://cs336.stanford.edu/" target="_blank" rel="noopener noreferrer">Stanford CS336 ↗</a><a href="https://modelcontextprotocol.io/specification/2025-06-18" target="_blank" rel="noopener noreferrer">MCP Specification ↗</a></div></section>
+          <div id="pager"></div>
+        </div>
+        <aside id="pageToc"></aside>
+      </div>
+    </main>
+  </div>
+  <script src="../../assets/js/toc.js"></script>
+  <script src="../../assets/js/search-index.js"></script>
+  <script>window.ROOT = "../../";</script>
+  <script src="../../assets/js/nav.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
+  <script src="../../assets/js/render.js"></script>
+</body>
+</html>

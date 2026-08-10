@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="训练大模型时，显存总是比算力先见底。一个 7B 模型，光是权重加梯度加优化器状态就要 112 GB——单张 80 GB 的卡连一份都放不下。这一页要做三件事：教你 徒手算出任何模型的显存账 、讲清 FP32/FP16/BF16/FP8 每一位比特都在干什么、把「显存换算力」的各种手段（梯度检查点、卸载、重计算">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="混合精度与显存优化 · 大模型技术 Cookbook">
+  <meta property="og:description" content="训练大模型时，显存总是比算力先见底。一个 7B 模型，光是权重加梯度加优化器状态就要 112 GB——单张 80 GB 的卡连一份都放不下。这一页要做三件事：教你 徒手算出任何模型的显存账 、讲清 FP32/FP16/BF16/FP8 每一位比特都在干什么、把「显存换算力」的各种手段（梯度检查点、卸载、重计算">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/06-pretraining/mixed-precision.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/06-pretraining/mixed-precision.html">
   <title>混合精度与显存优化 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="06-pretraining" data-topic="mixed-precision">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -30,23 +43,7 @@
             <div class="card-title">一图看懂</div>
             <p>混合精度的核心思路只有一句：<strong>用低精度存和算（省显存、跑得快），用高精度更新参数（不丢精度）</strong>。因为参数更新的步长常常小到 $10^{-7}$ 量级，在 BF16 里会被直接舍入成零——所以必须留一份 FP32 的「主权重」专门承接更新。至于其他显存手段——梯度检查点、激活值压缩、CPU 卸载——本质都是同一笔交易：<strong>用额外的计算或通信，换回显存空间</strong>。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart LR
-  W32["FP32 主权重<br/>优化器唯一更新对象"] -->|"cast 每步开头"| W16["BF16 权重副本<br/>参与计算"]
-  W16 --> F["前向传播<br/>BF16 GEMM 走 Tensor Core"]
-  F --> A["激活值<br/>BF16 存下来等反向用"]
-  A --> B["反向传播<br/>BF16 GEMM"]
-  B --> G["BF16 梯度"]
-  G -->|"归约时升到 FP32"| G32["FP32 梯度"]
-  G32 --> U["Adam 更新<br/>FP32 一阶矩 二阶矩"]
-  U --> W32
-  style W16 fill:#e6f1fb,stroke:#185fa5
-  style A fill:#e6f1fb,stroke:#185fa5
-  style F fill:#e6f1fb,stroke:#185fa5
-  style B fill:#e6f1fb,stroke:#185fa5
-  style W32 fill:#eaf3de,stroke:#639922
-  style U fill:#eaf3de,stroke:#639922
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="8" data-edge-count="8" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="W32"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">FP32 主权重</span><span>优化器唯一更新对象</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Adam 更新 / FP32 一阶矩 二阶矩</span></li></ul></article><article class="html-flow-node tone-info shape-step" data-node-id="W16"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">BF16 权重副本</span><span>参与计算</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FP32 主权重 / 优化器唯一更新对象</span><span class="html-flow-condition">cast 每步开头</span></li></ul></article><article class="html-flow-node tone-info shape-step" data-node-id="F"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">前向传播</span><span>BF16 GEMM 走 Tensor Core</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">BF16 权重副本 / 参与计算</span></li></ul></article><article class="html-flow-node tone-info shape-step" data-node-id="A"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">激活值</span><span>BF16 存下来等反向用</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">前向传播 / BF16 GEMM 走 Tensor Core</span></li></ul></article><article class="html-flow-node tone-info shape-step" data-node-id="B"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">反向传播</span><span>BF16 GEMM</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">激活值 / BF16 存下来等反向用</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">BF16 梯度</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">反向传播 / BF16 GEMM</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G32"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">FP32 梯度</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">BF16 梯度</span><span class="html-flow-condition">归约时升到 FP32</span></li></ul></article><article class="html-flow-node tone-success shape-step" data-node-id="U"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Adam 更新</span><span>FP32 一阶矩 二阶矩</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FP32 梯度</span></li></ul></article></div></li></ol></div>
               <figcaption>混合精度训练的闭环：蓝色是低精度的「快车道」，绿色是高精度的「保险箱」。每一步都从主权重 cast 出 BF16 副本，算完再把梯度送回主权重更新——主权重从头到尾没被低精度污染过。</figcaption>
             </figure>
           </div>
@@ -185,19 +182,7 @@ estimate_memory(7e9, 32, 4096, 32, seq_len=4096, micro_bsz=1,
           <p>要理解为什么是 BF16 而不是 FP16，得先看清一个浮点数是怎么构成的。任何浮点格式都由三段组成：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root["浮点格式家族"]
-    高精度保真["高精度保真"]
-      FP32["FP32 32位<br/>主权重 优化器状态"]
-      TF32["TF32 8位指数<br/>GEMM 加速档"]
-    训练事实标准["训练事实标准"]
-      BF16["BF16 8位指数<br/>免 loss scaling"]
-    推理与微调["推理 微调"]
-      FP16["FP16 5位指数<br/>需 loss scaling"]
-    极限压缩["极限压缩"]
-      FP8["FP8 仅 8位<br/>E4M3 前向 E5M2 反向"]
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：浮点格式家族" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>浮点格式家族</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>高精度保真</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">FP32 32位 / 主权重 优化器状态</span></li><li><span class="html-mindmap-leaf">TF32 8位指数 / GEMM 加速档</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>训练事实标准</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">BF16 8位指数 / 免 loss scaling</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>推理 微调</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">FP16 5位指数 / 需 loss scaling</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>极限压缩</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">FP8 仅 8位 / E4M3 前向 E5M2 反向</span></li></ul></section></div></div>
             <figcaption>浮点格式家族的一张思维导图。所有格式本质都是「在 符号 / 指数 / 尾数 三段之间重新切蛋糕」：FP32 把位给了尾数（精度最高），FP16 砍指数换精度，BF16 砍尾数保范围，TF32 是 FP32 GEMM 的加速档，FP8 则把精度压到极限。<strong>训练选 BF16 不是因为它更准，而是因为它和 FP32 一样「装得下」十个数量级的梯度。</strong></figcaption>
           </figure>
 
@@ -258,11 +243,11 @@ sequenceDiagram
           <h2>混合精度训练的完整流程与代码</h2>
           <p>把上面的原理落到一步训练上。先看混合精度训练奠基论文（Mixed Precision Training）里的原图——它把「一层网络在混合精度下的一步迭代」画得清清楚楚，是理解整个流程最好的第一手材料。</p>
 
-          <figure class="paper-figure">
-            <img src="https://ar5iv.labs.arxiv.org/html/1710.03740/assets/mixed_prec_iteration.png" alt="论文原图：混合精度训练中一层网络的一次迭代——FP32 主权重副本用于优化器更新，前向/反向用 FP16 权重与激活，权重更新前把 FP32 梯度转成 FP16" loading="lazy" style="max-width:560px">
+          <figure class="paper-figure image-figure source-figure">
+            <img src="../../assets/figures/external/cfe254a8f464.png" alt="论文原图：混合精度训练中一层网络的一次迭代——FP32 主权重副本用于优化器更新，前向/反向用 FP16 权重与激活，权重更新前把 FP32 梯度转成 FP16" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：混合精度训练一层网络的一次迭代——FP32 主权重（Master Weights）负责更新，FP16 参与前向/反向计算，权重更新前先复制 FP32 主权重并转为 FP16</span>
-              <span class="pf-src">论文原图 · Micikevicius et al., <em>Mixed Precision Training</em>, 2018, Figure 1 · <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">arXiv:1710.03740</a></span>
+              <span class="pf-src">论文原图 · Micikevicius et al., <em>Mixed Precision Training</em>, 2018, Figure 1 · <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener noreferrer">arXiv:1710.03740</a></span>
             </figcaption>
           </figure>
 
@@ -497,21 +482,7 @@ model.config.use_cache = False   # 必须关掉 KV cache,否则与重计算冲�
           <p>OOM 报错信息通常只会告诉你「试图分配 X GB 失败」，对定位毫无帮助。下面这套流程能把范围快速收窄：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  OOM["训练 OOM"] --> Q0{"第几步 OOM"}
-  Q0 -->|"第 0 步 模型还没跑"| S1["模型状态本身放不下<br/>→ 开分片 或 减模型"]
-  Q0 -->|"前向中"| S2["激活值爆了<br/>→ 减 micro batch 或开重计算"]
-  Q0 -->|"第一次 optimizer.step"| S3["优化器状态是懒分配的<br/>→ 开 ZeRO-1 或换省显存优化器"]
-  Q0 -->|"跑了几百步后突然 OOM"| S4["显存碎片 或 变长序列尖峰"]
-  S4 --> S4a["检查是否有超长样本<br/>做长度分桶"]
-  S4 --> S4b["设置显存分配器可扩展段<br/>缓解碎片"]
-  S2 --> Q1{"用 FlashAttention 了吗"}
-  Q1 -->|"没有"| S2a["先开 FlashAttention<br/>可能直接解决"]
-  Q1 -->|"用了"| S2b["开选择性重计算<br/>再不够开全量"]
-  style S2a fill:#eaf3de,stroke:#639922
-  style S4b fill:#faeeda,stroke:#ba7517
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="11" data-edge-count="10" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="OOM"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">训练 OOM</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q0"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">第几步 OOM</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">训练 OOM</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S1"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">模型状态本身放不下</span><span>→ 开分片 或 减模型</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">第几步 OOM</span><span class="html-flow-condition">第 0 步 模型还没跑</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">激活值爆了</span><span>→ 减 micro batch 或开重计算</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">第几步 OOM</span><span class="html-flow-condition">前向中</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S3"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">优化器状态是懒分配的</span><span>→ 开 ZeRO-1 或换省显存优化器</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">第几步 OOM</span><span class="html-flow-condition">第一次 optimizer.step</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S4"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">显存碎片 或 变长序列尖峰</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">第几步 OOM</span><span class="html-flow-condition">跑了几百步后突然 OOM</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S4a"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">检查是否有超长样本</span><span>做长度分桶</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">显存碎片 或 变长序列尖峰</span></li></ul></article><article class="html-flow-node tone-warn shape-step" data-node-id="S4b"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">设置显存分配器可扩展段</span><span>缓解碎片</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">显存碎片 或 变长序列尖峰</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">用 FlashAttention 了吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">激活值爆了 / → 减 micro batch 或开重计算</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="S2a"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">先开 FlashAttention</span><span>可能直接解决</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">用 FlashAttention 了吗</span><span class="html-flow-condition">没有</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S2b"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">开选择性重计算</span><span>再不够开全量</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">用 FlashAttention 了吗</span><span class="html-flow-condition">用了</span></li></ul></article></div></li></ol></div>
             <figcaption>OOM 排查决策树。<strong>关键线索是「在第几步 OOM」</strong>：第 0 步说明模型状态就放不下，前向中说明激活值超了，第一次 step 说明是优化器状态（Adam 的动量和方差在第一次调用 step 时才真正分配），跑了很久才 OOM 则大概率是碎片或变长数据。</figcaption>
           </figure>
 
@@ -570,15 +541,15 @@ flowchart TB
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>Mixed Precision Training（Micikevicius et al., 2018）— 混合精度训练的奠基论文，FP32 主权重与 loss scaling 两个核心设计都出自这里 · <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">arXiv:1710.03740</a></li>
-            <li>FP8 Formats for Deep Learning（Micikevicius et al., 2022）— E4M3 与 E5M2 两种格式的规范定义、取值范围与前后向分工依据 · <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">arXiv:2209.05433</a></li>
-            <li>Training Deep Nets with Sublinear Memory Cost（Chen et al., 2016）— 梯度检查点的原始论文，$O(\sqrt{n})$ 显存的推导来源 · <a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener">arXiv:1604.06174</a></li>
-            <li>Reducing Activation Recomputation in Large Transformer Models（Korthikanti et al., 2022）— 本页激活值公式 $sbh(34+5as/h)$ 与「选择性重计算」的出处 · <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">arXiv:2205.05198</a></li>
-            <li>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness（Dao et al., 2022）— 解释为什么注意力矩阵可以不落显存 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></li>
-            <li>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models（Rajbhandari et al., 2020）— $16\Psi$ 显存公式与分片方案的原始出处 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">arXiv:1910.02054</a></li>
-            <li>DeepSeek-V3 Technical Report（DeepSeek-AI, 2024）— 目前公开资料中对 FP8 大规模预训练的细粒度量化策略描述最完整的一份 · <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arXiv:2412.19437</a></li>
-            <li>8-bit Optimizers via Block-wise Quantization（Dettmers et al., 2021）— 把 Adam 状态量化到 8 位，直接压缩优化器状态那 12Ψ · <a href="https://arxiv.org/abs/2110.02861" target="_blank" rel="noopener">arXiv:2110.02861</a></li>
-            <li>PyTorch AMP 官方文档 — <code>autocast</code> 与 <code>GradScaler</code> 的算子降精度规则与正确用法以官方文档为准 · <a href="https://pytorch.org/docs/stable/amp.html" target="_blank" rel="noopener">pytorch.org</a></li>
+            <li>Mixed Precision Training（Micikevicius et al., 2018）— 混合精度训练的奠基论文，FP32 主权重与 loss scaling 两个核心设计都出自这里 · <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener noreferrer">arXiv:1710.03740</a></li>
+            <li>FP8 Formats for Deep Learning（Micikevicius et al., 2022）— E4M3 与 E5M2 两种格式的规范定义、取值范围与前后向分工依据 · <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener noreferrer">arXiv:2209.05433</a></li>
+            <li>Training Deep Nets with Sublinear Memory Cost（Chen et al., 2016）— 梯度检查点的原始论文，$O(\sqrt{n})$ 显存的推导来源 · <a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener noreferrer">arXiv:1604.06174</a></li>
+            <li>Reducing Activation Recomputation in Large Transformer Models（Korthikanti et al., 2022）— 本页激活值公式 $sbh(34+5as/h)$ 与「选择性重计算」的出处 · <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener noreferrer">arXiv:2205.05198</a></li>
+            <li>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness（Dao et al., 2022）— 解释为什么注意力矩阵可以不落显存 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">arXiv:2205.14135</a></li>
+            <li>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models（Rajbhandari et al., 2020）— $16\Psi$ 显存公式与分片方案的原始出处 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener noreferrer">arXiv:1910.02054</a></li>
+            <li>DeepSeek-V3 Technical Report（DeepSeek-AI, 2024）— 目前公开资料中对 FP8 大规模预训练的细粒度量化策略描述最完整的一份 · <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener noreferrer">arXiv:2412.19437</a></li>
+            <li>8-bit Optimizers via Block-wise Quantization（Dettmers et al., 2021）— 把 Adam 状态量化到 8 位，直接压缩优化器状态那 12Ψ · <a href="https://arxiv.org/abs/2110.02861" target="_blank" rel="noopener noreferrer">arXiv:2110.02861</a></li>
+            <li>PyTorch AMP 官方文档 — <code>autocast</code> 与 <code>GradScaler</code> 的算子降精度规则与正确用法以官方文档为准 · <a href="https://pytorch.org/docs/stable/amp.html" target="_blank" rel="noopener noreferrer">pytorch.org</a></li>
           </ul>
 
           <div class="callout">
@@ -586,6 +557,8 @@ flowchart TB
             显存和精度问题解决后，训练过程中还会遇到 loss spike、梯度裁剪与优化器选型——见 <a href="stability-optimizer.html">训练稳定性与优化器</a>；把模型状态真正切开需要分布式框架，见 <a href="training-frameworks.html">训练框架与工程实现</a> 与 <a href="distributed-training.html">并行策略</a>；如果不打算从零训练而是在已有基座上继续，见 <a href="continual-pretrain.html">持续预训练与领域适配</a>；推理侧的低精度手段是另一套体系，见 <a href="../09-efficiency/quantization.html">模型量化</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“混合精度与显存优化”继续深入</h2></div></div><p class="rd-summary">本章覆盖从数据到训练集群的完整预训练链路：目标函数、语料清洗与合成、Scaling Laws、并行策略、混合精度和稳定性。</p><p class="rd-takeaway"><strong>阅读提示：</strong>预训练效果不是参数量单变量函数；数据质量、token 数、优化稳定性和通信效率共同决定最终结果。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Kaplan et al. · 2020</span></div><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener noreferrer">Scaling Laws for Neural Language Models ↗</a><p class="rd-note">最早系统刻画模型规模、数据量、计算量和损失之间幂律关系的工作。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Hoffmann et al. · 2022</span></div><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener noreferrer">Training Compute-Optimal Large Language Models ↗</a><p class="rd-note">Chinchilla 结论：固定算力下模型参数和训练 token 应共同增长，纠正只堆参数的直觉。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Gao et al. · 2020</span></div><a href="https://arxiv.org/abs/2101.00027" target="_blank" rel="noopener noreferrer">The Pile: An 800GB Dataset of Diverse Text ↗</a><p class="rd-note">公开语料混合、来源比例和去重处理的代表性数据集论文。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Shoeybi et al. · 2019</span></div><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">Megatron-LM: Training Multi-Billion Parameter Language Models ↗</a><p class="rd-note">张量并行、流水线并行和大规模 Transformer 训练工程的经典来源。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">PyTorch</span></div><a href="https://pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener noreferrer">Fully Sharded Data Parallel ↗</a><p class="rd-note">FSDP 的参数、梯度和优化器状态分片语义，适合将并行原理落到可运行配置。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“混合精度与显存优化”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>预训练从 CLM/MLM 目标扩展到多 token 预测、课程数据和合成数据，训练规模则由 Kaplan 经验律推进到 Chinchilla 的计算最优配比。</p></article><article><h3>机制抓手</h3><p>把数据去重、混合比例、token 预算、并行策略、checkpoint 和验证集视为同一个实验设计，而不是互相独立的脚本参数。</p></article><article><h3>工程权衡</h3><p>更多数据、更多参数和更长训练之间需要按计算预算平衡；数据污染、重复和合成数据坍缩会让离线 loss 失真。</p></article><article><h3>前沿观察</h3><p>持续预训练、数据飞轮、MTP、FP8 和新优化器仍在发展，必须报告数据谱系和消融实验。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能从 token 预算估算训练 FLOP、显存和并行策略，并设计 loss spike、数据泄漏和 checkpoint 恢复的排查流程。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener noreferrer">Scaling Laws ↗</a><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener noreferrer">Chinchilla ↗</a><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">Megatron-LM ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能解释 FP16、BF16、FP8 的动态范围与精度差异，并选择 loss scaling、master weight 和 checkpointing 策略。</p></article><article><h3>先修关系</h3><p>先修语言模型目标、反向传播和优化器；把 token 预算、数据版本和 checkpoint 视为实验输入。</p></article><article><h3>最小实验</h3><p>在同一小模型上运行 FP32、BF16/FP16 各 100 step，记录 loss、梯度范数、吞吐与峰值显存；主动放大 loss 制造溢出，再开启 GradScaler 或改用 BF16。</p></article><article><h3>验收标准</h3><p>稳定配置 100 step 内无 NaN/Inf，末段 loss 与 FP32 趋势一致；报告显存节省、吞吐变化、溢出检测次数及恢复策略。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -596,11 +569,16 @@ flowchart TB
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+  <script src="../../assets/vendor/chartjs/chart.umd.js"></script>
+
+
+
+
+
   <script src="../../assets/js/render.js"></script>
   <script>
   (function(){

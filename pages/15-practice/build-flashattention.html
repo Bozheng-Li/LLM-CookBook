@@ -4,16 +4,28 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="理论讲得再清楚，不如亲手写一个 kernel。这一页用 Triton 实现分块注意力（FlashAttention 的核心思想），与标准实现对齐精度，再对比速度——你会发现「IO 感知」四个字从纸上落到了 GPU 上。">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="实战：手写 FlashAttention Kernel · 大模型技术 Cookbook">
+  <meta property="og:description" content="理论讲得再清楚，不如亲手写一个 kernel。这一页用 Triton 实现分块注意力（FlashAttention 的核心思想），与标准实现对齐精度，再对比速度——你会发现「IO 感知」四个字从纸上落到了 GPU 上。">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/15-practice/build-flashattention.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/15-practice/build-flashattention.html">
   <title>实战：手写 FlashAttention Kernel · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="15-practice" data-topic="build-flashattention">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -29,19 +41,7 @@
             <div class="card-title">一图看懂</div>
             <p>FlashAttention 的思想只有一句：<strong>别把完整的注意力矩阵写进 HBM，分块算、分块用</strong>。标准注意力要先算 $QK^\top$（N×N 矩阵）存显存再读回来；FlashAttention 把 Q、K 切成小块，在片上把「算分 + softmax + 加权求和」一气呵成，靠 online softmax 的增量技巧保证结果精确等价。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart LR
-  subgraph STD["标准注意力"]
-    direction TB
-    S1["算完整 QK^T<br/>写入 HBM"] --> S2["读回做 softmax"] --> S3["再写再读<br/>乘 V"]
-  end
-  subgraph FA["FlashAttention"]
-    direction TB
-    F1["分块加载 Q K"] --> F2["片上算分块分数"] --> F3["online softmax<br/>增量更新 O"] --> F4["无需写完整矩阵"]
-  end
-  STD -->|"访存 O(N²)"| R1
-  FA -->|"访存 O(N)"| R2
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="11" data-edge-count="7" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">标准注意力</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">算完整 QK^T</span><span>写入 HBM</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">FlashAttention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">分块加载 Q K</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="STD" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">标准注意力</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="FA" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">FlashAttention</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">标准注意力</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">读回做 softmax</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">算完整 QK^T / 写入 HBM</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">FlashAttention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">片上算分块分数</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">分块加载 Q K</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="R1"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">N×N 中间矩阵写回 HBM</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">标准注意力</span><span class="html-flow-condition">访存 O(N²)</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="R2"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">不物化完整 N×N 矩阵</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FlashAttention</span><span class="html-flow-condition">访存 O(N)</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">标准注意力</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">再写再读</span><span>乘 V</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">读回做 softmax</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">FlashAttention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">online softmax</span><span>增量更新 O</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">片上算分块分数</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F4"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">FlashAttention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">无需写完整矩阵</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">online softmax / 增量更新 O</span></li></ul></article></div></li></ol></div>
               <figcaption>标准注意力反复读写 N×N 矩阵；FlashAttention 分块片上计算，访存降一个量级</figcaption>
             </figure>
           </div>
@@ -51,21 +51,7 @@ flowchart LR
           <p>「等内存」不是一个模糊的说法，它有一个精确的工程定义：当一个 kernel 的耗时主要取决于数据进出内存的时间，而不是在计算单元上做运算的时间时，就称它是 memory-bound（访存受限）。标准注意力实现就是典型的访存受限——矩阵乘法本身算得极快，瓶颈几乎全在 HBM 读写。理解「访存受限 vs 计算受限」这对概念，是读所有 GPU 优化文章的前提：如果是访存受限，优化方向是「少搬数据」（分块、融合、缓存复用）；如果是计算受限，优化方向才是「少算」（稀疏、量化、低精度）。FlashAttention 的目标非常明确：把注意力从访存受限拉回计算受限，然后再考虑如何降低计算量。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  subgraph Compute["计算"]
-    C1["FLOPs（算力）<br/>~19 TFLOPs（A100）"]
-    C2["矩阵乘法<br/>算得很快"]
-  end
-  subgraph Memory["访存"]
-    M1["HBM 带宽<br/>~2 TB/s（A100）"]
-    M2["N×N 矩阵读写<br/>是瓶颈"]
-  end
-  Compute --> Bottle{"谁更慢?"}
-  Memory --> Bottle
-  Bottle --> Ans["长序列时<br/>访存 >> 计算"]
-  Ans --> Key["关键：减少 HBM 往返"]
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="9" data-edge-count="4" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">计算</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">FLOPs（算力）</span><span>~19 TFLOPs（A100）</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="C2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">计算</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">矩阵乘法</span><span>算得很快</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M1"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">访存</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM 带宽</span><span>~2 TB/s（A100）</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">访存</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">N×N 矩阵读写</span><span>是瓶颈</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Compute" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">计算</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Memory" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">访存</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Bottle"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">谁更慢?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">计算</span></li><li><span class="html-flow-source">访存</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Ans"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">长序列时</span><span>访存 &gt;&gt; 计算</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">谁更慢?</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Key"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">关键：减少 HBM 往返</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">长序列时 / 访存 &gt;&gt; 计算</span></li></ul></article></div></li></ol></div>
             <figcaption>注意力瓶颈分析：长序列下访存主导，减少 HBM 读写是优化核心</figcaption>
           </figure>
 
@@ -124,24 +110,7 @@ stateDiagram-v2
           <p>选择 Triton 而不是 CUDA 的原因很实际：Triton 用 Python 编写、自动处理线程分配和数据搬运，写一个分块 kernel 只需几十分钟；手写 CUDA 则需要管理共享内存、同步屏障、线程块布局，复杂度高一个数量级。本页的目标是理解 FlashAttention 的算法骨架，Triton 恰好把这个骨架暴露得足够清晰，又不让底层细节淹没主线。等你在 Triton 里调通之后，如果还想追求极致性能，再考虑用 CUDA 重写同款逻辑。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  subgraph Inputs["输入（HBM）"]
-    Q1["Q 块<br/>[BLOCK_N, D]"]
-    K1["K 块<br/>[BLOCK_K, D]"]
-    V1["V 块<br/>[BLOCK_K, D]"]
-  end
-  subgraph SRAM["片上计算（SRAM）"]
-    S1["s = Q·Kᵀ·scale<br/>[BLOCK_N, BLOCK_K]"]
-    S2["online softmax<br/>m, l, acc 增量"]
-    S3["acc += p·V<br/>[BLOCK_N, D]"]
-  end
-  Q1 --> S1
-  K1 --> S1
-  S1 --> S2 --> S3
-  V1 --> S3
-  S3 --> Out["输出 O（HBM）<br/>[BLOCK_N, D]"]
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="7" data-edge-count="6" data-instance="2" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">输入（HBM）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Q 块</span><span>[BLOCK_N, D]</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="K1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">输入（HBM）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">K 块</span><span>[BLOCK_K, D]</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="V1"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">输入（HBM）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">V 块</span><span>[BLOCK_K, D]</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">片上计算（SRAM）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">s = Q·Kᵀ·scale</span><span>[BLOCK_N, BLOCK_K]</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Q 块 / [BLOCK_N, D]</span></li><li><span class="html-flow-source">K 块 / [BLOCK_K, D]</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">片上计算（SRAM）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">online softmax</span><span>m, l, acc 增量</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">s = Q·Kᵀ·scale / [BLOCK_N, BLOCK_K]</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">片上计算（SRAM）</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">acc += p·V</span><span>[BLOCK_N, D]</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">online softmax / m, l, acc 增量</span></li><li><span class="html-flow-source">V 块 / [BLOCK_K, D]</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Out"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">输出 O（HBM）</span><span>[BLOCK_N, D]</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">acc += p·V / [BLOCK_N, D]</span></li></ul></article></div></li></ol></div>
             <figcaption>Kernel 数据流：Q/K/V 分块载入 SRAM，片上完成分数与 softmax，只把最终 O 写回 HBM</figcaption>
           </figure>
 
@@ -395,11 +364,11 @@ sequenceDiagram
             </div>
           </details>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/05-systems/flash-attention/fig1.png" alt="论文原图：FlashAttention 将 Q、K、V 分块并在片上 SRAM 中完成注意力计算" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：FlashAttention 的分块（tiling）——Q、K、V 从 HBM 分块加载，在 SRAM 中完成分数、softmax 与输出累积</span>
-              <span class="pf-src">论文原图 · Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></span>
+              <span class="pf-src">论文原图 · Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">arXiv:2205.14135</a></span>
             </figcaption>
           </figure>
           <p>读图先找两层存储：外层的大矩形代表 GPU 的 HBM，里面较小的区域代表片上 SRAM。Q、K、V 被切成块后，不是把完整的 N×N 分数矩阵写回 HBM，而是在 SRAM 中完成当前块的矩阵乘、online softmax 和 V 的加权累积；因此图中反复移动的是输入块，最终写回的是 O，而不是 S/P。</p>
@@ -429,16 +398,18 @@ sequenceDiagram
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness — 原始论文 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></li>
-            <li>FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning — 第二版 · <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">arXiv:2307.08691</a></li>
-            <li>Triton 官方教程 — Triton 语言与 kernel 编写 · <a href="https://triton-lang.org" target="_blank" rel="noopener">triton-lang.org</a></li>
-            <li>在线 softmax 数值技巧 — Online normalizer calculation for softmax（Rabe & Staats）· <a href="https://arxiv.org/abs/2112.05682" target="_blank" rel="noopener">arXiv:2112.05682</a></li>
+            <li>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness — 原始论文 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">arXiv:2205.14135</a></li>
+            <li>FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning — 第二版 · <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener noreferrer">arXiv:2307.08691</a></li>
+            <li>Triton 官方教程 — Triton 语言与 kernel 编写 · <a href="https://triton-lang.org" target="_blank" rel="noopener noreferrer">triton-lang.org</a></li>
+            <li>在线 softmax 数值技巧 — Online normalizer calculation for softmax（Rabe & Staats）· <a href="https://arxiv.org/abs/2112.05682" target="_blank" rel="noopener noreferrer">arXiv:2112.05682</a></li>
           </ul>
 
           <div class="callout">
             <span class="callout-t">接下来</span>
             FlashAttention 是注意力优化的核心，理论见 <a href="../03-transformer/attention.html">注意力机制</a> 与 <a href="../05-systems/flash-attention.html">FlashAttention</a>；写 kernel 的语言基础见 <a href="../05-systems/triton-kernel.html">Triton 编程</a>；GPU 硬件背景见 <a href="../05-systems/gpu-architecture.html">GPU 架构</a>。
-          </div>
+          </div><section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“实战：手写 FlashAttention Kernel”继续深入</h2></div></div><p class="rd-summary">本章把前面的概念串成可运行项目：手写 tokenizer、miniGPT、FlashAttention kernel、RAG、微调和工具型 Agent。</p><p class="rd-takeaway"><strong>阅读提示：</strong>每个实战都应该保留一个可验证闭环：输入数据、模型计算、指标/测试和失败诊断缺一不可。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">代码仓库</span><span class="rd-source">Andrej Karpathy</span></div><a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener noreferrer">nanoGPT ↗</a><p class="rd-note">约数百行的 GPT 训练代码，适合逐行追踪数据、前向、反向和采样。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">课程</span><span class="rd-source">Stanford University</span></div><a href="https://cs336.stanford.edu/" target="_blank" rel="noopener noreferrer">Stanford CS336: Language Modeling from Scratch ↗</a><p class="rd-note">将从零实现扩展到真实数据、分布式训练和评测，适合作为实战的上一级路线。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方教程</span><span class="rd-source">Hugging Face</span></div><a href="https://huggingface.co/learn/llm-course/chapter6/1" target="_blank" rel="noopener noreferrer">Hugging Face Tokenizers Course ↗</a><p class="rd-note">从 BPE 训练到编码器导出，能直接对照本章手写 tokenizer 的每一步。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方教程</span><span class="rd-source">OpenAI Triton</span></div><a href="https://triton-lang.org/main/getting-started/tutorials/" target="_blank" rel="noopener noreferrer">Triton Tutorials ↗</a><p class="rd-note">通过小 kernel 逐步学习 tile、mask、程序实例和性能 benchmark，适合 FlashAttention 实战。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方规范</span><span class="rd-source">MCP Steering Group</span></div><a href="https://modelcontextprotocol.io/specification/2025-06-18" target="_blank" rel="noopener noreferrer">Model Context Protocol Specification ↗</a><p class="rd-note">为工具型 Agent 实战提供协议层约束，重点查看工具 schema、资源和传输安全。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“实战：手写 FlashAttention Kernel”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>实践章节把前面的抽象概念压缩成可运行闭环：数据、模型、训练/推理、指标、测试和故障诊断缺一不可。</p></article><article><h3>机制抓手</h3><p>每个实验都先建立最小基线，再逐项替换算法或系统组件，保留配置、随机种子、日志和对照结果。</p></article><article><h3>工程权衡</h3><p>教学实现追求可读性，生产实现追求吞吐、鲁棒性和可维护性；两者差异应在实验结论中明确写出。</p></article><article><h3>前沿观察</h3><p>实践优先选择已有开源实现和稳定协议，再用小规模实验验证原理，避免把不可复现的 demo 当作结论。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能独立复现实验、解释指标变化，并把失败现象定位到数据、算法、系统或评测环节。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener noreferrer">nanoGPT ↗</a><a href="https://cs336.stanford.edu/" target="_blank" rel="noopener noreferrer">Stanford CS336 ↗</a><a href="https://modelcontextprotocol.io/specification/2025-06-18" target="_blank" rel="noopener noreferrer">MCP Specification ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能从 Online Softmax 推导并实现分块 FlashAttention forward，完成边界 mask、数值精度和真实性能验证。</p></article><article><h3>先修关系</h3><p>先修 Python 与命令行调试；建议先跑通最小版本，再逐项注入失败并记录可复现实验结果。</p></article><article><h3>最小实验</h3><p>按页面实现 Triton kernel，覆盖 seq=63/128/513、head_dim=32/64、causal on/off；与 torch SDPA 对照，执行 25 次 warmup+100 次计时并记录峰值显存。</p></article><article><h3>验收标准</h3><p>FP32 最大误差小于 1e-5，BF16/FP16 阈值在报告中声明且全部通过；非整块长度无越界，基准包含硬件、版本、P50/P95 与至少一个性能反例。</p></article></div></div></section>
+
 
         </div>
         <aside id="pageToc"></aside>
@@ -449,11 +420,10 @@ sequenceDiagram
   <script src="../../assets/js/search-index.js"></script>
   <script src="../../assets/js/nav.js"></script>
   <script>window.ROOT = "../../";</script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

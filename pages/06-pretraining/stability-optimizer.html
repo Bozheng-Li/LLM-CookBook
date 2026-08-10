@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="大模型训练 90% 的深夜值班，都耗在同一个问题：loss 突然炸了。这一页给出一套「loss spike 排查 → 梯度裁剪兜底 → 学习率调度设计 → 新一代优化器选型」的完整打法。重点拆解三件事： 训练为什么会数值失稳 （从初始化、残差流到混合精度的全链路视角）、 梯度裁剪与 warmup 为何是默认安">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="训练稳定性与优化器 · 大模型技术 Cookbook">
+  <meta property="og:description" content="大模型训练 90% 的深夜值班，都耗在同一个问题：loss 突然炸了。这一页给出一套「loss spike 排查 → 梯度裁剪兜底 → 学习率调度设计 → 新一代优化器选型」的完整打法。重点拆解三件事： 训练为什么会数值失稳 （从初始化、残差流到混合精度的全链路视角）、 梯度裁剪与 warmup 为何是默认安">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/06-pretraining/stability-optimizer.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/06-pretraining/stability-optimizer.html">
   <title>训练稳定性与优化器 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="06-pretraining" data-topic="stability-optimizer">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -30,23 +43,7 @@
             <div class="card-title">一图看懂</div>
             <p>训练崩溃很少是「模型坏了」，而是「数值 / 数据 / 调度」三个环节的某个参数越界。标准响应流程：先看 loss 曲线形态判断崩溃类型，再查数据批次、精度、梯度范数，最后用梯度裁剪兜底并把学习率调度改稳。<strong>一个常被忽视的事实：80% 的崩溃是数值问题、15% 是数据问题、只有 5% 才是模型结构问题</strong>——所以先查数值与数据，别急着改模型。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart TB
-  SP["loss spike 出现"] --> C{"形态判断"}
-  C -->|"单点尖刺后恢复"| D1["数据坏批次<br/>或精度溢出"]
-  C -->|"持续发散"| D2["学习率过大<br/>或梯度爆炸"]
-  C -->|"缓慢爬升"| D3["数据分布漂移<br/>或 loss 计算 bug"]
-  D1 --> R["回滚坏步 + 过滤数据"]
-  D2 --> R2["降学习率 + 梯度裁剪"]
-  D3 --> R3["修数据管线"]
-  R --> OK["恢复稳定训练"]
-  R2 --> OK
-  R3 --> OK
-  style C fill:#e6f1fb,stroke:#185fa5
-  style D1 fill:#fcebeb,stroke:#a32d2d
-  style D2 fill:#fcebeb,stroke:#a32d2d
-  style D3 fill:#faeeda,stroke:#ba7517
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="9" data-edge-count="10" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SP"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">loss spike 出现</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">形态判断</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">loss spike 出现</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-danger shape-step" data-node-id="D1"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">数据坏批次</span><span>或精度溢出</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">形态判断</span><span class="html-flow-condition">单点尖刺后恢复</span></li></ul></article><article class="html-flow-node tone-danger shape-step" data-node-id="D2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">学习率过大</span><span>或梯度爆炸</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">形态判断</span><span class="html-flow-condition">持续发散</span></li></ul></article><article class="html-flow-node tone-warn shape-step" data-node-id="D3"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">数据分布漂移</span><span>或 loss 计算 bug</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">形态判断</span><span class="html-flow-condition">缓慢爬升</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="R"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">回滚坏步 + 过滤数据</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">数据坏批次 / 或精度溢出</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="R2"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">降学习率 + 梯度裁剪</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">学习率过大 / 或梯度爆炸</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="R3"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">修数据管线</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">数据分布漂移 / 或 loss 计算 bug</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="OK"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">恢复稳定训练</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">回滚坏步 + 过滤数据</span></li><li><span class="html-flow-source">降学习率 + 梯度裁剪</span></li><li><span class="html-flow-source">修数据管线</span></li></ul></article></div></li></ol></div>
               <figcaption>loss spike 排查决策树：按形态分类，对症下药。单点尖刺多半是一两个坏批次，持续发散多半是学习率或梯度失控，缓慢爬升则往往是数据管线慢性病。</figcaption>
             </figure>
           </div>
@@ -56,19 +53,7 @@ flowchart TB
           <p>训练不稳定几乎都先表现为 loss 曲线的异常形态。学会「读曲线」是第一步——三种形态对应三类完全不同的根因，处置方式也完全不同。下面用一张思维导图把三类的「根因—处置」配对记牢：读曲线时可以先问自己三个问题——「是一点还是一片？」「下一步还回得来吗？」「是突然还是慢慢？」，答案基本就能锁定形态。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root["Loss Spike 三类形态"]
-    单点尖刺["① 单点尖刺后恢复"]
-      根因["坏数据批次<br/>或 FP16 溢出"]
-      处置["回滚坏步 过滤数据"]
-    持续发散["② 持续发散 ↗"]
-      根因["学习率过大<br/>或梯度爆炸"]
-      处置["降 lr 梯度裁剪"]
-    缓慢爬升["③ 缓慢爬升 ↑"]
-      根因["数据漂移<br/>或 loss 计算 bug"]
-      处置["修数据管线"]
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：Loss Spike 三类形态" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>Loss Spike 三类形态</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>① 单点尖刺后恢复</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">坏数据批次 / 或 FP16 溢出</span></li><li><span class="html-mindmap-leaf">回滚坏步 过滤数据</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>② 持续发散 ↗</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">学习率过大 / 或梯度爆炸</span></li><li><span class="html-mindmap-leaf">降 lr 梯度裁剪</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>③ 缓慢爬升 ↑</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">数据漂移 / 或 loss 计算 bug</span></li><li><span class="html-mindmap-leaf">修数据管线</span></li></ul></section></div></div>
             <figcaption>三类 loss 异常形态的「根因—处置」配对。注意区分：尖刺是「点状事件」（回滚即可），发散是「趋势问题」（要改超参），缓升是「慢性病」（要修管线）。</figcaption>
           </figure>
 
@@ -247,11 +232,11 @@ stateDiagram-v2
 
           <p>WSD（Warmup-Stable-Decay，预热-稳定-衰减）是 2024 年后大规模预训练特别流行的调度，它的「后期快速衰减」到底长什么样、能带来什么，MiniCPM 论文里有一张很直观的实验图，值得直接看原图。</p>
 
-          <figure class="paper-figure">
-            <img src="https://ar5iv.labs.arxiv.org/html/2404.06395/assets/x2.png" alt="论文原图：MiniCPM 在 WSD 学习率调度的衰减阶段，模型训练 loss 出现一次突降——稳定段 loss 平滑，进入快速衰减段后 loss 明显下降并继续走低" loading="lazy" style="max-width:560px">
+          <figure class="paper-figure image-figure source-figure">
+            <img src="../../assets/figures/external/1183d7a7c403.png" alt="论文原图：MiniCPM 在 WSD 学习率调度的衰减阶段，模型训练 loss 出现一次突降——稳定段 loss 平滑，进入快速衰减段后 loss 明显下降并继续走低" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：WSD 调度下模型训练 loss 在衰减阶段出现突降——说明「末期把学习率快速压低」本身就能额外压下一截损失</span>
-              <span class="pf-src">论文原图 · Hu et al., <em>MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies</em>, 2024, Figure 5 · <a href="https://arxiv.org/abs/2404.06395" target="_blank" rel="noopener">arXiv:2404.06395</a></span>
+              <span class="pf-src">论文原图 · Hu et al., <em>MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies</em>, 2024, Figure 5 · <a href="https://arxiv.org/abs/2404.06395" target="_blank" rel="noopener noreferrer">arXiv:2404.06395</a></span>
             </figcaption>
           </figure>
 
@@ -291,18 +276,7 @@ def warmup_lr(step, warmup, lr_max):
           <p>优化器直接决定训练的稳定性与收敛速度。AdamW 是多年来的默认选择，但 2024–2026 年 Muon 等新一代优化器正在挑战它的地位。下面用思维导图把当前主流优化器家族理清：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root["优化器家族"]
-    一阶自适应["一阶自适应"]
-      AdamW["AdamW 默认安全"]
-      Adam["Adam 基础版本"]
-    矩阵正交化["矩阵正交化"]
-      Muon["Muon 牛顿-舒尔茨"]
-      Shampoo["Shampoo 二阶预处理"]
-    带动量SGD["带动量 SGD"]
-      SGD["SGD + Momentum"]
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：优化器家族" data-instance="1"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>优化器家族</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>一阶自适应</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">AdamW 默认安全</span></li><li><span class="html-mindmap-leaf">Adam 基础版本</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>矩阵正交化</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">Muon 牛顿-舒尔茨</span></li><li><span class="html-mindmap-leaf">Shampoo 二阶预处理</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>带动量 SGD</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">SGD + Momentum</span></li></ul></section></div></div>
             <figcaption>当前大模型训练的两大主流方向：以 AdamW 为代表的「逐参数一阶自适应」，和以 Muon 为代表的「把权重矩阵整体当作对象做正交化更新」。后者在同 token 数下通常收敛更快，但对超参更敏感。</figcaption>
           </figure>
 
@@ -364,27 +338,7 @@ def muon_step(W, G, lr=0.02, momentum=0.9):
           <p>大模型训练几乎必用混合精度（FP16/BF16 + FP32 主权重），而精度选择直接关系数值稳定性。BF16 的动态范围与 FP32 相同，是预训练默认；FP16 动态范围窄，需要 loss scaling，尖刺风险更高。两条路线对比如下：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TD
-  subgraph FP16["FP16 路线"]
-    F1["动态范围窄<br/>小数值下溢 / 大数值溢出"]
-    F2["需要 loss scaler<br/>动态调整缩放"]
-    F3["尖刺风险高<br/>需跳过 Inf 步"]
-  end
-  subgraph BF16["BF16 路线"]
-    B1["动态范围同 FP32<br/>无溢出问题"]
-    B2["无需 loss scaling"]
-    B3["但尾数仅 7 位<br/>长序列累加有误差"]
-  end
-  subgraph Mixed["混合策略"]
-    M1["BF16 前向 + 反向<br/>FP32 主权重 + 优化器状态"]
-    M2["梯度在 FP32 累加<br/>减小误差"]
-  end
-  FP16 --> Recommend["推荐：BF16 混合精度"]
-  BF16 --> Recommend
-  Mixed --> Recommend
-  style Recommend fill:#eaf3de,stroke:#639922
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="12" data-edge-count="3" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">FP16 路线</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">动态范围窄</span><span>小数值下溢 / 大数值溢出</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">FP16 路线</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">需要 loss scaler</span><span>动态调整缩放</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">FP16 路线</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">尖刺风险高</span><span>需跳过 Inf 步</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">BF16 路线</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">动态范围同 FP32</span><span>无溢出问题</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">BF16 路线</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">无需 loss scaling</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">BF16 路线</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">但尾数仅 7 位</span><span>长序列累加有误差</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M1"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">混合策略</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">BF16 前向 + 反向</span><span>FP32 主权重 + 优化器状态</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M2"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">混合策略</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">梯度在 FP32 累加</span><span>减小误差</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="FP16" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">FP16 路线</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="BF16" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">BF16 路线</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Mixed" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">混合策略</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="Recommend"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">推荐：BF16 混合精度</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FP16 路线</span></li><li><span class="html-flow-source">BF16 路线</span></li><li><span class="html-flow-source">混合策略</span></li></ul></article></div></li></ol></div>
             <figcaption>FP16 vs BF16：动态范围差异决定数值稳定性。BF16 因指数位与 FP32 相同，几乎不会溢出，成为预训练默认；FP16 则需要 loss scaling 兜底，尖刺风险显著更高。</figcaption>
           </figure>
 
@@ -522,30 +476,7 @@ timeline
           <h3>11.1 Loss spike 根因树：先把“坏步”分层</h3>
           <p>排障时不要从优化器开始猜。先记录发生 spike 的 <code>global_step</code>、数据 shard、样本 id、micro-batch 序号、学习率、梯度累积进度、loss scale 和通信状态，再沿根因树逐层排除。一个单点尖刺往往是局部输入或精度事件；连续发散更像更新规则或状态已经偏离；跨 rank 只有部分机器异常，则优先怀疑通信、随机数或状态同步。</p>
           <figure class="figure">
-            <div class="mermaid">
-flowchart TD
-  S["Loss spike / NaN"] --> Q1{"是否所有 rank 同时出现?"}
-  Q1 -->|"否"| C1["通信归约、rank 状态、数据分片不一致"]
-  Q1 -->|"是"| Q2{"是否单步后恢复?"}
-  Q2 -->|"是"| Q3{"批次或精度证据"}
-  Q2 -->|"否"| Q4{"grad norm / update norm"}
-  Q3 --> D1["坏批次：标签错位、超长样本、非法 token、异常权重"]
-  Q3 --> D2["FP16/BF16：Inf、NaN、scale 抖动、低精度归约"]
-  Q4 --> O1["学习率过大、warmup 太短、有效 batch 改变"]
-  Q4 --> O2["梯度爆炸、局部层异常、裁剪频繁"]
-  Q4 --> O3["优化器/主权重/动量状态恢复错误"]
-  C1 --> R["隔离坏步并回滚最近健康 checkpoint"]
-  D1 --> R
-  D2 --> R
-  O1 --> R
-  O2 --> R
-  O3 --> R
-  R --> V["重放固定批次 + 对比 FP32 参考路径"]
-  V --> F["修复根因后再放大训练"]
-  style S fill:#fcebeb,stroke:#a32d2d
-  style R fill:#e6f1fb,stroke:#185fa5
-  style F fill:#eaf3de,stroke:#639922
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="14" data-edge-count="18" data-instance="2" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-danger shape-step" data-node-id="S"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Loss spike / NaN</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">是否所有 rank 同时出现?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Loss spike / NaN</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C1"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">通信归约、rank 状态、数据分片不一致</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否所有 rank 同时出现?</span><span class="html-flow-condition">否</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="Q2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">是否单步后恢复?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否所有 rank 同时出现?</span><span class="html-flow-condition">是</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q3"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">批次或精度证据</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否单步后恢复?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="Q4"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">grad norm / update norm</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">是否单步后恢复?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="D1"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">坏批次：标签错位、超长样本、非法 token、异常权重</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">批次或精度证据</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D2"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">FP16/BF16：Inf、NaN、scale 抖动、低精度归约</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">批次或精度证据</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="O1"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">学习率过大、warmup 太短、有效 batch 改变</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">grad norm / update norm</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="O2"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">梯度爆炸、局部层异常、裁剪频繁</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">grad norm / update norm</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="O3"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">优化器/主权重/动量状态恢复错误</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">grad norm / update norm</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="R"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">隔离坏步并回滚最近健康 checkpoint</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">通信归约、rank 状态、数据分片不一致</span></li><li><span class="html-flow-source">坏批次：标签错位、超长样本、非法 token、异常权重</span></li><li><span class="html-flow-source">FP16/BF16：Inf、NaN、scale 抖动、低精度归约</span></li><li><span class="html-flow-source">学习率过大、warmup 太短、有效 batch 改变</span></li><li><span class="html-flow-source">梯度爆炸、局部层异常、裁剪频繁</span></li><li><span class="html-flow-source">优化器/主权重/动量状态恢复错误</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">07</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="V"><div class="html-flow-node-meta"><span class="html-flow-index">13</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">重放固定批次 + 对比 FP32 参考路径</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">隔离坏步并回滚最近健康 checkpoint</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">08</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="F"><div class="html-flow-node-meta"><span class="html-flow-index">14</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">修复根因后再放大训练</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">重放固定批次 + 对比 FP32 参考路径</span></li></ul></article></div></li></ol></div>
             <figcaption>根因树强调“先问是否跨 rank 同步，再问是否单步恢复”。数据、精度、优化器和通信问题的证据不同，不能只凭 loss 曲线猜测。</figcaption>
           </figure>
           <ul>
@@ -662,14 +593,14 @@ for micro_step, batch in enumerate(loader):
           <!-- ============ 参考文献 ============ -->
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>Muon: An optimizer for hidden layers in neural networks（Keller Jordan 等）— Muon 优化器原始介绍与牛顿-舒尔茨实现 · <a href="https://kellerjordan.github.io/posts/muon/" target="_blank" rel="noopener">kellerjordan.github.io</a></li>
-            <li>Decoupled Weight Decay Regularization（Loshchilov &amp; Hutter, 2019）— AdamW 解耦权重衰减，预训练事实标准优化器 · <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener">arXiv:1711.05101</a></li>
-            <li>Adam: A Method for Stochastic Optimization（Kingma &amp; Ba, 2015）— Adam 原始论文 · <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener">arXiv:1412.6980</a></li>
-            <li>On the Convergence of Adam and Beyond（Reddi et al., 2019）— 讨论 Adam 收敛性问题与 AMSGrad · <a href="https://arxiv.org/abs/1904.09237" target="_blank" rel="noopener">arXiv:1904.09237</a></li>
-            <li>Mixed Precision Training（Micikevicius et al., 2018）— 混合精度训练奠基论文，FP32 主权重与 loss scaling 的出处 · <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">arXiv:1710.03740</a></li>
-            <li>DeepSeek-LLM: Scaling Open-Source Language Models with Longtermism（DeepSeek-AI, 2024）— 记录了预训练中的周期性 loss spike 及工程化处置 · <a href="https://arxiv.org/abs/2401.02954" target="_blank" rel="noopener">arXiv:2401.02954</a></li>
-            <li>MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies（Hu et al., 2024）— 大规模采用 WSD 调度并讨论其对续训的友好性 · <a href="https://arxiv.org/abs/2404.06395" target="_blank" rel="noopener">arXiv:2404.06395</a></li>
-            <li>Cramming: Training a Language Model on a Single GPU（Geiping &amp; Goldstein, 2023）— 在受限算力下复现预训练稳定性技巧的实证 · <a href="https://arxiv.org/abs/2212.14034" target="_blank" rel="noopener">arXiv:2212.14034</a></li>
+            <li>Muon: An optimizer for hidden layers in neural networks（Keller Jordan 等）— Muon 优化器原始介绍与牛顿-舒尔茨实现 · <a href="https://kellerjordan.github.io/posts/muon/" target="_blank" rel="noopener noreferrer">kellerjordan.github.io</a></li>
+            <li>Decoupled Weight Decay Regularization（Loshchilov &amp; Hutter, 2019）— AdamW 解耦权重衰减，预训练事实标准优化器 · <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener noreferrer">arXiv:1711.05101</a></li>
+            <li>Adam: A Method for Stochastic Optimization（Kingma &amp; Ba, 2015）— Adam 原始论文 · <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener noreferrer">arXiv:1412.6980</a></li>
+            <li>On the Convergence of Adam and Beyond（Reddi et al., 2019）— 讨论 Adam 收敛性问题与 AMSGrad · <a href="https://arxiv.org/abs/1904.09237" target="_blank" rel="noopener noreferrer">arXiv:1904.09237</a></li>
+            <li>Mixed Precision Training（Micikevicius et al., 2018）— 混合精度训练奠基论文，FP32 主权重与 loss scaling 的出处 · <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener noreferrer">arXiv:1710.03740</a></li>
+            <li>DeepSeek-LLM: Scaling Open-Source Language Models with Longtermism（DeepSeek-AI, 2024）— 记录了预训练中的周期性 loss spike 及工程化处置 · <a href="https://arxiv.org/abs/2401.02954" target="_blank" rel="noopener noreferrer">arXiv:2401.02954</a></li>
+            <li>MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies（Hu et al., 2024）— 大规模采用 WSD 调度并讨论其对续训的友好性 · <a href="https://arxiv.org/abs/2404.06395" target="_blank" rel="noopener noreferrer">arXiv:2404.06395</a></li>
+            <li>Cramming: Training a Language Model on a Single GPU（Geiping &amp; Goldstein, 2023）— 在受限算力下复现预训练稳定性技巧的实证 · <a href="https://arxiv.org/abs/2212.14034" target="_blank" rel="noopener noreferrer">arXiv:2212.14034</a></li>
           </ul>
 
           <div class="callout">
@@ -677,6 +608,8 @@ for micro_step, batch in enumerate(loader):
             训练稳定是预训练的基础工程，预训练的整体流程见 <a href="objectives.html">预训练目标</a> 与 <a href="distributed-training.html">分布式训练</a>；混合精度的深入内容见 <a href="mixed-precision.html">混合精度与显存优化</a>；把模型状态真正切开需要分布式框架，见 <a href="training-frameworks.html">训练框架与工程实现</a>；算力规划见 <a href="../05-systems/compute-budget.html">算力预算</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“训练稳定性与优化器”继续深入</h2></div></div><p class="rd-summary">本章覆盖从数据到训练集群的完整预训练链路：目标函数、语料清洗与合成、Scaling Laws、并行策略、混合精度和稳定性。</p><p class="rd-takeaway"><strong>阅读提示：</strong>预训练效果不是参数量单变量函数；数据质量、token 数、优化稳定性和通信效率共同决定最终结果。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Kaplan et al. · 2020</span></div><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener noreferrer">Scaling Laws for Neural Language Models ↗</a><p class="rd-note">最早系统刻画模型规模、数据量、计算量和损失之间幂律关系的工作。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Hoffmann et al. · 2022</span></div><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener noreferrer">Training Compute-Optimal Large Language Models ↗</a><p class="rd-note">Chinchilla 结论：固定算力下模型参数和训练 token 应共同增长，纠正只堆参数的直觉。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Gao et al. · 2020</span></div><a href="https://arxiv.org/abs/2101.00027" target="_blank" rel="noopener noreferrer">The Pile: An 800GB Dataset of Diverse Text ↗</a><p class="rd-note">公开语料混合、来源比例和去重处理的代表性数据集论文。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Shoeybi et al. · 2019</span></div><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">Megatron-LM: Training Multi-Billion Parameter Language Models ↗</a><p class="rd-note">张量并行、流水线并行和大规模 Transformer 训练工程的经典来源。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">PyTorch</span></div><a href="https://pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener noreferrer">Fully Sharded Data Parallel ↗</a><p class="rd-note">FSDP 的参数、梯度和优化器状态分片语义，适合将并行原理落到可运行配置。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“训练稳定性与优化器”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>预训练从 CLM/MLM 目标扩展到多 token 预测、课程数据和合成数据，训练规模则由 Kaplan 经验律推进到 Chinchilla 的计算最优配比。</p></article><article><h3>机制抓手</h3><p>把数据去重、混合比例、token 预算、并行策略、checkpoint 和验证集视为同一个实验设计，而不是互相独立的脚本参数。</p></article><article><h3>工程权衡</h3><p>更多数据、更多参数和更长训练之间需要按计算预算平衡；数据污染、重复和合成数据坍缩会让离线 loss 失真。</p></article><article><h3>前沿观察</h3><p>持续预训练、数据飞轮、MTP、FP8 和新优化器仍在发展，必须报告数据谱系和消融实验。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能从 token 预算估算训练 FLOP、显存和并行策略，并设计 loss spike、数据泄漏和 checkpoint 恢复的排查流程。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener noreferrer">Scaling Laws ↗</a><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener noreferrer">Chinchilla ↗</a><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">Megatron-LM ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能从 loss、梯度范数、激活尺度和数据 batch 定位 spike，并为裁剪、warmup、优化器与 checkpoint 建立恢复顺序。</p></article><article><h3>先修关系</h3><p>先修语言模型目标、反向传播和优化器；把 token 预算、数据版本和 checkpoint 视为实验输入。</p></article><article><h3>最小实验</h3><p>训练小模型 300 step，在 step 100 注入 10 倍学习率或异常 batch；对比无保护与 gradient clip+warmup，保存异常前 checkpoint 并执行自动回滚。</p></article><article><h3>验收标准</h3><p>监控能在异常 step 标记非有限值或梯度突增；保护配置无 NaN，回滚后 20 step loss 回到注入前趋势，并保留触发原因和数据批次 ID。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -687,11 +620,14 @@ for micro_step, batch in enumerate(loader):
   <script src="../../assets/js/search-index.js"></script>
   <script src="../../assets/js/nav.js"></script>
   <script>window.ROOT = "../../";</script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

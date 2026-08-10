@@ -12,7 +12,7 @@
 
 **[打开大模型技术 Cookbook](https://bozheng-li.github.io/LLM-CookBook/)**
 
-这是推荐入口。站点支持章节导航、站内搜索、难度筛选、阅读进度、深色模式、公式渲染、Mermaid 图表和代码高亮。所有页面都是静态 HTML，打开速度快，也不依赖后端服务。
+这是推荐入口。站点支持章节导航、站内搜索、难度筛选、阅读进度、深色模式、公式渲染、原生 HTML 思维图与流程图、Mermaid 专项图表和代码高亮。所有浏览器运行时和图片资源均随仓库提供，正文页面不依赖 CDN 或后端服务。
 
 > 首次启用提示：仓库管理员需要在 GitHub 的 **Settings → Pages → Build and deployment → Source** 选择 **GitHub Actions**。完成一次后，后续推送 `main` 会自动更新阅读端。
 
@@ -33,7 +33,7 @@ python -m http.server 8000
 - 想实践微调、RAG、Agent、推理部署和评测的应用开发者
 - 想快速定位论文、官方文档和课程资料的研究学习者
 
-内容采用“直觉解释 → 关键公式 → 工程实现 → 失败模式 → 延伸资料”的组织方式。每个页面末尾都提供高亮的深化资料卡，包含论文、官方文档、大学课程或公开讲座，并附中文阅读提示。
+内容采用“直觉解释 → 关键公式 → 工程实现 → 失败模式 → 延伸资料”的组织方式。每个页面末尾都提供高亮的深化资料卡；篇章级主题另外给出学习目标、先修关系、最小实验、失败注入和量化验收标准，避免只停留在术语解释。
 
 ## 章节地图
 
@@ -44,7 +44,7 @@ python -m http.server 8000
 | 训练 | [05 GPU 与算子系统](pages/05-systems/index.html)、[06 预训练](pages/06-pretraining/index.html)、[07 后训练与对齐](pages/07-posttraining/index.html) | 如何把模型训练出来，并让它遵循指令？ |
 | 推理与应用 | [08 推理与推理时扩展](pages/08-inference/index.html)、[09 效率与部署](pages/09-efficiency/index.html)、[10 应用系统](pages/10-applications/index.html) | 如何以可控成本生成、检索和服务化？ |
 | 生产与治理 | [11 Agents](pages/11-agents/index.html)、[12 LLMOps](pages/12-llmops/index.html)、[13 评测](pages/13-evaluation/index.html)、[14 治理](pages/14-governance/index.html) | 如何让系统可用、可测、可追责？ |
-| 动手实践 | [15 实战](pages/15-practice/index.html) | 从零实现 tokenizer、miniGPT、FlashAttention、RAG 和工具型 Agent。 |
+| 动手实践 | [15 实战](pages/15-practice/index.html) | 从零实现 tokenizer、miniGPT、FlashAttention、RAG、Agent 与全栈大模型应用。 |
 
 ## 推荐阅读路线
 
@@ -58,7 +58,7 @@ python -m http.server 8000
 
 ### 应用开发路线
 
-[Prompt 工程](pages/10-applications/prompt-engineering.html) → [RAG](pages/10-applications/rag.html) → [结构化输出](pages/10-applications/structured-output.html) → [Agent 基础](pages/11-agents/agent.html) → [生产观测](pages/12-llmops/observability.html)
+[Prompt 工程](pages/10-applications/prompt-engineering.html) → [RAG](pages/10-applications/rag.html) → [结构化输出](pages/10-applications/structured-output.html) → [全栈大模型应用](pages/15-practice/fullstack-llm-app.html) → [生产观测](pages/12-llmops/observability.html)
 
 ### 研究与前沿路线
 
@@ -69,7 +69,9 @@ python -m http.server 8000
 - **系统化**：从数学、表示、架构、训练到生产治理，按依赖关系组织，而不是按热点堆叠术语。
 - **可验证**：关键结论尽量回到原始论文、官方文档、大学课程和公共机构材料。
 - **工程化**：显存、带宽、延迟、评测、失败模式和成本约束都会落到具体决策上。
-- **可运行**：实战章节提供 Python、PyTorch、Triton、RAG 和 Agent 示例。
+- **教材化**：页面级学习契约把知识点转成可复现实验、指标记录和通过/回退条件，适合自学、带教和代码评审。
+- **图表可读**：概念思维图和流程图使用原生 HTML，适配移动端、暗色与打印；时序图、状态图等专项语义图保留离线 Mermaid 渲染。
+- **可运行**：实战章节提供 Python、PyTorch、Triton、RAG、Agent，以及 FastAPI + React 全栈参考项目。
 - **持续更新**：前沿内容会标注时效性，引用资料记录检索日期和来源类型。
 
 ## 项目结构
@@ -84,6 +86,9 @@ python -m http.server 8000
 ├── assets/js/nav.js           # 导航、搜索、进度和页面行为
 ├── assets/js/toc.js           # 章节目录数据
 ├── assets/js/resources.js     # 权威延伸资料与中文摘要
+├── assets/figures/            # 本地论文插图与教学图
+├── assets/vendor/             # 离线公式、流程图、图表和代码高亮运行时
+├── examples/fullstack-llm/    # 可运行的 FastAPI + React + SSE + RAG 示例
 └── .github/workflows/pages.yml# GitHub Pages 自动部署
 ```
 
@@ -95,7 +100,7 @@ python -m http.server 8000
 
 欢迎通过 Issue 或 Pull Request 提交内容修正、失效链接、公式错误和新的权威资料。新增资料请尽量附上：作者或机构、发布日期、稳定链接、中文摘要，以及它解决了当前页面中的哪个具体问题。
 
-本项目是纯静态站点，不需要数据库、构建服务或 API 密钥。修改 HTML、CSS 或 JavaScript 后，推送到 `main` 分支即可由 GitHub Actions 自动发布。
+阅读站点是纯静态 HTML，不需要数据库、构建服务或 API 密钥。`examples/` 中的全栈参考项目是独立教学资源，不参与 GitHub Pages 构建；修改正文 HTML、CSS 或 JavaScript 后，推送到 `main` 分支即可由 GitHub Actions 自动发布。
 
 ## 运行状态
 

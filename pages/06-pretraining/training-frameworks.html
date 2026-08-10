@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="知道了五种并行该怎么叠加，下一个问题是：用哪个框架把它跑起来？ZeRO、FSDP、Megatron-LM、torchtitan 听起来都在做「分布式训练」，但它们封装的并行维度、配置方式和踩坑点完全不同。这一页把框架当成「显存与通信之间的一组旋钮」来讲：每个旋钮拧到底会发生什么、旋钮之间怎么互相牵制、从 8 ">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="训练框架与工程实现 · 大模型技术 Cookbook">
+  <meta property="og:description" content="知道了五种并行该怎么叠加，下一个问题是：用哪个框架把它跑起来？ZeRO、FSDP、Megatron-LM、torchtitan 听起来都在做「分布式训练」，但它们封装的并行维度、配置方式和踩坑点完全不同。这一页把框架当成「显存与通信之间的一组旋钮」来讲：每个旋钮拧到底会发生什么、旋钮之间怎么互相牵制、从 8 ">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/06-pretraining/training-frameworks.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/06-pretraining/training-frameworks.html">
   <title>训练框架与工程实现 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="06-pretraining" data-topic="training-frameworks">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -30,21 +43,10 @@
             <div class="card-title">一图看懂</div>
             <p>四个框架的核心区别只有一句话：<strong>它们把哪些并行做成了开箱即用的配置项</strong>。ZeRO/FSDP 走「数据并行 + 显存分片」路线，配置最简单但不支持张量并行；Megatron-LM 是「TP + PP + DP」的完整实现，性能上限最高但要改模型代码；torchtitan 是 PyTorch 官方的轻量方案，用 DTensor 把并行标注在张量上，目标是让原生 PyTorch 也能跑千卡训练。选型的本质不是「哪个更好」，而是「你愿意为多少性能付出多少工程复杂度」。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart TB
-  Need["我要训一个模型"] --> Q1{"单卡放得下<br/>全部训练状态吗"}
-  Q1 -->|"放得下"| DDP["普通 DDP<br/>只需数据并行"]
-  Q1 -->|"放不下"| Q2{"参数本身<br/>单卡放得下吗"}
-  Q2 -->|"放得下<br/>是优化器状态撑爆的"| ZeRO12["ZeRO-1/2<br/>FSDP SHARD_GRAD_OP"]
-  Q2 -->|"放不下"| Q3{"节点内带宽高<br/>且模型超大吗"}
-  Q3 -->|"否<br/>7B~70B"| ZeRO3["ZeRO-3<br/>FSDP FULL_SHARD"]
-  Q3 -->|"是<br/>百亿以上"| MG["Megatron-LM<br/>TP+PP+DP"]
-  Q3 -->|"想要原生方案"| TT["torchtitan<br/>DTensor 组合并行"]
-  style ZeRO12 fill:#e6f1fb,stroke:#185fa5
-  style ZeRO3 fill:#e6f1fb,stroke:#185fa5
-  style MG fill:#eaf3de,stroke:#639922
-  style TT fill:#faeeda,stroke:#ba7517
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="9" data-edge-count="8" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Need"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">我要训一个模型</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单卡放得下</span><span>全部训练状态吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">我要训一个模型</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="DDP"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">普通 DDP</span><span>只需数据并行</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单卡放得下 / 全部训练状态吗</span><span class="html-flow-condition">放得下</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="Q2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">参数本身</span><span>单卡放得下吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单卡放得下 / 全部训练状态吗</span><span class="html-flow-condition">放不下</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="ZeRO12"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">ZeRO-1/2</span><span>FSDP SHARD_GRAD_OP</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">参数本身 / 单卡放得下吗</span><span class="html-flow-condition">放得下
+是优化器状态撑爆的</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="Q3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">节点内带宽高</span><span>且模型超大吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">参数本身 / 单卡放得下吗</span><span class="html-flow-condition">放不下</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="ZeRO3"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">ZeRO-3</span><span>FSDP FULL_SHARD</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">节点内带宽高 / 且模型超大吗</span><span class="html-flow-condition">否
+7B~70B</span></li></ul></article><article class="html-flow-node tone-success shape-step" data-node-id="MG"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Megatron-LM</span><span>TP+PP+DP</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">节点内带宽高 / 且模型超大吗</span><span class="html-flow-condition">是
+百亿以上</span></li></ul></article><article class="html-flow-node tone-warn shape-step" data-node-id="TT"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">torchtitan</span><span>DTensor 组合并行</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">节点内带宽高 / 且模型超大吗</span><span class="html-flow-condition">想要原生方案</span></li></ul></article></div></li></ol></div>
               <figcaption>框架选型的第一性问题不是「哪个框架好」，而是「显存到底卡在哪一块」。卡在优化器状态就切优化器状态，卡在参数本身才需要上张量并行。</figcaption>
             </figure>
           </div>
@@ -80,11 +82,11 @@ flowchart TB
 
           <p>上面的文字和表格，本质都是 ZeRO 论文里那张著名柱状图的转述。直接看原图，能把「三个阶段各切什么、各省多少」的直觉一次建立起来——这张图是理解所有显存分片框架的钥匙。</p>
 
-          <figure class="paper-figure">
-            <img src="https://ar5iv.labs.arxiv.org/html/1910.02054/assets/x1.png" alt="论文原图：ZeRO 三种阶段下每设备模型状态显存对比——基线与 ZeRO-1/2/3 的柱状图，横轴为数据并行度，纵轴为每卡显存，展示优化器状态、梯度、参数逐级被分片" loading="lazy" style="max-width:560px">
+          <figure class="paper-figure image-figure source-figure">
+            <img src="../../assets/figures/external/ea643759bea8.png" alt="论文原图：ZeRO 三种阶段下每设备模型状态显存对比——基线与 ZeRO-1/2/3 的柱状图，横轴为数据并行度，纵轴为每卡显存，展示优化器状态、梯度、参数逐级被分片" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：ZeRO-DP 三个阶段下每设备模型状态显存对比——随着分片范围从优化器状态扩展到梯度再到参数，每卡显存随数据并行度线性下降</span>
-              <span class="pf-src">论文原图 · Rajbhandari et al., <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>, 2019, Figure 1 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">arXiv:1910.02054</a></span>
+              <span class="pf-src">论文原图 · Rajbhandari et al., <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>, 2019, Figure 1 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener noreferrer">arXiv:1910.02054</a></span>
             </figcaption>
           </figure>
 
@@ -101,31 +103,7 @@ flowchart TB
           <p>把主流框架按「封装了哪些并行维度」摊开看，格局立刻清晰：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root(("分布式训练框架"))
-    DeepSpeed 系
-      ZeRO-1 切优化器状态
-      ZeRO-2 再切梯度
-      ZeRO-3 再切参数
-      ZeRO-Offload 卸载到 CPU
-      ZeRO-Infinity 卸载到 NVMe
-    PyTorch 原生
-      DDP 纯数据并行
-      FSDP1 模块级分片
-      FSDP2 逐参数 DTensor 分片
-      Pipeline Parallel API
-    Megatron-LM 系
-      张量并行 TP
-      流水线并行 PP
-      序列并行 SP
-      专家并行 EP
-      Megatron-DeepSpeed 混血
-    torchtitan
-      DeviceMesh 描述拓扑
-      DTensor 标注分片
-      组合 FSDP2 加 TP 加 PP 加 CP
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：分布式训练框架" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>分布式训练框架</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>DeepSpeed 系</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">ZeRO-1 切优化器状态</span></li><li><span class="html-mindmap-leaf">ZeRO-2 再切梯度</span></li><li><span class="html-mindmap-leaf">ZeRO-3 再切参数</span></li><li><span class="html-mindmap-leaf">ZeRO-Offload 卸载到 CPU</span></li><li><span class="html-mindmap-leaf">ZeRO-Infinity 卸载到 NVMe</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>PyTorch 原生</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">DDP 纯数据并行</span></li><li><span class="html-mindmap-leaf">FSDP1 模块级分片</span></li><li><span class="html-mindmap-leaf">FSDP2 逐参数 DTensor 分片</span></li><li><span class="html-mindmap-leaf">Pipeline Parallel API</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>Megatron-LM 系</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">张量并行 TP</span></li><li><span class="html-mindmap-leaf">流水线并行 PP</span></li><li><span class="html-mindmap-leaf">序列并行 SP</span></li><li><span class="html-mindmap-leaf">专家并行 EP</span></li><li><span class="html-mindmap-leaf">Megatron-DeepSpeed 混血</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>torchtitan</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">DeviceMesh 描述拓扑</span></li><li><span class="html-mindmap-leaf">DTensor 标注分片</span></li><li><span class="html-mindmap-leaf">组合 FSDP2 加 TP 加 PP 加 CP</span></li></ul></section></div></div>
             <figcaption>框架族谱：DeepSpeed 与 PyTorch 原生走「分片数据并行」一路，Megatron 走「模型切分」一路，torchtitan 用 DTensor 抽象把两路统一起来。</figcaption>
           </figure>
 
@@ -342,21 +320,7 @@ model = FSDP(
           <p>它的精妙之处在于选对了切分方向，让一个 Transformer 层只需要两次通信。以 FFN 为例，设 $Y = \text{GeLU}(XA)$，$Z = YB$：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  I["输入 X<br/>每张卡都有完整副本"] --> A1["GPU0: X · A1<br/>A 按列切"]
-  I --> A2["GPU1: X · A2"]
-  A1 --> G1["GeLU 逐元素<br/>无需通信"]
-  A2 --> G2["GeLU 逐元素<br/>无需通信"]
-  G1 --> B1["GPU0: Y1 · B1<br/>B 按行切"]
-  G2 --> B2["GPU1: Y2 · B2"]
-  B1 --> AR["AllReduce<br/>把部分和加起来"]
-  B2 --> AR
-  AR --> O["输出 Z<br/>每张卡都有完整副本"]
-  style G1 fill:#eaf3de,stroke:#639922
-  style G2 fill:#eaf3de,stroke:#639922
-  style AR fill:#faeeda,stroke:#ba7517
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="9" data-edge-count="9" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="I"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">输入 X</span><span>每张卡都有完整副本</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU0: X · A1</span><span>A 按列切</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">输入 X / 每张卡都有完整副本</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="A2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU1: X · A2</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">输入 X / 每张卡都有完整副本</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="G1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GeLU 逐元素</span><span>无需通信</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU0: X · A1 / A 按列切</span></li></ul></article><article class="html-flow-node tone-success shape-step" data-node-id="G2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GeLU 逐元素</span><span>无需通信</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU1: X · A2</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="B1"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU0: Y1 · B1</span><span>B 按行切</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GeLU 逐元素 / 无需通信</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B2"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPU1: Y2 · B2</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GeLU 逐元素 / 无需通信</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-step" data-node-id="AR"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">AllReduce</span><span>把部分和加起来</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">GPU0: Y1 · B1 / B 按行切</span></li><li><span class="html-flow-source">GPU1: Y2 · B2</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="O"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">输出 Z</span><span>每张卡都有完整副本</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">AllReduce / 把部分和加起来</span></li></ul></article></div></li></ol></div>
             <figcaption>Megatron 的 FFN 切分：第一个权重按<strong>列</strong>切、第二个按<strong>行</strong>切。这样 GeLU 这个非线性函数落在切分点之间，可以完全逐元素并行；整个 FFN 只在最后需要一次 AllReduce。切反了（第一个按行切）就必须在 GeLU 之前通信，代价翻倍。</figcaption>
           </figure>
 
@@ -593,16 +557,16 @@ stateDiagram-v2
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models（Rajbhandari et al., 2020）— ZeRO 三阶段的奠基论文，本页的 $16\Psi$ 显存公式与各阶段通信量分析都出自这里 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">arXiv:1910.02054</a></li>
-            <li>ZeRO-Offload: Democratizing Billion-Scale Model Training（Ren et al., 2021）— 把优化器状态与参数更新卸载到 CPU 的设计与开销分析 · <a href="https://arxiv.org/abs/2101.06840" target="_blank" rel="noopener">arXiv:2101.06840</a></li>
-            <li>ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning（Rajbhandari et al., 2021）— 进一步把状态卸载到 NVMe，理解异构存储层级的代价 · <a href="https://arxiv.org/abs/2104.07857" target="_blank" rel="noopener">arXiv:2104.07857</a></li>
-            <li>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism（Shoeybi et al., 2019）— 张量并行的原始论文，FFN 与注意力的列切/行切方案在此提出 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">arXiv:1909.08053</a></li>
-            <li>Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM（Narayanan et al., 2021）— PTD-P 三维并行的系统化工作，含流水线气泡分析与交错式调度 · <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">arXiv:2104.04473</a></li>
-            <li>Reducing Activation Recomputation in Large Transformer Models（Korthikanti et al., 2022）— 序列并行与选择性重计算，本页「开 TP 就该开 SP」的依据 · <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">arXiv:2205.05198</a></li>
-            <li>PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel（Zhao et al., 2023）— FSDP 的设计动机、wrap 粒度与重叠策略的工程经验 · <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener">arXiv:2304.11277</a></li>
-            <li>Megatron-LM GitHub 仓库 — NVIDIA 官方实现，参数含义与示例脚本以此为准 · <a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener">GitHub</a></li>
-            <li>torchtitan GitHub 仓库 — PyTorch 官方训练框架，DeviceMesh 与 DTensor 组合并行的参考实现 · <a href="https://github.com/pytorch/torchtitan" target="_blank" rel="noopener">GitHub</a></li>
-            <li>DeepSpeed GitHub 仓库 — ZeRO 系列的官方实现与配置文档 · <a href="https://github.com/deepspeedai/DeepSpeed" target="_blank" rel="noopener">GitHub</a></li>
+            <li>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models（Rajbhandari et al., 2020）— ZeRO 三阶段的奠基论文，本页的 $16\Psi$ 显存公式与各阶段通信量分析都出自这里 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener noreferrer">arXiv:1910.02054</a></li>
+            <li>ZeRO-Offload: Democratizing Billion-Scale Model Training（Ren et al., 2021）— 把优化器状态与参数更新卸载到 CPU 的设计与开销分析 · <a href="https://arxiv.org/abs/2101.06840" target="_blank" rel="noopener noreferrer">arXiv:2101.06840</a></li>
+            <li>ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning（Rajbhandari et al., 2021）— 进一步把状态卸载到 NVMe，理解异构存储层级的代价 · <a href="https://arxiv.org/abs/2104.07857" target="_blank" rel="noopener noreferrer">arXiv:2104.07857</a></li>
+            <li>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism（Shoeybi et al., 2019）— 张量并行的原始论文，FFN 与注意力的列切/行切方案在此提出 · <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">arXiv:1909.08053</a></li>
+            <li>Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM（Narayanan et al., 2021）— PTD-P 三维并行的系统化工作，含流水线气泡分析与交错式调度 · <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener noreferrer">arXiv:2104.04473</a></li>
+            <li>Reducing Activation Recomputation in Large Transformer Models（Korthikanti et al., 2022）— 序列并行与选择性重计算，本页「开 TP 就该开 SP」的依据 · <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener noreferrer">arXiv:2205.05198</a></li>
+            <li>PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel（Zhao et al., 2023）— FSDP 的设计动机、wrap 粒度与重叠策略的工程经验 · <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener noreferrer">arXiv:2304.11277</a></li>
+            <li>Megatron-LM GitHub 仓库 — NVIDIA 官方实现，参数含义与示例脚本以此为准 · <a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+            <li>torchtitan GitHub 仓库 — PyTorch 官方训练框架，DeviceMesh 与 DTensor 组合并行的参考实现 · <a href="https://github.com/pytorch/torchtitan" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+            <li>DeepSpeed GitHub 仓库 — ZeRO 系列的官方实现与配置文档 · <a href="https://github.com/deepspeedai/DeepSpeed" target="_blank" rel="noopener noreferrer">GitHub</a></li>
           </ul>
 
           <div class="callout">
@@ -610,6 +574,8 @@ stateDiagram-v2
             框架选定后，怎么用 BF16/FP8 和梯度检查点进一步压显存、提速度，见 <a href="mixed-precision.html">混合精度与显存优化</a>；训练跑起来后遇到 loss spike 和优化器选型问题，见 <a href="stability-optimizer.html">训练稳定性与优化器</a>；五种并行本身的原理与通信模式见 <a href="distributed-training.html">并行策略：5D 并行的原理与组合</a>；算力预算怎么估见 <a href="../05-systems/compute-budget.html">算力预算</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“训练框架与工程实现”继续深入</h2></div></div><p class="rd-summary">本章覆盖从数据到训练集群的完整预训练链路：目标函数、语料清洗与合成、Scaling Laws、并行策略、混合精度和稳定性。</p><p class="rd-takeaway"><strong>阅读提示：</strong>预训练效果不是参数量单变量函数；数据质量、token 数、优化稳定性和通信效率共同决定最终结果。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Kaplan et al. · 2020</span></div><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener noreferrer">Scaling Laws for Neural Language Models ↗</a><p class="rd-note">最早系统刻画模型规模、数据量、计算量和损失之间幂律关系的工作。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Hoffmann et al. · 2022</span></div><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener noreferrer">Training Compute-Optimal Large Language Models ↗</a><p class="rd-note">Chinchilla 结论：固定算力下模型参数和训练 token 应共同增长，纠正只堆参数的直觉。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Gao et al. · 2020</span></div><a href="https://arxiv.org/abs/2101.00027" target="_blank" rel="noopener noreferrer">The Pile: An 800GB Dataset of Diverse Text ↗</a><p class="rd-note">公开语料混合、来源比例和去重处理的代表性数据集论文。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Shoeybi et al. · 2019</span></div><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">Megatron-LM: Training Multi-Billion Parameter Language Models ↗</a><p class="rd-note">张量并行、流水线并行和大规模 Transformer 训练工程的经典来源。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">PyTorch</span></div><a href="https://pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener noreferrer">Fully Sharded Data Parallel ↗</a><p class="rd-note">FSDP 的参数、梯度和优化器状态分片语义，适合将并行原理落到可运行配置。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“训练框架与工程实现”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>预训练从 CLM/MLM 目标扩展到多 token 预测、课程数据和合成数据，训练规模则由 Kaplan 经验律推进到 Chinchilla 的计算最优配比。</p></article><article><h3>机制抓手</h3><p>把数据去重、混合比例、token 预算、并行策略、checkpoint 和验证集视为同一个实验设计，而不是互相独立的脚本参数。</p></article><article><h3>工程权衡</h3><p>更多数据、更多参数和更长训练之间需要按计算预算平衡；数据污染、重复和合成数据坍缩会让离线 loss 失真。</p></article><article><h3>前沿观察</h3><p>持续预训练、数据飞轮、MTP、FP8 和新优化器仍在发展，必须报告数据谱系和消融实验。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能从 token 预算估算训练 FLOP、显存和并行策略，并设计 loss spike、数据泄漏和 checkpoint 恢复的排查流程。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener noreferrer">Scaling Laws ↗</a><a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener noreferrer">Chinchilla ↗</a><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener noreferrer">Megatron-LM ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能根据模型、集群和恢复需求选择 DDP、FSDP/ZeRO 或 Megatron，并理解框架封装背后的状态分片。</p></article><article><h3>先修关系</h3><p>先修语言模型目标、反向传播和优化器；把 token 预算、数据版本和 checkpoint 视为实验输入。</p></article><article><h3>最小实验</h3><p>用同一两层模型比较单进程与两进程 DDP/FSDP 的一个训练 step；无多卡时使用 CPU gloo，记录 state_dict 形态、通信事件、峰值内存和保存/加载过程。</p></article><article><h3>验收标准</h3><p>相同初始权重下聚合梯度与单进程基线在 atol=1e-6 下相同；checkpoint 可在新进程重载，且配置表明确 world size、分片策略和恢复命令。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -620,11 +586,14 @@ stateDiagram-v2
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

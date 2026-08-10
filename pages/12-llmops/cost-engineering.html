@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="团队第一次收到 LLM 账单时通常会震惊——月成本比预估高了 3 倍。原因很简单：大家按&quot;模型报价 × 请求量&quot;算账，但真实的 token 消耗被系统提示、对话历史、RAG 上下文、重排模型、重试和 fallback 共同推高。本节讲怎么把成本拆到看得见的颗粒度，以及两个真正有效的省钱杠杆：语义缓存和前缀缓存">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="推理成本工程 · 大模型技术 Cookbook">
+  <meta property="og:description" content="团队第一次收到 LLM 账单时通常会震惊——月成本比预估高了 3 倍。原因很简单：大家按&quot;模型报价 × 请求量&quot;算账，但真实的 token 消耗被系统提示、对话历史、RAG 上下文、重排模型、重试和 fallback 共同推高。本节讲怎么把成本拆到看得见的颗粒度，以及两个真正有效的省钱杠杆：语义缓存和前缀缓存">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/12-llmops/cost-engineering.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/12-llmops/cost-engineering.html">
   <title>推理成本工程 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="12-llmops" data-topic="cost-engineering">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -29,21 +42,7 @@
             <div class="card-title">一图看懂</div>
             <p>推理成本不是"模型单价 × 请求量"这么简单。一次请求的真实成本像洋葱一样有多层：你看到的是最终账单，剥开第一层是模型调用，再剥是系统提示和上下文，最里面是重试和 fallback 的隐性成本。成本工程就是把这颗洋葱一层层剥开，按工作流、租户、用户、版本四个维度归因，然后针对性优化。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart TB
-  BILL["月度账单<br/>你看到的"] --> CALL["模型调用成本<br/>单价 × token"]
-  CALL --> SYS["系统提示<br/>每次请求都带"]
-  CALL --> HIST["对话历史<br/>越聊越长"]
-  CALL --> RAG["RAG 上下文<br/>检索注入的 chunk"]
-  CALL --> RERANK["重排模型调用<br/>Cross-Encoder"]
-  SYS --> RETRY["重试与 fallback<br/>失败换更贵的模型"]
-  HIST --> RETRY
-  RAG --> RETRY
-
-  style BILL fill:#fce4e4,stroke:#c0392b
-  style RETRY fill:#fff8e6,stroke:#d4a017
-  style SYS fill:#eaf3de,stroke:#639922
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="7" data-edge-count="8" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="BILL"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">月度账单</span><span>你看到的</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="CALL"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">模型调用成本</span><span>单价 × token</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">月度账单 / 你看到的</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="SYS"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">系统提示</span><span>每次请求都带</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型调用成本 / 单价 × token</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="HIST"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">对话历史</span><span>越聊越长</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型调用成本 / 单价 × token</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="RAG"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">RAG 上下文</span><span>检索注入的 chunk</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型调用成本 / 单价 × token</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="RERANK"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">重排模型调用</span><span>Cross-Encoder</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型调用成本 / 单价 × token</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-step" data-node-id="RETRY"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">重试与 fallback</span><span>失败换更贵的模型</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">系统提示 / 每次请求都带</span></li><li><span class="html-flow-source">对话历史 / 越聊越长</span></li><li><span class="html-flow-source">RAG 上下文 / 检索注入的 chunk</span></li></ul></article></div></li></ol></div>
               <figcaption>推理成本洋葱：账单只是最外层。系统提示、历史、RAG 上下文、重排、重试/fallback 共同推高真实消耗</figcaption>
             </figure>
           </div>
@@ -137,24 +136,7 @@ sequenceDiagram
           <p>知道成本被什么推高还不够，你需要知道是<strong>谁</strong>在消耗。四维归因把每笔请求的成本分配到四个正交维度上，让成本可见、可追责、可优化。</p>
 
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-flowchart TB
-  REQ["单笔请求成本"] --> D1["工作流维度<br/>哪个功能产生的"]
-  REQ --> D2["租户维度<br/>哪个客户/团队"]
-  REQ --> D3["用户维度<br/>哪个终端用户"]
-  REQ --> D4["版本维度<br/>哪个 prompt/模型版本"]
-
-  D1 --> W1["RAG 问答<br/>高 token / 低单价"]
-  D1 --> W2["代码生成<br/>高输出 token"]
-  D1 --> W3["意图分类<br/>低 token / 高频"]
-
-  D2 --> T1["大客户 A<br/>占 40% 成本"]
-  D2 --> T2["免费用户<br/>ROI 需评估"]
-
-  style REQ fill:#e6f1fb,stroke:#185fa5
-  style D1 fill:#eaf3de,stroke:#639922
-  style D2 fill:#fff8e6,stroke:#d4a017
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="10" data-edge-count="9" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="REQ"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单笔请求成本</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="D1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">工作流维度</span><span>哪个功能产生的</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单笔请求成本</span></li></ul></article><article class="html-flow-node tone-warn shape-step" data-node-id="D2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">租户维度</span><span>哪个客户/团队</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单笔请求成本</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D3"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">用户维度</span><span>哪个终端用户</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单笔请求成本</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D4"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">版本维度</span><span>哪个 prompt/模型版本</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单笔请求成本</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="W1"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">RAG 问答</span><span>高 token / 低单价</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">工作流维度 / 哪个功能产生的</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="W2"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">代码生成</span><span>高输出 token</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">工作流维度 / 哪个功能产生的</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="W3"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">意图分类</span><span>低 token / 高频</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">工作流维度 / 哪个功能产生的</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T1"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">大客户 A</span><span>占 40% 成本</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">租户维度 / 哪个客户/团队</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T2"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">免费用户</span><span>ROI 需评估</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">租户维度 / 哪个客户/团队</span></li></ul></article></div></li></ol></div>
             <figcaption>四维成本归因：同一笔请求从四个角度切片。工作流看功能 ROI，租户看客户盈利性，用户看异常消耗，版本看变更影响</figcaption>
           </figure>
 
@@ -247,19 +229,7 @@ def record_llm_call(model, in_tok, out_tok, status, sink):
           <h3>怎么用</h3>
           <p>语义缓存的实现流程：</p>
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-flowchart LR
-  Q["用户提问"] --> EM["问题向量化"]
-  EM --> SEARCH["在缓存库中<br/>向量相似度检索"]
-  SEARCH --> HIT{"相似度 &gt; 阈值?"}
-  HIT -->|"是"| RET["返回缓存答案"]
-  HIT -->|"否"| LLM["调用模型生成"]
-  LLM --> STORE["问题+答案存入缓存"]
-  STORE --> A["返回用户"]
-  RET --> A
-  style RET fill:#eaf3de,stroke:#639922
-  style LLM fill:#e6f1fb,stroke:#185fa5
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="8" data-edge-count="8" data-instance="2" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Q"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">用户提问</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="EM"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">问题向量化</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">用户提问</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SEARCH"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">在缓存库中</span><span>向量相似度检索</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">问题向量化</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="HIT"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">相似度 &gt; 阈值?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">在缓存库中 / 向量相似度检索</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="RET"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">返回缓存答案</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">相似度 &gt; 阈值?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-info shape-step" data-node-id="LLM"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">调用模型生成</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">相似度 &gt; 阈值?</span><span class="html-flow-condition">否</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="STORE"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">问题+答案存入缓存</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">调用模型生成</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">07</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">返回用户</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">问题+答案存入缓存</span></li><li><span class="html-flow-source">返回缓存答案</span></li></ul></article></div></li></ol></div>
             <figcaption>语义缓存流程：用向量相似度判断是否有足够接近的历史问答。阈值越高越保守（命中少但误命中少），越低越激进（命中多但可能答错）</figcaption>
           </figure>
           <p>关键参数是<strong>相似度阈值</strong>。设太高（如 0.99）命中率接近传统缓存，设太低（如 0.80）会误命中——"怎么退款"和"怎么退货"向量很近但答案完全不同。<strong>不同业务场景需要不同阈值</strong>：FAQ 类问题可以激进些，专业问答必须保守。建议从 0.92 左右开始，根据实际命中准确率调整。</p>
@@ -319,11 +289,11 @@ stateDiagram-v2
           <h3>权威图：KV Cache 为什么能省、为什么难省</h3>
           <p>"复用 KV cache"到底复用什么、为什么传统做法会浪费显存？这是 vLLM 系统论文（SOSP 2023）里的 Figure 1 要回答的问题。它是推理引擎领域的奠基原图，理解它，前缀缓存和 KV cache 管理的所有讨论都有了落脚点。</p>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/09-efficiency/inference-engines/fig1.png" alt="论文原图：PagedAttention 分页 KV Cache 管理——左侧展示连续显存存储导致的内部碎片与共享受限，右侧展示按页分配、可共享的显存布局" loading="lazy" style="max-width:620px">
             <figcaption>
               <span class="pf-title">图：PagedAttention 的 KV Cache 显存管理——把连续存储改成按页分配，碎片被消除，同一前缀的 KV 页可以在多个请求间共享（正是前缀缓存的底层机制）</span>
-              <span class="pf-src">论文原图 · Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>, SOSP 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a></span>
+              <span class="pf-src">论文原图 · Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>, SOSP 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">arXiv:2309.06180</a></span>
             </figcaption>
           </figure>
 
@@ -387,26 +357,7 @@ stateDiagram-v2
           <h2>成本治理：让超支在发生前被拦住</h2>
           <p>前面讲的都是"怎么把成本降下来"，但生产系统还得回答另一个问题：<strong>成本失控的那一刻，谁会知道，系统会怎么办？</strong>没有预算护栏的成本优化是脆弱的——一次死循环的 Agent、一个没加限流的批处理脚本、一次让输出变长 3 倍的 prompt 回归，都能把一个月省下来的钱在一天里吃光。</p>
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-mindmap
-  root((成本治理))
-    可见
-      四维归因看板
-      单位经济指标
-      沉没成本单列
-    预警
-      日预算消耗速率
-      租户配额水位
-      单请求成本 p99
-    限制
-      租户级配额
-      单请求 token 上限
-      Agent 最大步数
-    降级
-      切换到小模型
-      关闭重排
-      收紧检索 top-k
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：成本治理" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>成本治理</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>可见</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">四维归因看板</span></li><li><span class="html-mindmap-leaf">单位经济指标</span></li><li><span class="html-mindmap-leaf">沉没成本单列</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>预警</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">日预算消耗速率</span></li><li><span class="html-mindmap-leaf">租户配额水位</span></li><li><span class="html-mindmap-leaf">单请求成本 p99</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>限制</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">租户级配额</span></li><li><span class="html-mindmap-leaf">单请求 token 上限</span></li><li><span class="html-mindmap-leaf">Agent 最大步数</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>降级</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">切换到小模型</span></li><li><span class="html-mindmap-leaf">关闭重排</span></li><li><span class="html-mindmap-leaf">收紧检索 top-k</span></li></ul></section></div></div>
             <figcaption>成本治理的四层：可见 → 预警 → 限制 → 降级。多数团队只做到了第一层，结果就是"事后知道花超了"</figcaption>
           </figure>
           <p>这四层是递进的，缺一层就会在某个环节断掉：只有"可见"没有"预警"，看板得有人盯着才有用；有"预警"没有"限制"，值班同学只能眼睁睁看着数字往上走；有"限制"没有"降级"，超限的结果是服务直接不可用，业务方宁可花钱也不愿意接受。建议按下面的分级把动作写成明确的运行手册：</p>
@@ -535,13 +486,13 @@ mindmap
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>Efficient Memory Management for LLM Serving with PagedAttention — vLLM 系统论文，本页前缀缓存图的出处 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arxiv.org/abs/2309.06180</a></li>
-            <li>Anthropic Prompt Caching 文档 — 前缀缓存的官方实现、定价折扣与使用指南 · <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" target="_blank" rel="noopener">docs.anthropic.com/en/docs/build-with-claude/prompt-caching</a></li>
-            <li>OpenAI API Pricing & Caching — 模型定价与自动前缀缓存机制 · <a href="https://openai.com/api/pricing/" target="_blank" rel="noopener">openai.com/api/pricing</a></li>
-            <li>GPTCache — 开源语义缓存方案，支持自定义 embedding 与相似度评估 · <a href="https://github.com/zilliztech/GPTCache" target="_blank" rel="noopener">github.com/zilliztech/GPTCache</a></li>
-            <li>SGLang: RadixAttention 论文 — 用基数树组织 KV cache，实现跨请求的自动前缀复用 · <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">arxiv.org/abs/2312.07104</a></li>
-            <li>LiteLLM 文档 — 统一多模型网关，内置按 key/租户的用量与预算控制 · <a href="https://docs.litellm.ai/" target="_blank" rel="noopener">docs.litellm.ai</a></li>
-            <li>OpenTelemetry GenAI 语义约定 — 在 Span 上记录 token 数与模型信息的标准字段命名 · <a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/" target="_blank" rel="noopener">opentelemetry.io/docs/specs/semconv/gen-ai</a></li>
+            <li>Efficient Memory Management for LLM Serving with PagedAttention — vLLM 系统论文，本页前缀缓存图的出处 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">arxiv.org/abs/2309.06180</a></li>
+            <li>Anthropic Prompt Caching 文档 — 前缀缓存的官方实现、定价折扣与使用指南 · <a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching" target="_blank" rel="noopener noreferrer">docs.anthropic.com/en/docs/build-with-claude/prompt-caching</a></li>
+            <li>OpenAI API Pricing & Caching — 模型定价与自动前缀缓存机制 · <a href="https://openai.com/api/pricing/" target="_blank" rel="noopener noreferrer">openai.com/api/pricing</a></li>
+            <li>GPTCache — 开源语义缓存方案，支持自定义 embedding 与相似度评估 · <a href="https://github.com/zilliztech/GPTCache" target="_blank" rel="noopener noreferrer">github.com/zilliztech/GPTCache</a></li>
+            <li>SGLang: RadixAttention 论文 — 用基数树组织 KV cache，实现跨请求的自动前缀复用 · <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener noreferrer">arxiv.org/abs/2312.07104</a></li>
+            <li>LiteLLM 文档 — 统一多模型网关，内置按 key/租户的用量与预算控制 · <a href="https://docs.litellm.ai/" target="_blank" rel="noopener noreferrer">docs.litellm.ai</a></li>
+            <li>OpenTelemetry GenAI 语义约定 — 在 Span 上记录 token 数与模型信息的标准字段命名 · <a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/" target="_blank" rel="noopener noreferrer">opentelemetry.io/docs/specs/semconv/gen-ai</a></li>
           </ul>
 
           <div class="callout">
@@ -549,6 +500,8 @@ mindmap
             成本管好了，还要保证系统跑得稳。<a href="rag-in-production.html">RAG 生产运维</a>讲 RAG 系统三个月不烂掉的运维方法，<a href="guardrails.html">护栏与输出校验</a>讲怎么拦住不安全内容。成本监控的基础设施见 <a href="observability.html">可观测性与全链路追踪</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“推理成本工程”继续深入</h2></div></div><p class="rd-summary">本章覆盖模型上线后的工程闭环：评测 CI、RAG 生产化、成本控制、观测、护栏和故障处理。</p><p class="rd-takeaway"><strong>阅读提示：</strong>生产系统的最小闭环是可追踪输入、可解释输出、可回放轨迹和可执行的质量门禁，而不是简单接一个模型 API。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">Cloud Native Computing Foundation</span></div><a href="https://opentelemetry.io/docs/" target="_blank" rel="noopener noreferrer">OpenTelemetry Documentation ↗</a><p class="rd-note">统一 traces、metrics 和 logs 的开放标准，适合为 LLM 调用、检索和工具链建立关联追踪。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">工程指南</span><span class="rd-source">Google SRE</span></div><a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener noreferrer">Service Level Objectives ↗</a><p class="rd-note">从用户目标定义可测 SLO、错误预算和告警策略，为延迟和可用性指标提供中立框架。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方框架</span><span class="rd-source">NIST</span></div><a href="https://www.nist.gov/itl/ai-risk-management-framework" target="_blank" rel="noopener noreferrer">AI Risk Management Framework ↗</a><p class="rd-note">将治理、测量、管理和映射组织成风险闭环，可作为护栏和上线审查的通用基线。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">Ragas Project</span></div><a href="https://docs.ragas.io/" target="_blank" rel="noopener noreferrer">Ragas Documentation ↗</a><p class="rd-note">提供 RAG 的 context precision、faithfulness 等评测指标和数据集组织方式。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">MLflow</span></div><a href="https://mlflow.org/docs/latest/genai/eval-monitor/" target="_blank" rel="noopener noreferrer">MLflow GenAI Evaluation and Monitoring ↗</a><p class="rd-note">展示生产轨迹、在线评估和反馈回流的实现方式，适合与页面中的评测 CI 对照。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“推理成本工程”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>LLMOps 把离线实验、在线流量、数据回流、评测 CI、成本和安全护栏串成持续交付闭环。</p></article><article><h3>机制抓手</h3><p>每次请求应能关联 prompt/model/retrieval/tool/trace 版本，并将质量、延迟、token 和人工反馈写入可回放记录。</p></article><article><h3>工程权衡</h3><p>更完整的 tracing 和评测会增加存储与延迟，但缺少证据就无法定位模型、数据还是工具导致的回归。</p></article><article><h3>前沿观察</h3><p>OpenTelemetry、自动评测、在线实验、模型路由和质量门禁正在成为默认基础设施。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能定义一组线上 SLO、离线回归集和事故 runbook，并说明数据脱敏和采样策略。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://opentelemetry.io/docs/" target="_blank" rel="noopener noreferrer">OpenTelemetry ↗</a><a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener noreferrer">Google SRE SLO ↗</a><a href="https://www.nist.gov/itl/ai-risk-management-framework" target="_blank" rel="noopener noreferrer">NIST AI RMF ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能把模型 token、检索、重排、工具、缓存、重试和基础设施成本归因到一次成功业务结果。</p></article><article><h3>先修关系</h3><p>先修 RAG/Agent 请求链路和基础服务 SLO；先定义可观测字段，再讨论工具或平台选型。</p></article><article><h3>最小实验</h3><p>采集或构造 100 条 RAG trace，逐 span 记录 token、模型单价、向量检索、缓存与重试；实现成本聚合器并比较无缓存、语义缓存和前缀缓存。</p></article><article><h3>验收标准</h3><p>聚合账与逐条明细误差小于 1%，命中与未命中成本可分解；报告每成功回答成本、P95 成本及缓存错误命中的质量损失。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -559,11 +512,14 @@ mindmap
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

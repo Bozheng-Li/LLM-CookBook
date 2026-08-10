@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="模型在 4K 上下文上训练，怎么让它推理时能处理 128K 甚至 1M 的输入？这不是&quot;把位置编码拉长&quot;那么简单——位置编码外推、KV Cache 膨胀、注意力计算爆炸、长文本训练数据匮乏，每一关都是硬骨头。这一节梳理从位置插值到大海捞针评测的完整技术链路。">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="长上下文技术 · 大模型技术 Cookbook">
+  <meta property="og:description" content="模型在 4K 上下文上训练，怎么让它推理时能处理 128K 甚至 1M 的输入？这不是&quot;把位置编码拉长&quot;那么简单——位置编码外推、KV Cache 膨胀、注意力计算爆炸、长文本训练数据匮乏，每一关都是硬骨头。这一节梳理从位置插值到大海捞针评测的完整技术链路。">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/04-modern-arch/long-context.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/04-modern-arch/long-context.html">
   <title>长上下文技术 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="04-modern-arch" data-topic="long-context">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -29,17 +42,7 @@
             <div class="card-title">一图看懂</div>
             <p>长上下文技术的核心挑战一句话：<strong>模型在短上下文上训练的位置编码，推理时拉到超长距离就"失真"了</strong>。解决办法分三步走——先靠位置插值让模型"假装"见过长距离，再用长文本继续训练让它"真的适应"长距离，最后用大海捞针评测验证它"真的能看到"远处的信息。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart LR
-  A["短上下文训练<br/>4K-8K"] --> B{"推理时需要<br/>更长上下文?"}
-  B -->|"是"| C["位置插值<br/>PI / NTK-aware"]
-  C --> D["长文本继续训练<br/>微调适配"]
-  D --> E["大海捞针评测<br/>验证长距离检索"]
-  E --> F["上线服务<br/>128K-1M"]
-  style C fill:#fff3e0,stroke:#e65100
-  style D fill:#e3f2fd,stroke:#1565c0
-  style E fill:#e8f5e9,stroke:#2e7d32
-              </div>
+              <div class="html-flowchart is-linear" data-diagram="flowchart-html" data-direction="LR" data-node-count="6" data-edge-count="5" data-instance="0" role="group" aria-label="HTML 流程图"><ol class="html-flow-linear"><li><article class="html-flow-node tone-neutral shape-step" data-node-id="A"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">短上下文训练</span><span>4K-8K</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-warn shape-decision" data-node-id="B"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">推理时需要</span><span>更长上下文?</span></div></article><div class="html-flow-connector"><span>是</span></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">位置插值</span><span>PI / NTK-aware</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="D"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">长文本继续训练</span><span>微调适配</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="E"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">大海捞针评测</span><span>验证长距离检索</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="F"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">上线服务</span><span>128K-1M</span></div></article></li></ol></div>
               <figcaption>长上下文的三步走：位置插值 → 长文本训练 → 大海捞针验证</figcaption>
             </figure>
           </div>
@@ -64,26 +67,7 @@ flowchart LR
           <p>第三个瓶颈——注意力计算爆炸——主要由 <a href="attention-variants.html">注意力变体</a>（GQA/MLA/SWA）和 <a href="../05-systems/flash-attention.html">FlashAttention</a> 解决。本节聚焦前两个：位置编码外推和 KV Cache 管理。</p>
 
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-mindmap
-  root((长上下文技术))
-    位置编码外推
-      PI 统一压缩
-      NTK-aware 分频率
-      YaRN 分段缩放
-    长文本训练
-      渐进扩展
-      跨距离检索数据
-      数据混合防遗忘
-    评测
-      大海捞针
-      多针推理
-      注意力稀释
-    显存管理
-      GQA/MLA
-      量化与卸载
-      前缀缓存
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：长上下文技术" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>长上下文技术</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>位置编码外推</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">PI 统一压缩</span></li><li><span class="html-mindmap-leaf">NTK-aware 分频率</span></li><li><span class="html-mindmap-leaf">YaRN 分段缩放</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>长文本训练</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">渐进扩展</span></li><li><span class="html-mindmap-leaf">跨距离检索数据</span></li><li><span class="html-mindmap-leaf">数据混合防遗忘</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>评测</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">大海捞针</span></li><li><span class="html-mindmap-leaf">多针推理</span></li><li><span class="html-mindmap-leaf">注意力稀释</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>显存管理</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">GQA/MLA</span></li><li><span class="html-mindmap-leaf">量化与卸载</span></li><li><span class="html-mindmap-leaf">前缀缓存</span></li></ul></section></div></div>
             <figcaption>长上下文技术地图：从位置编码外推、长文本训练，到评测与显存管理，是一条完整链路</figcaption>
           </figure>
 
@@ -146,19 +130,7 @@ def build_rope(seq_len, base, dim, scale=1.0):
           </div>
 
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-flowchart LR
-  subgraph PI_Scaling["PI：统一缩放"]
-    P1["高频维度"] -->|"1/s 缩放"| P2["分辨率下降"]
-    P3["低频维度"] -->|"1/s 缩放"| P4["安全压缩"]
-  end
-  subgraph NTK_Scaling["NTK-aware：分频率缩放"]
-    N1["高频维度"] -->|"几乎不缩"| N2["分辨率保持"]
-    N3["低频维度"] -->|"大幅缩放"| N4["允许外推"]
-  end
-  style P2 fill:#ffebee,stroke:#c62828
-  style N2 fill:#e8f5e9,stroke:#2e7d32
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="8" data-edge-count="4" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="P1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">PI：统一缩放</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">高频维度</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">PI：统一缩放</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">低频维度</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="N1"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">NTK-aware：分频率缩放</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">高频维度</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="N3"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">NTK-aware：分频率缩放</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">低频维度</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="P2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">PI：统一缩放</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">分辨率下降</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">高频维度</span><span class="html-flow-condition">1/s 缩放</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P4"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">PI：统一缩放</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">安全压缩</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">低频维度</span><span class="html-flow-condition">1/s 缩放</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="N2"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">NTK-aware：分频率缩放</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">分辨率保持</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">高频维度</span><span class="html-flow-condition">几乎不缩</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="N4"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">NTK-aware：分频率缩放</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">允许外推</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">低频维度</span><span class="html-flow-condition">大幅缩放</span></li></ul></article></div></li></ol></div>
             <figcaption>PI 统一缩放导致高频维度分辨率下降；NTK-aware 分频率处理，高频保精度、低频保外推</figcaption>
           </figure>
 
@@ -281,11 +253,11 @@ sequenceDiagram
 
           <p>StreamingLLM 论文的 Figure 1 把四种「在长文本上生成」的策略放在一起对比，是理解这件事最直观的图。四格从左到右分别是：<strong>稠密注意力</strong>（每次对所有历史算注意力，缓存无限增长）、<strong>窗口注意力</strong>（只留最近窗口，一旦把开头 token 的 KV 逐出就崩溃）、<strong>滑窗+重算</strong>（每个新 token 都从最近的窗口重建 KV，效果好但慢）、以及 <strong>StreamingLLM</strong>（保留开头几个 token 的 KV 作为汇聚点 + 最近窗口，又快又稳）。</p>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/04-modern-arch/long-context/fig1.png" alt="论文原图：StreamingLLM 论文 Figure 1——四种长文本生成策略对比：稠密注意力、窗口注意力、滑窗重算、StreamingLLM" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：StreamingLLM 的 Figure 1——四种策略的对比。窗口注意力在开头 token 的 KV 被逐出后性能骤降；StreamingLLM 靠「保留注意力汇聚点 + 最近窗口」保持稳定</span>
-              <span class="pf-src">论文原图 · Xiao et al., <em>Efficient Streaming Language Models with Attention Sinks</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></span>
+              <span class="pf-src">论文原图 · Xiao et al., <em>Efficient Streaming Language Models with Attention Sinks</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener noreferrer">arXiv:2309.17453</a></span>
             </figcaption>
           </figure>
 
@@ -293,11 +265,11 @@ sequenceDiagram
 
           <p>图里还有一个细节值得留意：注意力汇聚点不需要是「有意义」的 token。StreamingLLM 论文甚至发现，在预训练时就刻意加一个占位 token（比如 BOS）专门充当汇聚点，效果更好——因为它给了模型一个明确的「排水口」，不用把注意力浪费在真正的文本上。这个设计后来被不少长上下文模型采纳。</p>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/04-modern-arch/long-context/fig4.png" alt="论文原图：StreamingLLM 论文 Figure 4——StreamingLLM 的 KV Cache 结构：固定保留若干初始 token 的 KV（注意力汇聚点）加上滚动窗口内最近 token 的 KV" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：StreamingLLM 的 KV Cache 结构——图里清晰画出「固定的汇聚点 KV」和「滑动的窗口 KV」两部分，两者之和就是固定大小的缓存</span>
-              <span class="pf-src">论文原图 · Xiao et al., <em>Efficient Streaming Language Models with Attention Sinks</em>, 2023, Figure 4 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></span>
+              <span class="pf-src">论文原图 · Xiao et al., <em>Efficient Streaming Language Models with Attention Sinks</em>, 2023, Figure 4 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener noreferrer">arXiv:2309.17453</a></span>
             </figcaption>
           </figure>
 
@@ -340,14 +312,14 @@ sequenceDiagram
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>Extending Context Window of Large Language Models via Positional Interpolation — 位置插值（PI）原始论文 · <a href="https://arxiv.org/abs/2306.15595" target="_blank" rel="noopener">arXiv:2306.15595</a></li>
-            <li>YaRN: Efficient Context Window Extension of Large Language Models — YaRN 方法论文，对 RoPE 频率分段缩放 · <a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">arXiv:2309.00071</a></li>
-            <li>Lost in the Middle: How Language Models Use Long Contexts — 分析长上下文中"中间信息丢失"现象的经典论文 · <a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener">arXiv:2307.03172</a></li>
-            <li>Efficient Streaming Language Models with Attention Sinks（StreamingLLM）— 注意力汇聚点现象的发现与固定缓存流式生成 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></li>
-            <li>No Train No Gain: Revisiting Efficient Training Algorithms For Transformer-based Language Models — 对 PI/NTK 等扩展方法的系统评测，结论是「不训练就很难真的长上下文」 · <a href="https://arxiv.org/abs/2407.06072" target="_blank" rel="noopener">arXiv:2407.06072</a></li>
-            <li>RoFormer: Enhanced Transformer with Rotary Position Embedding — RoPE 原始论文 · <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">arXiv:2104.09864</a></li>
-            <li>LongBench: A Bilingual, Multitask Benchmark for Long Context Understanding — 覆盖多种长上下文任务的评测基准 · <a href="https://arxiv.org/abs/2308.14508" target="_blank" rel="noopener">arXiv:2308.14508</a></li>
-            <li>Hugging Face 博客: 如何扩展 LLM 的上下文长度 — 关于 RoPE 扩展方法与工具的工程实践综述 · <a href="https://huggingface.co/blog/long-context" target="_blank" rel="noopener">huggingface.co/blog</a></li>
+            <li>Extending Context Window of Large Language Models via Positional Interpolation — 位置插值（PI）原始论文 · <a href="https://arxiv.org/abs/2306.15595" target="_blank" rel="noopener noreferrer">arXiv:2306.15595</a></li>
+            <li>YaRN: Efficient Context Window Extension of Large Language Models — YaRN 方法论文，对 RoPE 频率分段缩放 · <a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener noreferrer">arXiv:2309.00071</a></li>
+            <li>Lost in the Middle: How Language Models Use Long Contexts — 分析长上下文中"中间信息丢失"现象的经典论文 · <a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener noreferrer">arXiv:2307.03172</a></li>
+            <li>Efficient Streaming Language Models with Attention Sinks（StreamingLLM）— 注意力汇聚点现象的发现与固定缓存流式生成 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener noreferrer">arXiv:2309.17453</a></li>
+            <li>No Train No Gain: Revisiting Efficient Training Algorithms For Transformer-based Language Models — 对 PI/NTK 等扩展方法的系统评测，结论是「不训练就很难真的长上下文」 · <a href="https://arxiv.org/abs/2407.06072" target="_blank" rel="noopener noreferrer">arXiv:2407.06072</a></li>
+            <li>RoFormer: Enhanced Transformer with Rotary Position Embedding — RoPE 原始论文 · <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener noreferrer">arXiv:2104.09864</a></li>
+            <li>LongBench: A Bilingual, Multitask Benchmark for Long Context Understanding — 覆盖多种长上下文任务的评测基准 · <a href="https://arxiv.org/abs/2308.14508" target="_blank" rel="noopener noreferrer">arXiv:2308.14508</a></li>
+            <li>Hugging Face 博客: 如何扩展 LLM 的上下文长度 — 关于 RoPE 扩展方法与工具的工程实践综述 · <a href="https://huggingface.co/blog/long-context" target="_blank" rel="noopener noreferrer">huggingface.co/blog</a></li>
           </ul>
 
           <div class="callout">
@@ -355,6 +327,8 @@ sequenceDiagram
             长上下文解决"能读多长"的问题，而 <a href="kv-cache.html">KV Cache</a> 解决"推理时怎么存"的问题，<a href="attention-variants.html">注意力变体</a> 解决"算得少"的问题。三者共同决定了模型能服务的实际上下文长度。如果想看上下文工程层面的信息组织策略，见 <a href="../10-applications/context-engineering.html">上下文工程</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“长上下文技术”继续深入</h2></div></div><p class="rd-summary">本章关注 Transformer 之后的架构选择：稀疏专家、线性/状态空间模型、长上下文、多模态和扩散语言模型。重点是理解每种方法改变了哪一层约束。</p><p class="rd-takeaway"><strong>阅读提示：</strong>比较新架构时同时看训练目标、权重兼容性、推理状态和硬件实现；只看理论复杂度很容易得出错误结论。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Fedus, Zoph &amp; Shazeer · 2021</span></div><a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener noreferrer">Switch Transformers: Scaling to Trillion Parameter Models ↗</a><p class="rd-note">MoE 路由、容量因子和负载均衡的经典介绍，适合建立稀疏激活的共同语言。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Gu &amp; Dao · 2023</span></div><a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener noreferrer">Mamba: Linear-Time Sequence Modeling with Selective State Spaces ↗</a><p class="rd-note">选择性状态空间模型的代表作，解释线性扫描、选择机制和长序列效率之间的关系。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Ainslie et al. · 2023</span></div><a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener noreferrer">GQA: Training Generalized Multi-Query Transformer Models ↗</a><p class="rd-note">用较少 KV 头降低推理带宽和缓存开销，是理解 MQA/GQA 工程取舍的直接来源。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Dosovitskiy et al. · 2020</span></div><a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener noreferrer">An Image is Worth 16x16 Words ↗</a><p class="rd-note">ViT 将图像 patch 化并交给 Transformer，帮助理解多模态视觉编码器的基本范式。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Nie et al. · 2025</span></div><a href="https://arxiv.org/abs/2502.09992" target="_blank" rel="noopener noreferrer">Large Language Diffusion Models ↗</a><p class="rd-note">以 LLaDA 为代表的扩散语言模型工作，适合和自回归模型对照并识别当前研究边界。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="topic" aria-labelledby="technical-deepening-title"><div class="td-kicker">主题级技术深化</div><h2 id="technical-deepening-title">围绕“长上下文技术”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>长上下文经历位置外推、RoPE scaling、长文档继续预训练和检索增强，窗口长度增加并不等价于有效利用率增加。</p></article><article><h3>机制抓手</h3><p>分别测长度外推、needle retrieval、跨段推理和位置偏置；记录有效 token、注意力衰减、KV 显存和训练数据长度分布。</p></article><article><h3>工程权衡</h3><p>更长窗口带来 quadratic attention、缓存和噪声成本；上下文压缩、分块检索和摘要常比单纯扩窗更稳定。</p></article><article><h3>前沿观察</h3><p>YaRN、位置插值、Ring/Block attention 和长序列训练仍在演进，必须区分支持长度、训练长度和可靠工作长度。</p></article></div><div class="td-check"><strong>实践检查</strong><span>设计 4K/32K/128K 的同题对照，分别报告召回、推理、延迟和显存，而不是只写最大窗口。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener noreferrer">Switch Transformers ↗</a><a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener noreferrer">Mamba ↗</a><a href="https://arxiv.org/abs/2502.09992" target="_blank" rel="noopener noreferrer">LLaDA ↗</a></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -365,11 +339,14 @@ sequenceDiagram
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

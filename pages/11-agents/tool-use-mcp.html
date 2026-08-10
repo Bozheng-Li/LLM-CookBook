@@ -4,15 +4,28 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="模型光会说不够——它得能查、能算、能操作。工具调用是让 LLM 长出双手，MCP 是让这双手接上标准接口。这一节从底层的输出格式讲到 MCP 协议全貌，配上完整代码和实战踩坑。">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="工具调用与 MCP · 大模型技术 Cookbook">
+  <meta property="og:description" content="模型光会说不够——它得能查、能算、能操作。工具调用是让 LLM 长出双手，MCP 是让这双手接上标准接口。这一节从底层的输出格式讲到 MCP 协议全貌，配上完整代码和实战踩坑。">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/11-agents/tool-use-mcp.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/11-agents/tool-use-mcp.html">
   <title>工具调用与 MCP · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="11-agents" data-topic="tool-use-mcp">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -56,13 +69,13 @@ sequenceDiagram
           <p>理解工具调用最有效的方式，是看它怎么从原始的 prompt 工程一步步演化过来的。这个演化过程揭示了一个关键事实：<strong>Function Calling 不是新能力，而是输出约束的工程化封装</strong>。</p>
 
           <!-- ============ 论文原图：Toolformer 自主调用工具（Schick et al., 2023, Figure 1） ============ -->
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/11-agents/tool-use-mcp/fig1.png"
                  alt="论文原图：Toolformer 模型自主决定何时调用何种工具（Schick et al., 2023, Figure 1）"
                  loading="lazy" style="max-width:520px">
             <figcaption>
               <span class="pf-title">图：Toolformer 的预测示例——模型在生成过程中自主插入工具调用（搜索/计算器等），并利用返回结果继续生成</span>
-              <span class="pf-src">论文原图 · Schick et al., <em>Toolformer: Language Models Can Teach Themselves to Use Tools</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2302.04761" target="_blank" rel="noopener">arXiv:2302.04761</a></span>
+              <span class="pf-src">论文原图 · Schick et al., <em>Toolformer: Language Models Can Teach Themselves to Use Tools</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2302.04761" target="_blank" rel="noopener noreferrer">arXiv:2302.04761</a></span>
             </figcaption>
           </figure>
 
@@ -70,20 +83,7 @@ sequenceDiagram
           <p>最早的「工具调用」是这样的：你在 prompt 里告诉模型「请用 JSON 格式回答，包含 action 和 parameters 字段」，然后祈祷模型真的输出合法 JSON，再用 <code>json.loads()</code> 解析。问题一堆——模型经常在 JSON 前面加一句「好的，以下是结果：」，或者用单引号代替双引号，或者在 JSON 后面加一句解释。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  A["用户问题"] --> B["Prompt 里写<br/>'请输出 JSON'"]
-  B --> C["模型输出<br/>(可能不合法)"]
-  C --> D["正则/JSON 解析"]
-  D --> E{"解析成功?"}
-  E -->|否| F["报错/重试/降级"]
-  E -->|是| G["执行工具"]
-  G --> H["结果拼回 prompt"]
-  H --> B
-
-  style F fill:#fde8e8,stroke:#c44
-  style G fill:#e8f5e9,stroke:#4a7
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="8" data-edge-count="8" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">用户问题</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="B"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Prompt 里写</span><span>&#39;请输出 JSON&#39;</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">用户问题</span></li><li><span class="html-flow-source">结果拼回 prompt</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">模型输出</span><span>(可能不合法)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Prompt 里写 / &#39;请输出 JSON&#39;</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">正则/JSON 解析</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型输出 / (可能不合法)</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="E"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">解析成功?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">正则/JSON 解析</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">执行工具</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">解析成功?</span><span class="html-flow-condition">是</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="H"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">结果拼回 prompt</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">执行工具</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">报错/重试/降级</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">解析成功?</span><span class="html-flow-condition">否</span></li></ul></article></div></li></ol></div>
             <figcaption>阶段一：裸 prompt 方案。解析失败率高，每次失败都要重试，token 浪费严重。而且模型可能「假装」调用了工具，实际输出的参数是编的。</figcaption>
           </figure>
 
@@ -94,24 +94,7 @@ flowchart LR
           <p>OpenAI 在 2023 年 6 月推出了 Function Calling API，把上面两步封装成了一个干净的原语：<strong>你把工具定义传给 API，模型在输出中返回结构化的工具调用声明</strong>。底层实现仍然是「prompt 引导 + 约束解码」，但 API 层面给了一个标准化的契约。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  subgraph S1["阶段一:裸 prompt"]
-    A1["prompt 写'输出 JSON'"] --> A2["正则解析"] --> A3["祈祷不出错"]
-  end
-  subgraph S2["阶段二:约束解码"]
-    B1["JSON Schema 定义"] --> B2["解码时强制合法"] --> B3["格式 OK 但选错工具"]
-  end
-  subgraph S3["阶段三:Function Calling"]
-    C1["工具定义传入 API"] --> C2["模型选工具+填参数"] --> C3["返回结构化调用声明"]
-  end
-  S1 -->|"格式可靠性↑"| S2
-  S2 -->|"工具选择准确性↑"| S3
-
-  style S1 fill:#fde8e8,stroke:#c44
-  style S2 fill:#fff8e1,stroke:#e90
-  style S3 fill:#e8f5e9,stroke:#4a7
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="12" data-edge-count="8" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">阶段一:裸 prompt</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">prompt 写&#39;输出 JSON&#39;</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">阶段二:约束解码</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">JSON Schema 定义</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="C1"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">阶段三:Function Calling</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">工具定义传入 API</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="S1" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">阶段一:裸 prompt</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">阶段一:裸 prompt</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">正则解析</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">prompt 写&#39;输出 JSON&#39;</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">阶段二:约束解码</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">解码时强制合法</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">JSON Schema 定义</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="C2"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">阶段三:Function Calling</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">模型选工具+填参数</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">工具定义传入 API</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="S2" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">阶段二:约束解码</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">阶段一:裸 prompt</span><span class="html-flow-condition">格式可靠性↑</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">阶段一:裸 prompt</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">祈祷不出错</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">正则解析</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">阶段二:约束解码</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">格式 OK 但选错工具</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">解码时强制合法</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="C3"><div class="html-flow-node-meta"><span class="html-flow-index">09</span><span class="html-flow-group-label">阶段三:Function Calling</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">返回结构化调用声明</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型选工具+填参数</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="S3" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">阶段三:Function Calling</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">阶段二:约束解码</span><span class="html-flow-condition">工具选择准确性↑</span></li></ul></article></div></li></ol></div>
             <figcaption>三步演化：每一步都解决了前一步的痛点。但注意——阶段三并没有让模型获得「新能力」，它只是把阶段一和阶段二的技巧工程化了。</figcaption>
           </figure>
 
@@ -125,28 +108,7 @@ flowchart TB
           <p>每个工具在进入上下文时，携带三段信息：名称、描述、参数 Schema。这三段不是随便填的——每一段都直接影响模型选工具的准确率和参数填充的质量。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  subgraph Tool["一个完整的工具定义"]
-    direction TB
-    T1["name: 'search_documents'<br/>模型的'点名'用名"]
-    T2["description: '在知识库中搜索文档...'<br/>提示工程的主体"]
-    T3["parameters: JSON Schema<br/>参数的填表指南"]
-  end
-
-  subgraph Schema["参数 Schema 内部"]
-    direction TB
-    P1["type: object"]
-    P2["properties:<br/>  query (string, required)<br/>  limit (integer, optional)<br/>  filter (string, enum)"]
-    P3["required: ['query']"]
-  end
-
-  Tool --> Schema
-
-  style T1 fill:#e6f1fb,stroke:#185fa5
-  style T2 fill:#eaf3de,stroke:#639922
-  style T3 fill:#faeeda,stroke:#ba7517
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="8" data-edge-count="1" data-instance="2" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="T1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">一个完整的工具定义</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">name: &#39;search_documents&#39;</span><span>模型的&#39;点名&#39;用名</span></div></article><article class="html-flow-node tone-success shape-step" data-node-id="T2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">一个完整的工具定义</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">description: &#39;在知识库中搜索文档...&#39;</span><span>提示工程的主体</span></div></article><article class="html-flow-node tone-warn shape-step" data-node-id="T3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">一个完整的工具定义</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">parameters: JSON Schema</span><span>参数的填表指南</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">参数 Schema 内部</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">type: object</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">参数 Schema 内部</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">properties:</span><span>query (string, required)</span><span>limit (integer, optional)</span><span>filter (string, enum)</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">参数 Schema 内部</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">required: [&#39;query&#39;]</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Tool" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">一个完整的工具定义</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Schema" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">参数 Schema 内部</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">一个完整的工具定义</span></li></ul></article></div></li></ol></div>
             <figcaption>工具定义的三层结构。name 是「点名」用的，description 是「选不选」用的，parameters 是「怎么填」用的。</figcaption>
           </figure>
 
@@ -262,18 +224,7 @@ sequenceDiagram
           <h3>第二步：宿主解析、校验、执行</h3>
           <p>宿主程序收到工具调用声明后，做四件事：</p>
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  A["解析 JSON"] --> B["校验参数<br/>类型/必填/枚举"]
-  B --> C{"校验通过?"}
-  C -->|否| D["返回错误信息<br/>让模型重试"]
-  C -->|是| E["执行工具调用"]
-  E --> F["包装结果为<br/>tool_result"]
-  F --> G["注入对话上下文"]
-
-  style D fill:#fde8e8,stroke:#c44
-  style E fill:#e8f5e9,stroke:#4a7
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="7" data-edge-count="6" data-instance="3" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">解析 JSON</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="B"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">校验参数</span><span>类型/必填/枚举</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">解析 JSON</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">校验通过?</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">校验参数 / 类型/必填/枚举</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="D"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">返回错误信息</span><span>让模型重试</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">校验通过?</span><span class="html-flow-condition">否</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="E"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">执行工具调用</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">校验通过?</span><span class="html-flow-condition">是</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">包装结果为</span><span>tool_result</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">执行工具调用</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="G"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">注入对话上下文</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">包装结果为 / tool_result</span></li></ul></article></div></li></ol></div>
             <figcaption>宿主程序的职责：解析 → 校验 → 执行 → 注入。每一步都不能省——跳过校验就是给幻觉参数开后门。</figcaption>
           </figure>
 
@@ -345,28 +296,7 @@ print(result)</code></pre>
           <p>模型在选择工具时，本质上是<strong>在工具描述集合上做检索</strong>。当可选工具从 5 个增加到 50 个时，上下文变长，模型注意力被稀释——就像让人从 5 份简历里挑一份和从 50 份里挑一份的区别。研究表明，当工具数超过 15-20 个时，选择准确率开始显著下降。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  subgraph Few["少量工具 (1-15)"]
-    F1["所有定义塞进上下文"] --> F2["模型直接选"]
-    F2 --> F3["准确率高"]
-  end
-  subgraph Many["大量工具 (15-100+)"]
-    M1["所有定义塞进上下文"] --> M2["注意力被稀释<br/>准确率下降"]
-    M2 --> M3["需要分层路由"]
-  end
-  subgraph Huge["海量工具 (100+)"]
-    H1["向量检索预筛 Top-K"] --> H2["路由模型分组"]
-    H2 --> H3["组内精选"]
-    H3 --> H4["准确率恢复"]
-  end
-  Few -->|"工具数增长"| Many
-  Many -->|"加路由层"| Huge
-
-  style F3 fill:#e8f5e9,stroke:#4a7
-  style M2 fill:#fde8e8,stroke:#c44
-  style H4 fill:#e8f5e9,stroke:#4a7
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="13" data-edge-count="9" data-instance="4" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">少量工具 (1-15)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">所有定义塞进上下文</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">大量工具 (15-100+)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">所有定义塞进上下文</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="H1"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">海量工具 (100+)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">向量检索预筛 Top-K</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Few" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">少量工具 (1-15)</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">少量工具 (1-15)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">模型直接选</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">所有定义塞进上下文</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">大量工具 (15-100+)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">注意力被稀释</span><span>准确率下降</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">所有定义塞进上下文</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="H2"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">海量工具 (100+)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">路由模型分组</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">向量检索预筛 Top-K</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Many" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">12</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">大量工具 (15-100+)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">少量工具 (1-15)</span><span class="html-flow-condition">工具数增长</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">少量工具 (1-15)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">准确率高</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型直接选</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="M3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">大量工具 (15-100+)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">需要分层路由</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">注意力被稀释 / 准确率下降</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="H3"><div class="html-flow-node-meta"><span class="html-flow-index">09</span><span class="html-flow-group-label">海量工具 (100+)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">组内精选</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">路由模型分组</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Huge" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">13</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">海量工具 (100+)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">大量工具 (15-100+)</span><span class="html-flow-condition">加路由层</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="H4"><div class="html-flow-node-meta"><span class="html-flow-index">10</span><span class="html-flow-group-label">海量工具 (100+)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">准确率恢复</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">组内精选</span></li></ul></article></div></li></ol></div>
             <figcaption>工具数量与选择策略的关系。核心思路：不要让模型一次看到所有工具——先检索/路由缩小范围，再让模型在小组里选。</figcaption>
           </figure>
 
@@ -374,20 +304,7 @@ flowchart LR
           <p>当你有 50+ 个工具时，推荐用<strong>两步选择</strong>：第一步用一个轻量级模型（或向量检索）判断用户意图属于哪个工具组，第二步只把该组的 5-10 个工具传给主模型选择。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  U["用户: '帮我查下订单状态'"] --> R["路由模型<br/>(轻量 LLM 或分类器)"]
-  R --> RC{"意图分类"}
-  RC -->|"订单相关"| G1["订单工具组<br/>get_order<br/>cancel_order<br/>track_shipment"]
-  RC -->|"客服相关"| G2["客服工具组<br/>create_ticket<br/>check_faq"]
-  RC -->|"支付相关"| G3["支付工具组<br/>process_refund<br/>get_invoice"]
-
-  G1 --> M["主模型<br/>(只看到 3 个工具)"]
-  M --> MC["选择: get_order<br/>参数: order_id=..."]
-
-  style R fill:#e6f1fb,stroke:#185fa5
-  style M fill:#eaf3de,stroke:#639922
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="8" data-edge-count="7" data-instance="5" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="U"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">用户: &#39;帮我查下订单状态&#39;</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="R"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">路由模型</span><span>(轻量 LLM 或分类器)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">用户: &#39;帮我查下订单状态&#39;</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="RC"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">意图分类</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">路由模型 / (轻量 LLM 或分类器)</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="G1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">订单工具组</span><span>get_order</span><span>cancel_order</span><span>track_shipment</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">意图分类</span><span class="html-flow-condition">订单相关</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">客服工具组</span><span>create_ticket</span><span>check_faq</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">意图分类</span><span class="html-flow-condition">客服相关</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">支付工具组</span><span>process_refund</span><span>get_invoice</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">意图分类</span><span class="html-flow-condition">支付相关</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="M"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">主模型</span><span>(只看到 3 个工具)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">订单工具组 / get_order / cancel_order / t...</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="MC"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">选择: get_order</span><span>参数: order_id=...</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">主模型 / (只看到 3 个工具)</span></li></ul></article></div></li></ol></div>
             <figcaption>两步路由：先分类到工具组，再在组内选具体工具。主模型每次只看到 5-10 个工具，选择准确率远高于一次看 50 个。</figcaption>
           </figure>
 
@@ -404,33 +321,7 @@ flowchart TB
           <p>在没有 MCP 之前，每个应用都要为每个工具写一遍适配代码——N 个工具 × M 个应用 = N×M 段胶水。MCP（Model Context Protocol）把这个模式翻转了：工具提供方实现一次 MCP 服务端，任何支持 MCP 客户端的应用都可以直接用。N 个工具 + M 个应用 = N+M。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  subgraph Before["没有 MCP: M x N 段胶水"]
-    direction LR
-    A1["App A"] --- T1["Tool 1"]
-    A1 --- T2["Tool 2"]
-    A1 --- T3["Tool 3"]
-    A2["App B"] --- T1
-    A2 --- T2
-    A2 --- T3
-    A3["App C"] --- T1
-    A3 --- T2
-    A3 --- T3
-  end
-  subgraph After["有了 MCP: M + N"]
-    direction LR
-    B1["App A"] --- P["MCP 协议"]
-    B2["App B"] --- P
-    B3["App C"] --- P
-    P --- S1["Tool 1 Server"]
-    P --- S2["Tool 2 Server"]
-    P --- S3["Tool 3 Server"]
-  end
-
-  style Before fill:#fde8e8,stroke:#c44
-  style After fill:#e8f5e9,stroke:#4a7
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="15" data-edge-count="15" data-instance="6" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">没有 MCP: M x N 段胶水</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">App A</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="A2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">没有 MCP: M x N 段胶水</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">App B</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="A3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">没有 MCP: M x N 段胶水</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">App C</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B1"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">有了 MCP: M + N</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">App A</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B2"><div class="html-flow-node-meta"><span class="html-flow-index">09</span><span class="html-flow-group-label">有了 MCP: M + N</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">App B</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="B3"><div class="html-flow-node-meta"><span class="html-flow-index">10</span><span class="html-flow-group-label">有了 MCP: M + N</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">App C</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Before" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">14</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">没有 MCP: M x N 段胶水</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="After" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">15</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">有了 MCP: M + N</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="T1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">没有 MCP: M x N 段胶水</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Tool 1</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">App A</span></li><li><span class="html-flow-source">App B</span></li><li><span class="html-flow-source">App C</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">没有 MCP: M x N 段胶水</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Tool 2</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">App A</span></li><li><span class="html-flow-source">App B</span></li><li><span class="html-flow-source">App C</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T3"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">没有 MCP: M x N 段胶水</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Tool 3</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">App A</span></li><li><span class="html-flow-source">App B</span></li><li><span class="html-flow-source">App C</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">有了 MCP: M + N</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">MCP 协议</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">App A</span></li><li><span class="html-flow-source">App B</span></li><li><span class="html-flow-source">App C</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S1"><div class="html-flow-node-meta"><span class="html-flow-index">11</span><span class="html-flow-group-label">有了 MCP: M + N</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Tool 1 Server</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">MCP 协议</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S2"><div class="html-flow-node-meta"><span class="html-flow-index">12</span><span class="html-flow-group-label">有了 MCP: M + N</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Tool 2 Server</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">MCP 协议</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="S3"><div class="html-flow-node-meta"><span class="html-flow-index">13</span><span class="html-flow-group-label">有了 MCP: M + N</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Tool 3 Server</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">MCP 协议</span></li></ul></article></div></li></ol></div>
             <figcaption>左：没有 MCP，每个应用和每个工具之间都有一段私有适配代码。右：有了 MCP，应用实现一次客户端，工具实现一次服务端，中间走标准协议。集成成本从乘法变成加法。</figcaption>
           </figure>
 
@@ -438,36 +329,7 @@ flowchart TB
           <p>MCP 不是一个单一的协议，而是三层架构：传输层、协议层、能力层。理解这三层，你就能理解 MCP 为什么能支持从本地文件系统到远程 API 的各种工具。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  subgraph Client["MCP 客户端 (App 侧)"]
-    CL["Client Library"]
-  end
-  subgraph Server["MCP 服务端 (Tool 侧)"]
-    SL["Server Library"]
-  end
-  subgraph Transport["传输层"]
-    direction LR
-    ST1["stdio<br/>(本地进程)"]
-    ST2["HTTP+SSE<br/>(远程服务)"]
-    ST3["WebSocket<br/>(双向流)"]
-  end
-
-  CL -->|"JSON-RPC 2.0"| Transport
-  Transport --> SL
-
-  subgraph Capabilities["能力层 (服务端暴露的)"]
-    direction LR
-    C1["Tools<br/>(可执行的函数)"]
-    C2["Resources<br/>(可读取的数据)"]
-    C3["Prompts<br/>(预置的提示模板)"]
-    C4["Sampling<br/>(请求客户端<br/>代为调 LLM)"]
-  end
-  SL --> Capabilities
-
-  style Transport fill:#e6f1fb,stroke:#185fa5
-  style Capabilities fill:#eaf3de,stroke:#639922
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="11" data-edge-count="3" data-instance="7" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="CL"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">MCP 客户端 (App 侧)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Client Library</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="ST1"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">传输层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">stdio</span><span>(本地进程)</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="ST2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">传输层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HTTP+SSE</span><span>(远程服务)</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="ST3"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">传输层</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">WebSocket</span><span>(双向流)</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="C1"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">能力层 (服务端暴露的)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Tools</span><span>(可执行的函数)</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="C2"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">能力层 (服务端暴露的)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Resources</span><span>(可读取的数据)</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="C3"><div class="html-flow-node-meta"><span class="html-flow-index">09</span><span class="html-flow-group-label">能力层 (服务端暴露的)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Prompts</span><span>(预置的提示模板)</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="C4"><div class="html-flow-node-meta"><span class="html-flow-index">10</span><span class="html-flow-group-label">能力层 (服务端暴露的)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Sampling</span><span>(请求客户端</span><span>代为调 LLM)</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node is-group-node tone-info shape-step" data-node-id="Transport" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">传输层</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Client Library</span><span class="html-flow-condition">JSON-RPC 2.0</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SL"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">MCP 服务端 (Tool 侧)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Server Library</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">传输层</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node is-group-node tone-success shape-step" data-node-id="Capabilities" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">能力层 (服务端暴露的)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">Server Library</span></li></ul></article></div></li></ol></div>
             <figcaption>MCP 三层架构。传输层支持多种方式（本地 stdio、远程 HTTP），协议层用 JSON-RPC 2.0，能力层定义了服务端可以暴露的四种资源类型。</figcaption>
           </figure>
 
@@ -569,36 +431,7 @@ asyncio.run(main())</code></pre>
           <p>工具调用让模型能操作真实世界——查数据库、发邮件、写文件。这带来了安全风险：模型可能被 prompt injection 诱导调用恶意工具，或因为幻觉参数导致误操作。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart TB
-  subgraph Threats["威胁模型"]
-    direction LR
-    T1["Prompt Injection<br/>诱导调恶意工具"]
-    T2["参数幻觉<br/>编造非法参数"]
-    T3["工具返回注入<br/>工具结果含恶意指令"]
-    T4["权限提升<br/>工具做了不该做的事"]
-  end
-  subgraph Defenses["防御措施"]
-    direction LR
-    D1["参数校验 + 白名单"]
-    D2["沙箱执行<br/>隔离副作用"]
-    D3["人工确认<br/>高危操作需审批"]
-    D4["速率限制<br/>防止滥用"]
-    D5["结果清洗<br/>工具返回不直接<br/>当指令执行"]
-  end
-
-  Threats --> Defenses
-
-  style T1 fill:#fde8e8,stroke:#c44
-  style T2 fill:#fde8e8,stroke:#c44
-  style T3 fill:#fde8e8,stroke:#c44
-  style T4 fill:#fde8e8,stroke:#c44
-  style D1 fill:#e8f5e9,stroke:#4a7
-  style D2 fill:#e8f5e9,stroke:#4a7
-  style D3 fill:#e8f5e9,stroke:#4a7
-  style D4 fill:#e8f5e9,stroke:#4a7
-  style D5 fill:#e8f5e9,stroke:#4a7
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="11" data-edge-count="1" data-instance="8" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="T1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">威胁模型</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Prompt Injection</span><span>诱导调恶意工具</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">威胁模型</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">参数幻觉</span><span>编造非法参数</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">威胁模型</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">工具返回注入</span><span>工具结果含恶意指令</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="T4"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">威胁模型</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">权限提升</span><span>工具做了不该做的事</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D1"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">防御措施</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">参数校验 + 白名单</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D2"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">防御措施</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">沙箱执行</span><span>隔离副作用</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D3"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">防御措施</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">人工确认</span><span>高危操作需审批</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D4"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">防御措施</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">速率限制</span><span>防止滥用</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D5"><div class="html-flow-node-meta"><span class="html-flow-index">09</span><span class="html-flow-group-label">防御措施</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">结果清洗</span><span>工具返回不直接</span><span>当指令执行</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Threats" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">威胁模型</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Defenses" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">防御措施</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">威胁模型</span></li></ul></article></div></li></ol></div>
             <figcaption>工具调用的四类威胁与五层防御。最危险的威胁是「工具返回注入」——工具返回的结果里包含恶意指令，模型把它当正常指令执行了。</figcaption>
           </figure>
 
@@ -687,22 +520,7 @@ flowchart TB
           <p>新版 API 支持模型在一次回复里返回多个 tool_call——它们之间如果没有依赖关系，可以并行执行以减少延迟。但如果有依赖（第二个调用的参数依赖第一个的结果），必须串行。判断依赖关系是宿主的责任，不是模型的。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  subgraph Serial["串行 (有依赖)"]
-    direction TB
-    S1["调用 weather_lookup"] --> S2["得到 temp=32"]
-    S2 --> S3["调用 send_reminder<br/>(参数依赖 temp)"]
-  end
-  subgraph Parallel["并行 (无依赖)"]
-    direction TB
-    P1["调用 weather_lookup"] --> P3["合并结果"]
-    P2["调用 get_calendar"] --> P3
-  end
-
-  style Serial fill:#fff8e1,stroke:#e90
-  style Parallel fill:#e8f5e9,stroke:#4a7
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="8" data-edge-count="4" data-instance="9" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">串行 (有依赖)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">调用 weather_lookup</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">并行 (无依赖)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">调用 weather_lookup</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P2"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">并行 (无依赖)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">调用 get_calendar</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Serial" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">串行 (有依赖)</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="Parallel" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">并行 (无依赖)</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">串行 (有依赖)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">得到 temp=32</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">调用 weather_lookup</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P3"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">并行 (无依赖)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">合并结果</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">调用 weather_lookup</span></li><li><span class="html-flow-source">调用 get_calendar</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">串行 (有依赖)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">调用 send_reminder</span><span>(参数依赖 temp)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">得到 temp=32</span></li></ul></article></div></li></ol></div>
             <figcaption>串行 vs 并行工具调用。串行用于有依赖的调用链，并行用于无依赖的独立查询。并行可以把 N 次调用的延迟从 N×T 降到 max(T)。</figcaption>
           </figure>
 
@@ -741,11 +559,11 @@ flowchart LR
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>Model Context Protocol 官方规范 — MCP 完整协议，含传输层、能力层、生命周期管理，实现 MCP 服务端时必读 · <a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">modelcontextprotocol.io</a></li>
-            <li>OpenAI Function Calling 官方文档 — 提供 API 的完整参数定义和调用示例 · <a href="https://platform.openai.com/docs/guides/function-calling" target="_blank" rel="noopener">platform.openai.com</a></li>
-            <li>Anthropic Tool Use 官方文档 — Claude 的工具调用实现，与 OpenAI 有细微差异（如 tool_use/tool_result 消息格式） · <a href="https://docs.anthropic.com/en/docs/build-with-claude/tool-use" target="_blank" rel="noopener">docs.anthropic.com</a></li>
-            <li>MCP Python SDK（GitHub）— 官方 Python 实现，服务端与客户端开发示例 · <a href="https://github.com/modelcontextprotocol/python-sdk" target="_blank" rel="noopener">github.com/modelcontextprotocol</a></li>
-            <li>LangChain Tool Calling 文档 — 主流 Agent 框架中工具调用的工程封装 · <a href="https://python.langchain.com/docs/how_to/tool_calling/" target="_blank" rel="noopener">python.langchain.com</a></li>
+            <li>Model Context Protocol 官方规范 — MCP 完整协议，含传输层、能力层、生命周期管理，实现 MCP 服务端时必读 · <a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener noreferrer">modelcontextprotocol.io</a></li>
+            <li>OpenAI Function Calling 官方文档 — 提供 API 的完整参数定义和调用示例 · <a href="https://platform.openai.com/docs/guides/function-calling" target="_blank" rel="noopener noreferrer">platform.openai.com</a></li>
+            <li>Anthropic Tool Use 官方文档 — Claude 的工具调用实现，与 OpenAI 有细微差异（如 tool_use/tool_result 消息格式） · <a href="https://docs.anthropic.com/en/docs/build-with-claude/tool-use" target="_blank" rel="noopener noreferrer">docs.anthropic.com</a></li>
+            <li>MCP Python SDK（GitHub）— 官方 Python 实现，服务端与客户端开发示例 · <a href="https://github.com/modelcontextprotocol/python-sdk" target="_blank" rel="noopener noreferrer">github.com/modelcontextprotocol</a></li>
+            <li>LangChain Tool Calling 文档 — 主流 Agent 框架中工具调用的工程封装 · <a href="https://python.langchain.com/docs/how_to/tool_calling/" target="_blank" rel="noopener noreferrer">python.langchain.com</a></li>
           </ul>
 
           <div class="callout">
@@ -753,6 +571,8 @@ flowchart LR
             工具调用是 Agent 的核心能力之一——接上工具后，模型从「回答器」升级为「执行器」。但光有工具还不够——Agent 还需要<strong>规划</strong>（把复杂任务拆成步骤）和<strong>反思</strong>（执行后评估结果、调整策略）。看 <a href="agent.html">Agent 基础范式</a>，了解怎么把工具调用、规划和反思组成一个完整的自治系统。工具调用的安全问题详见 <a href="agent-safety.html">Agent 安全</a>，多 Agent 协作时的工具共享详见 <a href="multi-agent.html">多智能体协作</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“工具调用与 MCP”继续深入</h2></div></div><p class="rd-summary">本章把 Agent 看成一个带工具的闭环系统：模型负责决策，工具改变环境，反馈驱动下一步；记忆、规划、协作和安全共同决定可靠性。</p><p class="rd-takeaway"><strong>阅读提示：</strong>Agent 的核心不是“让模型多想几步”，而是设计可观察、可中止、可验证的行动循环。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Yao et al. · ICLR 2023</span></div><a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener noreferrer">ReAct: Synergizing Reasoning and Acting ↗</a><p class="rd-note">最常用的思考–行动–观察循环之一，适合作为工具型 Agent 的最小抽象。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Schick et al. · 2023</span></div><a href="https://arxiv.org/abs/2302.04761" target="_blank" rel="noopener noreferrer">Toolformer: Language Models Can Teach Themselves to Use Tools ↗</a><p class="rd-note">展示模型如何学习何时调用 API 以及如何把工具结果纳入上下文。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">协议规范</span><span class="rd-source">MCP Steering Group</span></div><a href="https://modelcontextprotocol.io/specification/2025-06-18" target="_blank" rel="noopener noreferrer">Model Context Protocol Specification ↗</a><p class="rd-note">工具、资源和提示的开放协议规范，适合核对 MCP 客户端/服务端边界和安全责任。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Yang et al. · 2024</span></div><a href="https://arxiv.org/abs/2405.15793" target="_blank" rel="noopener noreferrer">SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering ↗</a><p class="rd-note">以代码仓库任务说明工具接口、上下文组织和执行反馈如何影响 Agent 成功率。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Xie et al. · 2024</span></div><a href="https://arxiv.org/abs/2404.07972" target="_blank" rel="noopener noreferrer">OSWorld: Benchmarking Multimodal Agents for Open-Ended Tasks ↗</a><p class="rd-note">桌面环境中的长链任务评测，帮助理解 Computer Use 的状态、动作和可复现性问题。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="topic" aria-labelledby="technical-deepening-title"><div class="td-kicker">主题级技术深化</div><h2 id="technical-deepening-title">围绕“工具调用与 MCP”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>工具调用从手写 function schema 发展到 Toolformer 数据构造、模型原生调用和 MCP 协议化发现，协议统一不等于安全自动成立。</p></article><article><h3>机制抓手</h3><p>工具契约至少包含名称、参数 schema、权限、超时、幂等性、错误码和结果大小；调用前后都要检查提示注入和副作用。</p></article><article><h3>工程权衡</h3><p>自动发现降低接入成本却扩大攻击面；强 schema 提高可验证性，却可能限制复杂工具的表达。</p></article><article><h3>前沿观察</h3><p>MCP 资源/提示/工具边界、代理间通信和沙箱执行正在快速演进，版本与权限必须显式记录。</p></article></div><div class="td-check"><strong>实践检查</strong><span>为一个有写操作的工具设计 allowlist、审批点、重试规则和审计事件，并验证重复提交不会产生二次副作用。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener noreferrer">ReAct ↗</a><a href="https://arxiv.org/abs/2302.04761" target="_blank" rel="noopener noreferrer">Toolformer ↗</a><a href="https://arxiv.org/abs/2404.07972" target="_blank" rel="noopener noreferrer">OSWorld ↗</a></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -763,10 +583,10 @@ flowchart LR
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

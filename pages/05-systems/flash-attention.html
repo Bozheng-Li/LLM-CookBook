@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="注意力机制在数学上早已明确，但在真实硬件上，标准实现会把一个 N×N 的中间矩阵反复读写 HBM，白白浪费带宽。FlashAttention 不是改了注意力的&quot;算法&quot;，而是改了&quot;怎么算&quot;——它让 softmax 在 SRAM 里完成，把 IO 复杂度从 O(N²) 降到 O(N²d/M)。这一改，让几乎所有大">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="FlashAttention 与 IO 感知注意力 · 大模型技术 Cookbook">
+  <meta property="og:description" content="注意力机制在数学上早已明确，但在真实硬件上，标准实现会把一个 N×N 的中间矩阵反复读写 HBM，白白浪费带宽。FlashAttention 不是改了注意力的&quot;算法&quot;，而是改了&quot;怎么算&quot;——它让 softmax 在 SRAM 里完成，把 IO 复杂度从 O(N²) 降到 O(N²d/M)。这一改，让几乎所有大">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/05-systems/flash-attention.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/05-systems/flash-attention.html">
   <title>FlashAttention 与 IO 感知注意力 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="05-systems" data-topic="flash-attention">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -34,27 +47,7 @@
             <div class="card-title">一图看懂</div>
             <p>标准 Attention 把 $N \times N$ 的注意力矩阵 $S = QK^\top$ 和 softmax 归一化后的 $P$ 全部写到 HBM 再读回来。FlashAttention 把 Q、K、V 分成小块（tile），每块加载到 SRAM 后直接算完 softmax 再输出——<strong>中间结果 $S$ 和 $P$ 从不落盘 HBM</strong>。代价是反向传播时需要重计算（recomputation），但这比读写 HBM 快得多。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart TB
-  subgraph Standard["标准 Attention"]
-    S1["HBM → SRAM: Q, K, V 块"] --> S2["SRAM: 算 S=QK^T"]
-    S2 --> S3["HBM ← 写回 S (N×N)"]
-    S3 --> S4["HBM → SRAM: 读回 S"]
-    S4 --> S5["SRAM: softmax → P"]
-    S5 --> S6["HBM ← 写回 P (N×N)"]
-    S6 --> S7["HBM → SRAM: 读回 P, V"]
-    S7 --> S8["SRAM: O=PV"]
-    S8 --> S9["HBM ← 写回 O"]
-  end
-  subgraph Flash["FlashAttention"]
-    F1["HBM → SRAM: Q 块, K 块, V 块"] --> F2["SRAM: S=QK^T<br/>online softmax<br/>O=PV"]
-    F2 --> F3["HBM ← 只写最终 O"]
-  end
-  style S3 fill:#fde8e8,stroke:#c44
-  style S6 fill:#fde8e8,stroke:#c44
-  style S7 fill:#fde8e8,stroke:#c44
-  style F2 fill:#e8f5e9,stroke:#4a4
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="12" data-edge-count="10" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">标准 Attention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM → SRAM: Q, K, V 块</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F1"><div class="html-flow-node-meta"><span class="html-flow-index">10</span><span class="html-flow-group-label">FlashAttention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM → SRAM: Q 块, K 块, V 块</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">标准 Attention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SRAM: 算 S=QK^T</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">HBM → SRAM: Q, K, V 块</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F2"><div class="html-flow-node-meta"><span class="html-flow-index">11</span><span class="html-flow-group-label">FlashAttention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SRAM: S=QK^T</span><span>online softmax</span><span>O=PV</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">HBM → SRAM: Q 块, K 块, V 块</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">标准 Attention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM ← 写回 S (N×N)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">SRAM: 算 S=QK^T</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F3"><div class="html-flow-node-meta"><span class="html-flow-index">12</span><span class="html-flow-group-label">FlashAttention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM ← 只写最终 O</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">SRAM: S=QK^T / online softmax / O=PV</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S4"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">标准 Attention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM → SRAM: 读回 S</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">HBM ← 写回 S (N×N)</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S5"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">标准 Attention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SRAM: softmax → P</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">HBM → SRAM: 读回 S</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S6"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">标准 Attention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM ← 写回 P (N×N)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">SRAM: softmax → P</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">07</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S7"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">标准 Attention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM → SRAM: 读回 P, V</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">HBM ← 写回 P (N×N)</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">08</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S8"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">标准 Attention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">SRAM: O=PV</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">HBM → SRAM: 读回 P, V</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">09</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="S9"><div class="html-flow-node-meta"><span class="html-flow-index">09</span><span class="html-flow-group-label">标准 Attention</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">HBM ← 写回 O</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">SRAM: O=PV</span></li></ul></article></div></li></ol></div>
               <figcaption>标准实现（上）反复读写 N×N 中间矩阵到 HBM；FlashAttention（下）在 SRAM 内完成全部计算，只读写最终结果</figcaption>
             </figure>
           </div>
@@ -129,11 +122,11 @@ sequenceDiagram
             <figcaption>FlashAttention 前向与反向的数据流：中间矩阵 S 和 P 始终不离开 SRAM</figcaption>
           </figure>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/05-systems/flash-attention/fig1.png" alt="论文原图：FlashAttention 的分块（tiling）示意——Q、K、V 切块后在 SRAM 内完成注意力计算" loading="lazy" style="max-width:480px">
             <figcaption>
               <span class="pf-title">图：FlashAttention 分块（tiling）——将 Q、K、V 切成小块逐块处理，中间矩阵不落 HBM</span>
-              <span class="pf-src">论文原图 · Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></span>
+              <span class="pf-src">论文原图 · Dao et al., <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>, 2022, Figure 1 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">arXiv:2205.14135</a></span>
             </figcaption>
           </figure>
 
@@ -234,29 +227,7 @@ timeline
 
           <h3>优化维度全景（mindmap）</h3>
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-mindmap
-  root((FlashAttention))
-    分块 tiling
-      SRAM 内完成计算
-      块大小适配 M
-      避免 N 平方落盘
-    online softmax
-      增量更新 m
-      增量更新 l
-      无需整行
-    重计算
-      前向不存 P
-      反向重算 S P
-      算力换带宽
-    异步 Hopper
-      TMA 异步搬运
-      warp specialization
-      计算访存重叠
-    低精度
-      FP8 E4M3
-      误差可控
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：FlashAttention" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>FlashAttention</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>分块 tiling</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">SRAM 内完成计算</span></li><li><span class="html-mindmap-leaf">块大小适配 M</span></li><li><span class="html-mindmap-leaf">避免 N 平方落盘</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>online softmax</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">增量更新 m</span></li><li><span class="html-mindmap-leaf">增量更新 l</span></li><li><span class="html-mindmap-leaf">无需整行</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>重计算</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">前向不存 P</span></li><li><span class="html-mindmap-leaf">反向重算 S P</span></li><li><span class="html-mindmap-leaf">算力换带宽</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>异步 Hopper</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">TMA 异步搬运</span></li><li><span class="html-mindmap-leaf">warp specialization</span></li><li><span class="html-mindmap-leaf">计算访存重叠</span></li></ul></section><section class="html-mindmap-branch tone-5" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">05</span><strong>低精度</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">FP8 E4M3</span></li><li><span class="html-mindmap-leaf">误差可控</span></li></ul></section></div></div>
             <figcaption>FlashAttention 的几条优化主线：分块、online softmax、重计算、Hopper 异步、低精度</figcaption>
           </figure>
 
@@ -499,11 +470,11 @@ pie title 标准注意力前向耗时占比 示意
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (2022) — FlashAttention-1 原始论文，提出分块 + online softmax + 重计算 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a></li>
-            <li>Dao, "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (2023) — FA2 的改进：减少非 matmul 运算、序列维度并行 · <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">arXiv:2307.08691</a></li>
-            <li>Shah et al., "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision" (2024) — FA3：Hopper 架构的 warp specialization + TMA + FP8 · <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener">arXiv:2407.08608</a></li>
-            <li>Dao et al., "Monarch Mixer" 与 FlashAttention 工程实现讨论（GitHub：Dao-AILab/flash-attention）— 实际 kernel 实现、回退条件与 benchmark 说明 · <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">GitHub 仓库</a></li>
-            <li>PyTorch 官方文档 "Scaled Dot Product Attention" — SDPA 后端选择、<code>sdpa_kernel</code> 强制后端与可用后端枚举的权威说明 · <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">PyTorch Docs</a></li>
+            <li>Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (2022) — FlashAttention-1 原始论文，提出分块 + online softmax + 重计算 · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">arXiv:2205.14135</a></li>
+            <li>Dao, "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (2023) — FA2 的改进：减少非 matmul 运算、序列维度并行 · <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener noreferrer">arXiv:2307.08691</a></li>
+            <li>Shah et al., "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision" (2024) — FA3：Hopper 架构的 warp specialization + TMA + FP8 · <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener noreferrer">arXiv:2407.08608</a></li>
+            <li>Dao et al., "Monarch Mixer" 与 FlashAttention 工程实现讨论（GitHub：Dao-AILab/flash-attention）— 实际 kernel 实现、回退条件与 benchmark 说明 · <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener noreferrer">GitHub 仓库</a></li>
+            <li>PyTorch 官方文档 "Scaled Dot Product Attention" — SDPA 后端选择、<code>sdpa_kernel</code> 强制后端与可用后端枚举的权威说明 · <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener noreferrer">PyTorch Docs</a></li>
           </ul>
 
           <div class="callout">
@@ -511,6 +482,8 @@ pie title 标准注意力前向耗时占比 示意
             想亲手实现 FlashAttention kernel，跳转 <a href="triton-kernel.html">Triton Kernel 与编译优化</a>，或直接看 <a href="../15-practice/build-flashattention.html">实战：手写 FlashAttention Kernel</a>。想理解为什么大模型训练需要这么多卡，回顾 <a href="compute-budget.html">FLOP 与显存核算</a>；想了解它在长序列推理里的搭档，读 <a href="../04-modern-arch/kv-cache.html">KV Cache</a> 与 <a href="../09-efficiency/inference-engines.html">推理引擎</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“FlashAttention 与 IO 感知注意力”继续深入</h2></div></div><p class="rd-summary">本章把模型公式连接到真实硬件：GPU 的执行和内存层级、FLOP 与带宽核算、FlashAttention 的 IO 优化，以及 Triton kernel 的工程方法。</p><p class="rd-takeaway"><strong>阅读提示：</strong>性能问题先判断是算力受限还是访存受限，再用 profiler 和小规模 benchmark 验证；不要把峰值 FLOP 当成实际吞吐。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Dao et al. · NeurIPS 2022</span></div><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">FlashAttention: Fast and Memory-Efficient Exact Attention ↗</a><p class="rd-note">分块、online softmax 和重计算的原始论文，完整解释“IO 感知”为什么能在不近似的情况下加速。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">NVIDIA</span></div><a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener noreferrer">CUDA C++ Programming Guide ↗</a><p class="rd-note">warp、线程块、共享内存、全局内存和同步语义的权威参考，核对 GPU 章节中的硬件事实。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方指南</span><span class="rd-source">NVIDIA</span></div><a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/" target="_blank" rel="noopener noreferrer">CUDA C++ Best Practices Guide ↗</a><p class="rd-note">合并访存、occupancy、bank conflict 和性能分析的工程清单，适合配合 profiler 使用。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方教程</span><span class="rd-source">OpenAI Triton</span></div><a href="https://triton-lang.org/main/getting-started/tutorials/" target="_blank" rel="noopener noreferrer">Triton Tutorials ↗</a><p class="rd-note">从向量加法、矩阵乘法到融合 kernel 的渐进式教程，是实战页面的直接延伸。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Williams et al. · CACM 2009</span></div><a href="https://doi.org/10.1145/1498765.1498785" target="_blank" rel="noopener noreferrer">Roofline: An Insightful Visual Performance Model ↗</a><p class="rd-note">用算术强度把计算瓶颈和带宽瓶颈放在同一张图上，是性能剖析的经典框架。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“FlashAttention 与 IO 感知注意力”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>系统优化从 GPU 层次结构、Roofline 和通信原语出发，逐步发展到 FlashAttention、算子融合、编译器和端到端 profiling。</p></article><article><h3>机制抓手</h3><p>先判断瓶颈属于计算、HBM/SRAM 访问、kernel 启动还是跨卡通信，再选择 tile、融合、重计算、并行或布局优化。</p></article><article><h3>工程权衡</h3><p>理论 FLOP、峰值带宽和实际吞吐常常不同；任何优化都必须同时报告精度、形状覆盖、显存和回退路径。</p></article><article><h3>前沿观察</h3><p>FP8、异步执行、编译期融合、推理/训练解耦和新一代互联正在改变系统边界，基准应固定硬件、batch、长度和版本。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能够用 profiler 找到一个端到端热点，并解释优化前后算术强度、显存流量和延迟变化。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener noreferrer">FlashAttention-2 ↗</a><a href="https://triton-lang.org/main/getting-started/tutorials/" target="_blank" rel="noopener noreferrer">Triton tutorials ↗</a><a href="https://crd.lbl.gov/divisions/computer-science/par/research/roofline/" target="_blank" rel="noopener noreferrer">Roofline model ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能推导 Online Softmax 的分块合并公式，并用 HBM 读写量解释 FlashAttention 的收益来自 IO 而非近似计算。</p></article><article><h3>先修关系</h3><p>先修矩阵乘法、Transformer 前向过程和 GPU 的线程/显存层级；实验需固定硬件与 batch。</p></article><article><h3>最小实验</h3><p>用 PyTorch 实现朴素 attention 与分块 Online Softmax，测试 seq=64/256/1024、head_dim=64；固定 warmup 和重复次数，比较输出、峰值显存和延迟。</p></article><article><h3>验收标准</h3><p>FP32 输出最大绝对误差小于 1e-5，且不实例化完整 NxN 分数矩阵；报告硬件、dtype、tile、P50 延迟与峰值显存，不以单次计时下结论。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -521,11 +494,16 @@ pie title 标准注意力前向耗时占比 示意
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+  <script src="../../assets/vendor/chartjs/chart.umd.js"></script>
+
+
+
+
+
   <script src="../../assets/js/render.js"></script>
   <script>
   (function () {

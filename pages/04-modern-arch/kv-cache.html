@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="自回归生成每出一个 token，都要把前面所有 token 的 K 和 V 重算一遍——而它们明明一模一样。KV Cache 把这笔冤枉账省掉，但也带来了新的问题：当一篇长文写完，缓存占的显存比模型权重本身还大。怎么存、怎么管、怎么复用，就是这一节要解决的问题。">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="KV Cache 原理与优化 · 大模型技术 Cookbook">
+  <meta property="og:description" content="自回归生成每出一个 token，都要把前面所有 token 的 K 和 V 重算一遍——而它们明明一模一样。KV Cache 把这笔冤枉账省掉，但也带来了新的问题：当一篇长文写完，缓存占的显存比模型权重本身还大。怎么存、怎么管、怎么复用，就是这一节要解决的问题。">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/04-modern-arch/kv-cache.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/04-modern-arch/kv-cache.html">
   <title>KV Cache 原理与优化 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="04-modern-arch" data-topic="kv-cache">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -29,15 +42,7 @@
             <div class="card-title">一图看懂</div>
             <p>自回归生成分为两段：<strong>prefill</strong> 一次性算出整条 prompt 的 K/V 并存起来，<strong>decode</strong> 每次只算新 token 的 K/V 并追加进缓存，注意力只对缓存里的 K/V 做一次增量查询。省掉的是 $O(n^2)$ 逐 token 的重复重算。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart LR
-  PRE["Prompt Token"] --> PF["Prefill 阶段<br/>一次性算出所有 K/V<br/>存入 Cache"]
-  PF --> CACHE["KV Cache<br/>〈K₁,V₁〉〈K₂,V₂〉...〈Kₙ,Vₙ〉"]
-  CACHE --> DEC1["Decode Step 1<br/>只算新 token 的<br/>Q,K,V | 旧 K/V 直接用"]
-  DEC1 --> DEC2["Decode Step 2<br/>只算新 token 的<br/>Q,K,V | 旧 K/V 直接用"]
-  DEC2 --> DECD["……"]
-  DECD --> DECN["逐 token 生成<br/>直到 EOS"]
-              </div>
+              <div class="html-flowchart is-linear" data-diagram="flowchart-html" data-direction="LR" data-node-count="7" data-edge-count="6" data-instance="0" role="group" aria-label="HTML 流程图"><ol class="html-flow-linear"><li><article class="html-flow-node tone-neutral shape-step" data-node-id="PRE"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Prompt Token</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="PF"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Prefill 阶段</span><span>一次性算出所有 K/V</span><span>存入 Cache</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="CACHE"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">KV Cache</span><span>〈K₁,V₁〉〈K₂,V₂〉...〈Kₙ,Vₙ〉</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="DEC1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Decode Step 1</span><span>只算新 token 的</span><span>Q,K,V | 旧 K/V 直接用</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="DEC2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">Decode Step 2</span><span>只算新 token 的</span><span>Q,K,V | 旧 K/V 直接用</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="DECD"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">……</span></div></article><div class="html-flow-connector"></div></li><li><article class="html-flow-node tone-neutral shape-step" data-node-id="DECN"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">逐 token 生成</span><span>直到 EOS</span></div></article></li></ol></div>
               <figcaption>Prefill 灌满缓存，Decode 增量更新。每一步只产生一组新的 K/V 并追加。</figcaption>
             </figure>
           </div>
@@ -126,10 +131,10 @@ flowchart LR
           <p><strong>一条 128K 的请求，KV Cache（16 GB）已经和模型权重本身（16 GB）一样大了。</strong>这还只是 Llama-3-8B，换成 70B 模型，权重 140 GB，KV Cache 按比例涨到上百 GB。而且这是 $H_{kv}=8$（GQA）的版本——如果换成同等规模的纯 MHA 模型（$H_{kv}=H_Q$），上面的数字要再乘以 4 到 8。</p>
 
           <p>下图把这个"指数级膨胀"画出来：随着上下文从 4K 拉到 256K，单个 8B 级 GQA 请求的 KV Cache 从半 GB 涨到 32 GB 量级。一旦并发或多轮叠加，显存很快被吃满。</p>
-          <div class="figure" style="text-align:center;max-width:640px;margin:12px auto">
+          <figure class="figure" style="text-align:center;max-width:640px;margin:12px auto">
             <canvas id="kvGrowChart" height="240"></canvas>
             <figcaption>Llama-3-8B 单请求 KV Cache 显存随上下文长度增长（BF16，GQA $H_{kv}=8$，示意值）</figcaption>
-          </div>
+          </figure>
 
           <div class="callout warn">
             <span class="callout-t">这张表在说什么</span>
@@ -172,11 +177,11 @@ flowchart LR
           </ul>
           <p>PagedAttention 的洞见直接把操作系统里"虚拟内存分页"那套搬了过来：</p>
 
-          <figure class="paper-figure">
-            <img src="https://ar5iv.labs.arxiv.org/html/2309.06180/assets/x2.png" alt="论文原图：PagedAttention 论文 Figure 1——左侧是 13B 模型在 A100 上服务时的显存布局（灰色权重常驻、红色 KV Cache 随请求分配），右侧是 vLLM 平滑 KV Cache 增长曲线带来吞吐提升" loading="lazy" style="max-width:560px">
+          <figure class="paper-figure image-figure source-figure">
+            <img src="../../assets/figures/external/6d5c17a5bd09.png" alt="论文原图：PagedAttention 论文 Figure 1——左侧是 13B 模型在 A100 上服务时的显存布局（灰色权重常驻、红色 KV Cache 随请求分配），右侧是 vLLM 平滑 KV Cache 增长曲线带来吞吐提升" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：LLM 服务时的显存全景——左图灰色是常驻的模型权重，红色是按请求动态分配/释放的 KV Cache，黄色是临时激活；右图对比 vLLM 与既有系统在 KV Cache 增长上的差异</span>
-              <span class="pf-src">论文原图 · Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a> · 外链图来自 arXiv HTML 渲染（ar5iv）</span>
+              <span class="pf-src">论文原图 · Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>, 2023, Figure 1 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">arXiv:2309.06180</a> · 外链图来自 arXiv HTML 渲染（ar5iv）</span>
             </figcaption>
           </figure>
 
@@ -184,11 +189,11 @@ flowchart LR
 
           <p>再看同一篇论文的 Figure 3，它把碎片化拆成了三种可量化的「浪费」，比「瑞士奶酪」这种比喻更精确：<strong>预留浪费</strong>（reserved）——请求按最大可能长度预留空间，实际没用到那么多；<strong>内部碎片</strong>（internal fragmentation）——分配单元里用不满的边角料；<strong>外部碎片</strong>（external fragmentation）——显存里零散的洞凑不出一个连续大块。PagedAttention 按固定大小的页分配，让后两种碎片只发生在「一页」的粒度上，外部碎片从「放不下整个请求」降级成「最多浪费半页」。这也是为什么把图 1 和图 3 放一起读，能一次看懂 vLLM 的价值。</p>
 
-          <figure class="paper-figure">
-            <img src="https://ar5iv.labs.arxiv.org/html/2309.06180/assets/x4.png" alt="论文原图：PagedAttention 论文 Figure 3——三种显存浪费（预留、内部碎片、外部碎片）示意" loading="lazy" style="max-width:560px">
+          <figure class="paper-figure image-figure source-figure">
+            <img src="../../assets/figures/external/b7980cbac1ed.png" alt="论文原图：PagedAttention 论文 Figure 3——三种显存浪费（预留、内部碎片、外部碎片）示意" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：KV Cache 的三种显存浪费——预留空间、内部碎片、外部碎片，PagedAttention 把碎片粒度从「整个请求」缩小到「一页」</span>
-              <span class="pf-src">论文原图 · Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>, 2023, Figure 3 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a> · 外链图来自 arXiv HTML 渲染（ar5iv）</span>
+              <span class="pf-src">论文原图 · Kwon et al., <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>, 2023, Figure 3 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">arXiv:2309.06180</a> · 外链图来自 arXiv HTML 渲染（ar5iv）</span>
             </figcaption>
           </figure>
 
@@ -206,26 +211,7 @@ flowchart LR
           </div>
 
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-flowchart LR
-  subgraph REQ["逻辑序列 (请求视角)"]
-    P1["token 1-16"]
-    P2["token 17-32"]
-    P3["token 33-48"]
-  end
-  subgraph MEM["物理显存 (实际存储)"]
-    F1["空闲"]
-    F2["页 A = 请求1/token 1-16"]
-    F3["页 B = 请求2/token 1-16"]
-    F4["空闲"]
-    F5["页 C = 请求1/token 17-32"]
-    F6["页 D = 请求1/token 33-48"]
-    F7["空闲"]
-  end
-  P1 -.页表映射.-> F2
-  P2 -.页表映射.-> F5
-  P3 -.页表映射.-> F6
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="10" data-edge-count="3" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="P1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">逻辑序列 (请求视角)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">token 1-16</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P2"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">逻辑序列 (请求视角)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">token 17-32</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P3"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">逻辑序列 (请求视角)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">token 33-48</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F1"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">物理显存 (实际存储)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">空闲</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F3"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">物理显存 (实际存储)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">页 B = 请求2/token 1-16</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F4"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">物理显存 (实际存储)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">空闲</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F7"><div class="html-flow-node-meta"><span class="html-flow-index">10</span><span class="html-flow-group-label">物理显存 (实际存储)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">空闲</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F2"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">物理显存 (实际存储)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">页 A = 请求1/token 1-16</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">token 1-16</span><span class="html-flow-condition">页表映射</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F5"><div class="html-flow-node-meta"><span class="html-flow-index">08</span><span class="html-flow-group-label">物理显存 (实际存储)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">页 C = 请求1/token 17-32</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">token 17-32</span><span class="html-flow-condition">页表映射</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F6"><div class="html-flow-node-meta"><span class="html-flow-index">09</span><span class="html-flow-group-label">物理显存 (实际存储)</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">页 D = 请求1/token 33-48</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">token 33-48</span><span class="html-flow-condition">页表映射</span></li></ul></article></div></li></ol></div>
             <figcaption>逻辑上连续的 KV Cache 序列通过页表映射到物理显存中分散的页面块</figcaption>
           </figure>
 
@@ -300,16 +286,10 @@ def match_prefix(tree, tokens):
           <p>RadixAttention 把"前缀共享"做成了数据结构：用一个<strong>基数树（Radix Tree）</strong>维护所有活跃请求的 KV Cache。树的一条边对应一段连续 token 的 KV 页面，从根到叶子的路径就是一条完整的 KV 序列。</p>
 
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-flowchart TB
-  ROOT["ROOT"] --> SYS["System Prompt<br/>〈K/V token 0-500〉<br/>所有请求共享"]
-  SYS --> Q1["用户问题 A<br/>〈K/V token 501-600〉"]
-  SYS --> Q2["用户问题 B<br/>〈K/V token 501-620〉"]
-  SYS --> Q3["用户问题 C<br/>〈K/V token 501-580〉"]
-  Q1 -.各自生成的回答<br/>互不共享.-> A1["回答 Token"]
-  Q2 -.各自生成的回答<br/>互不共享.-> A2["回答 Token"]
-  Q3 -.各自生成的回答<br/>互不共享.-> A3["回答 Token"]
-              </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="8" data-edge-count="7" data-instance="2" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="ROOT"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">共享前缀根节点</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="SYS"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">System Prompt</span><span>〈K/V token 0-500〉</span><span>所有请求共享</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">共享前缀根节点</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">用户问题 A</span><span>〈K/V token 501-600〉</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">System Prompt / 〈K/V token 0-500〉 / ...</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Q2"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">用户问题 B</span><span>〈K/V token 501-620〉</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">System Prompt / 〈K/V token 0-500〉 / ...</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Q3"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">用户问题 C</span><span>〈K/V token 501-580〉</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">System Prompt / 〈K/V token 0-500〉 / ...</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A1"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">回答 Token</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">用户问题 A / 〈K/V token 501-600〉</span><span class="html-flow-condition">各自生成的回答
+互不共享</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="A2"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">回答 Token</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">用户问题 B / 〈K/V token 501-620〉</span><span class="html-flow-condition">各自生成的回答
+互不共享</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="A3"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">回答 Token</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li data-kind="feedback"><span class="html-flow-source">用户问题 C / 〈K/V token 501-580〉</span><span class="html-flow-condition">各自生成的回答
+互不共享</span></li></ul></article></div></li></ol></div>
             <figcaption>Radix Tree：System Prompt 的 KV 只存一份，100 个请求都从同一棵子树分叉。只有分叉之后的内容各自存储。</figcaption>
           </figure>
 
@@ -421,30 +401,7 @@ stateDiagram-v2
           <p>KV Cache 相关的优化在过去两年爆炸式增长，容易看得眼花。按"动了公式里的哪个因子"来归类，其实非常清晰：</p>
 
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-mindmap
-  root(("KV Cache 优化"))
-    减少头数
-      MQA 全共享
-      GQA 分组共享
-      MLA 低秩潜在压缩
-    降低精度
-      FP8 KV
-      INT8 分组量化
-      INT4 K按通道 V按token
-    减少 token 数
-      StreamingLLM 汇聚点加窗口
-      H2O 重击者保留
-      跨层共享 KV
-    改进存储管理
-      PagedAttention 分页
-      RadixAttention 前缀树
-      写时复制共享
-    换个地方放
-      卸载到 CPU 内存
-      卸载到 NVMe
-      PD 分离跨节点传输
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：KV Cache 优化" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>KV Cache 优化</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>减少头数</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">MQA 全共享</span></li><li><span class="html-mindmap-leaf">GQA 分组共享</span></li><li><span class="html-mindmap-leaf">MLA 低秩潜在压缩</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>降低精度</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">FP8 KV</span></li><li><span class="html-mindmap-leaf">INT8 分组量化</span></li><li><span class="html-mindmap-leaf">INT4 K按通道 V按token</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>减少 token 数</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">StreamingLLM 汇聚点加窗口</span></li><li><span class="html-mindmap-leaf">H2O 重击者保留</span></li><li><span class="html-mindmap-leaf">跨层共享 KV</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>改进存储管理</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">PagedAttention 分页</span></li><li><span class="html-mindmap-leaf">RadixAttention 前缀树</span></li><li><span class="html-mindmap-leaf">写时复制共享</span></li></ul></section><section class="html-mindmap-branch tone-5" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">05</span><strong>换个地方放</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">卸载到 CPU 内存</span></li><li><span class="html-mindmap-leaf">卸载到 NVMe</span></li><li><span class="html-mindmap-leaf">PD 分离跨节点传输</span></li></ul></section></div></div>
             <figcaption>KV Cache 优化手段的分类地图：前三类改变缓存本身的大小，后两类改变缓存的存放与管理方式</figcaption>
           </figure>
 
@@ -504,14 +461,14 @@ mindmap
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention — PagedAttention 原始论文，把虚拟内存分页引入 KV Cache 管理 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a></li>
-            <li>SGLang: A Language for Structured Generation of Language Models — 提出 RadixAttention 前缀树共享 · <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">arXiv:2312.07104</a></li>
-            <li>Orca: A Distributed Serving System for Transformer-Based Generative Models — 迭代级调度与连续批处理，PagedAttention 的前驱思想 · <a href="https://arxiv.org/abs/2205.05178" target="_blank" rel="noopener">arXiv:2205.05178</a></li>
-            <li>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints — 提出分组查询注意力，并给出从 MHA 检查点转换的方法 · <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">arXiv:2305.13245</a></li>
-            <li>Efficient Streaming Language Models with Attention Sinks（StreamingLLM）— 发现注意力汇聚点现象，用固定大小缓存支持无限长流式生成 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453</a></li>
-            <li>H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models — 基于累积注意力得分的动态 KV 驱逐策略 · <a href="https://arxiv.org/abs/2306.14048" target="_blank" rel="noopener">arXiv:2306.14048</a></li>
-            <li>KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache — K 按通道、V 按 token 的非对称量化方案 · <a href="https://arxiv.org/abs/2402.02750" target="_blank" rel="noopener">arXiv:2402.02750</a></li>
-            <li>vLLM 官方文档 — PagedAttention 与连续批处理的工程实现与配置参数 · <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">docs.vllm.ai</a></li>
+            <li>vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention — PagedAttention 原始论文，把虚拟内存分页引入 KV Cache 管理 · <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">arXiv:2309.06180</a></li>
+            <li>SGLang: A Language for Structured Generation of Language Models — 提出 RadixAttention 前缀树共享 · <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener noreferrer">arXiv:2312.07104</a></li>
+            <li>Orca: A Distributed Serving System for Transformer-Based Generative Models — 迭代级调度与连续批处理，PagedAttention 的前驱思想 · <a href="https://arxiv.org/abs/2205.05178" target="_blank" rel="noopener noreferrer">arXiv:2205.05178</a></li>
+            <li>GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints — 提出分组查询注意力，并给出从 MHA 检查点转换的方法 · <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener noreferrer">arXiv:2305.13245</a></li>
+            <li>Efficient Streaming Language Models with Attention Sinks（StreamingLLM）— 发现注意力汇聚点现象，用固定大小缓存支持无限长流式生成 · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener noreferrer">arXiv:2309.17453</a></li>
+            <li>H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models — 基于累积注意力得分的动态 KV 驱逐策略 · <a href="https://arxiv.org/abs/2306.14048" target="_blank" rel="noopener noreferrer">arXiv:2306.14048</a></li>
+            <li>KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache — K 按通道、V 按 token 的非对称量化方案 · <a href="https://arxiv.org/abs/2402.02750" target="_blank" rel="noopener noreferrer">arXiv:2402.02750</a></li>
+            <li>vLLM 官方文档 — PagedAttention 与连续批处理的工程实现与配置参数 · <a href="https://docs.vllm.ai/" target="_blank" rel="noopener noreferrer">docs.vllm.ai</a></li>
           </ul>
 
           <div class="callout">
@@ -519,6 +476,8 @@ mindmap
             本节覆盖的是 KV Cache 的<strong>机制和单机优化</strong>。当上下文长到单卡真的放不下时，需要把 KV Cache 的一部分卸载到 CPU 内存——见 <a href="../09-efficiency/kv-offload.html">KV Cache 分级卸载</a>。大规模部署时，缓存的管理和调度也需要专门的分离架构——见 <a href="../09-efficiency/pd-disaggregation.html">Prefill-Decode 分离部署</a>。高效实现方面，PagedAttention 的实际核函数实现与 <a href="../05-systems/flash-attention.html">FlashAttention</a> 共享底层的分块 + 在线 Softmax 技术，推理引擎落地则见 <a href="../09-efficiency/inference-engines.html">推理引擎概览</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“KV Cache 原理与优化”继续深入</h2></div></div><p class="rd-summary">本章关注 Transformer 之后的架构选择：稀疏专家、线性/状态空间模型、长上下文、多模态和扩散语言模型。重点是理解每种方法改变了哪一层约束。</p><p class="rd-takeaway"><strong>阅读提示：</strong>比较新架构时同时看训练目标、权重兼容性、推理状态和硬件实现；只看理论复杂度很容易得出错误结论。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Fedus, Zoph &amp; Shazeer · 2021</span></div><a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener noreferrer">Switch Transformers: Scaling to Trillion Parameter Models ↗</a><p class="rd-note">MoE 路由、容量因子和负载均衡的经典介绍，适合建立稀疏激活的共同语言。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Gu &amp; Dao · 2023</span></div><a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener noreferrer">Mamba: Linear-Time Sequence Modeling with Selective State Spaces ↗</a><p class="rd-note">选择性状态空间模型的代表作，解释线性扫描、选择机制和长序列效率之间的关系。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Ainslie et al. · 2023</span></div><a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener noreferrer">GQA: Training Generalized Multi-Query Transformer Models ↗</a><p class="rd-note">用较少 KV 头降低推理带宽和缓存开销，是理解 MQA/GQA 工程取舍的直接来源。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Dosovitskiy et al. · 2020</span></div><a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener noreferrer">An Image is Worth 16x16 Words ↗</a><p class="rd-note">ViT 将图像 patch 化并交给 Transformer，帮助理解多模态视觉编码器的基本范式。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Nie et al. · 2025</span></div><a href="https://arxiv.org/abs/2502.09992" target="_blank" rel="noopener noreferrer">Large Language Diffusion Models ↗</a><p class="rd-note">以 LLaDA 为代表的扩散语言模型工作，适合和自回归模型对照并识别当前研究边界。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="topic" aria-labelledby="technical-deepening-title"><div class="td-kicker">主题级技术深化</div><h2 id="technical-deepening-title">围绕“KV Cache 原理与优化”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>KV Cache 消除 decode 阶段重复 K/V 计算；PagedAttention 切块管理，prefix caching 与 disaggregation 将缓存变成可调度资源。</p></article><article><h3>机制抓手</h3><p>缓存显存约为 2*layers*tokens*kv_heads*head_dim*bytes；GQA/MQA 通过减少 kv_heads 降低占用。</p></article><article><h3>工程权衡</h3><p>共享缓存提高吞吐却引入匹配、租户隔离和失效策略；offload 节省显存但把瓶颈移到 PCIe/NVLink。</p></article><article><h3>前沿观察</h3><p>RadixAttention、KV 量化、选择性缓存和 Prefill/Decode 分离正在优化长上下文服务，需同时报告 TTFT、TPOT 和尾延迟。</p></article></div><div class="td-check"><strong>实践检查</strong><span>为 32 层、8 KV heads、128K context、BF16 模型估算缓存显存，并设计超限时的驱逐策略。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener noreferrer">Switch Transformers ↗</a><a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener noreferrer">Mamba ↗</a><a href="https://arxiv.org/abs/2502.09992" target="_blank" rel="noopener noreferrer">LLaDA ↗</a></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -529,11 +488,16 @@ mindmap
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+  <script src="../../assets/vendor/chartjs/chart.umd.js"></script>
+
+
+
+
+
   <script src="../../assets/js/render.js"></script>
   <script>
     window.addEventListener('load', function () {

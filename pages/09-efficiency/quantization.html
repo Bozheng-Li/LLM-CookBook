@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="7B 模型 FP16 权重约 14GB，INT4 量化后不到 4GB——同样的模型、同样的参数，显存直接砍掉四分之三。量化是 LLM 部署最常用的压缩手段，但「掉点」和「硬件支持」是两道绕不开的坎。本节讲清楚 PTQ/QAT 的分工、GPTQ/AWQ 的差异、1.58bit 的极限在哪里，以及为什么剪枝这条路">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="量化、剪枝与模型压缩 · 大模型技术 Cookbook">
+  <meta property="og:description" content="7B 模型 FP16 权重约 14GB，INT4 量化后不到 4GB——同样的模型、同样的参数，显存直接砍掉四分之三。量化是 LLM 部署最常用的压缩手段，但「掉点」和「硬件支持」是两道绕不开的坎。本节讲清楚 PTQ/QAT 的分工、GPTQ/AWQ 的差异、1.58bit 的极限在哪里，以及为什么剪枝这条路">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/09-efficiency/quantization.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/09-efficiency/quantization.html">
   <title>量化、剪枝与模型压缩 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="09-efficiency" data-topic="quantization">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -29,27 +42,8 @@
             <div class="card-title">一图看懂</div>
                        <p>量化的本质是把高精度浮点数（FP16/BF16）映射到低精度整数（INT8/INT4），用更少的 bit 存同样的信息。就像把 1080p 图片压成 720p——大部分细节还在，文件小了一大截，但极端情况下会糊。<strong>训练后量化（PTQ）</strong>不改训练流程、一条命令就能跑，是部署首选；<strong>量化感知训练（QAT）</strong>在训练时模拟量化误差，精度更好但要重新训练。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart TB
-  subgraph FP["FP16 原始模型<br/>7B ≈ 14GB"]
-    F1["权重: float16<br/>每参数 2 字节"]
-  end
-  subgraph PTQ["训练后量化 PTQ"]
-    P1["校准数据集<br/>~128-512 条样本"] --> P2["统计激活分布<br/>确定缩放因子"]
-    P2 --> P3["权重 → INT4/INT8"]
-  end
-  subgraph QAT["量化感知训练 QAT"]
-    Q1["插入伪量化节点"] --> Q2["继续训练微调"] --> Q3["权重 → INT4/INT8"]
-  end
-  FP --> PTQ
-  FP --> QAT
-  PTQ --> OUT["量化模型<br/>7B INT4 ≈ 3.5GB"]
-  QAT --> OUT
-  style FP fill:#e8f0fe,stroke:#185fa5
-  style OUT fill:#e8f5e9,stroke:#2e7d32
-  style PTQ fill:#fff3e0,stroke:#e65100
-  style QAT fill:#fce4ec,stroke:#c62828
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="11" data-edge-count="8" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">FP16 原始模型
+7B ≈ 14GB</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">权重: float16</span><span>每参数 2 字节</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="P1"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">训练后量化 PTQ</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">校准数据集</span><span>~128-512 条样本</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Q1"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">量化感知训练 QAT</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">插入伪量化节点</span></div></article><article class="html-flow-node is-group-node tone-info shape-step" data-node-id="FP" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">FP16 原始模型 / 7B ≈ 14GB</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="P2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">训练后量化 PTQ</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">统计激活分布</span><span>确定缩放因子</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">校准数据集 / ~128-512 条样本</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Q2"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">量化感知训练 QAT</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">继续训练微调</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">插入伪量化节点</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="PTQ" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">训练后量化 PTQ</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FP16 原始模型 / 7B ≈ 14GB</span></li></ul></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="QAT" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">10</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">量化感知训练 QAT</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">FP16 原始模型 / 7B ≈ 14GB</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="P3"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">训练后量化 PTQ</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">权重 → INT4/INT8</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">统计激活分布 / 确定缩放因子</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="Q3"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">量化感知训练 QAT</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">权重 → INT4/INT8</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">继续训练微调</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="OUT"><div class="html-flow-node-meta"><span class="html-flow-index">11</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">量化模型</span><span>7B INT4 ≈ 3.5GB</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">训练后量化 PTQ</span></li><li><span class="html-flow-source">量化感知训练 QAT</span></li></ul></article></div></li></ol></div>
               <figcaption>两条量化路径：PTQ 无需训练、开箱即用；QAT 精度更高但需重新训练</figcaption>
             </figure>
           </div>
@@ -108,16 +102,7 @@ flowchart TB
           <p>实践中 90% 的部署场景用 PTQ 就够了。QAT 主要用在两个地方：一是要把模型压到 INT4 以下（如 3bit、2bit）且 PTQ 掉点太严重时；二是像 BitNet 那样从头用低精度训练的「原生量化」模型，权重在训练时就是三值（-1, 0, 1），不存在「量化后掉点」的问题。</p>
 
           <figure class="figure">
-            <div class="mermaid">
-flowchart LR
-  A["校准数据集<br/>128-512 条样本"] --> B["前向推理<br/>收集激活分布"]
-  B --> C["确定缩放因子 s<br/>per-channel / per-group"]
-  C --> D["权重映射到 INT4<br/>round(x/s)"]
-  D --> E["构造量化模型"]
-  E --> F["反量化验证<br/>在评测集上查精度回退"]
-  F -->|"掉点可接受"| G["部署"]
-  F -->|"掉点过大"| H["换 AWQ/GPTQ<br/>或上 QAT"]
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="8" data-edge-count="7" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">校准数据集</span><span>128-512 条样本</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="B"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">前向推理</span><span>收集激活分布</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">校准数据集 / 128-512 条样本</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">确定缩放因子 s</span><span>per-channel / per-group</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">前向推理 / 收集激活分布</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="D"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">权重映射到 INT4</span><span>round(x/s)</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">确定缩放因子 s / per-channel / per-group</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="E"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">构造量化模型</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">权重映射到 INT4 / round(x/s)</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="F"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">反量化验证</span><span>在评测集上查精度回退</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">构造量化模型</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">07</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="G"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">部署</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">反量化验证 / 在评测集上查精度回退</span><span class="html-flow-condition">掉点可接受</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="H"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">换 AWQ/GPTQ</span><span>或上 QAT</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">反量化验证 / 在评测集上查精度回退</span><span class="html-flow-condition">掉点过大</span></li></ul></article></div></li></ol></div>
             <figcaption>PTQ 校准流程：用少量样本确定缩放因子，把权重压到 INT4，再验证精度回退是否在可接受范围</figcaption>
           </figure>
 
@@ -133,11 +118,11 @@ flowchart LR
 
           <p>光看公式容易晕，下面这张 GPTQ 论文里的原图把整个量化流程画了出来。它是理解「为什么 GPTQ 比朴素量化准」的最直接证据——注意看图中那些<strong>从已量化列伸向未量化列的箭头</strong>：误差不是被忽略，而是被主动「推」给了后面的权重。</p>
 
-          <figure class="paper-figure">
+          <figure class="paper-figure image-figure">
             <img src="../../assets/figures/09-efficiency/quantization/fig1.png" alt="论文原图：GPTQ 逐层量化流程——先一次性量化当前列，再利用 Hessian 信息把量化误差补偿到剩余权重上" loading="lazy" style="max-width:560px">
             <figcaption>
               <span class="pf-title">图：GPTQ 的量化流程——逐列量化 + 基于 Hessian 的二阶误差补偿，把量化误差分摊到尚未量化的权重上</span>
-              <span class="pf-src">论文原图 · Frantar et al., <em>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</em>, 2022, Figure 2 · <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">arXiv:2210.17323</a></span>
+              <span class="pf-src">论文原图 · Frantar et al., <em>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</em>, 2022, Figure 2 · <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener noreferrer">arXiv:2210.17323</a></span>
             </figcaption>
           </figure>
 
@@ -148,20 +133,7 @@ flowchart LR
           <p>AWQ（Activation-aware Weight Quantization）的观察更直觉：不是所有权重都同等重要，那些被大激活值乘到的权重，量化误差会被放大。AWQ 通过校准数据找到这些「显著权重」（salient channels），对它们做等价缩放保护，而不需要做反向传播。</p>
 
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-flowchart LR
-  subgraph AWQ["AWQ 量化流程"]
-    A["校准数据<br/>前向推理"] --> B["识别显著通道<br/>激活值大的位置"]
-    B --> C["等价缩放<br/>保护重要权重"]
-    C --> D["INT4 量化<br/>不重要的正常量化"]
-  end
-  subgraph GPTQ["GPTQ 量化流程"]
-    E["校准数据<br/>算 Hessian"] --> F["逐列量化<br/>二阶补偿"]
-    F --> G["更新剩余权重<br/>抵消误差"]
-  end
-  style AWQ fill:#e8f5e9,stroke:#2e7d32
-  style GPTQ fill:#e8f0fe,stroke:#185fa5
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="9" data-edge-count="5" data-instance="2" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">AWQ 量化流程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">校准数据</span><span>前向推理</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="E"><div class="html-flow-node-meta"><span class="html-flow-index">05</span><span class="html-flow-group-label">GPTQ 量化流程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">校准数据</span><span>算 Hessian</span></div></article><article class="html-flow-node is-group-node tone-neutral shape-step" data-node-id="AWQ" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">AWQ 量化流程</span></div></article><article class="html-flow-node is-group-node tone-info shape-step" data-node-id="GPTQ" data-group-node="true"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">GPTQ 量化流程</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="B"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">AWQ 量化流程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">识别显著通道</span><span>激活值大的位置</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">校准数据 / 前向推理</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="F"><div class="html-flow-node-meta"><span class="html-flow-index">06</span><span class="html-flow-group-label">GPTQ 量化流程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">逐列量化</span><span>二阶补偿</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">校准数据 / 算 Hessian</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">AWQ 量化流程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">等价缩放</span><span>保护重要权重</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">识别显著通道 / 激活值大的位置</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="G"><div class="html-flow-node-meta"><span class="html-flow-index">07</span><span class="html-flow-group-label">GPTQ 量化流程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">更新剩余权重</span><span>抵消误差</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">逐列量化 / 二阶补偿</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="D"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">AWQ 量化流程</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">INT4 量化</span><span>不重要的正常量化</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">等价缩放 / 保护重要权重</span></li></ul></article></div></li></ol></div>
             <figcaption>AWQ 靠激活感知保护重要权重，GPTQ 靠二阶补偿逐列纠错</figcaption>
           </figure>
 
@@ -169,24 +141,7 @@ flowchart LR
           <p>把本节涉及的压缩手段放进一张图里，能看清它们的位置与关系——量化是主线，剪枝和蒸馏是旁支，BitNet 是另一条极端的训练范式路线：</p>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root((模型压缩))
-    量化 Quantization
-      PTQ
-      QAT
-      GPTQ
-      AWQ
-      KV 量化
-    极限压缩
-      BitNet 1.58bit
-    剪枝 Pruning
-      结构化剪枝
-      非结构化剪枝
-    蒸馏 Distillation
-      响应蒸馏
-      思维链蒸馏
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：模型压缩" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>模型压缩</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>量化 Quantization</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">PTQ</span></li><li><span class="html-mindmap-leaf">QAT</span></li><li><span class="html-mindmap-leaf">GPTQ</span></li><li><span class="html-mindmap-leaf">AWQ</span></li><li><span class="html-mindmap-leaf">KV 量化</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>极限压缩</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">BitNet 1.58bit</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>剪枝 Pruning</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">结构化剪枝</span></li><li><span class="html-mindmap-leaf">非结构化剪枝</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>蒸馏 Distillation</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">响应蒸馏</span></li><li><span class="html-mindmap-leaf">思维链蒸馏</span></li></ul></section></div></div>
             <figcaption>模型压缩方法全景：量化是 LLM 部署主线，剪枝与蒸馏为旁支，BitNet 是训练范式层面的极端路线</figcaption>
           </figure>
 
@@ -257,18 +212,7 @@ vllm serve --model Qwen/Qwen2.5-7B-Instruct-AWQ \
           <p>剪枝（Pruning）在 CNN 时代是经典压缩手段——去掉不重要的连接，让模型变稀疏，理论上可以大幅减少计算量。但在 LLM 时代，这条路基本没跑通。原因有三层：</p>
 
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-flowchart TB
-  subgraph WHY["剪枝在 LLM 上失效的三重困境"]
-    W1["精度掉点<br/>LLM 参数高度耦合<br/>剪掉任何一部分都会连锁影响"] --> R["剪枝路线<br/>在 LLM 上搁置"]
-    W2["恢复训练成本高<br/>剪枝后需要大量重新训练<br/>成本不亚于从头训"] --> R
-    W3["硬件加速缺位<br/>非结构化稀疏 GPU 不加速<br/>2:4 稀疏只加速矩阵乘<br/>不覆盖注意力与 FFN 全链路"] --> R
-  end
-  style W1 fill:#fce4ec,stroke:#c62828
-  style W2 fill:#fff3e0,stroke:#e65100
-  style W3 fill:#e3f2fd,stroke:#1565c0
-  style R fill:#f5f5f5,stroke:#999
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="TB" data-node-count="4" data-edge-count="3" data-instance="3" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="W1"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">剪枝在 LLM 上失效的三重困境</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">精度掉点</span><span>LLM 参数高度耦合</span><span>剪掉任何一部分都会连锁影响</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="W2"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">剪枝在 LLM 上失效的三重困境</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">恢复训练成本高</span><span>剪枝后需要大量重新训练</span><span>成本不亚于从头训</span></div></article><article class="html-flow-node tone-neutral shape-step" data-node-id="W3"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">剪枝在 LLM 上失效的三重困境</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">硬件加速缺位</span><span>非结构化稀疏 GPU 不加速</span><span>2:4 稀疏只加速矩阵乘</span><span>不覆盖注意力与 FFN 全链路</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="R"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">剪枝在 LLM 上失效的三重困境</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">剪枝路线</span><span>在 LLM 上搁置</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">精度掉点 / LLM 参数高度耦合 / 剪掉任何一部分都会连锁影响</span></li><li><span class="html-flow-source">恢复训练成本高 / 剪枝后需要大量重新训练 / 成本不亚于从头训</span></li><li><span class="html-flow-source">硬件加速缺位 / 非结构化稀疏 GPU 不加速 / 2:4 稀疏只加速矩...</span></li></ul></article></div></li></ol></div>
             <figcaption>剪枝在 LLM 上面临精度、恢复成本、硬件加速三重困境</figcaption>
           </figure>
 
@@ -408,14 +352,14 @@ def dequantize(q, scale, group_size=128):
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers — 逐层二阶补偿量化，本页论文原图来源 · <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">arXiv:2210.17323</a></li>
-            <li>AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration — 激活感知的权重保护 · <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">arXiv:2306.00978</a></li>
-            <li>BitNet: Scaling 1-bit Transformers for Large Language Models — 1.58bit 原生低精度训练 · <a href="https://arxiv.org/abs/2310.11453" target="_blank" rel="noopener">arXiv:2310.11453</a></li>
-            <li>SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models — 激活平滑的 INT8 量化 · <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">arXiv:2211.10438</a></li>
-            <li>LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale — 不掉点的 INT8 推理 · <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">arXiv:2208.07339</a></li>
-            <li>NVIDIA 2:4 Structured Sparsity 文档 — 硬件支持的稀疏格式说明 · <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-load-instruction-using-sparse-matrix" target="_blank" rel="noopener">NVIDIA PTX 文档</a></li>
-            <li>AutoGPTQ 官方仓库 — GPTQ 量化与推理的主流实现 · <a href="https://github.com/AutoGPTQ/AutoGPTQ" target="_blank" rel="noopener">github.com/AutoGPTQ/AutoGPTQ</a></li>
-            <li>llama.cpp 官方仓库 — GGUF 量化格式与 llama.cpp 生态的起点 · <a href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noopener">github.com/ggml-org/llama.cpp</a></li>
+            <li>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers — 逐层二阶补偿量化，本页论文原图来源 · <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener noreferrer">arXiv:2210.17323</a></li>
+            <li>AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration — 激活感知的权重保护 · <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener noreferrer">arXiv:2306.00978</a></li>
+            <li>BitNet: Scaling 1-bit Transformers for Large Language Models — 1.58bit 原生低精度训练 · <a href="https://arxiv.org/abs/2310.11453" target="_blank" rel="noopener noreferrer">arXiv:2310.11453</a></li>
+            <li>SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models — 激活平滑的 INT8 量化 · <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener noreferrer">arXiv:2211.10438</a></li>
+            <li>LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale — 不掉点的 INT8 推理 · <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener noreferrer">arXiv:2208.07339</a></li>
+            <li>NVIDIA 2:4 Structured Sparsity 文档 — 硬件支持的稀疏格式说明 · <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-load-instruction-using-sparse-matrix" target="_blank" rel="noopener noreferrer">NVIDIA PTX 文档</a></li>
+            <li>AutoGPTQ 官方仓库 — GPTQ 量化与推理的主流实现 · <a href="https://github.com/AutoGPTQ/AutoGPTQ" target="_blank" rel="noopener noreferrer">github.com/AutoGPTQ/AutoGPTQ</a></li>
+            <li>llama.cpp 官方仓库 — GGUF 量化格式与 llama.cpp 生态的起点 · <a href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noopener noreferrer">github.com/ggml-org/llama.cpp</a></li>
           </ul>
 
           <div class="callout">
@@ -423,6 +367,8 @@ def dequantize(q, scale, group_size=128):
             量化解决了「模型怎么变小」的问题，但「模型怎么跑得快」是另一回事——推理引擎的连续批处理和 KV Cache 调度才是吞吐的关键，见 <a href="inference-engines.html">推理引擎</a>。服务化部署的 SLO 设计和成本三角见 <a href="serving-cost.html">服务化与推理经济学</a>。压缩的另一条路——换小模型继承大模型能力——见 <a href="../07-posttraining/distillation.html">知识蒸馏与能力迁移</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“量化、剪枝与模型压缩”继续深入</h2></div></div><p class="rd-summary">本章从模型压缩、KV Cache、推理引擎、投机解码和端侧部署几个角度回答同一个问题：怎样以更少显存和更低延迟提供可接受的能力。</p><p class="rd-takeaway"><strong>阅读提示：</strong>先定义服务约束（质量、TTFT、吞吐、显存和成本），再选量化、批处理、缓存或硬件方案，避免只比较单一速度数字。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Frantar et al. · 2022</span></div><a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener noreferrer">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers ↗</a><p class="rd-note">基于近似二阶信息的后训练量化代表作，解释 4-bit 权重量化的误差补偿。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Lin et al. · MLSys 2024</span></div><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener noreferrer">AWQ: Activation-aware Weight Quantization ↗</a><p class="rd-note">保护激活显著权重的量化方法，适合比较 GPTQ、AWQ 与不同推理后端。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Xiao et al. · 2022</span></div><a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener noreferrer">SmoothQuant: Accurate and Efficient Post-Training Quantization ↗</a><p class="rd-note">将量化难度从激活迁移到权重，为 W8A8 推理提供工程路径。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">vLLM Project · UC Berkeley 起源</span></div><a href="https://docs.vllm.ai/en/latest/" target="_blank" rel="noopener noreferrer">vLLM Documentation ↗</a><p class="rd-note">连续批处理、PagedAttention、量化和 OpenAI-compatible server 的实践入口。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Sheng et al. · 2023</span></div><a href="https://arxiv.org/abs/2303.06865" target="_blank" rel="noopener noreferrer">FlexGen: High-Throughput Generative Inference of Large Language Models ↗</a><p class="rd-note">在 GPU、CPU 和磁盘之间进行 offload 的系统设计，适合理解端侧与低显存部署。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="topic" aria-labelledby="technical-deepening-title"><div class="td-kicker">主题级技术深化</div><h2 id="technical-deepening-title">围绕“量化、剪枝与模型压缩”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>量化从 GPTQ/AWQ 的权重后训练量化，发展到 SmoothQuant、KV quant、FP8/FP4 和量化感知训练。</p></article><article><h3>机制抓手</h3><p>分别量化权重、激活和 KV；校准集决定 scale，异常通道会导致误差集中，per-channel/group-wise 颗粒度影响 kernel 效率。</p></article><article><h3>工程权衡</h3><p>更低 bit 减少显存和带宽，却可能损害长上下文、稀有 token 和推理模型的细粒度概率；端到端吞吐不只由 bit 数决定。</p></article><article><h3>前沿观察</h3><p>W4A8、FP4 tensor core、动态激活量化和 KV 压缩快速发展，应同时报告 perplexity、任务准确率和实际 tokens/s。</p></article></div><div class="td-check"><strong>实践检查</strong><span>对同一模型比较 FP16、W8A8、W4A16 的误差、显存、首 token 延迟和长上下文退化。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener noreferrer">vLLM / PagedAttention ↗</a><a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener noreferrer">SmoothQuant ↗</a><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener noreferrer">AWQ ↗</a></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -433,11 +379,14 @@ def dequantize(q, scale, group_size=128):
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+
+
+
+
   <script src="../../assets/js/render.js"></script>
 </body>
 </html>

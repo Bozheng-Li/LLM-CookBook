@@ -4,16 +4,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="../../assets/favicon.svg" type="image/svg+xml">
+  <meta name="description" content="「训一个 70B 模型要多少张卡、跑多少天？」——如果你答不上来，就还没准备好训模型。这一节教你用手算回答这个问题：从参数量到训练 FLOP，从显存占用到通信量，再到 Roofline 分析和 MFU。全程只用小学算术和几个记得住的常数，把「大概要花多少钱」变成一个可推导的工程问题。">
+  <meta name="robots" content="index,follow">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="大模型技术 Cookbook">
+  <meta property="og:title" content="FLOP、显存核算与性能剖析 · 大模型技术 Cookbook">
+  <meta property="og:description" content="「训一个 70B 模型要多少张卡、跑多少天？」——如果你答不上来，就还没准备好训模型。这一节教你用手算回答这个问题：从参数量到训练 FLOP，从显存占用到通信量，再到 Roofline 分析和 MFU。全程只用小学算术和几个记得住的常数，把「大概要花多少钱」变成一个可推导的工程问题。">
+  <meta property="og:url" content="https://bozheng-li.github.io/LLM-CookBook/pages/05-systems/compute-budget.html">
+  <meta property="og:locale" content="zh_CN">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://bozheng-li.github.io/LLM-CookBook/pages/05-systems/compute-budget.html">
   <title>FLOP、显存核算与性能剖析 · 大模型技术 Cookbook</title>
   <link rel="stylesheet" href="../../assets/css/theme.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-  <link id="hljs-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+  <link rel="stylesheet" href="../../assets/vendor/katex/katex.min.css">
+  <link id="hljs-theme" rel="stylesheet" href="../../assets/vendor/highlight/github.min.css" data-light-href="../../assets/vendor/highlight/github.min.css" data-dark-href="../../assets/vendor/highlight/github-dark.min.css">
+
 </head>
 <body data-part="05-systems" data-topic="compute-budget">
+  <a class="skip-link" href="#main-content">跳到正文</a>
   <header id="topbar"></header>
   <div class="layout">
     <nav id="sidebar"></nav>
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       <div class="with-toc">
         <div class="container">
           <div id="breadcrumb"></div>
@@ -29,22 +42,7 @@
             <div class="card-title">一图看懂</div>
             <p>做训练预算就是回答三个问题：<strong>算多少</strong>（总 FLOP）、<strong>存多少</strong>（显存占用）、<strong>跑多快</strong>（MFU 和通信）。把这三个数算清楚，「几张卡跑几天」就是一道除法题。整条链路上只需要记住四个常数：<strong>训练 6PD、推理 2P、Adam 16 字节/参数、MFU 约 40%</strong>。</p>
             <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-              <div class="mermaid">
-flowchart LR
-  A["模型配置<br/>层数 / 维度 / 头数"] --> B["参数量 P"]
-  B --> C["训练 FLOP<br/>约 6 × P × D"]
-  B --> D["显存占用<br/>权重+梯度+优化器+激活"]
-  C --> E{"单卡算力 × MFU"}
-  D --> F{"放得下吗"}
-  E --> G["训练时间<br/>= FLOP ÷ 卡数 ÷ 算力 ÷ MFU"]
-  F -->|"放不下"| H["并行策略<br/>TP / PP / ZeRO"]
-  F -->|"放得下"| G
-  H --> G
-  G --> I["卡数 × 天数<br/>= GPU 小时数 = 钱"]
-  style G fill:#eaf3de,stroke:#639922
-  style F fill:#faeeda,stroke:#ba7517
-  style I fill:#e6f1fb,stroke:#185fa5
-              </div>
+              <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="9" data-edge-count="10" data-instance="0" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="A"><div class="html-flow-node-meta"><span class="html-flow-index">01</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">模型配置</span><span>层数 / 维度 / 头数</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="B"><div class="html-flow-node-meta"><span class="html-flow-index">02</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">参数量 P</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">模型配置 / 层数 / 维度 / 头数</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="C"><div class="html-flow-node-meta"><span class="html-flow-index">03</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">训练 FLOP</span><span>约 6 × P × D</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">参数量 P</span></li></ul></article><article class="html-flow-node tone-neutral shape-step" data-node-id="D"><div class="html-flow-node-meta"><span class="html-flow-index">04</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">显存占用</span><span>权重+梯度+优化器+激活</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">参数量 P</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">04</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-decision" data-node-id="E"><div class="html-flow-node-meta"><span class="html-flow-index">05</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">单卡算力 × MFU</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">训练 FLOP / 约 6 × P × D</span></li></ul></article><article class="html-flow-node tone-warn shape-decision" data-node-id="F"><div class="html-flow-node-meta"><span class="html-flow-index">06</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">放得下吗</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">显存占用 / 权重+梯度+优化器+激活</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">05</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="H"><div class="html-flow-node-meta"><span class="html-flow-index">08</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">并行策略</span><span>TP / PP / ZeRO</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">放得下吗</span><span class="html-flow-condition">放不下</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">06</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="G"><div class="html-flow-node-meta"><span class="html-flow-index">07</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">训练时间</span><span>= FLOP ÷ 卡数 ÷ 算力 ÷ MFU</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">单卡算力 × MFU</span></li><li><span class="html-flow-source">放得下吗</span><span class="html-flow-condition">放得下</span></li><li><span class="html-flow-source">并行策略 / TP / PP / ZeRO</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">07</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-info shape-step" data-node-id="I"><div class="html-flow-node-meta"><span class="html-flow-index">09</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">卡数 × 天数</span><span>= GPU 小时数 = 钱</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">训练时间 / = FLOP ÷ 卡数 ÷ 算力 ÷ MFU</span></li></ul></article></div></li></ol></div>
               <figcaption>训练预算的核心计算链：从模型配置推出参数量，再到 FLOP 和显存需求，最终落到 GPU 小时数。每一环都是可手算的。</figcaption>
             </figure>
           </div>
@@ -233,18 +231,7 @@ pie showData
           <h2>Roofline 分析：算力墙还是带宽墙</h2>
           <p>知道了总算力需求，还需要知道<strong>瓶颈在哪</strong>。Roofline 模型是最直观的分析工具——它把算力和带宽统一到一个坐标系里。</p>
           <figure class="figure" style="background:transparent;border:none;padding:8px 0 0">
-            <div class="mermaid">
-flowchart LR
-  subgraph Roof["Roofline 模型的两段"]
-    direction TB
-    X["横轴: 算术强度 FLOP/Byte"] --> R["拐点<br/>= 峰值算力 ÷ 峰值带宽"]
-    L["左段: 带宽受限<br/>可达算力 = 强度 × 带宽<br/>斜线上升"] --> R
-    R --> H["右段: 算力受限<br/>可达算力 = 峰值算力<br/>水平封顶"]
-  end
-  style L fill:#fcebeb,stroke:#a32d2d
-  style H fill:#eaf3de,stroke:#639922
-  style R fill:#faeeda,stroke:#ba7517
-            </div>
+            <div class="html-flowchart is-network" data-diagram="flowchart-html" data-direction="LR" data-node-count="4" data-edge-count="3" data-instance="1" role="group" aria-label="HTML 分支流程图"><ol class="html-flow-stages"><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">01</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-neutral shape-step" data-node-id="X"><div class="html-flow-node-meta"><span class="html-flow-index">01</span><span class="html-flow-group-label">Roofline 模型的两段</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">横轴: 算术强度 FLOP/Byte</span></div></article><article class="html-flow-node tone-danger shape-step" data-node-id="L"><div class="html-flow-node-meta"><span class="html-flow-index">03</span><span class="html-flow-group-label">Roofline 模型的两段</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">左段: 带宽受限</span><span>可达算力 = 强度 × 带宽</span><span>斜线上升</span></div></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">02</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-warn shape-step" data-node-id="R"><div class="html-flow-node-meta"><span class="html-flow-index">02</span><span class="html-flow-group-label">Roofline 模型的两段</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">拐点</span><span>= 峰值算力 ÷ 峰值带宽</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">横轴: 算术强度 FLOP/Byte</span></li><li><span class="html-flow-source">左段: 带宽受限 / 可达算力 = 强度 × 带宽 / 斜线上升</span></li></ul></article></div></li><li class="html-flow-stage"><div class="html-flow-stage-label" aria-hidden="true">03</div><div class="html-flow-stage-nodes"><article class="html-flow-node tone-success shape-step" data-node-id="H"><div class="html-flow-node-meta"><span class="html-flow-index">04</span><span class="html-flow-group-label">Roofline 模型的两段</span></div><div class="html-flow-node-copy"><span class="html-flow-node-title">右段: 算力受限</span><span>可达算力 = 峰值算力</span><span>水平封顶</span></div><ul class="html-flow-inputs" aria-label="输入关系"><li><span class="html-flow-source">拐点 / = 峰值算力 ÷ 峰值带宽</span></li></ul></article></div></li></ol></div>
             <figcaption>Roofline 模型：横轴是算术强度（FLOP/Byte），纵轴是可达算力。拐点左侧被带宽卡住，右侧被算力卡住。优化的方向取决于你落在哪一段。</figcaption>
           </figure>
 
@@ -254,13 +241,13 @@ flowchart LR
           <p style="font-size:13px;color:var(--text-3);text-align:center;margin-top:-6px">H100 的 Roofline 曲线（横轴为算术强度，对数刻度取样）。LayerNorm、softmax 这类算子的算术强度只有个位数，落在最左端，可达算力不到峰值的 3%。</p>
 
           <h3>权威示意图：Roofline 模型到底长什么样</h3>
-          <p>上面我们自己画了 Roofline 的两段结构，也画了 H100 的具体曲线，但「第一手证据」还是要看提出这个模型的论文。下面这张图是 Roofline 模型经典示意图的公认重绘版（收录于 Wikimedia Commons，源自 Williams 等人 2009 年发表在 CACM 的原始论文），它和上面我们的画法完全同构：横轴是算术强度，纵轴是可达性能，两条粗线把平面切成两半。</p>
+          <p>上面我们自己画了 Roofline 的两段结构，也画了 H100 的具体曲线，但「第一手证据」还是要看提出这个模型的论文。下面是本书依据 Williams 等人 2009 年 CACM 论文绘制的教学版：横轴是算术强度，纵轴是可达性能，两条粗线把平面切成两半。</p>
 
-          <figure class="paper-figure">
-            <img src="https://upload.wikimedia.org/wikipedia/commons/5/5a/Example_of_a_naive_Roofline_model.svg" alt="Roofline 模型权威示意图：横轴算术强度、纵轴可达性能；对角斜线是带宽上限、水平线是算力上限，两个 kernel 一个落在带宽受限区、一个落在算力受限区" loading="lazy" style="max-width:520px">
+          <figure class="paper-figure image-figure source-figure">
+            <img src="../../assets/figures/05-systems/compute-budget/roofline-model.svg" alt="Roofline 模型教学图：横轴算术强度、纵轴可达性能；对角斜线是带宽上限、水平线是算力上限，两个算子分别落在带宽受限区和算力受限区" loading="lazy" style="max-width:620px">
             <figcaption>
               <span class="pf-title">图：Roofline 模型的经典示意——左下带宽受限、右上算力受限，拐点（ridge point）处两条限制线相遇</span>
-              <span class="pf-src">权威示意图 · 依据 Williams et al., <em>Roofline: An Insightful Visual Performance Model for Multicore Architectures</em>, CACM 2009 重绘 · 图源 Wikimedia Commons · <a href="https://dl.acm.org/doi/10.1145/1498765.1498785" target="_blank" rel="noopener">ACM 原文</a></span>
+              <span class="pf-src">本书教学重绘 · 依据 Williams et al., <em>Roofline: An Insightful Visual Performance Model for Multicore Architectures</em>, CACM 2009 · <a href="https://dl.acm.org/doi/10.1145/1498765.1498785" target="_blank" rel="noopener noreferrer">ACM 原文</a></span>
             </figcaption>
           </figure>
 
@@ -562,37 +549,7 @@ print(f"单步耗时: {dt*1e3:.1f} ms, MFU ≈ {mfu*100:.1f}%")</code></pre>
           </div>
 
           <figure class="figure">
-            <div class="mermaid">
-mindmap
-  root(("训练预算核对清单"))
-    算多少
-      参数量 P
-      总 tokens D
-      6PD 加注意力项
-      MoE 要用激活参数量
-    存多少
-      固定显存 16P
-      激活显存随 BS 变
-      是否开梯度检查点
-      KV Cache 只在推理侧
-    跑多快
-      单卡峰值算力
-      目标 MFU 40 到 55
-      通信是否能重叠
-      数据加载够不够快
-    放得下吗
-      最小卡数 = 总显存 除 单卡可用
-      并行策略组合
-      TP 不出 NVLink 域
-    花多少
-      GPU 小时数
-      乘 1.2 到 1.5 现实系数
-      故障重启余量
-    怎么验证
-      FlopCounterMode 校验 FLOP
-      Profiler 找热点
-      实测 tokens 每秒
-            </div>
+            <div class="html-mindmap" data-diagram="mindmap-html" role="group" aria-label="思维导图：训练预算核对清单" data-instance="0"><div class="html-mindmap-root"><span class="html-mindmap-kicker">核心主题</span><strong>训练预算核对清单</strong></div><div class="html-mindmap-branches" role="list"><section class="html-mindmap-branch tone-1" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">01</span><strong>算多少</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">参数量 P</span></li><li><span class="html-mindmap-leaf">总 tokens D</span></li><li><span class="html-mindmap-leaf">6PD 加注意力项</span></li><li><span class="html-mindmap-leaf">MoE 要用激活参数量</span></li></ul></section><section class="html-mindmap-branch tone-2" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">02</span><strong>存多少</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">固定显存 16P</span></li><li><span class="html-mindmap-leaf">激活显存随 BS 变</span></li><li><span class="html-mindmap-leaf">是否开梯度检查点</span></li><li><span class="html-mindmap-leaf">KV Cache 只在推理侧</span></li></ul></section><section class="html-mindmap-branch tone-3" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">03</span><strong>跑多快</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">单卡峰值算力</span></li><li><span class="html-mindmap-leaf">目标 MFU 40 到 55</span></li><li><span class="html-mindmap-leaf">通信是否能重叠</span></li><li><span class="html-mindmap-leaf">数据加载够不够快</span></li></ul></section><section class="html-mindmap-branch tone-4" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">04</span><strong>放得下吗</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">最小卡数 = 总显存 除 单卡可用</span></li><li><span class="html-mindmap-leaf">并行策略组合</span></li><li><span class="html-mindmap-leaf">TP 不出 NVLink 域</span></li></ul></section><section class="html-mindmap-branch tone-5" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">05</span><strong>花多少</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">GPU 小时数</span></li><li><span class="html-mindmap-leaf">乘 1.2 到 1.5 现实系数</span></li><li><span class="html-mindmap-leaf">故障重启余量</span></li></ul></section><section class="html-mindmap-branch tone-6" data-depth="1"><div class="html-mindmap-branch-head"><span class="html-mindmap-index">06</span><strong>怎么验证</strong></div><ul class="html-mindmap-tree" data-depth="0"><li><span class="html-mindmap-leaf">FlopCounterMode 校验 FLOP</span></li><li><span class="html-mindmap-leaf">Profiler 找热点</span></li><li><span class="html-mindmap-leaf">实测 tokens 每秒</span></li></ul></section></div></div>
             <figcaption>训练预算的六个必答问题。建议在开训前把每一项都填成一个具体数字，而不是「差不多够」。</figcaption>
           </figure>
 
@@ -614,13 +571,13 @@ mindmap
 
           <h2>参考文献与延伸阅读</h2>
           <ul class="refs">
-            <li>Williams et al., "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (2009) — Roofline 模型的原始论文，本页权威示意图的理论出处 · <a href="https://dl.acm.org/doi/10.1145/1498765.1498785" target="_blank" rel="noopener">ACM Digital Library</a></li>
-            <li>Narayanan et al., "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM" (2021) — 3D 并行下训练显存、激活显存与通信量的系统化估算公式来源 · <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">arXiv:2104.04473</a></li>
-            <li>Hoffmann et al., "Training Compute-Optimal Large Language Models"（Chinchilla, 2022） — 训练 FLOP 的 $6PD$ 口径与算力-数据最优配比的经典参考 · <a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener">arXiv:2203.15556</a></li>
-            <li>Kaplan et al., "Scaling Laws for Neural Language Models" (2020) — 附录中给出了逐层 FLOP 的详细拆解，包括本页用到的注意力修正项 · <a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener">arXiv:2001.08361</a></li>
-            <li>Rajbhandari et al., "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models" (2019) — 「16 字节/参数」这个口径的出处，以及三级分片的显存与通信分析 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">arXiv:1910.02054</a></li>
-            <li>Stanford CS336: Language Modeling from Scratch — 用「一张 A100 能不能训 7B」这样的手算练习训练预算能力，与本页口径一致 · <a href="https://stanford-cs336.github.io/" target="_blank" rel="noopener">课程主页</a></li>
-            <li>PyTorch Profiler 官方教程 — profiler 的 schedule 用法、内存分析与 trace 导出 · <a href="https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html" target="_blank" rel="noopener">pytorch.org</a></li>
+            <li>Williams et al., "Roofline: An Insightful Visual Performance Model for Multicore Architectures" (2009) — Roofline 模型的原始论文，本页权威示意图的理论出处 · <a href="https://dl.acm.org/doi/10.1145/1498765.1498785" target="_blank" rel="noopener noreferrer">ACM Digital Library</a></li>
+            <li>Narayanan et al., "Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM" (2021) — 3D 并行下训练显存、激活显存与通信量的系统化估算公式来源 · <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener noreferrer">arXiv:2104.04473</a></li>
+            <li>Hoffmann et al., "Training Compute-Optimal Large Language Models"（Chinchilla, 2022） — 训练 FLOP 的 $6PD$ 口径与算力-数据最优配比的经典参考 · <a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener noreferrer">arXiv:2203.15556</a></li>
+            <li>Kaplan et al., "Scaling Laws for Neural Language Models" (2020) — 附录中给出了逐层 FLOP 的详细拆解，包括本页用到的注意力修正项 · <a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener noreferrer">arXiv:2001.08361</a></li>
+            <li>Rajbhandari et al., "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models" (2019) — 「16 字节/参数」这个口径的出处，以及三级分片的显存与通信分析 · <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener noreferrer">arXiv:1910.02054</a></li>
+            <li>Stanford CS336: Language Modeling from Scratch — 用「一张 A100 能不能训 7B」这样的手算练习训练预算能力，与本页口径一致 · <a href="https://stanford-cs336.github.io/" target="_blank" rel="noopener noreferrer">课程主页</a></li>
+            <li>PyTorch Profiler 官方教程 — profiler 的 schedule 用法、内存分析与 trace 导出 · <a href="https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html" target="_blank" rel="noopener noreferrer">pytorch.org</a></li>
           </ul>
 
           <div class="callout">
@@ -628,6 +585,8 @@ mindmap
             知道了带宽墙的来源，下一步看如何用它优化注意力计算：<a href="flash-attention.html">FlashAttention 与 IO 感知注意力</a>。想自己动手把带宽墙上的算子融合掉，看 <a href="triton-kernel.html">Triton Kernel 与编译优化</a>。想了解多卡训练如何分摊显存与通信，跳转 <a href="../06-pretraining/distributed-training.html">分布式训练与并行策略</a>；硬件层面的物理约束回顾 <a href="gpu-architecture.html">GPU 执行模型与显存层级</a>。
           </div>
 
+          <section class="resource-deepening" data-static-resource="true" aria-labelledby="resource-deepening-title"><div class="rd-head"><div><div class="rd-kicker">权威延伸资料</div><h2 id="resource-deepening-title">围绕“FLOP、显存核算与性能剖析”继续深入</h2></div></div><p class="rd-summary">本章把模型公式连接到真实硬件：GPU 的执行和内存层级、FLOP 与带宽核算、FlashAttention 的 IO 优化，以及 Triton kernel 的工程方法。</p><p class="rd-takeaway"><strong>阅读提示：</strong>性能问题先判断是算力受限还是访存受限，再用 profiler 和小规模 benchmark 验证；不要把峰值 FLOP 当成实际吞吐。</p><ul class="rd-list"><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Dao et al. · NeurIPS 2022</span></div><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener noreferrer">FlashAttention: Fast and Memory-Efficient Exact Attention ↗</a><p class="rd-note">分块、online softmax 和重计算的原始论文，完整解释“IO 感知”为什么能在不近似的情况下加速。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方文档</span><span class="rd-source">NVIDIA</span></div><a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener noreferrer">CUDA C++ Programming Guide ↗</a><p class="rd-note">warp、线程块、共享内存、全局内存和同步语义的权威参考，核对 GPU 章节中的硬件事实。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方指南</span><span class="rd-source">NVIDIA</span></div><a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/" target="_blank" rel="noopener noreferrer">CUDA C++ Best Practices Guide ↗</a><p class="rd-note">合并访存、occupancy、bank conflict 和性能分析的工程清单，适合配合 profiler 使用。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">官方教程</span><span class="rd-source">OpenAI Triton</span></div><a href="https://triton-lang.org/main/getting-started/tutorials/" target="_blank" rel="noopener noreferrer">Triton Tutorials ↗</a><p class="rd-note">从向量加法、矩阵乘法到融合 kernel 的渐进式教程，是实战页面的直接延伸。</p></li><li class="rd-item"><div class="rd-meta"><span class="rd-type">论文</span><span class="rd-source">Williams et al. · CACM 2009</span></div><a href="https://doi.org/10.1145/1498765.1498785" target="_blank" rel="noopener noreferrer">Roofline: An Insightful Visual Performance Model ↗</a><p class="rd-note">用算术强度把计算瓶颈和带宽瓶颈放在同一张图上，是性能剖析的经典框架。</p></li></ul><p class="rd-foot">资料优先选用原始论文、官方文档、大学课程和公共机构材料；链接按 2026-08-10 检索，具体版本以来源页面为准。</p></section>
+          <section class="technical-deepening" data-static-depth="true" data-depth-scope="part" aria-labelledby="technical-deepening-title"><div class="td-kicker">篇章视角</div><h2 id="technical-deepening-title">围绕“FLOP、显存核算与性能剖析”继续深入</h2><div class="td-grid"><article><h3>发展脉络</h3><p>系统优化从 GPU 层次结构、Roofline 和通信原语出发，逐步发展到 FlashAttention、算子融合、编译器和端到端 profiling。</p></article><article><h3>机制抓手</h3><p>先判断瓶颈属于计算、HBM/SRAM 访问、kernel 启动还是跨卡通信，再选择 tile、融合、重计算、并行或布局优化。</p></article><article><h3>工程权衡</h3><p>理论 FLOP、峰值带宽和实际吞吐常常不同；任何优化都必须同时报告精度、形状覆盖、显存和回退路径。</p></article><article><h3>前沿观察</h3><p>FP8、异步执行、编译期融合、推理/训练解耦和新一代互联正在改变系统边界，基准应固定硬件、batch、长度和版本。</p></article></div><div class="td-check"><strong>实践检查</strong><span>能够用 profiler 找到一个端到端热点，并解释优化前后算术强度、显存流量和延迟变化。</span></div><div class="td-refs"><strong>经典与延伸</strong><a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener noreferrer">FlashAttention-2 ↗</a><a href="https://triton-lang.org/main/getting-started/tutorials/" target="_blank" rel="noopener noreferrer">Triton tutorials ↗</a><a href="https://crd.lbl.gov/divisions/computer-science/par/research/roofline/" target="_blank" rel="noopener noreferrer">Roofline model ↗</a></div><div class="td-contract" aria-label="本页学习契约"><div class="td-contract-grid"><article><h3>学习目标</h3><p>能从层级配置推导参数量、训练 FLOP、显存组成、算术强度和 MFU，并用 profiler 校验估算误差。</p></article><article><h3>先修关系</h3><p>先修矩阵乘法、Transformer 前向过程和 GPU 的线程/显存层级；实验需固定硬件与 batch。</p></article><article><h3>最小实验</h3><p>选择一个可本地加载的小型 Transformer，手算参数量、一次前后向的 6PD FLOP 与 AdamW 显存；运行 20 次 warmup+100 次测量，用 profiler 记录时间和显存峰值。</p></article><article><h3>验收标准</h3><p>参数量估算与程序统计误差小于 1%，所有单位统一为 token/s、GB、TFLOP/s；能根据算术强度判断瓶颈并说明 MFU 分母来源。</p></article></div></div></section>
           <div id="pager"></div>
         </div>
         <aside id="pageToc"></aside>
@@ -638,11 +597,16 @@ mindmap
   <script src="../../assets/js/search-index.js"></script>
   <script>window.ROOT = "../../";</script>
   <script src="../../assets/js/nav.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.16.1/dist/mermaid.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="../../assets/vendor/mermaid/mermaid.min.js"></script>
+  <script src="../../assets/vendor/katex/katex.min.js"></script>
+  <script src="../../assets/vendor/katex/contrib/auto-render.min.js"></script>
+  <script src="../../assets/vendor/highlight/highlight.min.js"></script>
+  <script src="../../assets/vendor/chartjs/chart.umd.js"></script>
+
+
+
+
+
   <script src="../../assets/js/render.js"></script>
   <script>
   (function(){
