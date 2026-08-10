@@ -1,1 +1,36 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent 算法深度导读</title><link rel="stylesheet" href="../../assets/css/theme.css"></head><body data-part="11-agents" data-topic="agent-algorithms"><header id="topbar"></header><div class="layout"><nav id="sidebar"></nav><main class="main"><div class="container"><div class="page-head"><h1>Agent 算法：规划、工具使用与学习</h1><p class="lead">把 Agent 看成可恢复、可评测的 POMDP 闭环。</p></div><h2>一个三步任务</h2><p>回答“公司营收是否增长”需要搜索财报、用计算器比较数字、带来源回答。工具返回是 observation；失败时应改写查询或说明不确定性，不能凭空补全。</p><h2>ReAct 与 Plan-and-Execute</h2><p>短链工具探索用 ReAct 的 Thought-Action-Observation；长任务先列计划再执行；只有有明确测试时才加入 Reflexion。反思必须记录失败原因、修复动作和证据，空泛的“再试一次”没有训练价值。</p><h2>工具轨迹如何训练</h2><p>保存目标、tool call、真实结果和最终答案。过滤参数错误与越权轨迹，再用成功/失败对做 DPO。训练集必须包含超时、空结果和权限拒绝，工具结果要先过提示注入检测。</p><h2>Agentic RL</h2><p>终局奖励会造成信用分配问题。可用 R=任务成功-工具成本-风险成本，并给可验证里程碑奖励；每种工具单独归一化，防止调用次数成为捷径。MCP 是 Agent 到工具，A2A 是 Agent 到 Agent。</p><h2>评测练习</h2><p>对同一任务记录完成率、工具精度、重试次数、token、延迟、越权率和人工接管率。故意让工具失败，检查系统能否恢复且不重复执行有副作用的操作。</p><h2>论文</h2><ul class="refs"><li><a href="https://arxiv.org/abs/2210.03629">ReAct</a></li><li><a href="https://arxiv.org/abs/2303.11366">Reflexion</a></li><li><a href="https://arxiv.org/abs/2302.04761">Toolformer</a></li><li><a href="https://arxiv.org/abs/2404.07972">OSWorld</a></li></ul></div></main></div><script src="../../assets/js/nav.js"></script><script>window.ROOT='../../'</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent 算法深度导读</title><link rel="stylesheet" href="../../assets/css/theme.css"></head><body data-part="11-agents" data-topic="agent-algorithms"><header id="topbar"></header><div class="layout"><nav id="sidebar"></nav><main class="main"><div class="container"><div class="page-head"><h1>Agent 算法：从反应式循环到可验证执行</h1><p class="lead">把 Agent 理解为一个带工具、状态和失败恢复的闭环系统，而不是“会调用函数的聊天机器人”。</p></div>
+<div class="callout"><strong>本页结论：</strong>Agent 的核心算法是状态估计、动作选择、环境反馈和终止判定。提示词只定义了策略的一部分，工具契约、权限、轨迹和评测决定系统是否可靠。</div>
+<h2>1. 形式化：Agent 到底在优化什么</h2>
+<p>将一次任务表示为部分可观测决策过程。环境状态为 <code>s_t</code>，模型只能看到观测 <code>o_t</code>，历史轨迹为 <code>h_t=(o_0,a_0,...,o_t)</code>。策略 <code>pi(a_t|h_t)</code> 选择自然语言回复或工具动作，工具执行后返回新的观测。一个有副作用的 Agent 还必须维护权限状态 <code>p_t</code> 和预算 <code>b_t</code>。</p>
+<pre><code>while not terminal(state) and budget > 0:
+    context = compose(goal, state, memory, tool_schemas)
+    action = policy(context)
+    action = validate_schema_permission_idempotency(action)
+    observation = execute(action, timeout=deadline)
+    state = update(state, action, observation)
+return answer_or_handoff(state)</code></pre>
+<p>与普通生成不同，动作会改变外部世界。因此正确性至少包含任务结果、工具参数、状态转移和副作用四层。失败时优先修复状态或工具输入，不能让模型凭空补全工具结果。</p>
+<h2>2. 算法谱系：ReAct、规划与反思</h2>
+<table><thead><tr><th>范式</th><th>控制流</th><th>优势</th><th>典型失败</th></tr></thead><tbody>
+<tr><td>ReAct</td><td>Thought -> Action -> Observation 交替</td><td>短链探索、工具反馈及时</td><td>循环、重复搜索、把猜测当观察</td></tr>
+<tr><td>Plan-and-Execute</td><td>先生成步骤图，再逐步执行</td><td>长任务可视化、易于审批</td><td>计划过时，局部错误传播到后续步骤</td></tr>
+<tr><td>ReWOO/无思考执行</td><td>预先绑定变量与工具结果</td><td>减少模型调用和 token</td><td>无法适应动态环境</td></tr>
+<tr><td>Reflexion</td><td>失败后生成可检索的反思记忆</td><td>能把失败转成下一次策略提示</td><td>反思内容空泛，记忆污染后续任务</td></tr></tbody></table>
+<p>工程上通常采用混合结构：确定性编排器负责权限、重试、并行和终止，模型只在需要语义判断的节点选择动作。规划器输出的不是不可验证的自然语言，而应是带依赖、输入和验收条件的结构化计划。</p>
+<h2>3. 工具调用：契约比提示词更重要</h2>
+<p>工具 schema 至少需要名称、参数类型、必填字段、权限范围、超时、幂等键、错误码和结果大小上限。执行前做参数校验和越权检查，执行后把原始结果、摘要和可信度分开保存，避免把未经处理的网页内容直接拼进系统提示。</p>
+<pre><code>{
+  "name": "create_ticket",
+  "input": {"title": "string", "priority": "enum(low,high)"},
+  "auth": {"scope": "ticket:write", "approval": "required"},
+  "runtime": {"timeout_ms": 5000, "idempotency_key": "required"}
+}</code></pre>
+<p>MCP 统一了工具发现、资源和提示的协议边界，但不替应用承担最小权限、审计和提示注入防护。对写操作应设置预览/审批节点；对读操作也要限制返回字段和数据租户范围。</p>
+<h2>4. 轨迹学习与 Agentic RL</h2>
+<p>一条可训练轨迹应包含目标、环境快照、模型消息、工具调用、真实结果、错误、最终状态和人工/程序评分。只保留成功答案会丢失恢复策略；只保留模型思考会掩盖工具和环境因素。常见训练顺序是行为克隆或 SFT 打底，再用成功/失败轨迹做偏好优化，最后在可验证环境中做 RFT/RLVR。</p>
+<p>终局奖励可写成 <code>R = success - lambda_cost * cost - lambda_risk * risk</code>。工具调用次数、输出长度和格式都可能成为捷径，因此奖励必须按工具、任务和轨迹长度分层归一化，并用独立 verifier 检查真正目标。</p>
+<h2>5. 评测与故障模式</h2>
+<p>至少报告：任务成功率、步骤成功率、工具参数准确率、重试次数、token、p50/p95 延迟、成本、越权率和人工接管率。故障注入应覆盖超时、空结果、错误 schema、部分成功、重复写入、提示注入和环境状态变化。</p>
+<div class="callout"><strong>实践检查：</strong>实现一个最多 8 步的 Agent，给写工具加入幂等键和人工审批；保存完整轨迹，分别统计“答对但越权”“工具正确但任务失败”“重试后恢复”三类结果。</div>
+<h2>论文与规范</h2><ul class="refs"><li><a href="https://arxiv.org/abs/2210.03629">ReAct (Yao et al., 2023)</a></li><li><a href="https://arxiv.org/abs/2302.04761">Toolformer (Schick et al., 2023)</a></li><li><a href="https://arxiv.org/abs/2303.11366">Reflexion (Shinn et al., 2023)</a></li><li><a href="https://arxiv.org/abs/2405.15793">SWE-agent (Yang et al., 2024)</a></li><li><a href="https://arxiv.org/abs/2404.07972">OSWorld (Xie et al., 2024)</a></li><li><a href="https://modelcontextprotocol.io/specification/2025-06-18">Model Context Protocol Specification</a></li></ul>
+</div></main></div><script>window.ROOT='../../'</script><script src="../../assets/js/toc.js"></script><script src="../../assets/js/search-index.js"></script><script src="../../assets/js/nav.js"></script></body></html>
