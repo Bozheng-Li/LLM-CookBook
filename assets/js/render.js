@@ -13,26 +13,30 @@
 
   /* 这里的色值与 theme.css 的 --cat-* 槽位对齐（蓝 / 绿 / 琥珀），
      让 Mermaid 专项图和原生 HTML 图读起来是同一套系统。
-     文字仍走各自的深色 ink，不用槽位色当正文色。 */
+     文字仍走各自的深色 ink，不用槽位色当正文色。
+     lineColor / clusterBorder 与原生流程图的 --flow-line 同值，
+     两类图并排出现时连线粗细与灰度一致。 */
   var LIGHT = {
     background: '#ffffff',
-    primaryColor: '#eaf3fd', primaryTextColor: '#0c447c', primaryBorderColor: '#2a78d6',
-    lineColor: '#8b97a6', lineColorHover: '#2a78d6',
-    secondaryColor: '#fdf4e0', secondaryTextColor: '#5d4204', secondaryBorderColor: '#eda100',
-    tertiaryColor: '#e6f7f1', tertiaryTextColor: '#0d4c34', tertiaryBorderColor: '#1baf7a',
+    primaryColor: '#eaf3fd', primaryTextColor: '#1a1d24', primaryBorderColor: '#2a78d6',
+    lineColor: '#c3cbd6', lineColorHover: '#2a78d6',
+    secondaryColor: '#fdf4e0', secondaryTextColor: '#1a1d24', secondaryBorderColor: '#eda100',
+    tertiaryColor: '#e6f7f1', tertiaryTextColor: '#1a1d24', tertiaryBorderColor: '#1baf7a',
     noteBkgColor: '#f4f6f8', noteTextColor: '#4a5160', noteBorderColor: '#d0d5de',
-    clusterBkg: '#f6f7f9', clusterBorder: '#c6cfdb',
+    clusterBkg: '#f6f7f9', clusterBorder: '#d0d5de',
+    titleColor: '#1a1d24',
     edgeLabelBackground: '#ffffff', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
     fontSize: '15px'
   };
   var DARK = {
     background: '#181b21',
-    primaryColor: '#16283c', primaryTextColor: '#cfe2f5', primaryBorderColor: '#3987e5',
-    lineColor: '#5a626e', lineColorHover: '#3987e5',
-    secondaryColor: '#2c2411', secondaryTextColor: '#e0b361', secondaryBorderColor: '#c98500',
-    tertiaryColor: '#122d26', tertiaryTextColor: '#7fd7b3', tertiaryBorderColor: '#199e70',
+    primaryColor: '#16283c', primaryTextColor: '#e8eaed', primaryBorderColor: '#3987e5',
+    lineColor: '#596575', lineColorHover: '#3987e5',
+    secondaryColor: '#2c2411', secondaryTextColor: '#e8eaed', secondaryBorderColor: '#c98500',
+    tertiaryColor: '#122d26', tertiaryTextColor: '#e8eaed', tertiaryBorderColor: '#199e70',
     noteBkgColor: '#1d2128', noteTextColor: '#b3b9c4', noteBorderColor: '#383f4a',
-    clusterBkg: '#1e232b', clusterBorder: '#323a46',
+    clusterBkg: '#1e232b', clusterBorder: '#383f4a',
+    titleColor: '#e8eaed',
     edgeLabelBackground: '#20242c', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
     fontSize: '15px'
   };
@@ -56,18 +60,21 @@
     };
   }
 
-  /* 注入全局图表样式:圆角节点 + 入场动画 + 标签描边 */
+  /* 注入全局图表样式:圆角节点 + 入场动画 + 标签描边。
+     圆角与 theme.css 的 --radius-sm(6px) / --radius(10px) 对齐，
+     Mermaid 节点和原生 HTML 流程图节点因此是同一个弧度。 */
   function injectFigStyles() {
     var css =
       '@keyframes cbFigIn{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}' +
       '.mermaid svg{animation:cbFigIn .55s cubic-bezier(.22,.61,.36,1) both}' +
+      '@media (prefers-reduced-motion: reduce){.mermaid svg{animation:none}}' +
       '.mermaid svg .node rect,.mermaid svg .node circle,.mermaid svg .node polygon,.mermaid svg .node path' +
       '{shape-rendering:geometricPrecision;stroke-width:1.4px}' +
       '.mermaid svg .node rect{rx:6px}' +
       '.mermaid svg .label,.mermaid svg .nodeLabel{font-size:15px!important;font-weight:600;line-height:1.45}' +
       '.mermaid svg .edgeLabel{background:transparent!important;font-size:13px!important;font-weight:600}' +
       '.mermaid svg .messageText,.mermaid svg .loopText,.mermaid svg .state-note text{font-size:14px!important}' +
-      '.mermaid svg .cluster rect{rx:8px}' +
+      '.mermaid svg .cluster rect{rx:10px}' +
       /* 连线加粗到 2px、圆头收尾，与原生 HTML 流程图的连接器保持同一手感 */
       '.mermaid svg .flowchart-link{stroke-width:2px;stroke-linecap:round}' +
       '.mermaid svg .messageLine0,.mermaid svg .messageLine1{stroke-width:1.8px}';
