@@ -89,9 +89,24 @@ python -m http.server 8000
 ├── assets/js/resources.js     # 权威延伸资料与中文摘要
 ├── assets/figures/            # 本地论文插图与教学图
 ├── assets/vendor/             # 离线公式、流程图、图表和代码高亮运行时
-├── examples/fullstack-llm/    # 可运行的 FastAPI + React + SSE + RAG 示例
+├── examples/                  # 可运行的配套代码（见下表）
 └── .github/workflows/pages.yml# GitHub Pages 自动部署
 ```
+
+## 可运行示例
+
+第 15 章的每个实战页面都配了一份可以直接跑的代码，都带自检测试，都能离线运行。
+
+| 目录 | 依赖 | 自检 | 对应章节 |
+| --- | --- | --- | --- |
+| `examples/build-tokenizer/` | 无（仅标准库） | 9 项 | 手写 BPE Tokenizer |
+| `examples/build-minigpt/` | PyTorch | 11 项 | 从零实现 miniGPT |
+| `examples/build-flashattention/` | PyTorch | 10 项 | 手写 FlashAttention |
+| `examples/rag-practice/` | 无（仅标准库） | 21 项 | 搭建一个 RAG 系统 |
+| `examples/fullstack-llm/` | FastAPI + React | pytest | 全栈 LLM 应用 |
+
+每个目录下的 `README.md` 记录了实测数据和可复现的结论，而不只是使用说明。
+自带数据，首次运行不需要网络，也不需要 API 密钥。
 
 ## 资料与引用标准
 
@@ -101,7 +116,7 @@ python -m http.server 8000
 
 欢迎通过 Issue 或 Pull Request 提交内容修正、失效链接、公式错误和新的权威资料。新增资料请尽量附上：作者或机构、发布日期、稳定链接、中文摘要，以及它解决了当前页面中的哪个具体问题。
 
-阅读站点是纯静态 HTML，不需要数据库、构建服务或 API 密钥。`examples/` 中的全栈参考项目是独立教学资源，不参与 GitHub Pages 构建；修改正文 HTML、CSS 或 JavaScript 后，推送到 `main` 分支即可由 GitHub Actions 自动发布。
+阅读站点是纯静态 HTML，不需要数据库、构建服务或 API 密钥。`examples/` 中的参考项目是独立教学资源，不参与 GitHub Pages 构建；修改正文 HTML、CSS 或 JavaScript 后，推送到 `main` 分支即可由 GitHub Actions 自动发布。
 
 ## 运行状态
 

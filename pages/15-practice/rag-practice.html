@@ -74,6 +74,10 @@
 
           <!-- ============ 2 ============ -->
           <h2>二、环境准备</h2>
+          <div class="callout tip">
+            <span class="callout-t">配套代码</span>
+            <a href="../../examples/rag-practice/README.md"><code>examples/rag-practice/</code></a> 是本页的零依赖可运行版本：只用 Python 标准库实现切分、BM25、向量检索和 RRF 混合，自带 6 篇知识库和 22 条标注问题，<code>python eval.py</code> 几秒钟就能打出三种切分 × 三种检索器的指标对照表。它的重点不是替代下面的生产栈，而是<strong>让「换个切分策略效果会怎样」这类问题有确定答案</strong>，而不是靠感觉。
+          </div>
           <pre><code class="language-bash">pip install chromadb sentence-transformers openai python-dotenv</code></pre>
           <p>本页使用 ChromaDB 作为向量库（纯 Python，无需额外起服务，适合原型），sentence-transformers 做 Embedding，OpenAI 兼容接口做 LLM 生成。四个组件都可以替换：向量库可换 Qdrant / Milvus / pgvector，Embedding 可换任意开源或商用模型，LLM 换成本地部署的模型只需改 base_url。<strong>RAG 系统的可替换性极强，这正是它工程上受欢迎的原因</strong>——每一环都能独立升级而不影响其他环节。</p>
 
@@ -483,6 +487,33 @@ for k, v in metrics.items():
             <span class="callout-t">评测集必须包含负样本</span>
             只用「有答案的问题」评测，会得到一个非常危险的假象：系统看起来很准，但它可能对<strong>任何</strong>问题都能编出一段听起来合理的回答。加入 10%–20% 的负样本（文档里确实没有答案的问题），专门检验「它会不会诚实地说不知道」。生产事故里，<strong>自信地答错</strong>造成的损失，往往远大于<strong>老实说不知道</strong>。
           </div>
+
+          <p>指标一旦跑起来，会立刻推翻一些凭直觉的判断。下面三条来自 <a href="../../examples/rag-practice/README.md"><code>examples/rag-practice/</code></a> 的实测（6 篇文档、22 条标注问题、k=5），都可以在几秒内自己复现：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>实测发现</th><th>数据</th><th>它改变了什么</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>Recall 持平时，排序仍在变好</strong></td>
+                  <td>三种切分策略的 Recall@5 全是 <code>0.955</code>，但 MRR 从 <code>0.902</code> 升到 <code>0.932</code></td>
+                  <td>只盯 Recall 调参会漏掉一半收益。<strong>Recall 是及格线，MRR 才反映用户实际看到的顺序</strong></td>
+                </tr>
+                <tr>
+                  <td><strong>同义改写是真天花板</strong></td>
+                  <td>字面重叠的 16 条问题：BM25、向量、混合<strong>全部 1.000</strong>；同义改写的 6 条：<strong>三者全部 0.833</strong></td>
+                  <td>混合检索补不上这个缺口——两路都基于词面统计，会一起失败。<strong>要靠改写查询或真语义模型，不是靠换检索器</strong></td>
+                </tr>
+                <tr>
+                  <td><strong>RRF 结构上无法表达「都不相关」</strong></td>
+                  <td>真实问题与无关问题的 RRF 得分几乎相同，都约 <code>0.033</code></td>
+                  <td>RRF 只用<strong>排名</strong>，丢掉了分数。想做拒答，必须回头看原始相似度，不能用融合分卡阈值</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>第三条尤其值得留意：它意味着<strong>「加个阈值就能拒答」在混合检索上直接失效</strong>。示例项目里也验证了阈值本身的难度——无关问题的最高分能到 0.163，而真实问题最低会掉到 0.103，两者区间重叠，<strong>不存在一个能干净分开的阈值</strong>。所以那份代码提供了拒答开关，但不预设「推荐值」：这个数只能在你自己的数据上量出来。</p>
 
           <!-- ============ 8 ============ -->
           <h2>八、坏答案归因：三层定位法</h2>

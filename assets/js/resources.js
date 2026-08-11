@@ -48,7 +48,9 @@
         { type: "实现讲解", title: "The Annotated Transformer", source: "Harvard NLP", note: "将原论文逐行翻译成 PyTorch 实现，适合把 Q/K/V、mask、残差和学习率调度对应到代码。", url: "https://nlp.seas.harvard.edu/annotated-transformer/" },
         { type: "官方文档", title: "Scaled Dot Product Attention", source: "PyTorch", note: "说明 SDPA 的数学定义、mask 语义与后端选择，是核对实际 API 行为的权威入口。", url: "https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" },
         { type: "论文", title: "RoFormer: Enhanced Transformer with Rotary Position Embedding", source: "Su et al. · 2021", note: "RoPE 的原始论文，重点理解旋转后内积为何自然携带相对位置信息。", url: "https://arxiv.org/abs/2104.09864" },
-        { type: "论文", title: "Root Mean Square Layer Normalization", source: "Zhang & Sennrich · 2019", note: "RMSNorm 的来源和计算简化，帮助比较 LayerNorm、RMSNorm 以及 Pre-Norm 结构。", url: "https://arxiv.org/abs/1910.07467" }
+        { type: "论文", title: "Root Mean Square Layer Normalization", source: "Zhang & Sennrich · 2019", note: "RMSNorm 的来源和计算简化，帮助比较 LayerNorm、RMSNorm 以及 Pre-Norm 结构。", url: "https://arxiv.org/abs/1910.07467" },
+        { type: "课程讲义", title: "CS224N: NLP with Deep Learning", source: "Stanford University", note: "自注意力与 Transformer 两讲的讲义和板书，是补齐推导细节最稳的公开材料。", url: "https://web.stanford.edu/class/cs224n/" },
+        { type: "官方教程", title: "LLM Course: Transformer Models", source: "Hugging Face", note: "配可运行 notebook 讲清编码器/解码器分工，适合边跑边核对本章结构图。", url: "https://huggingface.co/learn/llm-course/chapter1/1" }
       ]
     },
     "04-modern-arch": {
@@ -59,7 +61,9 @@
         { type: "论文", title: "Mamba: Linear-Time Sequence Modeling with Selective State Spaces", source: "Gu & Dao · 2023", note: "选择性状态空间模型的代表作，解释线性扫描、选择机制和长序列效率之间的关系。", url: "https://arxiv.org/abs/2312.00752" },
         { type: "论文", title: "GQA: Training Generalized Multi-Query Transformer Models", source: "Ainslie et al. · 2023", note: "用较少 KV 头降低推理带宽和缓存开销，是理解 MQA/GQA 工程取舍的直接来源。", url: "https://arxiv.org/abs/2305.13245" },
         { type: "论文", title: "An Image is Worth 16x16 Words", source: "Dosovitskiy et al. · 2020", note: "ViT 将图像 patch 化并交给 Transformer，帮助理解多模态视觉编码器的基本范式。", url: "https://arxiv.org/abs/2010.11929" },
-        { type: "论文", title: "Large Language Diffusion Models", source: "Nie et al. · 2025", note: "以 LLaDA 为代表的扩散语言模型工作，适合和自回归模型对照并识别当前研究边界。", url: "https://arxiv.org/abs/2502.09992" }
+        { type: "论文", title: "Large Language Diffusion Models", source: "Nie et al. · 2025", note: "以 LLaDA 为代表的扩散语言模型工作，适合和自回归模型对照并识别当前研究边界。", url: "https://arxiv.org/abs/2502.09992" },
+        { type: "课程讲义", title: "CS25: Transformers United", source: "Stanford University", note: "每讲请一位作者本人讲自己的架构工作，是跟上架构演进最快的公开讲座序列。", url: "https://web.stanford.edu/class/cs25/" },
+        { type: "教材", title: "Speech and Language Processing (3rd ed. draft)", source: "Jurafsky & Martin", note: "第 9–10 章把 RNN 到 Transformer 的谱系讲得比论文完整，免费在线且持续更新。", url: "https://web.stanford.edu/~jurafsky/slp3/" }
       ]
     },
     "05-systems": {
@@ -81,7 +85,9 @@
         { type: "论文", title: "Training Compute-Optimal Large Language Models", source: "Hoffmann et al. · 2022", note: "Chinchilla 结论：固定算力下模型参数和训练 token 应共同增长，纠正只堆参数的直觉。", url: "https://arxiv.org/abs/2203.15556" },
         { type: "论文", title: "The Pile: An 800GB Dataset of Diverse Text", source: "Gao et al. · 2020", note: "公开语料混合、来源比例和去重处理的代表性数据集论文。", url: "https://arxiv.org/abs/2101.00027" },
         { type: "论文", title: "Megatron-LM: Training Multi-Billion Parameter Language Models", source: "Shoeybi et al. · 2019", note: "张量并行、流水线并行和大规模 Transformer 训练工程的经典来源。", url: "https://arxiv.org/abs/1909.08053" },
-        { type: "官方文档", title: "Fully Sharded Data Parallel", source: "PyTorch", note: "FSDP 的参数、梯度和优化器状态分片语义，适合将并行原理落到可运行配置。", url: "https://pytorch.org/docs/stable/fsdp.html" }
+        { type: "官方文档", title: "Fully Sharded Data Parallel", source: "PyTorch", note: "FSDP 的参数、梯度和优化器状态分片语义，适合将并行原理落到可运行配置。", url: "https://pytorch.org/docs/stable/fsdp.html" },
+        { type: "课程", title: "CS336: Language Modeling from Scratch", source: "Stanford University", note: "作业本身就是搭一条完整预训练链路，讲义和代码公开，是本章唯一能真正动手的系统课。", url: "https://stanford-cs336.github.io/" },
+        { type: "教材", title: "Deep Learning", source: "Goodfellow, Bengio & Courville", note: "第 8 章优化和第 11 章方法论仍是训练稳定性问题的标准参考，免费在线。", url: "https://www.deeplearningbook.org/" }
       ]
     },
     "07-posttraining": {
@@ -92,7 +98,9 @@
         { type: "论文", title: "Deep Reinforcement Learning from Human Preferences", source: "Christiano et al. · 2017", note: "人类偏好训练奖励模型并优化策略的早期奠基工作。", url: "https://arxiv.org/abs/1706.03741" },
         { type: "论文", title: "LoRA: Low-Rank Adaptation of Large Language Models", source: "Hu et al. · ICLR 2022", note: "冻结基座、训练低秩增量的参数高效微调方法，适合结合页面代码估算显存。", url: "https://arxiv.org/abs/2106.09685" },
         { type: "论文", title: "Direct Preference Optimization", source: "Rafailov et al. · NeurIPS 2023", note: "把奖励模型和 PPO 目标化简为偏好分类损失，帮助比较 DPO 与 RLHF 的隐含 KL 约束。", url: "https://arxiv.org/abs/2305.18290" },
-        { type: "论文", title: "DeepSeekMath: Pushing the Limits of Mathematical Reasoning", source: "DeepSeek-AI · 2024", note: "GRPO 的代表性来源，展示可验证奖励、群组采样和推理强化的训练闭环。", url: "https://arxiv.org/abs/2402.03300" }
+        { type: "论文", title: "DeepSeekMath: Pushing the Limits of Mathematical Reasoning", source: "DeepSeek-AI · 2024", note: "GRPO 的代表性来源，展示可验证奖励、群组采样和推理强化的训练闭环。", url: "https://arxiv.org/abs/2402.03300" },
+        { type: "官方教程", title: "TRL: Transformer Reinforcement Learning", source: "Hugging Face", note: "SFTTrainer、DPOTrainer、GRPOTrainer 的可运行示例，把本章每种算法对应到具体配置。", url: "https://huggingface.co/docs/trl/index" },
+        { type: "教材", title: "Reinforcement Learning: An Introduction (2nd ed.)", source: "Sutton & Barto", note: "策略梯度和价值估计的源头；读 RLHF 论文前补第 13 章能省掉大量困惑，免费在线。", url: "http://incompleteideas.net/book/the-book-2nd.html" }
       ]
     },
     "08-inference": {
@@ -103,7 +111,9 @@
         { type: "论文", title: "Self-Consistency Improves Chain of Thought Reasoning", source: "Wang et al. · 2022", note: "通过多条推理路径投票提高可验证任务准确率，是 test-time scaling 的基础范式。", url: "https://arxiv.org/abs/2203.11171" },
         { type: "论文", title: "Let's Verify Step by Step", source: "Lightman et al. · 2023", note: "过程奖励模型和逐步验证的代表作，说明“答案对不对”和“推理过程是否可靠”是不同信号。", url: "https://arxiv.org/abs/2305.20050" },
         { type: "论文", title: "Tree of Thoughts", source: "Yao et al. · NeurIPS 2023", note: "把语言模型生成组织成可回溯的搜索树，适合和页面中的 beam、Best-of-N 对照。", url: "https://arxiv.org/abs/2305.10601" },
-        { type: "技术报告", title: "DeepSeek-R1", source: "DeepSeek-AI · 2025", note: "大规模推理强化的公开技术报告，适合观察奖励设计、冷启动和蒸馏的组合方式。", url: "https://arxiv.org/abs/2501.12948" }
+        { type: "技术报告", title: "DeepSeek-R1", source: "DeepSeek-AI · 2025", note: "大规模推理强化的公开技术报告，适合观察奖励设计、冷启动和蒸馏的组合方式。", url: "https://arxiv.org/abs/2501.12948" },
+        { type: "课程讲义", title: "CS234: Reinforcement Learning", source: "Stanford University", note: "搜索、价值估计和探索–利用的系统课；本章的树搜索与验证器思路都能回到这里。", url: "https://web.stanford.edu/class/cs234/" },
+        { type: "官方文档", title: "Generation Strategies", source: "Hugging Face Transformers", note: "把温度、top-p、beam、对比搜索等参数与实际行为一一对应，适合边调边读。", url: "https://huggingface.co/docs/transformers/generation_strategies" }
       ]
     },
     "09-efficiency": {
@@ -114,7 +124,9 @@
         { type: "论文", title: "AWQ: Activation-aware Weight Quantization", source: "Lin et al. · MLSys 2024", note: "保护激活显著权重的量化方法，适合比较 GPTQ、AWQ 与不同推理后端。", url: "https://arxiv.org/abs/2306.00978" },
         { type: "论文", title: "SmoothQuant: Accurate and Efficient Post-Training Quantization", source: "Xiao et al. · 2022", note: "将量化难度从激活迁移到权重，为 W8A8 推理提供工程路径。", url: "https://arxiv.org/abs/2211.10438" },
         { type: "官方文档", title: "vLLM Documentation", source: "vLLM Project · UC Berkeley 起源", note: "连续批处理、PagedAttention、量化和 OpenAI-compatible server 的实践入口。", url: "https://docs.vllm.ai/en/latest/" },
-        { type: "论文", title: "FlexGen: High-Throughput Generative Inference of Large Language Models", source: "Sheng et al. · 2023", note: "在 GPU、CPU 和磁盘之间进行 offload 的系统设计，适合理解端侧与低显存部署。", url: "https://arxiv.org/abs/2303.06865" }
+        { type: "论文", title: "FlexGen: High-Throughput Generative Inference of Large Language Models", source: "Sheng et al. · 2023", note: "在 GPU、CPU 和磁盘之间进行 offload 的系统设计，适合理解端侧与低显存部署。", url: "https://arxiv.org/abs/2303.06865" },
+        { type: "课程", title: "MLC: Machine Learning Compilation", source: "Tianqi Chen · CMU", note: "从计算图到算子和内存规划的公开课，解释推理引擎为何能快，而不只是怎么用。", url: "https://mlc.ai/" },
+        { type: "官方教程", title: "Quantization", source: "Hugging Face Transformers", note: "GPTQ/AWQ/bitsandbytes 的加载方式和精度对比，把本章三篇量化论文接到可运行代码。", url: "https://huggingface.co/docs/transformers/quantization" }
       ]
     },
     "10-applications": {
@@ -125,7 +137,9 @@
         { type: "论文", title: "ReAct: Synergizing Reasoning and Acting in Language Models", source: "Yao et al. · ICLR 2023", note: "交错推理与行动的 Agent 范式，也是工具调用和 Agentic RAG 的共同基础。", url: "https://arxiv.org/abs/2210.03629" },
         { type: "官方示例", title: "Structured Outputs Introduction", source: "OpenAI Cookbook", note: "展示如何用 JSON Schema 约束生成并验证结构化结果，适合与本页的约束解码对照。", url: "https://cookbook.openai.com/examples/structured_outputs_intro" },
         { type: "官方文档", title: "Prompting Guide", source: "Hugging Face Transformers", note: "从任务模板、少样本示例到生成参数，提供可迁移的提示设计基础。", url: "https://huggingface.co/docs/transformers/tasks/prompting" },
-        { type: "综述论文", title: "Retrieval-Augmented Generation for Large Language Models: A Survey", source: "Gao et al. · 2023", note: "按检索、增强、生成和评测梳理 RAG 变体，适合作为进阶地图。", url: "https://arxiv.org/abs/2312.10997" }
+        { type: "综述论文", title: "Retrieval-Augmented Generation for Large Language Models: A Survey", source: "Gao et al. · 2023", note: "按检索、增强、生成和评测梳理 RAG 变体，适合作为进阶地图。", url: "https://arxiv.org/abs/2312.10997" },
+        { type: "课程", title: "CS324: Advances in Foundation Models", source: "Stanford University", note: "第 5 讲把 prompt、RAG、工具与模型能力的关系讲成完整框架，且全部讲义公开。", url: "https://stanford-cs324.github.io/winter2025/" },
+        { type: "官方教程", title: "OpenAI Cookbook", source: "OpenAI", note: "从基础调用到函数调用、检索和 eval 的官方示例库，适合做应用开发的第一步参考。", url: "https://cookbook.openai.com/" }
       ]
     },
     "11-agents": {
@@ -136,7 +150,9 @@
         { type: "论文", title: "Toolformer: Language Models Can Teach Themselves to Use Tools", source: "Schick et al. · 2023", note: "展示模型如何学习何时调用 API 以及如何把工具结果纳入上下文。", url: "https://arxiv.org/abs/2302.04761" },
         { type: "协议规范", title: "Model Context Protocol Specification", source: "MCP Steering Group", note: "工具、资源和提示的开放协议规范，适合核对 MCP 客户端/服务端边界和安全责任。", url: "https://modelcontextprotocol.io/specification/2025-06-18" },
         { type: "论文", title: "SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering", source: "Yang et al. · 2024", note: "以代码仓库任务说明工具接口、上下文组织和执行反馈如何影响 Agent 成功率。", url: "https://arxiv.org/abs/2405.15793" },
-        { type: "论文", title: "OSWorld: Benchmarking Multimodal Agents for Open-Ended Tasks", source: "Xie et al. · 2024", note: "桌面环境中的长链任务评测，帮助理解 Computer Use 的状态、动作和可复现性问题。", url: "https://arxiv.org/abs/2404.07972" }
+        { type: "论文", title: "OSWorld: Benchmarking Multimodal Agents for Open-Ended Tasks", source: "Xie et al. · 2024", note: "桌面环境中的长链任务评测，帮助理解 Computer Use 的状态、动作和可复现性问题。", url: "https://arxiv.org/abs/2404.07972" },
+        { type: "官方教程", title: "Building Effective Agents", source: "Anthropic", note: "先讲清楚工作流与 Agent 的分界，再给出五种可组合模式；本章读任何论文前建议先看它。", url: "https://www.anthropic.com/engineering/building-effective-agents" },
+        { type: "官方教程", title: "Agents Course", source: "Hugging Face", note: "从工具定义、循环控制到多 Agent 协作的动手课程，配可运行 notebook。", url: "https://huggingface.co/learn/agents-course/unit0/introduction" }
       ]
     },
     "12-llmops": {
@@ -147,7 +163,9 @@
         { type: "工程指南", title: "Service Level Objectives", source: "Google SRE", note: "从用户目标定义可测 SLO、错误预算和告警策略，为延迟和可用性指标提供中立框架。", url: "https://sre.google/sre-book/service-level-objectives/" },
         { type: "官方框架", title: "AI Risk Management Framework", source: "NIST", note: "将治理、测量、管理和映射组织成风险闭环，可作为护栏和上线审查的通用基线。", url: "https://www.nist.gov/itl/ai-risk-management-framework" },
         { type: "官方文档", title: "Ragas Documentation", source: "Ragas Project", note: "提供 RAG 的 context precision、faithfulness 等评测指标和数据集组织方式。", url: "https://docs.ragas.io/" },
-        { type: "官方文档", title: "MLflow GenAI Evaluation and Monitoring", source: "MLflow", note: "展示生产轨迹、在线评估和反馈回流的实现方式，适合与页面中的评测 CI 对照。", url: "https://mlflow.org/docs/latest/genai/eval-monitor/" }
+        { type: "官方文档", title: "MLflow GenAI Evaluation and Monitoring", source: "MLflow", note: "展示生产轨迹、在线评估和反馈回流的实现方式，适合与页面中的评测 CI 对照。", url: "https://mlflow.org/docs/latest/genai/eval-monitor/" },
+        { type: "教材", title: "Site Reliability Engineering", source: "Google · O'Reilly", note: "全书免费在线，SLO、错误预算、发布工程和事故复盘的原始出处；LLMOps 的运维半边基本沿用它。", url: "https://sre.google/sre-book/table-of-contents/" },
+        { type: "课程", title: "Machine Learning Systems Design (CS 329S)", source: "Stanford University", note: "讲义覆盖数据分布漂移、在线评估和部署模式，把模型质量和系统可靠性放在同一张图里。", url: "https://stanford-cs329s.github.io/syllabus.html" }
       ]
     },
     "13-evaluation": {
@@ -158,7 +176,9 @@
         { type: "论文", title: "Measuring Massive Multitask Language Understanding", source: "Hendrycks et al. · 2021", note: "MMLU 的任务构成和多学科知识评估方式，帮助理解基准覆盖范围与局限。", url: "https://arxiv.org/abs/2009.03300" },
         { type: "论文", title: "Beyond the Imitation Game: BIG-bench", source: "Srivastava et al. · 2022", note: "大规模多任务基准及其涌现曲线，适合讨论任务选择和能力分布。", url: "https://arxiv.org/abs/2206.04615" },
         { type: "论文", title: "TruthfulQA: Measuring How Models Mimic Human Falsehoods", source: "Lin, Hilton & Evans · 2022", note: "用对抗式问题测量模型复述常见错误信念的倾向，是幻觉与真实性章节的重要对照。", url: "https://arxiv.org/abs/2109.07958" },
-        { type: "评测工具", title: "Inspect AI", source: "UK AI Security Institute", note: "开放的模型评测框架，支持任务、评分器、沙箱和轨迹记录，适合搭建可复现实验。", url: "https://inspect.aisi.org.uk/" }
+        { type: "评测工具", title: "Inspect AI", source: "UK AI Security Institute", note: "开放的模型评测框架，支持任务、评分器、沙箱和轨迹记录，适合搭建可复现实验。", url: "https://inspect.aisi.org.uk/" },
+        { type: "评测工具", title: "LM Evaluation Harness", source: "EleutherAI", note: "多数论文报告分数所用的实现；先看它怎么定义 few-shot 和归一化，再比较任何榜单数字。", url: "https://github.com/EleutherAI/lm-evaluation-harness" },
+        { type: "官方教程", title: "Evaluating Model Performance", source: "Hugging Face Evaluate", note: "指标选择、聚合和显著性的实操指南，适合把本章的评测原则落成代码。", url: "https://huggingface.co/docs/evaluate/index" }
       ]
     },
     "14-governance": {
@@ -169,7 +189,9 @@
         { type: "国际规范", title: "Recommendation on the Ethics of Artificial Intelligence", source: "UNESCO · 2021", note: "以人权、比例原则、透明度和环境责任为核心，适合伦理与公平章节的国际参照。", url: "https://unesdoc.unesco.org/ark:/48223/pf0000381137" },
         { type: "国际原则", title: "OECD AI Principles", source: "OECD", note: "强调包容增长、人本价值、透明可解释、稳健安全和问责，适合和企业治理要求对照。", url: "https://oecd.ai/en/ai-principles" },
         { type: "法规", title: "Regulation (EU) 2024/1689 (AI Act)", source: "European Union", note: "按风险等级规定透明度、通用 AI 和高风险系统义务，阅读时重点看定义与适用范围。", url: "https://eur-lex.europa.eu/eli/reg/2024/1689/oj" },
-        { type: "论文", title: "Model Cards for Model Reporting", source: "Mitchell et al. · FAT* 2019", note: "用标准化模型卡记录用途、限制、评测和偏差，是把研究结果转成可审计文档的经典方案。", url: "https://arxiv.org/abs/1810.03993" }
+        { type: "论文", title: "Model Cards for Model Reporting", source: "Mitchell et al. · FAT* 2019", note: "用标准化模型卡记录用途、限制、评测和偏差，是把研究结果转成可审计文档的经典方案。", url: "https://arxiv.org/abs/1810.03993" },
+        { type: "教材", title: "Fairness and Machine Learning: Limitations and Opportunities", source: "Barocas, Hardt & Narayanan · MIT Press", note: "全书免费在线，讲清楚各类公平性定义为何互相冲突，避免把治理讨论停在口号层面。", url: "https://fairmlbook.org/" },
+        { type: "课程", title: "Ethics of Technological and Digital Innovation", source: "MIT OpenCourseWare", note: "公开讲义和阅读清单，提供伦理论证的分析工具，而不只是结论列表。", url: "https://ocw.mit.edu/courses/24-133-experiential-ethics-fall-2020/" }
       ]
     },
     "15-practice": {

@@ -1,0 +1,88 @@
+The model reads a sequence of tokens and predicts the next one. That single
+objective, repeated over enough text, is enough to produce a system that can
+summarize, translate, answer questions and write code. Nothing in the training
+objective mentions any of those tasks.
+
+A tokenizer sits between raw text and the model. It decides what the atomic
+units are. If the tokenizer is bad, the model wastes capacity learning to
+reassemble fragments that should have been single units, and every downstream
+number — context length, cost per request, throughput — gets worse.
+
+Byte pair encoding starts from raw bytes and repeatedly merges the most frequent
+adjacent pair. The merges are learned from the corpus, so a tokenizer trained on
+English code will produce different units than one trained on Chinese prose.
+This is why vocabulary choice is a data decision, not just an engineering one.
+
+注意力机制让每个位置都能看到序列里的其他位置。查询、键和值都是同一个输入的
+线性投影，注意力权重由查询和键的点积决定，再经过 softmax 归一化。这个结构没有
+循环，也没有卷积，所以整个序列可以并行计算，这是 Transformer 能扩展到今天规模
+的根本原因。
+
+多头注意力把表示空间切成若干子空间，每个头独立计算注意力，然后拼接回去。不同的
+头会学到不同的关系：有的关注相邻词，有的关注句法依存，有的负责把主语和很远的
+谓语连起来。单头也能工作，但表达能力会明显下降。
+
+位置编码解决的是注意力本身不区分顺序的问题。绝对位置编码把位置信息加进输入，
+相对位置编码把它加进注意力分数，旋转位置编码则把它变成对查询和键的旋转。
+后者在长文本外推上表现更好，也是现在多数开源模型的默认选择。
+
+Training a large model is mostly a systems problem. The mathematics fits on one
+page; the difficulty is keeping tens of thousands of accelerators busy while
+gradients, parameters and optimizer states move between them. Data parallelism,
+tensor parallelism and pipeline parallelism each trade communication volume
+against memory, and real systems combine all three.
+
+Mixed precision training keeps a master copy of the weights in higher precision
+while doing the forward and backward passes in lower precision. The loss scale
+exists because gradients in low precision underflow to zero; multiplying the
+loss before the backward pass shifts them into representable range, and the
+optimizer divides it back out before the update.
+
+推理和训练的瓶颈完全不同。训练是计算密集的，推理在自回归解码阶段是访存密集的：
+每生成一个 token 都要把整个模型的参数从显存读一遍，而实际计算量只有一次矩阵
+向量乘。这就是为什么批处理能极大提升吞吐——参数只读一次，却服务了很多请求。
+
+KV 缓存把已经算过的键和值存下来，避免每步重算整个前缀。代价是显存占用随序列
+长度线性增长，长上下文场景下缓存可能比模型权重本身还大。分组查询注意力和多查询
+注意力就是为了压缩这部分开销。
+
+Retrieval augmented generation does not make a model smarter. It changes what
+information is in the context window when the model answers. The quality of the
+answer is then bounded by the quality of the retrieval, which is why evaluating
+a RAG system means evaluating retrieval and generation separately before
+evaluating them together.
+
+Evaluation is where most projects are least rigorous. A benchmark score without
+the task definition, the prompt, the decoding parameters and the contamination
+analysis is not a measurement. Two papers reporting different numbers on the
+same benchmark are usually measuring different things.
+
+对齐的目标是让模型的输出符合人的意图和价值判断。监督微调提供了正确行为的示例，
+偏好优化则告诉模型在两个都合理的回答之间应该更倾向哪一个。前者教会格式和风格，
+后者调整的是更细的取舍。
+
+护栏不能只放在模型这一层。输入侧要处理注入和越权，输出侧要检查敏感信息和事实性，
+工具调用侧要限制权限和副作用。任何一层缺失，整个系统的安全性就等于最弱的那一环。
+
+An agent is a loop, not a model. The model chooses an action, the environment
+executes it and returns an observation, and the loop repeats until a stopping
+condition. Reliability comes from making that loop observable, interruptible and
+verifiable — not from asking the model to think harder.
+
+Cost in production is dominated by tokens, and tokens are dominated by context.
+Caching prompts, trimming retrieved passages and choosing a smaller model for
+routing decisions usually saves more than any single optimization inside the
+serving stack.
+
+监控大模型系统需要记录完整轨迹：用户输入、检索到的片段、模型输出、工具调用和
+最终结果。只记录请求延迟和错误率是不够的，因为质量下降往往不表现为报错，而是
+表现为回答变得平庸或开始编造。
+
+Scaling laws describe how loss falls as a power law in model size, data size and
+compute. They are empirical regularities, not theorems, and they hold over the
+range where they were measured. Their practical value is in allocating a fixed
+compute budget between more parameters and more data.
+
+The most common failure in applied work is not a wrong model choice. It is a
+missing feedback loop: no one is measuring whether the system got better after
+the last change, so every change is a guess.
