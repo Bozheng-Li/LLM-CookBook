@@ -140,11 +140,23 @@
 
   /* 图表和论文插图在正文中按列宽显示，点击后打开可缩放阅读层。 */
   function initFigureZoom() {
+    /* 三类可放大的东西：Mermaid 容器、论文插图、烘焙出的流程图 SVG。
+       点击委托与键盘激活都用这一份，免得加了一处漏了另一处。 */
+    var ZOOM_SOURCE = '.mermaid, .image-figure img, .flow-figure .flow-svg';
     document.querySelectorAll('.mermaid').forEach(function (node) {
       node.dataset.cbZoom = 'ready';
       node.setAttribute('tabindex', '0');
       node.setAttribute('role', 'button');
       node.setAttribute('aria-label', '放大查看流程图');
+    });
+    /* 流程图 SVG 只加可聚焦，不动 role/aria。它烘焙时已经带了
+       role="img" + aria-labelledby(图注) + aria-describedby(节点与连线全文)，
+       改成 role="button" 会把这套读屏信息一起丢掉；而 aria-labelledby 在
+       命名计算里本来就压过 aria-label，补一句「放大查看」也是空转。
+       可放大的提示交给 fig-flow.css 的 cursor: zoom-in 与焦点环。 */
+    document.querySelectorAll('.flow-figure .flow-svg').forEach(function (node) {
+      node.dataset.cbZoom = 'ready';
+      node.setAttribute('tabindex', '0');
     });
     document.querySelectorAll('.image-figure img').forEach(function (node) {
       node.setAttribute('tabindex', '0');
@@ -154,11 +166,15 @@
     if (document.body.dataset.cbZoomBound) return;
     document.body.dataset.cbZoomBound = '1';
     document.addEventListener('click', function (event) {
-      var source = event.target.closest('.mermaid, .image-figure img');
+      var source = event.target.closest(ZOOM_SOURCE);
       if (!source || event.target.closest('.cb-zoom-layer')) return;
-      var visual = source.matches('img') ? source.cloneNode(true) : source.querySelector('svg');
+      /* Mermaid 是容器要往里取 svg；插图和流程图 SVG 自己就是那张图。 */
+      var visual = source.matches('img, svg') ? source : source.querySelector('svg');
       if (!visual) return;
       visual = visual.cloneNode(true);
+      /* 副本别再当放大入口：留着 tabindex 会在弹层里多一个跳不出去的焦点点。 */
+      visual.removeAttribute('tabindex');
+      visual.removeAttribute('data-cb-zoom');
       var layer = document.createElement('div');
       layer.className = 'cb-zoom-layer';
       layer.setAttribute('role', 'dialog');
@@ -221,7 +237,23 @@
         status.value = Math.round(scale * 100) + '%';
         status.textContent = status.value;
       }
-      applyScale(Math.max(1, Math.min(1.35, 980 / Math.max(naturalWidth, 1))));
+      function fitScale() {
+        return Math.max(1, Math.min(1.35, 980 / Math.max(naturalWidth, 1)));
+      }
+      var fitted = fitScale();
+      applyScale(fitted);
+      /* loading="lazy" 的插图可能还没解码就被点开：那时 naturalWidth 是 0，
+         退到 clientWidth 只剩占位框的十几像素，放大层会开出一张缩略图。
+         副本解码完成后按真实尺寸重算——用户已经手调过缩放就只换尺寸不换倍率。 */
+      if (visual.matches('img') && !visual.complete) {
+        visual.addEventListener('load', function () {
+          if (!visual.naturalWidth) return;
+          var keepFit = scale === fitted;
+          naturalWidth = visual.naturalWidth;
+          naturalHeight = visual.naturalHeight;
+          applyScale(keepFit ? fitScale() : scale);
+        }, { once: true });
+      }
       zoomOut.addEventListener('click', function () { applyScale(scale - 0.2); });
       zoomReset.addEventListener('click', function () { applyScale(1); });
       zoomIn.addEventListener('click', function () { applyScale(scale + 0.2); });
@@ -244,9 +276,13 @@
     });
     document.addEventListener('keydown', function (event) {
       var node = document.activeElement;
-      if ((event.key === 'Enter' || event.key === ' ') && node && node.matches('.mermaid, .image-figure img')) {
+      if ((event.key === 'Enter' || event.key === ' ') && node && node.matches(ZOOM_SOURCE)) {
         event.preventDefault();
-        node.click();
+        /* 不用 node.click()：click() 只定义在 HTMLElement 上，SVGElement 没有
+           （它从 HTMLOrSVGElement 拿到的只有 focus/blur/dataset），
+           对流程图 SVG 调用会抛 TypeError，键盘就再也打不开放大层。
+           派发一个会冒泡的 click 事件，走的还是上面那个委托处理器。 */
+        node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       }
     });
   }
@@ -262,6 +298,39 @@
     Chart.defaults.plugins.legend.labels.boxWidth = 12;
     Chart.defaults.plugins.legend.labels.usePointStyle = true;
     Chart.defaults.maintainAspectRatio = false;
+  }
+
+  /**
+   * 横滚容器只在真的溢出时才可聚焦。
+   *
+   * 烘焙期给 .flow-scroll 一律写死 tabindex="0"（JS 挂掉时也能用键盘滚），
+   * 但 314 张带壳图里绝大多数在桌面宽度下根本不溢出，全留着就是 300 多个
+   * 按 Tab 只会停一下、什么也做不了的空停留点，而每张图的 SVG 本身还要占一个
+   * （放大入口）。所以这里按实测溢出量收回：不溢出就摘掉 tabindex 和 role，
+   * 窗口尺寸变了再算一次。
+   */
+  function initFlowScroll() {
+    var boxes = document.querySelectorAll('.flow-scroll');
+    if (!boxes.length) return;
+    function sync() {
+      boxes.forEach(function (box) {
+        var overflows = box.scrollWidth - box.clientWidth > 1;
+        if (overflows) {
+          box.setAttribute('tabindex', '0');
+          box.setAttribute('role', 'region');
+        } else {
+          box.removeAttribute('tabindex');
+          box.removeAttribute('role');
+        }
+      });
+    }
+    sync();
+    var pending = false;
+    window.addEventListener('resize', function () {
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(function () { pending = false; sync(); });
+    });
   }
 
   function init() {
@@ -281,6 +350,7 @@
       if (typeof mermaid !== 'undefined') mermaid.run({ nodes: document.querySelectorAll('.mermaid') });
     } catch (e) { /* noop */ }
     initFigureZoom();
+    initFlowScroll();
   }
 
   // The UMD bundle registers its load handler before this script. Disable
