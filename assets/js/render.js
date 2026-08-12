@@ -90,10 +90,24 @@
 
   /* 保存每个 Mermaid 节点的原始源码,供主题切换时重渲染 */
   var mermaidSources = [];
+  /* 静态站点构建会把部分手写 HTML 压成一行。flowchart/timeline 可以
+     容忍空白，但 sequenceDiagram 把换行当作语句边界；例如
+     `autonumber participant` 会被 Mermaid 当作一条非法命令。只在这
+     一类图上恢复命令边界，保持正文和其它 Mermaid 语法不受影响。 */
+  function normalizeSequenceDiagram(source) {
+    if (!/^\s*sequenceDiagram\b/.test(source)) return source;
+    return source
+      .replace(/^(\s*sequenceDiagram)\s+autonumber\s+/, '$1\nautonumber\n')
+      .replace(/\s+(?=participant\s+\S+\s+as\s+)/g, '\n')
+      .replace(/\s+(?=Note\s+(?:over|right of|left of)\s+)/g, '\n')
+      .replace(/\s+(?=[A-Za-z0-9_]+\s*(?:-->>|->>|-->|->)\s*[A-Za-z0-9_]+)/g, '\n');
+  }
   function saveMermaidSrc() {
     if (mermaidSources.length) return;
     document.querySelectorAll('.mermaid').forEach(function (n) {
-      mermaidSources.push(n.textContent);
+      var source = normalizeSequenceDiagram(n.textContent);
+      n.textContent = source;
+      mermaidSources.push(source);
     });
   }
 
@@ -142,7 +156,7 @@
   function initFigureZoom() {
     /* 三类可放大的东西：Mermaid 容器、论文插图、烘焙出的流程图 SVG。
        点击委托与键盘激活都用这一份，免得加了一处漏了另一处。 */
-    var ZOOM_SOURCE = '.mermaid, .image-figure img, .flow-figure .flow-svg';
+    var ZOOM_SOURCE = '.mermaid, .image-figure img, .flow-figure .flow-svg, .classic-figure .classic-svg';
     document.querySelectorAll('.mermaid').forEach(function (node) {
       node.dataset.cbZoom = 'ready';
       node.setAttribute('tabindex', '0');
@@ -155,6 +169,12 @@
        命名计算里本来就压过 aria-label，补一句「放大查看」也是空转。
        可放大的提示交给 fig-flow.css 的 cursor: zoom-in 与焦点环。 */
     document.querySelectorAll('.flow-figure .flow-svg').forEach(function (node) {
+      node.dataset.cbZoom = 'ready';
+      node.setAttribute('tabindex', '0');
+    });
+    /* 手绘 SVG 和流程图一样：保留 role="img" 的完整读屏描述，
+       只给键盘焦点和放大手势，不把语义降级成普通按钮。 */
+    document.querySelectorAll('.classic-figure .classic-svg').forEach(function (node) {
       node.dataset.cbZoom = 'ready';
       node.setAttribute('tabindex', '0');
     });
