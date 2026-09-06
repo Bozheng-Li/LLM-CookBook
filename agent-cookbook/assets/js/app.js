@@ -87,7 +87,9 @@
   function normText(s) { return (s || "").replace(/\s+/g, " ").trim(); }
   function loadIndex() {
     if (SEARCH_INDEX) return Promise.resolve(SEARCH_INDEX);
-    return fetch("assets/search-index.json")
+    var inChapters = location.pathname.indexOf("/chapters/") >= 0 || location.href.indexOf("/chapters/") >= 0;
+    var indexPath = inChapters ? "../assets/search-index.json" : "assets/search-index.json";
+    return fetch(indexPath)
       .then(function (r) { if (!r.ok) throw new Error("index missing"); return r.json(); })
       .then(function (d) { SEARCH_INDEX = d; return d; })
       .catch(function () { SEARCH_INDEX = []; return SEARCH_INDEX; });
@@ -125,8 +127,10 @@
         if (!results.length) {
           box.innerHTML = '<div class="sr-empty">没有找到「' + q.replace(/</g, "&lt;") + '」相关内容</div>';
         } else {
+          var inChapters = location.pathname.indexOf("/chapters/") >= 0 || location.href.indexOf("/chapters/") >= 0;
           box.innerHTML = results.map(function (r, i) {
-            return '<a class="sr-item" data-i="' + i + '" href="' + r.doc.file + '">' +
+            var fileUrl = inChapters ? r.doc.file.replace(/^chapters\//, "") : (r.doc.file.indexOf("chapters/") === 0 ? r.doc.file : "chapters/" + r.doc.file);
+            return '<a class="sr-item" data-i="' + i + '" href="' + fileUrl + '">' +
               '<div class="sr-title">' + r.doc.title.replace(/</g, "&lt;") + "</div>" +
               '<div class="sr-snippet">' + snippet(r.doc.body, terms[0]) + "</div></a>";
           }).join("");

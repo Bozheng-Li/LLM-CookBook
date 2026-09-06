@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """build.py — 全书构建: 侧栏注入 / 目录生成 / 搜索索引 / 单页打印版 / 统计.
-用法: python tools/build.py
+支持自动根据页面层级（根目录 index.html vs chapters/*.html）计算正确的相对路径前缀，杜绝 404 死链！
 """
 import os, re, json, html
 
@@ -21,11 +21,16 @@ def all_chapters():
     return out
 
 
-def sidebar_html(current=""):
+def sidebar_html(is_in_chapters=False):
+    """
+    is_in_chapters=False 时（针对 index.html）：链接为 chapters/ch001.html
+    is_in_chapters=True 时（针对 chapters/*.html）：链接为 ch001.html
+    """
+    prefix = "" if is_in_chapters else "chapters/"
     parts_html = []
     for p in TOC["parts"]:
         items = "".join(
-            f'<a href="chapters/{c["file"]}"><span class="cn">{c["id"]:03d}</span>{esc(c["title"])}</a>'
+            f'<a href="{prefix}{c["file"]}"><span class="cn">{c["id"]:03d}</span>{esc(c["title"])}</a>'
             for c in p["chapters"])
         parts_html.append(
             f'<div class="toc-part"><div class="toc-part-head"><span class="num">{p["num"]}</span>'
@@ -34,13 +39,23 @@ def sidebar_html(current=""):
     return "".join(parts_html)
 
 
-SIDEBAR = sidebar_html()
+SIDEBAR_ROOT = sidebar_html(is_in_chapters=False)
+SIDEBAR_CHAPTERS = sidebar_html(is_in_chapters=True)
 
 
-def inject_sidebar(path):
+def inject_sidebar(path, is_in_chapters=False):
     raw = open(path, encoding="utf-8").read()
+    sidebar_content = SIDEBAR_CHAPTERS if is_in_chapters else SIDEBAR_ROOT
+    
+    # 替换已有侧边栏内容或标记
     if "<!--SIDEBAR-->" in raw:
-        raw = raw.replace("<!--SIDEBAR-->", SIDEBAR)
+        raw = raw.replace("<!--SIDEBAR-->", sidebar_content)
+        open(path, "w", encoding="utf-8").write(raw)
+        return True
+    elif '<div class="toc-part">' in raw:
+        # 已注入过侧边栏，更新全部 toc-part
+        raw = re.sub(r'<div class="toc-part">[\s\S]*?<div class="sidebar-foot">',
+                     sidebar_content + '\n  <div class="sidebar-foot">', raw, count=1)
         open(path, "w", encoding="utf-8").write(raw)
         return True
     return False
@@ -81,7 +96,7 @@ def build_search_index():
         raw = open(fp, encoding="utf-8").read()
         body = strip_tags(raw)
         body = re.sub(r"\s+", " ", body)
-        idx.append({"file": "chapters/" + ch["file"],
+        idx.append({"file": ch["file"],
                     "title": f'第{ch["id"]}章 · {ch["title"]}',
                     "body": body[:2600]})
     for a in TOC["appendices"]:
@@ -90,7 +105,7 @@ def build_search_index():
             continue
         raw = open(fp, encoding="utf-8").read()
         body = re.sub(r"\s+", " ", strip_tags(raw))
-        idx.append({"file": "chapters/" + a["file"], "title": a["title"], "body": body[:2600]})
+        idx.append({"file": a["file"], "title": a["title"], "body": body[:2600]})
     with open(os.path.join(ROOT, "assets", "search-index.json"), "w", encoding="utf-8") as f:
         json.dump(idx, f, ensure_ascii=False)
     print(f"search-index.json: {len(idx)} entries, {os.path.getsize(os.path.join(ROOT,'assets','search-index.json'))//1024}KB")
@@ -108,7 +123,11 @@ def build_index_toc():
             f'<div class="pt-card" id="part-{p["num"]}"><div class="pt-head"><span class="pt-num">{p["num"]}</span>'
             f'<h3>{p["icon"]} {esc(p["title"])}</h3></div>'
             f'<p class="pt-blurb">{esc(p["blurb"])}</p><ul>{items}</ul></div>')
-    raw = raw.replace("<!--TOC-GRID-->", '<div class="part-toc">' + "".join(cards) + "</div>")
+    if '<div class="part-toc">' in raw:
+        raw = re.sub(r'<div class="part-toc">[\s\S]*?</div>\s*<!--/TOC-GRID-->',
+                     '<div class="part-toc">' + "".join(cards) + "</div>\n<!--/TOC-GRID-->", raw, count=1)
+    elif "<!--TOC-GRID-->" in raw:
+        raw = raw.replace("<!--TOC-GRID-->", '<div class="part-toc">' + "".join(cards) + "</div>\n<!--/TOC-GRID-->")
     open(fp, "w", encoding="utf-8").write(raw)
     print("index.html TOC injected")
 
@@ -135,6 +154,9 @@ def build_print():
         inner = m.group(1) if m else ""
         inner = inner.replace('src="../assets/', 'src="assets/')
         inner = inner.replace('href="../assets/', 'href="assets/')
+        inner = inner.replace('href="../index.html', 'href="index.html')
+        # 将同级章节链接 chXXX.html 转换为 chapters/chXXX.html
+        inner = re.sub(r'href="(ch\d{3}\.html|app[a-d]\.html)', r'href="chapters/\g<1>', inner)
         body_parts.append(f'<section style="page-break-before:always">{inner}</section>')
     for a in TOC["appendices"]:
         fp = os.path.join(CH_DIR, a["file"])
@@ -142,7 +164,8 @@ def build_print():
             continue
         raw = open(fp, encoding="utf-8").read()
         m = re.search(r'<div class="content">([\s\S]*?)</main>', raw)
-        inner = (m.group(1) if m else "").replace('src="../assets/', 'src="assets/').replace('href="../assets/', 'href="assets/')
+        inner = (m.group(1) if m else "").replace('src="../assets/', 'src="assets/').replace('href="../assets/', 'href="assets/').replace('href="../index.html', 'href="index.html')
+        inner = re.sub(r'href="(ch\d{3}\.html|app[a-d]\.html)', r'href="chapters/\g<1>', inner)
         body_parts.append(f'<section style="page-break-before:always">{inner}</section>')
     page = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <title>AI Agent Cookbook · 打印版</title><link rel="stylesheet" href="assets/css/style.css">
@@ -200,18 +223,18 @@ def main():
     entries = all_chapters()
     n_inj = 0
     idx_fp = os.path.join(ROOT, "index.html")
-    if os.path.exists(idx_fp) and inject_sidebar(idx_fp):
+    if os.path.exists(idx_fp) and inject_sidebar(idx_fp, is_in_chapters=False):
         n_inj += 1
     for i, (p, ch) in enumerate(entries):
         fp = os.path.join(CH_DIR, ch["file"])
         if os.path.exists(fp):
-            if inject_sidebar(fp):
+            if inject_sidebar(fp, is_in_chapters=True):
                 n_inj += 1
             inject_nav(fp, [e for _, e in entries], i)
     for a in TOC["appendices"]:
         fp = os.path.join(CH_DIR, a["file"])
         if os.path.exists(fp):
-            if inject_sidebar(fp):
+            if inject_sidebar(fp, is_in_chapters=True):
                 n_inj += 1
     print(f"sidebar injected into {n_inj} files")
     build_index_toc()
