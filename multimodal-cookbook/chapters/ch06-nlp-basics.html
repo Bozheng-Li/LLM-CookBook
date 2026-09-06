@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 6 章 自然语言处理：从 Word2Vec 到 BERT · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第一部分 · 基础篇：单模态基石</div>
+  <h1 class="chapter-title">第 6 章　自然语言处理：从 Word2Vec 到 BERT</h1>
+  <div class="chapter-meta"><span>预计阅读 75 分钟</span><span>难度 ★★★☆☆</span><span>前置：第 3 章（Transformer）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">分布式语义假说与词向量</a></li>
+  <li><a href="#sec-2">Word2Vec：CBOW、Skip-gram 与负采样</a></li>
+  <li><a href="#sec-3">序列到序列与注意力机制的诞生</a></li>
+  <li><a href="#sec-4">上下文词向量：ELMo 与"动态表示"思想</a></li>
+  <li><a href="#sec-5">BERT：双向编码与预训练-微调范式</a></li>
+  <li><a href="#sec-6">GPT 谱系：从生成式预训练到上下文学习</a></li>
+  <li><a href="#sec-7">两条路线的合流与多模态启示</a></li>
+  <li><a href="#sec-8">动手实践：HuggingFace 管线与词向量探查</a></li>
+  <li><a href="#sec-9">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>多模态大模型的语言半边，几乎每一块基石都诞生于 2013–2020 年的 NLP：CLIP 的文本编码器是 Transformer，BLIP-2 的 Q-Former 骨架是 BERT，LLaVA 的底座是对话微调过的 LLaMA。本章沿着"静态词向量 → 序列建模 → 注意力 → 上下文表示 → 预训练范式"的历史主线，把这段历史中<b>对多模态最有影响</b>的思想讲透：分布式假说如何变成可优化的目标函数、注意力如何解决长程依赖、BERT 的掩码预训练如何被 ViLBERT/BLIP 直接搬进视觉语言领域、GPT 的生成式路线如何通向上下文学习。读完本章，你将能看懂第二部分所有 VLP 模型的"语言侧基因"。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>分布式语义假说与词向量</h2>
+<p>1957 年，语言学家 J. R. Firth 写下那句被引用了半个多世纪的话：<b>"You shall know a word by the company it keeps"</b>（观其伴而知其义）。这就是<b>分布式语义假说（distributional hypothesis）</b>：语义相近的词出现在相似的上下文中。2013 年之前，这一假说的实现方式是"计数"——构建词-文档矩阵或词-上下文矩阵（如 PPMI、LSA），用统计或矩阵分解得到低维表示。这些方法有效但笨重：矩阵巨大、高维稀疏、难以融入神经网络。</p>
+<p>Mikolov 等人在 2013 年的《Efficient Estimation of Word Representations in Vector Space》（arXiv:1301.3781）与《Distributed Representations of Words and Phrases and their Compositionality》（arXiv:1310.4546）改变了局面：把"预测上下文"直接变成一个<b>可以用梯度下降训练的自监督任务</b>，用浅层网络在数十亿词上高效训练，得到 300 维的稠密词向量。更迷人的是这些向量展现出惊人的线性结构：<code>vec("king") − vec("man") + vec("woman") ≈ vec("queen")</code>——语义关系被编码成了向量空间中的<b>平移不变方向</b>。</p>
+<div class="box-history"><p class="box-title">🕰 历史一刻：2013 年，词向量让"语义"变成了几何</p>
+<p>Word2Vec 之前，NLP 特征工程的代表是 one-hot 与 TF-IDF；之后，"把一切表示为稠密向量"成为默认。这个思想对多模态的影响是决定性的：2015 年的图像描述模型把图像特征"翻译"到词向量空间（DeViSE，2013 年已提出跨模态映射的雏形），2019 年后的 CLIP 更是把"图文对齐"完全建立在"双塔各自编码、余弦相似度对齐"的几何框架上。可以说，<b>没有词向量的几何化，就没有多模态的表示学习</b>。</p></div>
+
+<h3 id="sec-1-1">1.1 计数派与预测派：两条路线的竞争与合流</h3>
+<p>在 Word2Vec 出现前，"分布式语义"的主流实现是<b>计数派</b>：LSA 对词-文档矩阵做 SVD 降维、HAL/PMI 构建词-词共现矩阵。预测派（Word2Vec）的优势是工程性的：在线训练、对高频模式敏感、容易扩展到亿级语料。2014 年 Levy 与 Goldberg 的名文《Neural Word Embedding as Implicit Matrix Factorization》（arXiv:1401.6404）证明了一个漂亮结论：<b>Skip-gram with Negative Sampling（SGNS）在数学上等价于对移位 PMI 矩阵的隐式分解</b>——两个派别在目标函数层面是同一件事。这个视角给了我们两件武器：其一，理解对比学习的"共现统计+低秩约束"本质（第 10、12 章会反复回用）；其二，解释为什么 GloVe（Pennington et al., EMNLP 2014，全局共现+加权最小二乘）与 Word2Vec 效果接近——它们都在近似同一个统计量。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：把 SGNS 看作"点互信息回归"</p>
+<p>PMI（点互信息）$\mathrm{PMI}(w,c)=\log\frac{P(w,c)}{P(w)P(c)}$ 度量"共现频率超出随机水平多少"。SGNS 的最优解近似满足 $\mathbf{u}_w^\top\mathbf{v}_c \approx \mathrm{PMI}(w,c) - \log k$（$k$ 为负例数）。这个"$-\log k$ 偏置"解释了负例数量对表示几何的系统性影响——负例越多，向量范数越小、角度越能代表真实语义距离。读 CLIP 论文时你会发现温度参数承担了类似角色：都是<b>对相似度尺度的全局再校准</b>。</p></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>Word2Vec：CBOW、Skip-gram 与负采样</h2>
+
+<h3 id="sec-2-1">2.1 两个架构：谁预测谁</h3>
+<p>Word2Vec 提供两种互为镜像的架构。<b>CBOW（Continuous Bag-of-Words）</b>用上下文词预测中心词：把窗口内 $2c$ 个上下文词向量取平均（或求和），经一个投影矩阵预测中心词。<b>Skip-gram</b>则反过来，用中心词预测每个上下文词。经验规律是：<b>Skip-gram 在小数据上、对低频词的效果更好</b>（每个中心词-上下文对都是独立训练信号），CBOW 训练更快、对高频词更稳。原文的实验显示，在句法类比任务上 Skip-gram 明显占优。</p>
+<figure><svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+  <defs><marker id="a6" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="200" y="26" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a" font-family="sans-serif">CBOW：上下文 → 中心词</text>
+  <rect x="40" y="60" width="60" height="40" rx="6" fill="#eff6ff" stroke="#2563eb"/><text x="70" y="85" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#1e3a8a">"今天"</text>
+  <rect x="120" y="60" width="60" height="40" rx="6" fill="#eff6ff" stroke="#2563eb"/><text x="150" y="85" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#1e3a8a">"天气"</text>
+  <rect x="200" y="60" width="60" height="40" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-dasharray="4,3"/><text x="230" y="85" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#94a3b8">"？"（预测）</text>
+  <rect x="280" y="60" width="60" height="40" rx="6" fill="#eff6ff" stroke="#2563eb"/><text x="310" y="85" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#1e3a8a">"很好"</text>
+  <rect x="120" y="140" width="160" height="36" rx="8" fill="#fffbeb" stroke="#d97706"/><text x="200" y="163" text-anchor="middle" font-size="11.5" font-family="sans-serif" fill="#92400e">平均池化 → 投影层</text>
+  <line x1="70" y1="100" x2="170" y2="136" stroke="#64748b" stroke-width="1.5" marker-end="url(#a6)"/>
+  <line x1="150" y1="100" x2="180" y2="136" stroke="#64748b" stroke-width="1.5" marker-end="url(#a6)"/>
+  <line x1="310" y1="100" x2="240" y2="136" stroke="#64748b" stroke-width="1.5" marker-end="url(#a6)"/>
+  <line x1="200" y1="176" x2="230" y2="104" stroke="#d97706" stroke-width="2" marker-end="url(#a6)"/>
+  <text x="565" y="26" text-anchor="middle" font-size="14" font-weight="bold" fill="#5b21b6" font-family="sans-serif">Skip-gram：中心词 → 上下文</text>
+  <rect x="535" y="60" width="60" height="40" rx="6" fill="#f5f3ff" stroke="#8b5cf6"/><text x="565" y="85" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#5b21b6">"天气"</text>
+  <rect x="440" y="160" width="60" height="40" rx="6" fill="#f5f3ff" stroke="#8b5cf6" stroke-dasharray="4,3"/><text x="470" y="185" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#94a3b8">"今天"</text>
+  <rect x="535" y="160" width="60" height="40" rx="6" fill="#f5f3ff" stroke="#8b5cf6" stroke-dasharray="4,3"/><text x="565" y="185" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#94a3b8">"很好"</text>
+  <rect x="630" y="160" width="60" height="40" rx="6" fill="#f5f3ff" stroke="#8b5cf6" stroke-dasharray="4,3"/><text x="660" y="185" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#94a3b8">"不错"</text>
+  <line x1="565" y1="100" x2="480" y2="156" stroke="#64748b" stroke-width="1.5" marker-end="url(#a6)"/>
+  <line x1="565" y1="100" x2="565" y2="156" stroke="#64748b" stroke-width="1.5" marker-end="url(#a6)"/>
+  <line x1="565" y1="100" x2="650" y2="156" stroke="#64748b" stroke-width="1.5" marker-end="url(#a6)"/>
+  <text x="380" y="232" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">同一句话，两种"完形填空"方向：CBOW 便宜，Skip-gram 对低频词更友好</text>
+</svg><figcaption>图 6-1　<b>Word2Vec 的两种架构</b>：CBOW（左）用上下文预测中心词，Skip-gram（右）用中心词预测上下文。虚线框为预测目标。</figcaption></figure>
+
+<h3 id="sec-2-2">2.2 从 Softmax 到负采样：一个被低估的工程革命</h3>
+<p>朴素的做法是把"预测上下文词"当成 $|V|$ 类分类（$|V|$ 是词表大小，通常 $10^5$–$10^6$），每一步都要对全词表做 softmax——代价高得不可训练。Word2Vec 的第二篇论文给出了著名的解法：<b>负采样（Negative Sampling）</b>，把多分类问题塌缩成若干个二分类问题。</p>
+<div class="box-theory"><p class="box-title">📐 理论推导：负采样目标函数</p>
+<p>对中心词 $w$ 与其真实上下文词 $c$，定义"是否共现"标签 $y=1$；再从噪声分布 $P_n(c)$ 采样 $k$ 个负例 $c_1,\dots,c_k$，标签 $y=0$。对每对 $(w,c)$ 用点积加 sigmoid 定义共现概率：</p>
+<div class="math-block">$$P(y=1 \mid w,c) = \sigma(\mathbf{u}_w^\top \mathbf{v}_c) = \frac{1}{1+\exp(-\mathbf{u}_w^\top \mathbf{v}_c)}$$</div>
+<p>单个观测的负对数似然为（用 $\mathbb{E}_{c\sim P_n}$ 表示负例期望）：</p>
+<div class="math-block">$$\ell = -\log\sigma(\mathbf{u}_w^\top \mathbf{v}_c) - \sum_{i=1}^{k}\log\sigma\!\big(-\mathbf{u}_w^\top \mathbf{v}_{c_i}\big)$$</div>
+<p>三点关键设计：①<b>分母只含 $k+1$ 项</b>而非全词表，训练复杂度从 $O(|V|)$ 降到 $O(k)$，$k$ 取 5–20 即可；②噪声分布取<b>一元词频的 3/4 次幂</b> $P_n(c)\propto \mathrm{freq}(c)^{0.75}$——相比原始词频，它提升了低频词被采为负例的概率，实验上效果更好，这个"3/4 律"此后出现在无数对比学习实现里；③这个"拉近正例点积、推远负例点积"的形式，正是 InfoNCE 的先驱——第 12 章的 CLIP 损失可视为负采样思想在图文对上的复活。此外原文还使用<b>高频词下采样</b>（以概率 $1-\sqrt{t/\mathrm{freq}(w)}$ 丢弃高频词，$t\approx 10^{-5}$），缓解"的、了、是"主导训练的问题。</p></div>
+
+<h3 id="sec-2-3">2.3 词向量的性质与局限</h3>
+<p>训练良好的词向量有三个可依赖的性质：<b>线性类比</b>（king−man+woman≈queen）、<b>聚类结构</b>（同主题词自然聚簇）、<b>可迁移</b>（把预训练向量接入下游小模型即可涨点）。但有三个致命局限，直接推动了后续革命：<b>① 一词多义无解</b>——"bank"只有一个向量，河岸与银行被迫共享；<b>② 上下文信息丢失</b>——表示与句子无关，"苹果发布新机"和"我吃了个苹果"中的"苹果"完全相同；<b>③ 组合性缺失</b>——词向量求和无法表达语序与句法。解决之道是"让表示依赖上下文"，这条路线的终点就是 BERT 与 GPT。</p>
+<h2 id="sec-3"><span class="sec-no">3.</span>序列到序列与注意力机制的诞生</h2>
+<h3 id="sec-3-1">3.1 Seq2Seq：编码-解码框架的建立</h3>
+<p>机器翻译是检验序列建模的试金石。Sutskever 等人 2014 年的《Sequence to Sequence Learning with Neural Networks》（arXiv:1409.3215）确立了<b>编码器-解码器（encoder-decoder）</b>框架：编码器 LSTM 把源句压缩成一个固定向量 $\mathbf{c}$，解码器 LSTM 以 $\mathbf{c}$ 为初始状态逐词生成目标句。训练时以最大似然优化，推理时用束搜索（beam search）。这个框架优雅，但有一个结构性缺陷：<b>把变长句子的全部信息塞进一个固定维度向量</b>，句子一长（原文实验约超过 30 词）性能骤降——信息瓶颈在所难免。</p>
+<h3 id="sec-3-2">3.2 注意力机制：让解码器"回头看"</h3>
+<p>Bahdanau 等人 2014 年的《Neural Machine Translation by Jointly Learning to Align and Translate》（arXiv:1409.0473）给出教科书级的解法：解码每个词时，不再依赖单一向量，而是<b>对编码器的全部隐状态做一次加权和</b>，权重由当前解码状态与各编码状态的相关性决定。形式化：设编码器隐状态 $\{\mathbf{h}_1,\dots,\mathbf{h}_S\}$，解码器第 $t$ 步状态为 $\mathbf{s}_t$，则</p>
+<div class="math-block">$$e_{t,i}=a(\mathbf{s}_t,\mathbf{h}_i),\quad \alpha_{t,i}=\frac{\exp(e_{t,i})}{\sum_j \exp(e_{t,j})},\quad \mathbf{c}_t=\sum_i \alpha_{t,i}\mathbf{h}_i$$</div>
+<p>其中 $a$ 是对齐函数（原文用加性：$\mathbf{v}^\top\tanh(\mathbf{W}_s\mathbf{s}_t+\mathbf{W}_h\mathbf{h}_i)$；Luong 等人 2015 年 arXiv:1508.04025 简化为乘性点积——后者正是 Transformer 缩放点积注意力的直系祖先）。三个深远影响：①信息瓶颈消失，长句翻译大幅提升；②$\alpha_{t,i}$ 天然构成"软对齐"，可视化显示译文词与源词的对齐——<b>"注意力可解释"的叙事从这里开始</b>；③"加权求和"是模态无关的操作，为跨模态注意力（用文本查询图像区域）铺平了道路——ViLBERT、Flamingo 的 cross-attention 与这里唯一的区别是 $\mathbf{h}$ 来自另一个模态。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：理解注意力的一个记忆锚点</p>
+<p>注意力永远在回答同一句话：<b>"拿一个查询（query），去一组键值对（key-value）里按相关性取加权平均"</b>。翻译中 query 是解码状态、KV 是源句隐状态；CLIP 里 query 是文本、KV 是图像 patch（或反之）；LLaVA 里视觉 token 被塞进 KV 序列供文本注意力"参考"。看懂这一句，全书所有注意力变体都有了统一锚点。</p></div>
+
+<h3 id="sec-3-3">3.3 早期跨模态实践：词向量如何第一次"跨界"</h3>
+<p>词向量几何化之后，研究者立刻尝试把视觉信息"投进"同一个空间。<b>DeViSE</b>（Frome et al., NeurIPS 2013）用一个线性映射 $W$ 把 CNN 图像特征投到 Word2Vec 空间，损失函数采用 hinge 形式的排序损失——让正确标签的词向量比其他词向量更靠近图像表示。这是"视觉→语义空间零样本迁移"的第一次系统尝试：模型能对训练时从未见过的类别做出判断，因为语义空间本身是开放集合的。<b>VSE / VSE++</b>（Kiros et al. 2014 / Faghri et al. 2018，arXiv:1707.05612）把这类排序损失做成图文检索的标准范式：$\ell = \max(0, \alpha - s(i, c) + s(i, c'))$，其中 $s$ 是图文相似度、$c'$ 是最难负例——三元组损失（triplet loss）+ hard negative mining 的组合在第 10 章会展开成完整的表示学习理论。</p>
+<p>2015 年的 <b>VQA</b>（Antol et al., arXiv:1504.00325）则提出了另一种融合形态：把图像 CNN 特征与问题词向量<b>逐元素相乘或双线性池化</b>（MCB：Multi-modal Compact Bilinear Pooling，arXiv:1606.01847；MLB：低秩双线性）后再分类。双线性方法本质上是学习"视觉特征×文本特征"的外积交互，表达力强但参数与计算量大，后来被注意力机制逐步取代。到 2017 年 Transformer 出现，"融合"的统一答案开始浮现：<b>把两个模态的 token 放进同一个序列，让注意力自己做软对齐</b>——这正是第二部分所有故事的起点。</p>
+<div class="box-history"><p class="box-title">🕰 历史一刻：2015 年 5 月，VQA 把"看图回答"变成正式任务</p>
+<p>弗吉尼亚理工与 MSR 发布 VQA 数据集（20 万张 MS-COCO 图像、61 万问题），首次把"开放域看图问答"标准化。早期冠军模型不过是"CNN 特征 × 词袋问题特征 + MLP"，人类准确率 95% vs 模型约 54%——巨大差距催生了语言先验问题（" bananas 是什么颜色？"不看图答 yellow 也对）的持续研究，也直接导致了 2019 年 VQA v2 的平衡化改造（arXiv:1612.00837）。回望 2026 年 MMMU 上顶尖 MLLM 拿到 70%+ 的成绩，起点正是这张 2015 年的榜单。</p></div>
+
+<p>2018 年 2 月，Peters 等人的《Deep Contextualized Word Representations》（arXiv:1802.05365，ELMo）正面解决了词向量的多义问题：用<b>双向双层 LSTM</b> 对整个句子建模，每个词的表示是其两方向各层隐状态的拼接——同一个"bank"在"river bank"与"bank account"中得到不同向量。ELMo 的使用方式也开创了先河：预训练模型冻结，作为<b>特征提取器</b>给下游任务提供向量。这个"动态上下文表示"思想是 BERT 的直接前驱；而"预训练表示 + 下游微调/拼接"的两段式，正是后来 VLP（视觉语言预训练）的标准工作流——ViLBERT 只不过是把 ELMo 的语言流换成了视觉-语言双流。</p>
+<p>从工程视角看 ELMo 还有两个常被忽视的贡献。<b>其一，多层级表示的组合</b>：ELMo 发现不同层编码不同信息（底层偏词法、高层偏语义），下游任务用可学习的标量权重 $\gamma$ 混合各层：$\mathrm{ELMo}_k=\gamma\sum_{j=0}^{L}s_j\,\mathbf{h}_{k,j}$。这个"让任务自己决定用哪层特征"的思想，后来演化为 BERT 的"哪层最好"研究（通常中上层对语义任务最优）与 CLIP 投影头的多层选择讨论。<b>其二，冻结与微调的光谱</b>：ELMo 冻结主干只训下游头，BERT 全参微调，LoRA（第 36 章）居中——三条路线在 2023 年后的多模态训练里全部复活（冻结视觉塔 / 全参 SFT / LoRA 微调），历史只是换了模块重新上演。</p>
+
+<h2 id="sec-4"><span class="sec-no">4.</span>上下文词向量：ELMo 与"动态表示"思想</h2>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>BERT：双向编码与预训练-微调范式</h2>
+<h3 id="sec-5-1">5.1 架构与两大预训练目标</h3>
+<p>Devlin 等人 2018 年 10 月的 BERT（arXiv:1810.04805）把 ELMo 的思想搬进 Transformer 编码器，做出两个关键设计：<b>①双向注意力</b>——每个词能看到左右全部上下文（区别于 GPT 的因果单向）；<b>②两个自监督预训练目标</b>。<b>掩码语言建模（MLM）</b>：随机挑 15% 的 token，其中 80% 替换为 <code>[MASK]</code>、10% 换成随机词、10% 保持不变（缓解"预训练见 [MASK]、微调见不到"的分布漂移），用全部上下文预测原词；<b>下一句预测（NSP）</b>：输入句对 A/B，50% 概率 B 是 A 的真实下句，二分类判断——为句对级任务（问答、NLI）提供句间关系信号（后续 RoBERTa，arXiv:1907.11692，证明 NSP 弊大于利并移除之）。输入表示为三种嵌入相加：词嵌入 + 位置嵌入 + 段落嵌入（segment embedding 区分句 A/B）。</p>
+<figure><svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+  <defs><marker id="a6b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">BERT 的输入表示与 MLM 目标</text>
+  <rect x="60" y="60" width="90" height="34" rx="6" fill="#eff6ff" stroke="#2563eb"/><text x="105" y="82" text-anchor="middle" font-size="11.5" font-family="sans-serif" fill="#1e3a8a">[CLS]</text>
+  <rect x="160" y="60" width="90" height="34" rx="6" fill="#eff6ff" stroke="#2563eb"/><text x="205" y="82" text-anchor="middle" font-size="11.5" font-family="sans-serif" fill="#1e3a8a">苹果</text>
+  <rect x="260" y="60" width="90" height="34" rx="6" fill="#fef2f2" stroke="#ef4444"/><text x="305" y="82" text-anchor="middle" font-size="11.5" font-family="sans-serif" fill="#991b1b">[MASK] 80%</text>
+  <rect x="360" y="60" width="90" height="34" rx="6" fill="#eff6ff" stroke="#2563eb"/><text x="405" y="82" text-anchor="middle" font-size="11.5" font-family="sans-serif" fill="#1e3a8a">发布</text>
+  <rect x="460" y="60" width="110" height="34" rx="6" fill="#eff6ff" stroke="#2563eb"/><text x="515" y="82" text-anchor="middle" font-size="11.5" font-family="sans-serif" fill="#1e3a8a">了新手机</text>
+  <rect x="60" y="120" width="510" height="52" rx="10" fill="#f5f3ff" stroke="#8b5cf6"/>
+  <text x="315" y="142" text-anchor="middle" font-size="12" font-family="sans-serif" fill="#5b21b6">12/24 层双向 Transformer 编码器（每个位置看到全部上下文）</text>
+  <text x="315" y="162" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#7c3aed">输入嵌入 = 词嵌入 + 位置嵌入 + 段落嵌入</text>
+  <line x1="305" y1="94" x2="305" y2="116" stroke="#64748b" stroke-width="1.5" marker-end="url(#a6b)"/>
+  <rect x="200" y="210" width="230" height="44" rx="10" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="315" y="228" text-anchor="middle" font-size="12" font-weight="bold" font-family="sans-serif" fill="#065f46">MLM 头：预测被掩码位置</text>
+  <text x="315" y="246" text-anchor="middle" font-size="11" font-family="sans-serif" fill="#047857">"手机" ✓ （10% 随机替换 · 10% 保留）</text>
+  <line x1="305" y1="172" x2="305" y2="206" stroke="#64748b" stroke-width="1.5" marker-end="url(#a6b)"/>
+  <text x="620" y="140" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">[CLS] 输出向量</text>
+  <text x="620" y="160" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">用于句对任务（NSP）</text>
+  <text x="620" y="180" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">与下游分类</text>
+</svg><figcaption>图 6-2　<b>BERT 预训练示意</b>：双向编码器 + MLM/NSP 双目标。80/10/10 的掩码策略缓解预训练-微调分布漂移。</figcaption></figure>
+<h3 id="sec-5-2">5.2 微调范式与对多模态的直接移植</h3>
+<p>BERT 展示了"预训练一次、微调百task"的威力：11 项 NLP 基准刷榜，GLPT 式特征工程一夜过时。对多模态的直接移植发生在一年内：<b>ViLBERT</b>（arXiv:1908.02265）把 BERT 拆成视觉流与语言流、用共注意力块连接；<b>LXMERT</b>（arXiv:1908.07490）、<b>UNITER</b>（arXiv:1909.11790）延续单流设计并系统化了视觉侧的 MLM/ITM 目标——第 11 章将逐一精读。甚至 BERT 的"完形填空"目标也原样出现在 BLIP-2 的 Q-Former 训练里（ITC/ITM/ITM+MLM 三目标）。<b>读懂 BERT，等于拿到了 VLP 时代所有论文的说明书</b>。</p>
+<div class="box-warn"><p class="box-title">⚠️ 陷阱：把 BERT 的"双向"神化</p>
+<p>双向注意力只在<b>编码任务</b>（理解、分类、抽取）占优；对生成任务它并不适用——生成时你无法"看到未来"。这就是为什么 BERT 式融合在 VLP 中用于判别目标（ITM、VQA 打分），而生成式描述模型必须用因果语言模型。当代多模态 LLM 清一色采用因果 LLM 作底座、把视觉 token 当作"前缀"注入——理解这一点，第 13 章"融合位置"的所有争论都会豁然开朗。</p></div>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：BERT（Devlin et al., NAACL 2019, arXiv:1810.04805）</p>
+<p><b>问题</b>：ELMo 式特征拼接无法让预训练表示参与任务特定的深层交互；GPT 的单向注意力又限制了理解类任务利用右文。<b>方法</b>：双向 Transformer 编码器 + MLM（80/10/10 掩码策略）+ NSP 双目标，BooksCorpus 与 Wikipedia 共 33 亿词上预训练 BASE（110M）/LARGE（340M）两个规格；下游只需在顶部加一个分类头全参微调。<b>关键结果</b>：GLUE 均分提升至 82.1（LARGE）、SQuAD v1.1 F1 93.2，11 项 NLP 任务当时 SOTA。<b>为什么重要</b>：确立了"预训练-微调"范式与"模型规格分层发布"的工程惯例；输入嵌入三元组（词/位置/段落）成为一切 Transformer 的输入模板；其目标函数被 VLP 时代逐字继承。<b>延伸阅读</b>：RoBERTa（arXiv:1907.11692）修正训练配方（去 NSP、动态掩码、更大 batch）；ALBERT（arXiv:1909.11942）参数共享；ELECTRA（arXiv:2003.10555）用替换词判别替代 MLM 提升样本效率。</p></div>
+<div class="tbl-wrap"><table>
+<caption>表 6-2　BERT 家族关键变体对比</caption>
+<thead><tr><th>模型</th><th>改动</th><th>一句话结论</th></tr></thead>
+<tbody>
+<tr><td>RoBERTa</td><td>去 NSP、动态掩码、10× 数据、大 batch</td><td>"训练配方"与架构同样重要</td></tr>
+<tr><td>ALBERT</td><td>嵌入分解 + 层参数共享</td><td>参数量≠表示容量</td></tr>
+<tr><td>ELECTRA</td><td>替换词判别（RTD）</td><td>全位置学习信号，样本效率提升</td></tr>
+<tr><td>DeBERTa</td><td>解耦注意力（内容×位置）</td><td>位置信息单独编码更有效</td></tr>
+<tr><td>XLM-R</td><td>100 语言 MLM</td><td>跨语言共享表示的可行性证明</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-6"><span class="sec-no">6.</span>GPT 谱系：从生成式预训练到上下文学习</h2>
+<p>与 BERT 双向编码路线平行的是 OpenAI 的生成式路线。<b>GPT-1</b>（2018 年 6 月，《Improving Language Understanding by Generative Pre-Training》）证明：用因果 Transformer 解码器在图书语料上做"预测下一个词"，再对每个下游任务微调，同样能大幅提升表现。<b>GPT-2</b>（2019 年，《Language Models are Unsupervised Multitask Learners》，OpenAI 技术报告，无 arXiv 编号）把规模推到 15 亿参数、80 万本书级别的 WebText 数据，并提出惊人论断：语言模型可以是无监督多任务学习者——翻译、摘要、问答都能以"条件生成"的形式被同一个模型覆盖，zero-shot 开始崭露头角。<b>GPT-3</b>（arXiv:2005.14165，2020）以 1750 亿参数与 3000 亿 token 训练，发现了<b>上下文学习（in-context learning）</b>：不更新任何参数，仅在提示词里给几个示例，模型就能模仿任务模式。ICL 是后来"指令微调 + 多模态指令"路线的思想基础——LLaVA 的视觉指令微调，本质上是把"图像 token + 文字指令"作为 GPT-3 式上下文喂给模型。</p>
+<p>把 BERT 与 GPT 放在同一张坐标系里看，会发现它们的差异本质上是<b>注意力掩码与任务假设</b>的差异，而不是"谁更先进"：BERT 假设"理解是主要需求"，用双向掩码 + 判别目标换取表示质量；GPT 假设"生成即通用"，用因果掩码 + 单一目标换取扩展性与任务覆盖。2020 年前的证据偏向 BERT（GLUE 榜单碾压），2021 年后大规模数据与提示范式让天平彻底倒向 GPT——具体来说有三点：①因果结构天然适配自回归生成与流式服务；②单一目标函数不需要掩码策略这种"人工先验"，更容易吃规模红利；③ICL 与指令跟随让"一个模型服务所有任务"的商业模式成立。多模态研究者在 2022–2023 年选择 LLM 底座时几乎默认了这些结论，理解来龙去脉有助于你判断下一代架构（原生多模态、早期融合）中哪些设计是"工程选择"而非"必然真理"。</p>
+
+<div class="box-theory"><p class="box-title">📐 理论视角：为什么"预测下一词"能学到一切</p>
+<p>设语料是 $(\text{上下文}, \text{下一词})$ 对的分布。最小化 $-\log P_\theta(w_t \mid w_{<t})$ 时，为了把 loss 降到底，模型必须隐式学会：句法（决定词形）、语义（决定选词）、事实（决定实体）、推理（决定叙述走向）。这是"压缩即智能"叙事的最简版本：预测下一词是对语言流的无损压缩，而压缩逼出内部世界模型。同样的逻辑原样迁移到多模态：给图文对做"描述下一块视觉内容/下一个词"，模型就被迫学习跨模态对应——这正是 Chameleon、Emu3 等<b>原生多模态自回归模型</b>（第 19–20 章）的全部哲学。</p></div>
+
+<h3 id="sec-6-1">6.1 上下文学习（ICL）的机制：它到底在做什么</h3>
+<p>GPT-3 最迷人的发现是 ICL：在提示词中给 $k$ 个"输入-输出"示例，模型便能对新输入照样输出，全程零参数更新。三个被广泛接受的解释视角：<b>①隐式贝叶斯视角</b>——模型在提示中"推断"任务分布，示例相当于后验证据；<b>②隐式梯度下降视角</b>（Dai et al.，Why Can GPT Learn In-Context?，arXiv:2112.10579）——注意力前向计算的数学形式与一步梯度更新同构，示例相当于对"任务子空间"做了一次隐式权重修正；<b>③任务定位视角</b>——预训练语料天然混合了无数"模式"，示例的作用是把模型从一个通用模式空间"导航"到特定模式附近。对多模态的直接影响有两处：其一，Flamingo 用 32 个图文交错样本做 few-shot 学习，就是 ICL 的跨模态翻版（第 18 章）；其二，指令微调与视觉指令微调（第 16 章）可以视为"把 ICL 的示例内化成权重"的训练化改造。</p>
+<div class="tbl-wrap"><table>
+<caption>表 6-3　提升 ICL 效果的工程要素（GPT-3 论文及其后续研究的共识）</caption>
+<thead><tr><th>要素</th><th>效果方向</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>示例数量 $k$</td><td>单调提升，边际递减</td><td>多数任务在 $k=8\sim32$ 后收益趋平</td></tr>
+<tr><td>示例顺序</td><td>波动可达 ±10 点</td><td>存在顺序敏感性；可用"全局点数"等校准</td></tr>
+<tr><td>示例格式一致性</td><td>显著</td><td>空格、换行、标点都会影响结果</td></tr>
+<tr><td>示例选择</td><td>显著</td><td>与测试样本语义相近的示例更好（检索式选择）</td></tr>
+<tr><td>指令化改写</td><td>显著</td><td>"指令 + 示例"优于纯示例（InstructGPT 思路）</td></tr>
+</tbody></table></div>
+
+<h3 id="sec-6-2">6.2 生成质量评估的最小知识：困惑度与 BLEU</h3>
+<p>后续章节（尤其 VLP 与评测部分）会反复出现两个经典指标，在此建立直觉。<b>困惑度（Perplexity, PPL）</b>是语言模型在验证集上的平均"分支困难度"：</p>
+<div class="math-block">$$\mathrm{PPL} = \exp\Big(-\frac{1}{N}\sum_{t=1}^{N}\log P_\theta(w_t \mid w_{<t})\Big)$$</div>
+<p>直觉上 PPL 是"模型每一步在多少个等价选项里犹豫"：PPL=1 完美复述，PPL=|V| 相当于均匀瞎猜。预训练论文的 loss 曲线通常直接以每 token 交叉熵报告（PPL 即其指数化）。<b>注意</b>：PPL 只能衡量分布拟合，与下游任务表现并非严格单调——2020 年代的研究多次表明低 PPL 不保证更好的指令跟随。<b>BLEU</b>（Papineni et al., ACL 2002）则衡量生成文本与参考文本的 n-gram 重合精度（1~4 元组合几何平均 × 简短惩罚），曾是机器翻译与图像描述的标准指标；它对同义改写极度不友好，多模态生成评测已逐步转向 CIDEr、CLIPScore 与 LLM 判分（第 40 章展开），但读老论文必须懂它。</p>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：GPT-3《Language Models are Few-Shot Learners》（Brown et al., NeurIPS 2020, arXiv:2005.14165）</p>
+<p><b>问题</b>：预训练+微调范式要求每个任务准备标注数据并单独训练，代价高且泛化有限。<b>方法</b>：175B 参数因果 Transformer（96 层、96 头、$d=12288$），在约 3000 亿 token 混合语料上训练，提出 zero-/one-/few-shot 三档"提示即任务"协议，不做任何梯度更新。<b>关键结果</b>：few-shot 在多数任务上逼近甚至超过微调 SOTA；few-shot 性能随规模近似幂律提升——"能力涌现"的最早系统证据之一。<b>为什么重要</b>：确立"规模+提示"的通用性路线，直接催生指令微调（InstructGPT）、思维链与多模态指令调优；按 shot 数分层报告的评测协议成为 LLM/MLLM 评测标准姿势。<b>延伸阅读</b>：《Emergent Abilities of Large Language Models》（arXiv:2206.07682）与 Schaeffer et al.（arXiv:2304.15004）对照读——后者指出许多"涌现"是指标造成的假象，训练批判性思维的好材料。</p></div>
+
+<h2 id="sec-7"><span class="sec-no">7.</span>两条路线的合流与多模态启示</h2>
+<p>2020 年之后，BERT 与 GPT 的路线之争以"分工"告终：<b>理解任务曾长期由双向编码器把持，生成任务与通用能力由因果解码器通吃</b>；而随着模型与数据规模上涨，GPT 式单模型 + 提示的通用性优势碾压了 BERT 式"一任务一微调"。当代多模态大模型几乎全部继承了 GPT 式骨架（LLaVA 用 Vicuna、Qwen-VL 用 Qwen、InternVL 用 InternLM），同时大量借用 BERT 遗产：ITM/ITC 判别目标用于对齐预训练、双向注意力用于视觉编码器本身。把本章的历史脉络记成一句话：<b>多模态 LLM = GPT 的骨架 + BERT 的对齐目标 + Word2Vec 以来的几何世界观</b>。</p>
+<p>给后续章节立三个"路标"：<b>路标一（对齐）</b>——Word2Vec 的"预测上下文"与 DeViSE 的"跨空间排序"将在 CLIP 的 InfoNCE 中合体，成为图文对齐的标准解（第 12 章）；<b>路标二（融合）</b>——Bahdanau 注意力的"查询-加权"操作将在 ViLBERT 变成跨模态共注意力，在 Flamingo 变成门控交叉注意力，在 LLaVA 退化为"把视觉 token 直接塞进序列"（第 13、15 章）；<b>路标三（目标）</b>——BERT 的完形填空与 GPT 的续写将在 VLP/MLLM 训练中反复组合出 ITC/ITM/MLM/LM 的目标菜单（第 11、16 章）。当你在这三个路口看到熟悉的公式时，应当能立刻认出它们 2013–2020 年的原型。</p>
+<div class="tbl-wrap"><table>
+<caption>表 6-1　2013–2020 年 NLP 表示学习关键节点及其多模态影响</caption>
+<thead><tr><th>年份</th><th>工作</th><th>核心思想</th><th>多模态继承者</th></tr></thead>
+<tbody>
+<tr><td>2013</td><td>Word2Vec (1301.3781)</td><td>预测上下文的稠密词向量；负采样</td><td>跨模态嵌入、CLIP 对比损失</td></tr>
+<tr><td>2014</td><td>Seq2Seq (1409.3215)</td><td>编码-解码框架</td><td>图像描述（Show and Tell）</td></tr>
+<tr><td>2014</td><td>Attention (1409.0473)</td><td>软对齐加权求和</td><td>ViLBERT、Flamingo 的 cross-attention</td></tr>
+<tr><td>2018</td><td>ELMo (1802.05365)</td><td>上下文相关的动态表示</td><td>VLP 的"预训练表示+下游适配"</td></tr>
+<tr><td>2018</td><td>BERT (1810.04805)</td><td>双向编码 + MLM/NSP</td><td>ViLBERT/LXMERT/UNITER；Q-Former 目标</td></tr>
+<tr><td>2018–20</td><td>GPT-1/2/3</td><td>生成式预训练、ICL、缩放</td><td>MLLM 的因果底座与指令微调范式</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-8"><span class="sec-no">8.</span>动手实践：HuggingFace 管线与词向量探查</h2>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># 1) 用 gensim 训练一个小型 Word2Vec，验证类比结构
+from gensim.models import Word2Vec
+sentences = [["king","queen","man","woman","prince","princess"],
+             ["china","beijing","japan","tokyo","france","paris"]]
+model = Word2Vec(sentences, vector_size=64, window=5, min_count=1,
+                 sg=1, negative=10, epochs=300)   # sg=1 即 Skip-gram
+print(model.wv.most_similar(positive=["king","woman"], negative=["man"]))
+# 工业级建议直接用预训练向量：gensim.downloader.load("glove-wiki-gigaword-300")
+
+# 2) BERT 的 MLM 完形填空（预训练目标即下游能力）
+from transformers import pipeline
+fill = pipeline("fill-mask", model="bert-base-uncased")
+print(fill("the capital of france is [MASK].")[0]["token_str"])
+# 输出 paris —— 模型在预训练中把"事实"压进了权重
+
+# 3) BERT 句向量：CLS vs 平均池化（对比实验常见陷阱）
+import torch
+from transformers import AutoModel, AutoTokenizer
+tok = AutoTokenizer.from_pretrained("bert-base-uncased")
+enc = AutoModel.from_pretrained("bert-base-uncased")
+batch = tok(["a dog runs on the beach", "a cat sleeps indoors"],
+            return_tensors="pt", padding=True)
+with torch.no_grad():
+    out = enc(**batch)
+cls = out.last_hidden_state[:, 0]                    # [CLS] 表示
+mask = batch["attention_mask"].unsqueeze(-1)
+mean = (out.last_hidden_state * mask).sum(1) / mask.sum(1)  # 平均池化
+sim = torch.cosine_similarity(cls[0], cls[1], dim=0)
+print(f"CLS 余弦相似度: {sim:.3f}")  # 句相似度任务建议用平均池化或 SBERT</code></pre></div>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：多模态研究者需要的 NLP 基本功清单</p>
+<p>①会用 <code>tokenizer</code> 查特殊 token 与 id（第 2 章延伸）；②会读 <code>AutoModelForCausalLM/AutoModel</code> 的输出对象（logits、hidden_states、attentions）；③会用 <code>pipeline("fill-mask"/"feature-extraction")</code> 做快速验证；④理解因果掩码与 padding 掩码的区别（写 VLM 数据加载器时天天遇到）；⑤能徒手写"取最后一个非 padding 位置的隐状态"这类小函数。以上五点覆盖了后续章节 90% 的语言侧代码场景。</p></div>
+
+<h2 id="sec-9"><span class="sec-no">9.</span>本章小结</h2>
+<p>本章沿"Word2Vec → Seq2Seq/注意力 → ELMo → BERT → GPT"的主线，梳理了多模态大模型语言侧的全部基因：负采样的"3/4 律"与对比学习一脉相承；注意力是模态无关的"查询-加权"操作，跨模态融合只是换了个数据源；BERT 的 MLM/ITM 目标被 VLP 与 Q-Former 直接继承；GPT 的生成式预训练与上下文学习奠定了当代 MLLM 的骨架与指令范式；DeViSE、VSE++ 与 VQA 则记录了词向量第一次跨入视觉世界的尝试与教训。带着这张地图，下一章（第 7 章）我们把 LLM 本身讲透——预训练、SFT、RLHF 与解码，然后就可以正式进入多模态的世界。建议动手任务：跑通第 8 节的三段代码，并把你观察到的类比准确率、MLM 预测与两种池化的相似度差异记进复现日志——第 12 章讨论 CLIP 的"词向量 vs 编码器"之争时，这些数字会成为你的第一批证据。</p>
+
+<div class="box-tip"><p class="box-title">💡 技巧：三个值得亲手验证的"反直觉"实验</p>
+<p>① <b>掩码敏感性</b>：把 BERT 输入的 <code>[MASK]</code> 换成相近词，观察预测分布的变化幅度——体会 MLM 学到的是"分布式证据"而非规则；② <b>类比方向性</b>：在 Word2Vec 里测试 king−man+woman 与 woman−king+man 是否对称——体会偏置如何进入向量几何；③ <b>PPL vs 任务</b>：对比两个不同规模 GPT-2 在同一段文本上的 PPL 与它们 few-shot 回答准确率，亲手验证"低困惑度≠更聪明"。每个实验不超过 20 行代码，却能把本章所有抽象讨论落到数字。</p></div>
+
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>1.</b> 负采样为什么能把训练复杂度从 $O(|V|)$ 降到 $O(k)$？噪声分布的 3/4 次幂起什么作用？<br><b>答案要点</b>：把全词表 softmax 换成 1 正 + k 负的二元 sigmoid 求和，分母项数从 $|V|$ 变为 $k+1$；3/4 幂相对提升低频词作负例的概率，平衡高频词主导。</p>
+<p><b>2.</b> Bahdanau 注意力如何解决 Seq2Seq 的信息瓶颈？$\alpha_{t,i}$ 的副产物是什么？<br><b>答案要点</b>：解码每步对全部编码状态加权求和而非依赖单一固定向量，长句信息不再被压缩；$\alpha$ 构成软对齐矩阵，可解释。</p>
+<p><b>3.</b> BERT 的 80/10/10 掩码策略解决什么问题？为什么 RoBERTa 移除了 NSP？<br><b>答案要点</b>：缓解预训练（见 [MASK]）与微调（见真实词）的分布漂移；NSP 任务太简单且损害单句表示质量，更大 batch/更长序列的收益更大。</p>
+<p><b>4.</b> 为什么生成式多模态模型（LLaVA 等）不能直接用 BERT 当语言底座？<br><b>答案要点</b>：BERT 是双向编码器，无因果掩码与逐 token 生成头；生成需要"只看过去、预测未来"的因果解码器结构。</p>
+<p><b>5.</b> 从 Word2Vec 到 CLIP，"负采样"思想经历了怎样的演变？<br><b>答案要点</b>：词-上下文二分类 → 批内其他样本全部作负例的 InfoNCE（softmax 形式）→ 双向图文对比；共同内核是"拉近正对、推远负对、用难负例塑造表示几何"。</p>
+<p><b>6.</b> SGNS 与 PMI 矩阵分解的等价性带来了哪两个实用启发？<br><b>答案要点</b>：①对比学习的本质是"共现统计 + 低秩约束"，理解温度/负例数是对相似度尺度的全局再校准；②解释 GloVe 与 Word2Vec 效果接近——都在近似同一统计量，选型时不必迷信实现细节。</p>
+<p><b>7.</b> 双线性池化（MCB/MLB）融合与注意力融合的本质区别是什么？为何前者被后者取代？<br><b>答案要点</b>：双线性是显式的外积交互，表达力强但参数/计算随维度平方增长，且交互模式固定；注意力是动态的、数据依赖的加权对齐，复杂度线性、天然支持多对多对应关系，且与 Transformer 生态无缝衔接。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Mikolov T, et al. <a href="https://arxiv.org/abs/1301.3781">Efficient Estimation of Word Representations in Vector Space</a>. ICLR Workshop 2013. arXiv:1301.3781.</li>
+      <li>Mikolov T, et al. <a href="https://arxiv.org/abs/1310.4546">Distributed Representations of Words and Phrases and their Compositionality</a>. NeurIPS 2013. arXiv:1310.4546.</li>
+      <li>Pennington J, et al. <a href="https://aclanthology.org/D14-1162/">GloVe: Global Vectors for Word Representation</a>. EMNLP 2014.</li>
+      <li>Sutskever I, et al. <a href="https://arxiv.org/abs/1409.3215">Sequence to Sequence Learning with Neural Networks</a>. NeurIPS 2014. arXiv:1409.3215.</li>
+      <li>Bahdanau D, et al. <a href="https://arxiv.org/abs/1409.0473">Neural Machine Translation by Jointly Learning to Align and Translate</a>. ICLR 2015. arXiv:1409.0473.</li>
+      <li>Luong M-T, et al. <a href="https://arxiv.org/abs/1508.04025">Effective Approaches to Attention-based Neural Machine Translation</a>. EMNLP 2015. arXiv:1508.04025.</li>
+      <li>Peters M, et al. <a href="https://arxiv.org/abs/1802.05365">Deep Contextualized Word Representations (ELMo)</a>. NAACL 2018. arXiv:1802.05365.</li>
+      <li>Devlin J, et al. <a href="https://arxiv.org/abs/1810.04805">BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding</a>. NAACL 2019. arXiv:1810.04805.</li>
+      <li>Liu Y, et al. <a href="https://arxiv.org/abs/1907.11692">RoBERTa: A Robustly Optimized BERT Pretraining Approach</a>. arXiv 2019. arXiv:1907.11692.</li>
+      <li>Radford A, et al. <a href="https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf">Improving Language Understanding by Generative Pre-Training (GPT-1)</a>. OpenAI 2018.</li>
+      <li>Radford A, et al. <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf">Language Models are Unsupervised Multitask Learners (GPT-2)</a>. OpenAI 2019.</li>
+      <li>Brown T, et al. <a href="https://arxiv.org/abs/2005.14165">Language Models are Few-Shot Learners (GPT-3)</a>. NeurIPS 2020. arXiv:2005.14165.</li>
+      <li>Frome A, et al. <a href="https://papers.nips.cc/paper_files/paper/2013/hash/7a73fbcd0965cf24d6d1b3a25bdf8f6e-Abstract.html">DeViSE: A Deep Visual-Semantic Embedding Model</a>. NeurIPS 2013.</li>
+      <li>Lu J, et al. <a href="https://arxiv.org/abs/1908.02265">ViLBERT: Pretraining Task-Agnostic Visiolinguistic Representations</a>. NeurIPS 2019. arXiv:1908.02265.</li>
+      <li>Li J, et al. <a href="https://arxiv.org/abs/2301.12597">BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models</a>. ICML 2023. arXiv:2301.12597.</li>
+      <li>Vaswani A, et al. <a href="https://arxiv.org/abs/1706.03762">Attention Is All You Need</a>. NeurIPS 2017. arXiv:1706.03762.</li>
+      <li>Reimers N, Gurevych I. <a href="https://arxiv.org/abs/1908.10084">Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks</a>. EMNLP 2019. arXiv:1908.10084.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 38 章 分布式训练基础设施 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第六部分 · 训练与对齐实战</div>
+  <h1 class="chapter-title">第 38 章　分布式训练基础设施</h1>
+  <div class="chapter-meta"><span>预计阅读 100 分钟</span><span>难度 ★★★★★</span><span>前置：第 8 章（GPU 系统）、第 35 章（预训练实战）、第 36 章（PEFT）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">从单卡到集群：显存墙、算力墙与通信墙</a></li>
+  <li><a href="#sec-2">数据并行 → ZeRO 1/2/3 → FSDP：通信量与显存的完整推导</a></li>
+  <li><a href="#sec-3">张量并行：Megatron 的列/行并行与 f/g 通信算子</a></li>
+  <li><a href="#sec-4">序列并行与上下文并行：长序列时代的必然</a></li>
+  <li><a href="#sec-5">流水线并行：GPipe 与 1F1B 调度、bubble 率公式</a></li>
+  <li><a href="#sec-6">3D 并行组合与多模态训练的异构并行实践</a></li>
+  <li><a href="#sec-7">显存与算力估算：6ND 公式、MFU 与集群实例</a></li>
+  <li><a href="#sec-8">实战代码：DeepSpeed ZeRO 配置与 accelerate 多卡启动</a></li>
+  <li><a href="#sec-9">故障排查手册：NCCL 超时、loss 尖峰与显存碎片</a></li>
+  <li><a href="#sec-10">本章小结与自测</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>第 8 章从硬件视角讲了"一块 GPU 里发生了什么"，第 35 章讲了"多模态预训练怎么设计数据与阶段"——本章补上两者之间缺失的一环：<b>当模型和数据大到单卡放不下、单卡算不完时，如何把一台机器、一个机柜、一个数据中心组织成一台"逻辑上的超级计算机"</b>。这是多模态大模型工程中杠杆率最高、也最容易被新手低估的部分：一个错误的并行策略可以让同样的硬件慢 3 倍、贵 3 倍；一个正确的 ZeRO-3 配置可以让单机 8 卡训起 34B 级别的 VLM。本章沿着"第一性原理"展开：显存、算力、通信三个约束如何逼出 DP→ZeRO→TP→PP→CP 的技术演进，每一步的数学代价（显存切分比、通信字节数、bubble 率）都给出完整推导，最后落到 DeepSpeed/accelerate 的实战配置与一份"故障排查手册"。<b>读完你应当能为一台 8×H100 机器写出 ZeRO-3 配置，为 70B VLM 选出 3D 并行组合，并且在 NCCL 超时出现时知道先查什么</b>。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>从单卡到集群：显存墙、算力墙与通信墙</h2>
+<p>分布式训练的全部内容，可以浓缩为"三堵墙"的推倒过程。<b>第一堵墙：显存墙。</b>一个 7B 模型的推理需要约 14GB（bf16 权重），而训练需要约 12 倍于此的显存——权重 2P + 梯度 2P（bf16）+ 优化器状态 12P（fp32 的主权重、一阶动量 $m$、二阶动量 $v$ 各 4 字节）= 16 字节/参数，7B 即 112GB，再加上激活值（随 batch × 序列长度线性增长），单卡 80GB 根本放不下。<b>第二堵墙：算力墙。</b>即使显存放得下，时间也不允许：第 7 节将推导 7B 模型训 1 万亿 token 约需 $1.05\times10^{23}$ FLOPs，单张 A100（312 TFLOPS bf16、按 40% 利用率算有效 125 TFLOPS）要连续跑约 27 年——唯一的出路是把计算摊到成百上千张卡上。<b>第三堵墙：通信墙。</b>一旦卡多了，"卡与卡之间交换信息"的带宽就成为新的瓶颈：NVLink 卡间互联约 900GB/s，跨机的 InfiniBand 只有约 400Gb/s（50GB/s），比显存带宽（A100 约 2TB/s）低一到两个数量级——<b>并行策略设计的核心命题，就是"切分计算与显存的同时，把通信量压到最小、并让通信与计算重叠"</b>。</p>
+<p>这三堵墙分别催生了三大类并行（第 8 章的 GPU 规格表在这里全部派上用场）：<b>数据并行（Data Parallelism, DP）</b>对付算力墙——每张卡放完整模型，各自吃不同的数据分片，只交换梯度；<b>张量并行（Tensor Parallelism, TP）与流水线并行（Pipeline Parallelism, PP）</b>对付显存墙——把模型结构本身切开（TP 切"层内"、PP 切"层间"）；<b>ZeRO/FSDP 类的"状态分片"</b>也对付显存墙——不切计算图，只把权重/梯度/优化器状态切碎分存。理解它们各自"切的是什么、通信什么、通信几次"，是本章全部内容的骨架。图 38-1 给出这个全景地图。</p>
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 880 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="并行策略全景图">
+<rect x="0" y="0" width="880" height="400" fill="#f8fafc"/>
+<text x="440" y="28" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">并行策略全景：切什么、通信什么、对付哪堵墙</text>
+<!-- DP -->
+<rect x="30" y="50" width="260" height="150" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="160" y="74" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">数据并行 DP / DDP</text>
+<rect x="48" y="88" width="70" height="46" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="83" y="107" text-anchor="middle" font-size="11">GPU0</text><text x="83" y="123" text-anchor="middle" font-size="10">完整模型</text>
+<rect x="125" y="88" width="70" height="46" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="160" y="107" text-anchor="middle" font-size="11">GPU1</text><text x="160" y="123" text-anchor="middle" font-size="10">完整模型</text>
+<rect x="202" y="88" width="70" height="46" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="237" y="107" text-anchor="middle" font-size="11">GPU2</text><text x="237" y="123" text-anchor="middle" font-size="10">完整模型</text>
+<line x1="83" y1="136" x2="83" y2="152" stroke="#ef4444" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="160" y1="136" x2="160" y2="152" stroke="#ef4444" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="237" y1="136" x2="237" y2="152" stroke="#ef4444" stroke-width="2" marker-end="url(#a1)"/>
+<rect x="48" y="154" width="224" height="30" rx="6" fill="#fee2e2" stroke="#ef4444"/>
+<text x="160" y="174" text-anchor="middle" font-size="11" fill="#991b1b">all-reduce 梯度（每步 2Ψ 字节）</text>
+<text x="160" y="256" text-anchor="middle" font-size="11" fill="#334155">切分对象：数据 batch</text>
+<text x="160" y="274" text-anchor="middle" font-size="11" fill="#334155">对付：算力墙（扩吞吐）</text>
+<text x="160" y="292" text-anchor="middle" font-size="11" fill="#334155">显存：每卡仍存完整训练态</text>
+<!-- ZeRO -->
+<rect x="310" y="50" width="260" height="150" rx="10" fill="#ffffff" stroke="#10b981" stroke-width="2"/>
+<text x="440" y="74" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">ZeRO 1/2/3（状态分片）</text>
+<rect x="328" y="88" width="70" height="46" rx="6" fill="#d1fae5" stroke="#10b981"/><text x="363" y="107" text-anchor="middle" font-size="11">GPU0</text><text x="363" y="123" text-anchor="middle" font-size="10">1/3 训练态</text>
+<rect x="405" y="88" width="70" height="46" rx="6" fill="#d1fae5" stroke="#10b981"/><text x="440" y="107" text-anchor="middle" font-size="11">GPU1</text><text x="440" y="123" text-anchor="middle" font-size="10">1/3 训练态</text>
+<rect x="482" y="88" width="70" height="46" rx="6" fill="#d1fae5" stroke="#10b981"/><text x="517" y="107" text-anchor="middle" font-size="11">GPU2</text><text x="517" y="123" text-anchor="middle" font-size="10">1/3 训练态</text>
+<line x1="363" y1="136" x2="363" y2="152" stroke="#d97706" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="440" y1="136" x2="440" y2="152" stroke="#d97706" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="517" y1="136" x2="517" y2="152" stroke="#d97706" stroke-width="2" marker-end="url(#a1)"/>
+<rect x="328" y="154" width="224" height="30" rx="6" fill="#fef3c7" stroke="#d97706"/>
+<text x="440" y="174" text-anchor="middle" font-size="11" fill="#92400e">按层 pre-fetch：all-gather 权重 + reduce-scatter 梯度</text>
+<text x="440" y="256" text-anchor="middle" font-size="11" fill="#334155">切分对象：权重/梯度/优化器状态</text>
+<text x="440" y="274" text-anchor="middle" font-size="11" fill="#334155">对付：显存墙（切状态不切计算）</text>
+<text x="440" y="292" text-anchor="middle" font-size="11" fill="#334155">代价：通信量 ×1.5（ZeRO-3）</text>
+<!-- TP/PP -->
+<rect x="590" y="50" width="260" height="150" rx="10" fill="#ffffff" stroke="#8b5cf6" stroke-width="2"/>
+<text x="720" y="74" text-anchor="middle" font-size="13" font-weight="bold" fill="#6d28d9">张量并行 TP / 流水线并行 PP</text>
+<rect x="608" y="88" width="70" height="46" rx="6" fill="#ede9fe" stroke="#8b5cf6"/><text x="643" y="107" text-anchor="middle" font-size="11">GPU0</text><text x="643" y="123" text-anchor="middle" font-size="10">层内 1/4</text>
+<rect x="685" y="88" width="70" height="46" rx="6" fill="#ede9fe" stroke="#8b5cf6"/><text x="720" y="107" text-anchor="middle" font-size="11">GPU1</text><text x="720" y="123" text-anchor="middle" font-size="10">层内 1/4</text>
+<rect x="762" y="88" width="70" height="46" rx="6" fill="#ede9fe" stroke="#8b5cf6"/><text x="797" y="107" text-anchor="middle" font-size="11">GPU2</text><text x="797" y="123" text-anchor="middle" font-size="10">层内 1/4</text>
+<line x1="643" y1="136" x2="643" y2="152" stroke="#ef4444" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="720" y1="136" x2="720" y2="152" stroke="#ef4444" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="797" y1="136" x2="797" y2="152" stroke="#ef4444" stroke-width="2" marker-end="url(#a1)"/>
+<rect x="608" y="154" width="224" height="30" rx="6" fill="#fee2e2" stroke="#ef4444"/>
+<text x="720" y="174" text-anchor="middle" font-size="11" fill="#991b1b">每层前向+反向各 1–2 次激活通信</text>
+<text x="720" y="256" text-anchor="middle" font-size="11" fill="#334155">切分对象：模型结构本身</text>
+<text x="720" y="274" text-anchor="middle" font-size="11" fill="#334155">对付：显存墙（单层都放不下）</text>
+<text x="720" y="292" text-anchor="middle" font-size="11" fill="#334155">TP 限卡内 NVLink 域内使用</text>
+<!-- bottom legend -->
+<rect x="30" y="320" width="820" height="60" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="60" y="345" font-size="12" font-weight="bold" fill="#1e293b">选型直觉：</text>
+<text x="150" y="345" font-size="12" fill="#334155">模型放得下 → 纯 DP/ZeRO-1/2（最简单最快）</text>
+<text x="60" y="368" font-size="12" fill="#334155">模型放不下 → ZeRO-3/FSDP（单机首选）→ 还不够 → 叠 TP（卡内）+ PP（跨机）成 3D 并行</text>
+<defs><marker id="a1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#475569"/></marker></defs>
+</svg>
+<figcaption>图 38-1　并行策略全景图：DP/ZeRO/TP/PP 四大路线各自"切什么、通信什么、对付哪堵墙"。DP 切数据、ZeRO 切训练状态、TP/PP 切模型结构——最后的 3D 并行是三者的乘积组合。</figcaption>
+</figure>
+</div>
+<p>本章的叙述顺序刻意按"历史演进"排列：先讲最朴素的 DP 与它的通信瓶颈（第 2 节顺带给出 ZeRO 的完整数学），再讲 Megatron 的张量并行（第 3 节）、长序列的序列/上下文并行（第 4 节）、流水线并行（第 5 节），最后把三者乘起来（第 6 节）。<b>每一步演进都不是"发明新东西"，而是"当上一代的某个墙被撞上时，精确地补一个缺口"</b>——理解了这个因果链，你就不会在选型时犯"拿 TP 去扩吞吐"这类方向性错误。</p>
+<div class="box-history"><p class="box-title">🕰 历史脉络：2012–2026，从"两块 GPU 的 AlexNet"到十万卡集群</p>
+<p><b>2012 年</b>AlexNet 用两块 GTX 580 训练——深度学习的分布式训练史几乎与深度学习本身同龄，Krizhevsky 的做法朴素到"把网络按层垂直切开"（model parallelism 的雏形）。<b>2015–2017 年</b>，Facebook 的数据并行在 ImageNet 训练上把 256 卡的扩展效率做到 90%（arXiv:1706.02677 提出 LARS 大 batch 训练法则），"数据并行 + 大 batch"统治了 CNN 时代。<b>2018 年</b>是转折年：Google 的 GPipe（arXiv:1811.06965）把流水线并行引入 Transformer 训练，微软的 PipeDream（arXiv:1806.03377）同年提出 1F1B 调度的前身；NVIDIA 的 Megatron-LM（arXiv:1909.08053，论文 2019）给出张量并行的系统化推导——三大并行在同一时期凑齐。<b>2019–2020 年</b>，ZeRO（arXiv:1910.02054）与 DeepSpeed 开源，"状态分片"让数据并行也能装下大模型；GPT-3（2020）用 3D 并行（DP×TP×PP）在万卡级集群上训练，宣告"千卡时代"到来。<b>2021–2023 年</b>，PyTorch FSDP 把 ZeRO-3 思想内化进框架，Megatron-SP（arXiv:2105.13120）与序列并行解决了长序列激活显存；Colossal-AI、Alpa 等自动并行系统试图让"策略搜索"自动化。<b>2024–2026 年</b>，LLaMA-3 级别的万卡集群、DeepSeek-V3（arXiv:2412.19437）的 FP8 混合并行训练、以及"十万卡互联"的 xAI Colossus 把这条曲线推到极限——而本章要讲的数学，五年里几乎没有变过。</p></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>数据并行 → ZeRO 1/2/3 → FSDP：通信量与显存的完整推导</h2>
+<p>数据并行是最自然的起点：$N_d$ 张卡各持有完整模型副本，每步各自处理不同的数据分片，然后平均梯度。设参数量为 $\Psi$（第 36 章的显存数学已给出：训练态每参数 16 字节）。<b>朴素 DP（PyTorch 早期的 <code>DistributedDataParallel</code> 之前身）的问题在于通信串行</b>：前向计算完先把激活都算完，梯度要等所有卡的反向全部结束才能开始同步——通信时间完全暴露在关键路径上。</p>
+<p><b>DDP（DistributedDataParallel）的两个关键工程化</b>：其一，<b>反向传播与梯度通信重叠</b>——把参数分组为若干桶（bucket），反向传播进行到某个桶的最后一个参数时，立即对该桶发起 all-reduce，与此同时 GPU 继续算后面桶的梯度——通信躲在计算背后，理想情况下总时间 ≈ max(计算, 通信)；其二，<b>梯度分桶 + 环形 all-reduce</b>。环形 all-reduce 把"每对卡直接互发"的 $O(N^2)$ 通信压成 $O(2\Psi \cdot \frac{N-1}{N})$ 的两阶段（reduce-scatter + all-gather）：对 $N$ 张卡，每卡先以 reduce-scatter 收聚一份 $\Psi/N$ 的完整归约结果，再以 all-gather 广播出去——总通信量 $2\Psi\frac{N-1}{N} \approx 2\Psi$ 字节（bf16 下每参数 2 字节），<b>与卡数基本无关</b>，这正是 DDP 能扩展到数千卡的根本原因。</p>
+<div class="box-theory"><p class="box-title">📐 理论推导：DDP 每步通信量与 ZeRO 三级的显存/通信账</p>
+<p><b>记号</b>：参数量 $\Psi$，数据并行度 $N_d$，混合精度训练（bf16 计算、fp32 优化器状态）。每参数的训练态构成：</p>
+<div class="math-block">$$\underbrace{2\,\text{B}}_{\text{bf16 权重}} + \underbrace{2\,\text{B}}_{\text{bf16 梯度}} + \underbrace{4\,\text{B}}_{\text{fp32 主权重}} + \underbrace{4\,\text{B}+4\,\text{B}}_{\text{Adam 动量 } m, v} = 16\,\text{B/参数}$$</div>
+<p><b>① DDP 通信量</b>：每步一次梯度 all-reduce（bf16），环形实现 = reduce-scatter + all-gather，各传 $\Psi\frac{N_d-1}{N_d}$：</p>
+<div class="math-block">$$\text{DDP 通信量/卡/步} = 2\Psi\cdot\frac{N_d-1}{N_d}\ \text{B} \;\xrightarrow{N_d\text{大}}\; 2\Psi\ \text{B}$$</div>
+<p><b>② ZeRO-1（切优化器状态）</b>：$m, v$、fp32 主权重按 $N_d$ 等分，每卡只存 $\frac{8\Psi}{N_d}$ + 自身那份 bf16 权重/梯度。显存从 $16\Psi$ 降到 $4\Psi + \frac{12\Psi}{N_d}$。通信量不变（梯度 all-reduce $2\Psi$）——优化器的更新在各自分片上独立完成，无需额外通信。</p>
+<p><b>③ ZeRO-2（再切梯度）</b>：由于每张卡只需要"自己负责更新的那部分参数"的完整梯度，all-reduce 退化为 <b>reduce-scatter</b>：每卡只收聚 $\Psi/N_d$ 的归约梯度，通信量减半：</p>
+<div class="math-block">$$\text{ZeRO-2 通信量} = \Psi\cdot\frac{N_d-1}{N_d}\ \text{B},\qquad \text{显存} = 2\Psi + \frac{14\Psi}{N_d}$$</div>
+<p><b>④ ZeRO-3（连权重也切）</b>：前向/反向经过每一层时，各卡用 all-gather 临时拼出该层完整权重，用完即弃。每参数的权重在"通信"维度上被读两次（前向+反向各一次 all-gather），梯度再 reduce-scatter 一次：</p>
+<div class="math-block">$$\text{ZeRO-3 通信量} = \underbrace{2\Psi\cdot\frac{N_d-1}{N_d}}_{\text{前向 all-gather}} + \underbrace{2\Psi\cdot\frac{N_d-1}{N_d}}_{\text{反向 all-gather}} + \underbrace{\Psi\cdot\frac{N_d-1}{N_d}}_{\text{梯度 reduce-scatter}} \approx 3\times\,\text{DDP}$$</div>
+<p><b>⑤ 结论对照表</b>（$N_d\to\infty$ 的极限）：DDP 显存 $16\Psi$、通信 $2\Psi$；ZeRO-1 显存 $\approx 4\Psi$、通信 $2\Psi$；ZeRO-2 显存 $\approx 2\Psi$、通信 $\Psi$；ZeRO-3 显存 $\to \frac{16\Psi}{N_d}$（可无限切）、通信 $3\Psi$。<b>ZeRO 的核心洞察：三份状态被"切"的时机不同，通信代价就不同——切得越彻底，通信越贵，但显存越省；选型的本质是用通信换显存</b>。此外 ZeRO-3 可叠加 CPU/NVMe offload（把优化器状态换页到主机内存），用 PCIe ~50GB/s 的带宽再换一层显存——离 GPU 越远，换得越省、跑得越慢。</p>
+</div>
+
+<p>把上面推导里的通信原语"打开"看——图 38-2 给出三个原语的输入/输出状态与通信量，本章所有通信公式都是它们的组合计数。</p>
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 880 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="集合通信三原语">
+<rect x="0" y="0" width="880" height="340" fill="#f8fafc"/>
+<text x="440" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">集合通信三原语：ZeRO / TP 通信量公式的基本单位</text>
+<!-- panel 1: all-gather -->
+<rect x="30" y="48" width="260" height="240" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="160" y="72" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">all-gather（汇聚拼接）</text>
+<g font-size="10.5" text-anchor="middle">
+<rect x="50" y="92" width="64" height="26" rx="5" fill="#dbeafe" stroke="#2563eb"/><text x="82" y="109">GPU0: a</text>
+<rect x="50" y="128" width="64" height="26" rx="5" fill="#dbeafe" stroke="#2563eb"/><text x="82" y="145">GPU1: b</text>
+<rect x="50" y="164" width="64" height="26" rx="5" fill="#dbeafe" stroke="#2563eb"/><text x="82" y="181">GPU2: c</text>
+<rect x="50" y="200" width="64" height="26" rx="5" fill="#dbeafe" stroke="#2563eb"/><text x="82" y="217">GPU3: d</text>
+<line x1="118" y1="160" x2="146" y2="160" stroke="#475569" stroke-width="2" marker-end="url(#a6)"/>
+<rect x="150" y="92" width="118" height="26" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="209" y="109">a b c d</text>
+<rect x="150" y="128" width="118" height="26" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="209" y="145">a b c d</text>
+<rect x="150" y="164" width="118" height="26" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="209" y="181">a b c d</text>
+<rect x="150" y="200" width="118" height="26" rx="5" fill="#eff6ff" stroke="#2563eb"/><text x="209" y="217">a b c d</text>
+</g>
+<text x="160" y="252" text-anchor="middle" font-size="11" fill="#1d4ed8">每卡收 Ψ(N−1)/N 字节</text>
+<text x="160" y="272" text-anchor="middle" font-size="11" fill="#475569">ZeRO-3 按层取权重用</text>
+<!-- panel 2: reduce-scatter -->
+<rect x="310" y="48" width="260" height="240" rx="10" fill="#ffffff" stroke="#10b981" stroke-width="2"/>
+<text x="440" y="72" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">reduce-scatter（归约分存）</text>
+<g font-size="10.5" text-anchor="middle">
+<rect x="330" y="92" width="118" height="26" rx="5" fill="#d1fae5" stroke="#10b981"/><text x="389" y="109">a b c d（全量）</text>
+<rect x="330" y="128" width="118" height="26" rx="5" fill="#d1fae5" stroke="#10b981"/><text x="389" y="145">a b c d</text>
+<rect x="330" y="164" width="118" height="26" rx="5" fill="#d1fae5" stroke="#10b981"/><text x="389" y="181">a b c d</text>
+<rect x="330" y="200" width="118" height="26" rx="5" fill="#d1fae5" stroke="#10b981"/><text x="389" y="217">a b c d</text>
+<line x1="452" y1="160" x2="480" y2="160" stroke="#475569" stroke-width="2" marker-end="url(#a6)"/>
+<rect x="484" y="92" width="64" height="26" rx="5" fill="#ecfdf5" stroke="#10b981"/><text x="516" y="109">Σa</text>
+<rect x="484" y="128" width="64" height="26" rx="5" fill="#ecfdf5" stroke="#10b981"/><text x="516" y="145">Σb</text>
+<rect x="484" y="164" width="64" height="26" rx="5" fill="#ecfdf5" stroke="#10b981"/><text x="516" y="181">Σc</text>
+<rect x="484" y="200" width="64" height="26" rx="5" fill="#ecfdf5" stroke="#10b981"/><text x="516" y="217">Σd</text>
+</g>
+<text x="440" y="252" text-anchor="middle" font-size="11" fill="#047857">通信量减半：Ψ(N−1)/N 字节</text>
+<text x="440" y="272" text-anchor="middle" font-size="11" fill="#475569">ZeRO-2 的梯度同步用</text>
+<!-- panel 3: all-reduce -->
+<rect x="590" y="48" width="260" height="240" rx="10" fill="#ffffff" stroke="#8b5cf6" stroke-width="2"/>
+<text x="720" y="72" text-anchor="middle" font-size="13" font-weight="bold" fill="#6d28d9">all-reduce = 两者串联</text>
+<rect x="620" y="100" width="200" height="34" rx="6" fill="#f5f3ff" stroke="#8b5cf6"/>
+<text x="720" y="122" text-anchor="middle" font-size="11.5">第一步：reduce-scatter</text>
+<line x1="720" y1="136" x2="720" y2="156" stroke="#475569" stroke-width="2" marker-end="url(#a6)"/>
+<rect x="620" y="160" width="200" height="34" rx="6" fill="#f5f3ff" stroke="#8b5cf6"/>
+<text x="720" y="182" text-anchor="middle" font-size="11.5">第二步：all-gather</text>
+<text x="720" y="226" text-anchor="middle" font-size="11" fill="#6d28d9">通信量 2Ψ(N−1)/N ≈ 2Ψ 字节</text>
+<text x="720" y="248" text-anchor="middle" font-size="11" fill="#475569">DDP 梯度同步、TP 的 f/g 算子</text>
+<text x="720" y="272" text-anchor="middle" font-size="11" fill="#475569">（前向恒等 ↔ 反向 all-reduce）</text>
+<text x="440" y="318" text-anchor="middle" font-size="11.5" fill="#475569">环形实现把两两直连的 O(N²) 通信压成 O(N)——这是 DDP 能扩展到千卡的根本原因</text>
+<defs><marker id="a6" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#475569"/></marker></defs>
+</svg>
+<figcaption>图 38-2　集合通信三原语的输入/输出状态（4 卡示例）：all-gather 把各卡分片拼成全量，reduce-scatter 把全量归约成各卡分片（通信量恰为前者一半），all-reduce 是两者的串联。ZeRO-3 取权重用 all-gather、ZeRO-2 同步梯度用 reduce-scatter、DDP 用 all-reduce——第 2 节表格里的通信量数字全部由此推出。</figcaption>
+</figure>
+</div>
+<p><b>FSDP（Fully Sharded Data Parallel）</b>是 ZeRO-3 思想在 PyTorch 原生框架的落地（Facebook/PyTorch 团队 2021 年起逐步开源，论文正式化于 2023 年 arXiv:2304.11277）。它与 DeepSpeed ZeRO-3 的差异是工程性的而非原理性的：FSDP 通过 <code>wrap</code> 策略把模型切成若干 FSDP unit（通常按 Transformer 层），每个 unit 在前向/反向被调度到时才临时 all-gather 完整参数，计算结束立即释放——与 ZeRO-3 的"按层取权重"逐字对应。<b>实战选型口径</b>：单机 8 卡，DeepSpeed 与 FSDP 二选一即可（FSDP 与 HF Trainer 的集成更无感，DeepSpeed 的 offload 选项更丰富）；跨机多节点，DeepSpeed ZeRO-2/3 经过更多工业验证；需要自动切分策略搜索时看 Alpa/Colossal-AI。<b>一个常见误区</b>："ZeRO-3 一定比 ZeRO-2 慢"——不完全对：ZeRO-3 的额外通信可以被计算重叠掩盖（权重预取与上一层计算并行），实测差距常在 10–20% 以内；真正要避免的是"小模型配 ZeRO-3"（显存明明够却白付 3 倍通信）。</p>
+<div class="tbl-wrap"><table>
+<caption>表 38-1　ZeRO 三级与 DDP/FSDP 的显存、通信量对比（$\Psi$ 参数、$N_d$ 卡、bf16+fp32 混合精度）</caption>
+<thead><tr><th>方案</th><th>每卡权重</th><th>每卡梯度</th><th>每卡优化器状态</th><th>每卡显存合计</th><th>通信量/卡/步</th><th>典型场景</th></tr></thead>
+<tbody>
+<tr><td>DDP</td><td>$2\Psi$</td><td>$2\Psi$</td><td>$12\Psi$</td><td>$16\Psi$</td><td>$2\Psi$（all-reduce）</td><td>模型放得下时默认</td></tr>
+<tr><td>ZeRO-1</td><td>$2\Psi$</td><td>$2\Psi$</td><td>$12\Psi/N_d$</td><td>$4\Psi+12\Psi/N_d$</td><td>$2\Psi$（不变）</td><td>大 batch 微调、最平滑</td></tr>
+<tr><td>ZeRO-2</td><td>$2\Psi$</td><td>$2\Psi/N_d$</td><td>$12\Psi/N_d$</td><td>$2\Psi+14\Psi/N_d$</td><td>$\Psi$（reduce-scatter）</td><td>单机 8 卡训练首选</td></tr>
+<tr><td>ZeRO-3 / FSDP</td><td>$2\Psi/N_d$</td><td>$2\Psi/N_d$</td><td>$12\Psi/N_d$</td><td>$16\Psi/N_d$+激活</td><td>$3\Psi$（gather×2+scatter）</td><td>7B+ 全参训练标配</td></tr>
+<tr><td>ZeRO-3 + offload</td><td>$2\Psi/N_d$</td><td>$2\Psi/N_d$</td><td>→ CPU/NVMe</td><td>激活 + 少量驻留</td><td>$3\Psi$ + PCIe 流量</td><td>显存极限、能接受 2–4× 减速</td></tr>
+</tbody></table></div>
+<p><b>读表方法</b>：先看"每卡显存合计"列能否装下（装不下就往下一行），再在同列可行的方案里选通信量最小的（越往上越快）。<b>两个经验数字</b>：单机 8×A100-80G 训 7B 全参，ZeRO-2 峰值约 100GB/卡级别装不下 → 实际用 ZeRO-3 + 激活检查点，稳定在 40–60GB/卡；34B 全参在单机 8 卡上必须 ZeRO-3 + offload 或干脆上多机 3D 并行。第 7 节会给出完整算例。</p>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>
+<h2 id="sec-3"><span class="sec-no">3.</span>张量并行：Megatron 的列/行并行与 f/g 通信算子</h2>
+<p>ZeRO 切的是"训练状态"，但有一个东西它始终没切：<b>单层的激活</b>。当单层的前向激活就大到一张卡放不下（如超长序列 + 大 hidden size 的场景），或者单层权重本身大到无法在一张卡上完成计算（GPT-4 传闻中的 MoE 稠密部分、万亿级参数模型），就必须把<b>矩阵乘法本身</b>切开——这就是张量并行（Tensor Parallelism, TP），由 NVIDIA 的 Megatron-LM（arXiv:1909.08053）给出了教科书级的方案。TP 的本质是把线性层的权重矩阵 $\mathbf{W}$ 分片到 $N_p$ 张卡上，让"大矩阵乘"变成"$N_p$ 个小矩阵乘 + 一次规约/拼接"。</p>
+<div class="box-theory"><p class="box-title">📐 理论推导：列并行与行并行为什么恰好配对</p>
+<p><b>记号</b>：线性层 $Y = XW$，$X\in\mathbb{R}^{b\times s\times h_{in}}$ 是激活，$W\in\mathbb{R}^{h_{in}\times h_{out}}$ 是权重（约定 $X$ 在左、行向量语义）。TP 组大小 $N_p$，切分记号 $[A]_j$ 表示 $A$ 的第 $j$ 个分片。</p>
+<p><b>① 列并行（column parallel）</b>：把 $W$ 按输出维度切成 $N_p$ 份：$W=[W_1, W_2, \dots, W_{N_p}]$（$W_j\in\mathbb{R}^{h_{in}\times h_{out}/N_p}$）。每张卡持有完整的 $X$ 与一个 $W_j$，输出自己的"列条带"：</p>
+<div class="math-block">$$Y_j = X W_j, \qquad Y = [Y_1, Y_2, \dots, Y_{N_p}]$$</div>
+<p>关键性质：<b>前向零通信</b>（$X$ 直接复用，无需任何 gather）——因为矩阵分块乘法 $X[W_1,\dots,W_p]=[XW_1,\dots,XW_p]$ 严格成立。但 $Y_j$ 只是输出的一个切片，后续若要做非线性/归一化就需要小心（见下）。</p>
+<p><b>② 行并行（row parallel）</b>：把 $W$ 按输入维度切：$W = \begin{bmatrix} W_1 \\ \vdots \\ W_{N_p} \end{bmatrix}$，同时把输入 $X$ 也按最后一维切成 $X=[X_1,\dots,X_{N_p}]$（每卡持有 $X_j$ 与 $W_j$）。输出按加法分块：</p>
+<div class="math-block">$$Y = \sum_{j=1}^{N_p} X_j W_j, \qquad \text{每卡算出部分和 } Y_j = X_jW_j,\ \text{一次 all-reduce 得 } Y$$</div>
+<p><b>③ 为什么必须"列→行"成对出现</b>：MLP 是两级线性层夹一个非线性：$Y = \sigma(XW_1)W_2$。若 $W_1$ 列并行，则每卡的 $\sigma$ 只作用于自己的列条带——对 GeLU/ReLU 这类<b>逐元素</b>激活，分片计算与全量计算严格等价（逐元素函数可穿过列分片）；得到 $\sigma(XW_1)$ 的列条带后，它恰好可以作为<b>行并行 $W_2$ 的分片输入</b>（行并行要求输入按最后一维切分）——两级之间零通信、零重排。最后一个 all-reduce 拿回完整 $Y$。</p>
+<p><b>④ Attention 的切分</b>：多头注意力天然"按头切"——把 $N_h$ 个头分给 $N_p$ 张卡（$N_h$ 必须被 $N_p$ 整除），$W_Q, W_K, W_V$ 按列并行切分，每卡独立完成自己那部分头的 attention（头与头之间本来就不交互！），$W_O$ 行并行收尾、all-reduce 输出。<b>这就是"多头注意力是为 TP 而生"的含义：attention 的多头结构提供了免费的并行切分线</b>。</p>
+<p><b>⑤ 通信量</b>：一个 MLP 块（列+行）前向 1 次 all-reduce、反向 1 次 all-reduce；attention 块同样。一个 Transformer 层前向+反向共 <b>4 次 all-reduce</b>，每次 $2bs\cdot h$ 字节（bf16），故每层每卡通信量：</p>
+<div class="math-block">$$\text{TP 通信量/层/卡} = 4 \times 2bs h \times 2\,\frac{N_p-1}{N_p}\ \text{B} \approx 16\,bs\,h\ \text{B（每层，前向+反向）}$$</div>
+<p>它<b>正比于 batch×序列长度</b>——这是 TP 与 DP 的根本区别：DP 的通信量只与参数量有关（固定），TP 的通信量随数据规模线性涨。因此 TP 只能放在通信带宽最高的"卡内 NVLink 域"（8 卡以内），跨机用 TP 是新手最贵的错误之一。</p>
+</div>
+<p><b>f 与 g 算子：Megatron 的通信抽象</b>。Megatron 论文用两个共轭算子描述 TP 中的通信插入点：<b>f 算子</b>=前向恒等（identity）、反向 all-reduce；<b>g 算子</b>=前向 all-reduce、反向恒等。于是 MLP 块可以干净地写成 $Y = \mathrm{g}\big(\sigma(\mathrm{f}(X) W_1^{col})\, W_2^{row}\big)$——前向时 f 什么都不做（输入已复制），行并行末端的 g 做 all-reduce；反向时梯度流动恰好对调（自动微分对 f/g 的定义已保证梯度正确）。<b>这个抽象的工程价值在于：模型代码里只需插入 f/g 两个标记，通信调度全部由框架完成——现代实现（Megatron、DeepSpeed、PyTorch TP）都沿用这套记号</b>。图 38-3 把 MLP 与 attention 块的切分和 f/g 位置画在一起。</p>
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Megatron TP 切分与 f/g 算子">
+<rect x="0" y="0" width="880" height="360" fill="#f8fafc"/>
+<text x="440" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">Megatron 张量并行：MLP 与 Attention 块的切分（2 卡示例）</text>
+<!-- MLP block -->
+<rect x="30" y="48" width="400" height="280" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="230" y="72" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">MLP 块：列并行 → 行并行</text>
+<rect x="60" y="86" width="150" height="30" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="135" y="106" text-anchor="middle" font-size="11">f：前向恒等 / 反向 all-reduce</text>
+<line x1="135" y1="116" x2="135" y2="132" stroke="#475569" stroke-width="1.5" marker-end="url(#a2)"/>
+<rect x="60" y="134" width="70" height="42" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="2"/><text x="95" y="152" text-anchor="middle" font-size="11">GPU0</text><text x="95" y="168" text-anchor="middle" font-size="10.5">W₁ᶜᵒˡ 靠上列</text>
+<rect x="150" y="134" width="70" height="42" rx="6" fill="#fef3c7" stroke="#d97706" stroke-width="2"/><text x="185" y="152" text-anchor="middle" font-size="11">GPU1</text><text x="185" y="168" text-anchor="middle" font-size="10.5">W₁ᶜᵒˡ 靠下列</text>
+<text x="245" y="160" font-size="10.5" fill="#92400e">GeLU 逐元素，</text>
+<text x="245" y="174" font-size="10.5" fill="#92400e">可穿过列分片</text>
+<line x1="155" y1="176" x2="155" y2="194" stroke="#475569" stroke-width="1.5" marker-end="url(#a2)"/>
+<rect x="60" y="196" width="70" height="42" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="2"/><text x="95" y="214" text-anchor="middle" font-size="11">GPU0</text><text x="95" y="230" text-anchor="middle" font-size="10.5">W₂ʳᵒʷ 靠上行</text>
+<rect x="150" y="196" width="70" height="42" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="2"/><text x="185" y="214" text-anchor="middle" font-size="11">GPU1</text><text x="185" y="230" text-anchor="middle" font-size="10.5">W₂ʳᵒʷ 靠下行</text>
+<line x1="155" y1="238" x2="155" y2="254" stroke="#ef4444" stroke-width="2" marker-end="url(#a2)"/>
+<rect x="60" y="256" width="160" height="30" rx="6" fill="#fee2e2" stroke="#ef4444"/><text x="140" y="276" text-anchor="middle" font-size="11" fill="#991b1b">g：前向 all-reduce / 反向恒等</text>
+<text x="60" y="312" font-size="10.5" fill="#475569">前向 1 次 all-reduce + 反向 1 次，</text>
+<text x="60" y="326" font-size="10.5" fill="#475569">两级矩阵之间零通信（列输出=行输入的分片）</text>
+<!-- Attention block -->
+<rect x="450" y="48" width="400" height="280" rx="10" fill="#ffffff" stroke="#10b981" stroke-width="2"/>
+<text x="650" y="72" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">Attention 块：按注意力头切分</text>
+<rect x="480" y="86" width="150" height="30" rx="6" fill="#dbeafe" stroke="#2563eb"/><text x="555" y="106" text-anchor="middle" font-size="11">f：前向恒等 / 反向 all-reduce</text>
+<line x1="555" y1="116" x2="555" y2="132" stroke="#475569" stroke-width="1.5" marker-end="url(#a2)"/>
+<rect x="480" y="134" width="150" height="42" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="2"/>
+<text x="555" y="152" text-anchor="middle" font-size="11">GPU0：头 0,1 的 Q/K/V</text>
+<text x="555" y="168" text-anchor="middle" font-size="10.5">独立 softmax(QKᵀ/√d)·V</text>
+<rect x="650" y="134" width="150" height="42" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="2"/>
+<text x="725" y="152" text-anchor="middle" font-size="11">GPU1：头 2,3 的 Q/K/V</text>
+<text x="725" y="168" text-anchor="middle" font-size="10.5">独立 softmax(QKᵀ/√d)·V</text>
+<text x="480" y="196" font-size="10.5" fill="#047857">头与头之间零交互 → 免费的并行切分线</text>
+<line x1="555" y1="176" x2="555" y2="212" stroke="#475569" stroke-width="1.5" marker-end="url(#a2)"/>
+<rect x="480" y="214" width="150" height="42" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="2"/><text x="555" y="232" text-anchor="middle" font-size="11">GPU0</text><text x="555" y="248" text-anchor="middle" font-size="10.5">Wₒ 行并行（靠上行）</text>
+<rect x="650" y="214" width="150" height="42" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="2"/><text x="725" y="232" text-anchor="middle" font-size="11">GPU1</text><text x="725" y="248" text-anchor="middle" font-size="10.5">Wₒ 行并行（靠下行）</text>
+<line x1="555" y1="256" x2="555" y2="272" stroke="#ef4444" stroke-width="2" marker-end="url(#a2)"/>
+<rect x="480" y="274" width="160" height="30" rx="6" fill="#fee2e2" stroke="#ef4444"/><text x="560" y="294" text-anchor="middle" font-size="11" fill="#991b1b">g：前向 all-reduce / 反向恒等</text>
+<text x="480" y="322" font-size="10.5" fill="#475569">约束：注意力头数 Nₕ 必须被 TP 度 Nₚ 整除</text>
+<defs><marker id="a2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#475569"/></marker></defs>
+</svg>
+<figcaption>图 38-3　Megatron 张量并行的切分结构（2 卡示例）：MLP 用"列并行→行并行"配对（GeLU 逐元素穿过列分片，两级之间零通信），Attention 按注意力头切分。红色块是通信算子：f 在前向恒等/反向 all-reduce，g 在前向 all-reduce/反向恒等——每个子层前向+反向共 2 次 all-reduce。</figcaption>
+</figure>
+</div>
+<p><b>TP 的实践边界</b>：①<b>TP 度与延迟强耦合</b>——每层 2 次（前向）all-reduce 是同步点，TP 度越大、这些同步越慢，所以 TP 一般不超过单机 8 卡（NVLink 域）；②<b>TP 对小模型不划算</b>——TP 度翻倍算力减半但通信翻倍，模型越小"通信/计算比"越难看，经验阈值：hidden ≥ 5120（30B 级）才值得 TP=4 以上；③<b>LayerNorm 与输出头</b>——LN 的统计量要跨 TP 组 all-reduce（或复制输入）、词嵌入输出头的 softmax 前要做 all-gather（vocab 并行的细节见 Megatron 论文第 3.3 节与后续 vocab-parallel 工作），这些"边角"正是复现 Megatron 时最容易出错的地方。<b>2021 年后的 Megatron-LM v2（arXiv:2104.04473）还引入了 check-pointing 重计算与 interleaved 1F1B，把 TP 与 PP 组合成完整的 Megatron 训练栈——这是第 6 节 3D 并行的原型</b>。</p>
+
+<h2 id="sec-4"><span class="sec-no">4.</span>序列并行与上下文并行：长序列时代的必然</h2>
+<p>TP 解决了"单层权重过大"，但有一类显存它同样无能为力：<b>激活显存随序列长度线性增长</b>。多模态是这个问题的重灾区——一张高分辨率图片经 ViT 编码后动辄数千个视觉 token（第 22 章的动态分辨率方案可到 4k–16k token），加上长文本上下文，序列长度 32k+ 在 VLM 训练中已是常态。Megatron-SP（Sequence Parallelism，arXiv:2105.13120）与后续的 Ring Attention / 上下文并行（Context Parallelism, CP）给出了两代解法。</p>
+<p><b>Megatron 序列并行（SP）的核心观察</b>：TP 区域内的激活（LayerNorm 与 Dropout 之后的那部分）在序列维度上是<b>逐位置独立</b>的——每个 token 的 LayerNorm 统计量只依赖它自己。于是可以把 TP 组内的激活按序列维度也切成 $N_p$ 份，每卡只存"自己的那一段序列"的激活，<b>激活显存再除以 TP 度</b>。代价是通信模式要改：TP 的 all-reduce 在 SP 下被拆成 all-gather（进 TP 区域前，把序列分片拼齐）+ reduce-scatter（出 TP 区域后，归约并把序列重新切碎）——总通信量不变，<b>只是把一次 all-reduce 拆成了两次更"便宜"的原语（各为 all-reduce 的一半流量），且能与计算重叠得更好</b>。SP 的适用范围有限：它只切 TP 区域内的激活，attention 内部的 softmax 仍是全序列的。</p>
+<p><b>上下文并行（CP）/ Ring Attention 把切分推进到 attention 内部</b>：把序列切成 $N_c$ 份，每卡持有自己段的 Q/K/V；计算自身段的 attention 后，K/V 沿"环"逐跳传递（每跳一次，各卡用邻居的 K/V 段补算一段 attention），$N_c$ 跳之后所有 (Q 段, K/V 段) 组合都被算过——<b>这就是第 4 章 FlashAttention 的分块思想在"设备间"的重演：分块计算 + 在线 softmax 修正，把序列维度的显存压到 $1/N_c$</b>。Ring Attention（arXiv:2310.01889）证明了这套机制在数百万 token 上的可行性；现代框架（Megatron-Core、PyTorch FSDP2 + context parallel、LLaMA 3 的训练栈）都已内置 CP。图 38-4 对比 SP 与 CP 的切分面。</p>
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 880 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="序列并行与上下文并行示意">
+<rect x="0" y="0" width="880" height="330" fill="#f8fafc"/>
+<text x="440" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">长序列的两代切分：Megatron SP 与上下文并行 CP</text>
+<!-- left: SP -->
+<rect x="30" y="46" width="400" height="250" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="230" y="70" text-anchor="middle" font-size="13" font-weight="bold" fill="#1d4ed8">序列并行 SP（切 TP 区激活）</text>
+<rect x="60" y="88" width="340" height="34" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+<text x="230" y="110" text-anchor="middle" font-size="11">激活张量 (b, s, h)：按序列维切成 4 段，每卡 1 段</text>
+<rect x="60" y="86" width="85" height="38" fill="none" stroke="#1e293b" stroke-width="2"/><text x="102" y="110" text-anchor="middle" font-size="10">GPU0: s/4</text>
+<rect x="145" y="86" width="85" height="38" fill="none" stroke="#1e293b" stroke-width="2"/><text x="187" y="110" text-anchor="middle" font-size="10">GPU1: s/4</text>
+<rect x="230" y="86" width="85" height="38" fill="none" stroke="#1e293b" stroke-width="2"/><text x="272" y="110" text-anchor="middle" font-size="10">GPU2: s/4</text>
+<rect x="315" y="86" width="85" height="38" fill="none" stroke="#1e293b" stroke-width="2"/><text x="357" y="110" text-anchor="middle" font-size="10">GPU3: s/4</text>
+<text x="60" y="152" font-size="11.5" fill="#334155">· LN/Dropout 按序列位置独立 → 可切</text>
+<text x="60" y="172" font-size="11.5" fill="#334155">· 进 TP 区：all-gather 拼序列；出 TP 区：reduce-scatter</text>
+<text x="60" y="192" font-size="11.5" fill="#334155">· 通信总量不变（all-reduce 拆成两半）</text>
+<text x="60" y="212" font-size="11.5" fill="#334155">· 激活显存 ÷ TP 度；attention 内部仍是全序列</text>
+<rect x="60" y="232" width="340" height="44" rx="6" fill="#fef3c7" stroke="#d97706"/>
+<text x="230" y="250" text-anchor="middle" font-size="11" fill="#92400e">适合：TP 度 ≥2 的中等长度序列（8k–32k）</text>
+<text x="230" y="268" text-anchor="middle" font-size="11" fill="#92400e">多模态收益：视觉 token 多 → 激活占显存大头时最明显</text>
+<!-- right: CP -->
+<rect x="450" y="46" width="400" height="250" rx="10" fill="#ffffff" stroke="#10b981" stroke-width="2"/>
+<text x="650" y="70" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">上下文并行 CP（切进 attention）</text>
+<rect x="480" y="88" width="340" height="38" rx="6" fill="#d1fae5" stroke="#10b981"/>
+<text x="650" y="112" text-anchor="middle" font-size="11">每卡持有自己段的 Q/K/V，K/V 沿环逐跳传递</text>
+<circle cx="560" cy="180" r="26" fill="#d1fae5" stroke="#10b981" stroke-width="2"/><text x="560" y="184" text-anchor="middle" font-size="10">GPU0</text>
+<circle cx="650" cy="180" r="26" fill="#d1fae5" stroke="#10b981" stroke-width="2"/><text x="650" y="184" text-anchor="middle" font-size="10">GPU1</text>
+<circle cx="740" cy="180" r="26" fill="#d1fae5" stroke="#10b981" stroke-width="2"/><text x="740" y="184" text-anchor="middle" font-size="10">GPU2</text>
+<line x1="586" y1="180" x2="624" y2="180" stroke="#475569" stroke-width="2" marker-end="url(#a3)"/>
+<line x1="676" y1="180" x2="714" y2="180" stroke="#475569" stroke-width="2" marker-end="url(#a3)"/>
+<path d="M 740 154 A 90 90 0 0 0 560 154" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#a3)"/>
+<text x="650" y="146" text-anchor="middle" font-size="10" fill="#475569">K/V 环形传递（Nc 跳覆盖全序列）</text>
+<text x="480" y="232" font-size="11.5" fill="#334155">· 在线 softmax 修正 = FlashAttention 分块思想的跨卡重演</text>
+<text x="480" y="252" font-size="11.5" fill="#334155">· 序列显存 ÷ CP 度，可扩展到百万级 token</text>
+<text x="480" y="272" font-size="11.5" fill="#334155">· 适合：视频/长文档 VLM（64k–1M token）</text>
+<defs><marker id="a3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#475569"/></marker></defs>
+</svg>
+<figcaption>图 38-4　两代长序列切分：SP 只切 TP 区域内"逐位置独立"的激活（显存 ÷ TP 度，通信原语从 all-reduce 拆为 all-gather + reduce-scatter）；CP 把切分推进到 attention 内部，K/V 沿环传递、在线 softmax 修正，可扩展到百万 token。多模态训练中两者常同时开启。</figcaption>
+</figure>
+</div>
+<p><b>多模态视角的两个要点</b>：其一，<b>视觉 token 数量是序列长度的"隐藏放大器"</b>——规划训练时把"图片数 × 每图视觉 token 数 + 文本长度"一起算进序列预算（一张 1344×1344 的图在 Qwen2-VL 式动态分辨率下可达数千 token，一段 1 分钟视频可达上万 token，第 31 章的均匀采样只能缓解而非消除）；其二，<b>变长序列（varlen）打包与 CP 的配合</b>——把多条样本拼进同一序列做训练（第 34 章的数据打包）时，attention 要按"文档边界"分块（block-diagonal mask），这与 CP 的环形分块叠加时需要框架支持（Megatron-Core 的 THD 格式、FlashAttention 的 varlen API）——<b>自研训练框架时，varlen + CP 的组合是最容易踩坑、也最影响吞吐的地方</b>。</p>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>流水线并行：GPipe 与 1F1B 调度、bubble 率公式</h2>
+<p>TP 的通信太贵、不能跨机，而模型的"层"天然是串行结构——把不同层放到不同设备、像流水线一样让数据流过，这就是<b>流水线并行（Pipeline Parallelism, PP）</b>。设模型有 $L$ 层、切给 $N_p$ 个流水线级（stage），第 $i$ 级持有第 $i$ 段层。朴素做法（ naive 拆分）把一个 batch 整体送进流水线：同一时刻只有一级在算、其余在等，GPU 利用率 $1/N_p$——比不用并行还浪费（通信还更多）。解法是把 batch 切成 $M$ 个<b>微批（micro-batch）</b>，让各级同时处理不同的微批——流水线才真正"流动"起来。</p>
+<p><b>GPipe（arXiv:1811.06965，Google，2018）</b>：所有 $M$ 个微批连续做前向（F0, F1, ... 依次穿过各级），再做反向。问题在显存：每个微批在每个级产生的激活都要保留到反向，<b>激活显存 ∝ M</b>——要压 bubble 就得多放微批，多放微批就爆显存。GPipe 用重计算（activation checkpointing）缓解，但"用吞吐换显存"的矛盾没有根除。图 38-5（下）可以看到 GPipe 时序的上半段全是前向、下半段全是反向，中间各级有大量空转。</p>
+<p><b>1F1B（one-forward-one-backward，PipeDream-Flush / Megatron 采用的调度）</b>：每个级做完一次前向就立即做一次（属于更早微批的）反向，交替进行。效果：<b>在飞（in-flight）微批数被压到流水线深度 $N_p$ 量级</b>，激活显存从 ∝M 降到 ∝$N_p$——与 batch 解耦。代价是 warmup 阶段的空转与更复杂的调度。Megatron-LM v2（arXiv:2104.04473）的 interleaved 1F1B 再进一步：把模型切成 $N_v$ 个虚拟级（vpp），每个物理级持有 $N_v$ 段不连续的层，微批在段间交错——<b>用 $N_v$ 倍的通信次数换更小的 bubble</b>（bubble 率公式中的 $N_p-1$ 被压到 $(N_p-1)/N_v$）。</p>
+<div class="box-theory"><p class="box-title">📐 理论推导：bubble 率公式</p>
+<p><b>设定</b>：流水线深度 $N_p$，微批数 $M$（$M \ge N_p$），每个微批在每级的前向时间 $t_f$、反向时间 $t_b$（反向约为前向 2 倍：$t_b \approx 2t_f$）。理想情况下（无流水线），一个 iteration 的时间为 $M(t_f+t_b)$。</p>
+<p><b>1F1B 的 iteration 时间</b>：warmup 需要填 $N_p$ 级（每级 $t_f$），稳态阶段流水线全满，drain 阶段排空。总时间：</p>
+<div class="math-block">$$T_{1F1B} = (N_p - 1)(t_f) + M(t_f + t_b) + (N_p-1)(t_b) = M(t_f+t_b) + (N_p-1)(t_f+t_b)$$</div>
+<p><b>bubble 时间</b> $= (N_p-1)(t_f+t_b)$——恰好是"每个级各空转一次满周期"的总和。<b>bubble 占比（bubble 率）</b>：</p>
+<div class="math-block">$$\text{bubble 率} = \frac{(N_p-1)(t_f+t_b)}{M(t_f+t_b) + (N_p-1)(t_f+t_b)} = \frac{N_p-1}{M + N_p - 1}$$</div>
+<p><b>三个直接推论</b>（每个都对应一条实战纪律）：① $M \gg N_p$ 时 bubble 率 → 0，故<b>微批数要远大于流水线深度</b>——PP 度 8 时至少要 32–64 个微批；② $M$ 固定时 PP 度越大 bubble 越大，故 <b>PP 度是 3D 并行中最"省着用"的维度</b>（能用 TP/ZeRO 解决就别加 PP）；③ $t_f+t_b$ 越大 bubble 绝对值越大，故 PP 级数要与<b>大 batch、长序列</b>配合使用——这正是大模型训练的典型配置。interleaved 1F1B 把公式改为 $\frac{N_p-1}{M\cdot N_v + N_p - 1}$（$N_v$ 为虚拟级数），代价是段间通信次数增加 $N_v$ 倍。</p>
+</div>
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 880 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GPipe 与 1F1B 时序对比">
+<rect x="0" y="0" width="880" height="430" fill="#f8fafc"/>
+<text x="440" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">流水线调度时序对比：GPipe vs 1F1B（4 级 × 8 微批，示意取 6 个）</text>
+<!-- axis -->
+<text x="60" y="52" font-size="11" fill="#475569">时间 →</text>
+<!-- GPipe grid -->
+<text x="30" y="80" font-size="12" font-weight="bold" fill="#1d4ed8">GPipe</text>
+<g font-size="10" text-anchor="middle">
+<!-- device rows -->
+<text x="52" y="100" font-size="10" fill="#475569">级0</text>
+<text x="52" y="128" font-size="10" fill="#475569">级1</text>
+<text x="52" y="156" font-size="10" fill="#475569">级2</text>
+<text x="52" y="184" font-size="10" fill="#475569">级3</text>
+<!-- level0 forward F0..F5 then backward -->
+<rect x="70" y="88" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="88" y="104">F0</text>
+<rect x="106" y="88" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="124" y="104">F1</text>
+<rect x="142" y="88" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="160" y="104">F2</text>
+<rect x="178" y="88" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="196" y="104">F3</text>
+<rect x="214" y="88" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="232" y="104">F4</text>
+<rect x="250" y="88" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="268" y="104">F5</text>
+<rect x="286" y="88" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="304" y="104" fill="#94a3b8">空</text>
+<rect x="322" y="88" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="340" y="104">B5</text>
+<rect x="358" y="88" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="376" y="104">B4</text>
+<!-- level1 -->
+<rect x="106" y="116" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="124" y="132" fill="#94a3b8">空</text>
+<rect x="142" y="116" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="160" y="132">F0</text>
+<rect x="178" y="116" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="196" y="132">F1</text>
+<rect x="214" y="116" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="232" y="132">F2</text>
+<rect x="250" y="116" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="268" y="132">F3</text>
+<rect x="286" y="116" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="304" y="132">F4</text>
+<rect x="322" y="116" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="340" y="132">F5</text>
+<rect x="358" y="116" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="376" y="132">B5</text>
+<!-- level2 -->
+<rect x="142" y="144" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="160" y="160" fill="#94a3b8">空</text>
+<rect x="178" y="144" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="196" y="160" fill="#94a3b8">空</text>
+<rect x="214" y="144" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="232" y="160">F0</text>
+<rect x="250" y="144" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="268" y="160">F1</text>
+<rect x="286" y="144" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="304" y="160">F2</text>
+<rect x="322" y="144" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="340" y="160">F3</text>
+<rect x="358" y="144" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="376" y="160">F4</text>
+<rect x="394" y="144" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="412" y="160">F5</text>
+<!-- level3 -->
+<rect x="214" y="172" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="232" y="188" fill="#94a3b8">空</text>
+<rect x="250" y="172" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="268" y="188" fill="#94a3b8">空</text>
+<rect x="286" y="172" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="304" y="188">F0</text>
+<rect x="322" y="172" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="340" y="188">F1</text>
+<rect x="358" y="172" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="376" y="188">F2</text>
+<rect x="394" y="172" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="412" y="188">F3</text>
+<rect x="430" y="172" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="448" y="188">F4</text>
+<rect x="466" y="172" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="484" y="188">F5</text>
+</g>
+<text x="70" y="216" font-size="10.5" fill="#475569">蓝色=前向，红色=反向，灰=空转。前向全部完成后才开反向：在飞激活 ∝ 微批数 M，显存压力大。</text>
+<!-- 1F1B grid -->
+<text x="30" y="248" font-size="12" font-weight="bold" fill="#047857">1F1B</text>
+<g font-size="10" text-anchor="middle">
+<text x="52" y="268" font-size="10" fill="#475569">级0</text>
+<text x="52" y="296" font-size="10" fill="#475569">级1</text>
+<text x="52" y="324" font-size="10" fill="#475569">级2</text>
+<text x="52" y="352" font-size="10" fill="#475569">级3</text>
+<!-- level0 -->
+<rect x="70" y="256" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="88" y="272">F0</text>
+<rect x="106" y="256" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="124" y="272">F1</text>
+<rect x="142" y="256" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="160" y="272">F2</text>
+<rect x="178" y="256" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="196" y="272">F3</text>
+<rect x="214" y="256" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="232" y="272">F4</text>
+<rect x="250" y="256" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="268" y="272">B0</text>
+<rect x="286" y="256" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="304" y="272">F5</text>
+<rect x="322" y="256" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="340" y="272">B1</text>
+<rect x="358" y="256" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="376" y="272">B2</text>
+<!-- level1 -->
+<rect x="106" y="284" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="124" y="300" fill="#94a3b8">空</text>
+<rect x="142" y="284" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="160" y="300">F0</text>
+<rect x="178" y="284" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="196" y="300">F1</text>
+<rect x="214" y="284" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="232" y="300">F2</text>
+<rect x="250" y="284" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="268" y="300">F3</text>
+<rect x="286" y="284" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="304" y="300">B0</text>
+<rect x="322" y="284" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="340" y="300">F4</text>
+<rect x="358" y="284" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="376" y="300">B1</text>
+<rect x="394" y="284" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="412" y="300">F5</text>
+<!-- level2 -->
+<rect x="142" y="312" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="160" y="328" fill="#94a3b8">空</text>
+<rect x="178" y="312" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="196" y="328" fill="#94a3b8">空</text>
+<rect x="214" y="312" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="232" y="328">F0</text>
+<rect x="250" y="312" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="268" y="328">F1</text>
+<rect x="286" y="312" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="304" y="328">F2</text>
+<rect x="322" y="312" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="340" y="328">B0</text>
+<rect x="358" y="312" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="376" y="328">F3</text>
+<rect x="394" y="312" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="412" y="328">B1</text>
+<rect x="430" y="312" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="448" y="328">F4</text>
+<!-- level3 -->
+<rect x="214" y="340" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="232" y="356" fill="#94a3b8">空</text>
+<rect x="250" y="340" width="36" height="24" fill="#f1f5f9" stroke="#cbd5e1"/><text x="268" y="356" fill="#94a3b8">空</text>
+<rect x="286" y="340" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="304" y="356">F0</text>
+<rect x="322" y="340" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="340" y="356">B0</text>
+<rect x="358" y="340" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="376" y="356">F1</text>
+<rect x="394" y="340" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="412" y="356">B1</text>
+<rect x="430" y="340" width="36" height="24" fill="#dbeafe" stroke="#2563eb"/><text x="448" y="356">F2</text>
+<rect x="466" y="340" width="36" height="24" fill="#fee2e2" stroke="#ef4444"/><text x="484" y="356">B2</text>
+</g>
+<text x="70" y="384" font-size="10.5" fill="#475569">前向与反向交替：在飞激活 ∝ 级数（而非微批数），显存与 batch 解耦；bubble 只剩 warmup/drain 的 (Np-1) 个周期。</text>
+<!-- right: bubble formula -->
+<rect x="560" y="244" width="290" height="160" rx="10" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+<text x="705" y="268" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#92400e">bubble 率速查（1F1B）</text>
+<text x="580" y="294" font-size="11.5" fill="#334155">bubble 率 = (Np−1) / (M + Np−1)</text>
+<text x="580" y="318" font-size="11.5" fill="#334155">Np=8, M=16 → 32%　（勉强能用）</text>
+<text x="580" y="342" font-size="11.5" fill="#334155">Np=8, M=64 → 10%　（工程合格）</text>
+<text x="580" y="366" font-size="11.5" fill="#334155">Np=8, M=128 → 5%　（优秀）</text>
+<text x="580" y="392" font-size="11" fill="#92400e">纪律：微批数 M ≥ 4×Np 起步，</text>
+<text x="600" y="392" font-size="11" fill="#92400e">越大越好（显存允许时）</text>
+<defs><marker id="a4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#475569"/></marker></defs>
+</svg>
+<figcaption>图 38-5　GPipe 与 1F1B 的流水线时序（4 级 × 6 微批示意）：GPipe 先完成全部前向再做反向，在飞激活数正比于微批数；1F1B 让每级"做一次前向就做一次反向"，在飞激活压到级数水平。右上角给出 bubble 率速查——决定 PP 可用性的核心公式。</figcaption>
+</figure>
+</div>
+<p><b>PP 的隐性成本与纪律</b>：①<b>数值一致性</b>——各微批的梯度在流水线末端要做一次 all-reduce（或由第一个级累加），且 loss 要按微批加权平均，实现不对会直接导致"有效学习率偏移"；②<b>与 ZeRO 的组合</b>——PP 每级持有不同层，ZeRO-1 的优化器分片仍可在级内继续做（DeepSpeed 支持 PP+ZeRO-1，不支持 PP+ZeRO-2/3 的某些组合，配置前查版本矩阵）；③<b>PP 度选择</b>——经验顺序：先用满 DP（通信最便宜）→ 单层放不下加 TP（卡内）→ 层数太多加 PP（跨机）→ 序列太长加 SP/CP。<b>这个"先 DP 后 TP 后 PP"的顺序，就是第 6 节 3D 并行的组装手册</b>。</p>
+<h2 id="sec-6"><span class="sec-no">6.</span>3D 并行组合与多模态训练的异构并行实践</h2>
+<p>把前三节的三个维度乘起来，就是<b>3D 并行（3D Parallelism）</b>：总卡数 $N = N_d \times N_p^{TP} \times N_p^{PP}$（可再乘 $N_c^{CP}$ 成 4D）。每个维度解决各自的墙：DP 扩吞吐（通信最便宜、每步 1 次）、TP 切单层权重与激活（通信最贵、限卡内）、PP 切层数跨机（bubble 随深度涨）。<b>组合的自由度带来了选型的复杂度——这是分布式训练从"科学"滑向"工程艺术"的地方，但有两条硬性搜索顺序可以依赖</b>：</p>
+<p><b>顺序一：先算显存，定 TP×PP。</b>目标是"每个 GPU 上塞得下 $\frac{\text{权重}+\text{梯度}+\text{优化器状态}}{N_p^{TP}\times N_p^{PP}}$ + 激活"。TP 优先于 PP（TP 无 bubble），但 TP 只能在 NVLink 域内（≤8）；单层权重 $\Psi_{layer}$ 除以 TP 度后仍放不下才加 PP。<b>顺序二：显存定完后，用剩余的卡扩 DP 找吞吐。</b>DP 度 = 总卡数 ÷ (TP×PP)，然后检查：微批数 $M$（= global batch ÷ DP 度）是否 ≥ 4×PP 度（压 bubble），global batch 是否落在训练动力学的合理区间（第 35 章的 lr-batch 配比）。</p>
+<div class="tbl-wrap"><table>
+<caption>表 38-2　3D 并行选型速查（以典型 dense LLM/VLM 训练为参照）</caption>
+<thead><tr><th>模型规模</th><th>硬件</th><th>推荐组合（DP×TP×PP）</th><th>理由</th><th>预计 MFU</th></tr></thead>
+<tbody>
+<tr><td>≤7B 全参</td><td>单机 8×A100/H100</td><td>8×1×1（纯 DP+ZeRO-3）</td><td>单层放得下，通信最省</td><td>45–55%</td></tr>
+<tr><td>13B–34B 全参</td><td>单机 8×H100-80G</td><td>8×1×1（ZeRO-3+检查点）或 4×2×1</td><td>34B 权重切半更从容</td><td>40–50%</td></tr>
+<tr><td>70B 全参</td><td>2 机 16×H100</td><td>4×4×1 或 2×4×2</td><td>TP=4 卡内，PP 跨机压层</td><td>38–45%</td></tr>
+<tr><td>70B+ 长上下文 VLM</td><td>4 机 32×H100</td><td>4×4×2 + SP/CP</td><td>视觉 token 长序列必须 SP/CP</td><td>35–45%</td></tr>
+<tr><td>≥175B / MoE</td><td>数十至上百机</td><td>DP 大 × TP8 × PP8± + EP</td><td>MoE 再加专家并行 EP</td><td>30–45%</td></tr>
+<tr><td>7B LoRA 微调</td><td>单机 8×24–48G</td><td>8×1×1（ZeRO-2/3 + LoRA）</td><td>优化器状态小，DP 足够</td><td>40–50%</td></tr>
+</tbody></table></div>
+<p><b>MFU 列的含义</b>：3D 并行的组合越复杂，MFU（Model FLOPs Utilization，模型算力利用率，第 7 节定义）越难做高——每次叠加一个并行维度都引入新的通信与 bubble。大模型训练的 MFU 从 7B 的 ~50% 一路降到 175B+ 的 ~35%，<b>这不是实现得不好，而是"并行税"的必然</b>；工程的目标是让每一维的税都交在刀刃上。</p>
+<div class="box-paper"><p class="box-title">📄 论文精读：ZeRO（arXiv:1910.02054，SC 2020）与 Megatron-LM（arXiv:1909.08053，arXiv:2104.04473）——两篇奠定现代并行训练的基石</p>
+<p><b>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</b>（Rajbhandari, Rasley, Ruwase, He 等，Microsoft，SC 2020）。<b>要解决什么</b>：数据并行的显存冗余——$N_d$ 卡每卡都存完整的权重/梯度/优化器状态，其中优化器状态占训练态显存的 75%（12/16 字节每参数），却对"模型功能"毫无贡献。<b>方法</b>：三级递进的分片（依次切优化器状态、梯度、权重，对应 ZeRO-1/2/3）+ 显存与通信量的解析式分析（本章第 2 节的公式全部出自此文表 1）+ 与 CPU 内存/NVMe 的 offload 选项。<b>关键实验</b>：在 400 张 V100-GPU 集群上训练 1 万亿参数模型，达到 15 PetaFLOPS 的持续算力（~47% MFU），且 ZeRO-100B 相比朴素 DP 吞吐提升 10%+（显存释放换来更大 batch）——"分片不仅省显存还能提速"是常被忽略的结论。<b>读法建议</b>：精读第 2 节（显存/通信量分析，配合本章表 38-1）与第 6 节（offload 分析），第 4 节的实现细节可跳过（以 DeepSpeed 官方文档的最新版本为准）。<b>延伸</b>：同系列 ZeRO-Offload（arXiv:2101.06840，CPU offload 的数学）与 ZeRO-Infinity（arXiv:2104.07857，NVMe 级 offload）构成了 DeepSpeed 的显存三层存储体系。</p>
+<p><b>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</b>（Shoeybi 等，NVIDIA，arXiv:1909.08053，SC 2020）与续作 <b>Megatron-LM v2</b>（Narayanan 等，arXiv:2104.04473）。前者的贡献是<b>列/行并行的配对推导与 f/g 算子抽象</b>（本章第 3 节即其展开）：证明一个 Transformer 层只需 2 次前向 all-reduce 即可完成 TP，并把 8.3B GPT-2 做到 77% 的卡内扩展效率；后者把 TP 与 1F1B 流水线、activation checkpointing 重计算组合成完整的 3D 并行栈，在 3072 张 A100 上训练 1T 参数 GPT 达到 52% MFU——这个数字在 2021 年是惊叹号，在今天是"及格线"。<b>读法建议</b>：1909.08053 精读第 3 节（TP 设计），2104.04473 精读第 3 节（3D 并行组合与 bubble 分析，配合本章第 5 节公式）；两者合起来不到 30 页正文，是分布式训练领域"性价比最高的两篇论文"。<b>与多模态的关联</b>：Megatron 栈是今天绝大多数开源 VLM 大规模训练（Qwen-VL、InternVL 系列、LLaMA-3-V 等）的底层引擎——读懂这两篇，就看懂了这些模型训练配置文件里每个数字的来历。</p></div>
+<p><b>多模态大模型的异构并行需求</b>——这是本章对多模态读者的"特化加餐"。VLM 的训练计算由三块异质部分组成：<b>视觉塔（ViT）</b>、<b>连接器</b>、<b>LLM 主干</b>，它们的并行需求差异显著：①<b>ViT 的并行相对独立</b>——视觉塔通常 1–6B 参数、层数浅、单图计算量小而图片数多，普遍做法是<b>让 ViT 走数据并行（或 ZeRO）而不进 TP/PP 组</b>，避免给昂贵的 TP 通信添堵；Qwen-VL、InternVL 系列的工业训练中，ViT 与 LLM 常分属不同的并行配置段（freeze 阶段的 ViT 甚至可以 offload 到 CPU）；②<b>连接器参数量小（百万级）但处于并行边界的"缝合线"上</b>——当 ViT 与 LLM 分属不同 PP 级或不同 DP 组时，视觉 token 的传输点就是新的通信边界，要避免把 all-gather 视觉 token 塞进 TP 的关键路径；③<b>LLM 主干吃掉 95%+ 的算力</b>，3D 并行的全部配置都为它服务。图 38-6 给出典型的 VLM 异构并行布局。</p>
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 880 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VLM 异构并行布局">
+<rect x="0" y="0" width="880" height="340" fill="#f8fafc"/>
+<text x="440" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">多模态大模型训练的异构并行布局（典型 VLM 工业配置）</text>
+<!-- ViT group -->
+<rect x="30" y="50" width="240" height="240" rx="10" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+<text x="150" y="76" text-anchor="middle" font-size="13" font-weight="bold" fill="#b45309">视觉塔 ViT（1–6B）</text>
+<rect x="50" y="92" width="200" height="40" rx="6" fill="#fef3c7" stroke="#d97706"/>
+<text x="150" y="110" text-anchor="middle" font-size="11.5">数据并行 / ZeRO</text>
+<text x="150" y="124" text-anchor="middle" font-size="10.5" fill="#92400e">不进 TP/PP 组</text>
+<text x="50" y="160" font-size="11" fill="#334155">· 层数浅、算力占比小（&lt;10%）</text>
+<text x="50" y="180" font-size="11" fill="#334155">· 高分辨率切图 → 视觉 token 数多</text>
+<text x="50" y="200" font-size="11" fill="#334155">· 冻结阶段可 offload CPU</text>
+<text x="50" y="220" font-size="11" fill="#334155">· 微调时 lr 独立（第 36 章）</text>
+<text x="50" y="262" font-size="10.5" fill="#b45309">输出：N_img 个视觉 token 序列</text>
+<!-- connector -->
+<rect x="290" y="100" width="120" height="140" rx="10" fill="#ffffff" stroke="#10b981" stroke-width="2"/>
+<text x="350" y="130" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#047857">连接器</text>
+<text x="350" y="152" text-anchor="middle" font-size="11">MLP / Q-Former</text>
+<text x="350" y="174" text-anchor="middle" font-size="11" fill="#334155">参数小</text>
+<text x="350" y="196" text-anchor="middle" font-size="11" fill="#334155">全参训练</text>
+<text x="350" y="222" text-anchor="middle" font-size="10.5" fill="#047857">缝合线上的</text>
+<text x="350" y="236" text-anchor="middle" font-size="10.5" fill="#047857">通信边界</text>
+<!-- LLM group -->
+<rect x="430" y="50" width="420" height="240" rx="10" fill="#ffffff" stroke="#8b5cf6" stroke-width="2"/>
+<text x="640" y="76" text-anchor="middle" font-size="13" font-weight="bold" fill="#6d28d9">LLM 主干（7B–100B+，吃 95% 算力）</text>
+<rect x="450" y="92" width="180" height="70" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="2"/>
+<text x="540" y="116" text-anchor="middle" font-size="12" font-weight="bold" fill="#5b21b6">TP（卡内 ≤8）</text>
+<text x="540" y="136" text-anchor="middle" font-size="10.5" fill="#5b21b6">列/行并行 + SP</text>
+<text x="540" y="152" text-anchor="middle" font-size="10.5" fill="#5b21b6">单层权重/激活切分</text>
+<rect x="650" y="92" width="180" height="70" rx="6" fill="#ede9fe" stroke="#8b5cf6" stroke-width="2"/>
+<text x="740" y="116" text-anchor="middle" font-size="12" font-weight="bold" fill="#5b21b6">PP（跨机）</text>
+<text x="740" y="136" text-anchor="middle" font-size="10.5" fill="#5b21b6">1F1B / interleaved</text>
+<text x="740" y="152" text-anchor="middle" font-size="10.5" fill="#5b21b6">层数切分，M ≥ 4×Np</text>
+<rect x="450" y="176" width="180" height="70" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+<text x="540" y="200" text-anchor="middle" font-size="12" font-weight="bold" fill="#1d4ed8">DP + ZeRO-3/FSDP</text>
+<text x="540" y="220" text-anchor="middle" font-size="10.5" fill="#1d4ed8">剩余卡全给 DP 扩吞吐</text>
+<text x="540" y="236" text-anchor="middle" font-size="10.5" fill="#1d4ed8">梯度 reduce-scatter</text>
+<rect x="650" y="176" width="180" height="70" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="2"/>
+<text x="740" y="200" text-anchor="middle" font-size="12" font-weight="bold" fill="#047857">CP / 长序列</text>
+<text x="740" y="220" text-anchor="middle" font-size="10.5" fill="#047857">视频/长文档 64k+ token</text>
+<text x="740" y="236" text-anchor="middle" font-size="10.5" fill="#047857">varlen 打包（第 34 章）</text>
+<text x="640" y="272" text-anchor="middle" font-size="10.5" fill="#6d28d9">总卡数 N = N_dp × N_tp × N_pp（× N_cp）——每一维只解决自己那堵墙</text>
+<!-- arrows -->
+<line x1="270" y1="170" x2="286" y2="170" stroke="#1e293b" stroke-width="2.5" marker-end="url(#a5)"/>
+<line x1="410" y1="170" x2="426" y2="170" stroke="#1e293b" stroke-width="2.5" marker-end="url(#a5)"/>
+<defs><marker id="a5" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#475569"/></marker></defs>
+</svg>
+<figcaption>图 38-6　VLM 训练的异构并行布局：视觉塔走数据并行/ZeRO（算力占比小、不必进昂贵 TP 组），连接器全参但体量小，LLM 主干配置完整 3D 并行。两处箭头是"缝合线"——视觉 token 跨并行组传输的通信边界，工程上最易出问题的地方。</figcaption>
+</figure>
+</div>
+<p><b>多模态数据加载的两个特有工程点</b>（与并行策略联动）：①<b>图像数据打包（packing）</b>——单张图的视觉 token 往往撑不满一个训练序列，把多图+文本拼进同一序列（varlen packing）能把 GPU 利用率提 2–4 倍（第 34 章的打包策略），但要求 attention 按样本边界分块、且各 DP 分片的"token 总量"均衡（打包器要做 bin-packing 均衡，否则某张卡分到全是大图会成为全局同步的短板）；②<b>视觉预处理流水线</b>——图像解码/resize/normalize 是 CPU 密集操作，多模态训练中 CPU 常先于 GPU 成为瓶颈（每个 worker 每秒解码几十张大图很吃力），<b>机内 CPU 核数与 DataLoader worker 数的配比（每卡 4–8 worker 起步）、预解码缓存（webdataset/合并大文件）是吞吐规划的一部分</b>——这部分在单卡实验里不显眼，在千卡训练里能让 50% 的 GPU 时间空转等数据。</p>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：从硬件清单到并行配置的六步推导</p>
+<p><b>输入</b>：模型参数 $\Psi$（含视觉塔 $\Psi_v$ 与 LLM $\Psi_l$）、可用卡数 $N$ 与单卡显存 $M_{gpu}$、目标序列长度 $s$（含视觉 token）、目标训练 token 数。</p>
+<p><b>① 算训练态显存下限</b>：$16\Psi$ 字节（混合精度，第 2 节公式）。若 $16\Psi \le N \times 0.9 M_{gpu}$（留激活余量）→ 纯 ZeRO-3/DP，收工；否则进入 ②。</p>
+<p><b>② 定 TP</b>：从 1 开始试，直到"单层权重 + 该层激活 ÷ TP 度"放进单卡。经验：hidden ≤ 4096 用 TP=1–2；hidden ≥ 8192（50B+）用 TP=4–8。TP 不出卡。</p>
+<p><b>③ 定 PP</b>：剩余放不下的部分按层切。PP 度 = 覆盖"权重+梯度+优化器÷TP 度仍超显存"的最小级数；同时检查 1F1B bubble 率 $\frac{N_p-1}{M+N_p-1}$，通过加大 global batch 压制。</p>
+<p><b>④ 剩余卡全给 DP</b>：$N_d = N / (N_p^{TP} \cdot N_p^{PP})$，并反推 global batch = $N_d \times$（梯度累积）× per-device batch。</p>
+<p><b>⑤ 校验激活与序列</b>：按第 7 节公式估激活显存（视觉 token 计入 $s$！）；超了就开梯度检查点 → SP/CP → 减 per-device batch（顺序固定）。</p>
+<p><b>⑥ 校验通信拓扑</b>：TP 组必须落在同一机内（NVLink）；PP 跨机用同向带宽最高的链路；DP 的 all-reduce 与 PP 的点对点分属不同网卡/链路时最理想。跑 100 步基准，实测 MFU ≥ 表 38-2 区间下限再放量。</p>
+<p><b>速查锚点</b>：7B→单机 ZeRO-3；70B→2 机 4×TP4；175B→16 机 8×TP8×PP4±；千卡以上考虑 EP/MoE 与自动并行搜索。多模态在以上任一档位上，把"视觉 token 等效序列长度"代进 $s$ 即可。</p></div>
+
+<h2 id="sec-7"><span class="sec-no">7.</span>显存与算力估算：6ND 公式、MFU 与集群实例</h2>
+<p>并行选型之前，先要算清"这件事到底需要多少计算、多少显存"——两个公式是全部容量规划的基础。<b>算力公式（6ND）</b>：Transformer 训练的计算量近似为</p>
+<div class="math-block">$$C \approx 6ND \ \text{FLOPs}$$</div>
+<p>其中 $N$ 是参数量、$D$ 是训练 token 数。系数 6 的来历：每个 token 的前向约 $2N$（每参数一次乘加 = 2 FLOPs），反向是前向的 2 倍（$4N$，因要对输入与权重各求一次梯度），合计 $2N + 4N = 6N$。<b>两个立刻可得的推论</b>：①推理只有前向，计算量是 $2ND$——训练成本约为推理同 token 数的 3 倍；②反向占 $\frac{2}{3}$ 的计算，所以"重计算/梯度检查点"额外加一次前向 = 总计算 +33%（用 33% 算力换 60–70% 激活显存，第 35 章称其为"最划算的交换"）。</p>
+<p><b>算时间</b>：设集群有 $n$ 张卡、单卡有效算力 $F_{eff}$（峰值 × MFU），训练时间 $T = \frac{6ND}{n \cdot F_{eff}}$。<b>MFU（Model FLOPs Utilization）</b>的定义：</p>
+<div class="math-block">$$\text{MFU} = \frac{6ND / T_{step}}{n \times F_{peak}}$$</div>
+<p>即"模型实际消耗的理论 FLOPs ÷（硬件峰值 × 实测时间）"——它剥离了重计算等额外 FLOPs，只衡量"有效计算占峰值的比例"。经验区间：单机 8 卡训练 40–55%；千卡 3D 并行 30–45%；<b>低于 25% 说明配置有病</b>（常见病因：通信未重叠、序列打包不均、CPU 数据瓶颈、TP/PP 度过大）。<b>MFU 是分布式训练唯一的"体检指标"——一切优化（通信重叠、打包、算子融合）最终都要在 MFU 上兑现</b>。</p>
+
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2203.15556_1.png" alt="Chinchilla 的 isoFLOP 参数拟合与等高线" loading="lazy">
+<figcaption>图 38-7　<b>算力预算在模型规模 N 与数据量 D 之间的分配</b>（来源：Hoffmann et al., Chinchilla, arXiv:2203.15556 图 4）：固定算力预算 $C=6ND$ 下的损失等高线与 isoFLOP 切片——每个预算都存在一个"模型规模 × 数据量"的最优点。本章的 6ND 公式回答"这件事要多少 FLOPs"，Chinchilla 一族的缩放律回答"这笔 FLOPs 该怎么花"，两者共同构成集群预算规划的两张底图。</figcaption>
+</figure>
+</div>
+<p><b>显存公式大全</b>（把全章的碎片收进一张账单，多模态规划直接套用）：</p>
+<div class="math-block">$$\underbrace{16\Psi}_{\text{训练态：权重2+梯度2+优化器12（byte/参数）}} + \underbrace{b \cdot s \cdot h \cdot L \cdot k \cdot 2}_{\text{激活（byte；bf16，k≈20–34 无检查点 / 2–4 有检查点）}} + \underbrace{\text{CUDA 上下文} \approx 1\text{–}2\,\text{GB}}_{\text{固定开销}} \le M_{gpu}$$</div>
+<p><b>H100 集群训练 7B VLM 的完整实例</b>（把公式跑一遍，感受数字的量级）：设定——7B VLM（ViT 0.3B + LLM 6.7B），序列预算：文本 2048 + 每图 576 视觉 token × 平均 2 图 ≈ 3200 token；数据 500 亿 token（图文折算）；硬件 2 台 8×H100-80G（16 卡）。</p>
+<p><b>显存侧</b>：训练态 $16 \times 7\times10^9 = 112$ GB ÷ 16 卡 = 7GB/卡（ZeRO-3）——绰绰有余，甚至 ZeRO-2（$2\Psi + 14\Psi/16 \approx 20$GB/卡）就放得下；激活（开检查点、k=3）：$1 \times 3200 \times 4096 \times 32 \times 3 \times 2\,\text{B} \approx 2.5$ GB/微批——每卡可放 8–16 微批，全局 batch 潜力很大。<b>结论：用 ZeRO-2 + 梯度检查点即可，不需要 TP/PP——并行税为零</b>。</p>
+<p><b>算力侧</b>：$C = 6ND = 6 \times 7\times10^9 \times 5\times10^{10} = 2.1\times10^{21}$ FLOPs；16×H100（bf16 峰值 ~989 TFLOPS/卡）×MFU 45% ≈ $7.1\times10^{15}$ FLOPS 有效；$T = 2.1\times10^{21} / 7.1\times10^{15} \approx 2.9\times10^5$ 秒 ≈ <b>3.4 天</b>。<b>反过来做预算校验</b>：如果团队给你两周窗口，你还有 4 倍余量——可以训 200B token（更充分）或把 ViT 也全参训进去（$N$ 略增，D 不变）。<b>这种"正反两个方向的换算"就是容量规划的全部：先算需要多少，再算有多少，两者的商就是日程表</b>。</p>
+<div class="tbl-wrap"><table>
+<caption>表 38-3　不同规模训练任务的算力/时间速算（6ND，MFU 按 40% 计）</caption>
+<thead><tr><th>任务</th><th>N</th><th>D</th><th>总 FLOPs</th><th>硬件</th><th>预计时间</th></tr></thead>
+<tbody>
+<tr><td>7B VLM 对齐预训练</td><td>7B</td><td>50B token</td><td>$2.1\times10^{21}$</td><td>16×H100</td><td>~3.5 天</td></tr>
+<tr><td>7B SFT（全参）</td><td>7B</td><td>1B token</td><td>$4.2\times10^{19}$</td><td>8×H100</td><td>~1.5 天</td></tr>
+<tr><td>34B 继续预训练</td><td>34B</td><td>200B token</td><td>$4.1\times10^{22}$</td><td>256×H100</td><td>~6 天</td></tr>
+<tr><td>70B VLM 预训练</td><td>70B</td><td>2T token</td><td>$8.4\times10^{23}$</td><td>1024×H100</td><td>~11 天</td></tr>
+<tr><td>GPT-3 量级（参照）</td><td>175B</td><td>300B token</td><td>$3.1\times10^{23}$</td><td>10000×A100</td><td>~1 个月（文献口径）</td></tr>
+</tbody></table></div>
+<p><b>读表提醒</b>：表内时间为理想化估算（不含中断、调试与数据准备——实际工程时间通常 ×1.5–2）；A100/H100 峰值随精度与代际浮动，估算时用官方白皮书数字。GPT-3 一行按论文口径约 3.14e23 FLOPs（Kaplan et al. 附录量级）作为"行业标尺"帮助校准直觉。</p>
+<p>把本章公式封装成一个可执行的检查单——训练启动前跑一遍，30 秒完成显存与日程的交叉验证：</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>def plan(psi, tokens, n_gpu, gpu_tflops, mfu,
+         nd=1, ntp=1, npp=1, seq=4096, h=4096, L=32, k_ckpt=3):
+    """容量规划计算器：psi=参数量, tokens=训练 token 数, mfu=目标利用率"""
+    state_gb = 16 * psi / (nd * ntp * npp) / 1e9    # ZeRO-3 分片后每卡训练态（16B/参数）
+    act_gb   = 1 * seq * h * L * k_ckpt * 2 / 1e9   # 单微批激活（bf16、开梯度检查点）
+    flops    = 6 * psi * tokens                     # 6ND 总算力需求
+    days     = flops / (n_gpu * gpu_tflops * mfu * 1e12) / 86400
+    m_min    = 4 * npp                              # 微批数下限（bubble 率压到 ~20%）
+    print(f"每卡训练态 {state_gb:.1f}GB | 单微批激活 {act_gb:.1f}GB | "
+          f"预计 {days:.1f} 天 | 微批数 ≥ {m_min}")
+
+# 例：7B VLM、50B token、16×H100（989 TFLOPS bf16）、MFU 0.45、TP=PP=1、DP=16
+plan(7e9, 50e9, 16, 989, 0.45)
+# → 每卡训练态 7.0GB | 单微批激活 3.2GB | 预计 3.4 天 | 微批数 ≥ 4
+# 判读：训练态 < 80GB（ZeRO-2 可行）；激活 × 微批数 < 显存余量；天数 × 1.5~2 = 工程日程</code></pre></div>
+
+<h2 id="sec-8"><span class="sec-no">8.</span>实战代码：DeepSpeed ZeRO 配置与 accelerate 多卡启动</h2>
+<p>理论收束成两个文件：<b>一份 DeepSpeed 的 ZeRO 配置 JSON</b>与<b>一段 accelerate/transformers 的多模态训练脚本</b>。先给 ZeRO-2 与 ZeRO-3 的配置对照（含逐项中文注释），这是可以直接抄进项目的模板。</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">json</span><button class="copy-btn">复制</button></div>
+<pre><code>{
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": 1.0,                        // 防梯度爆炸的第一道闸
+  "bf16": { "enabled": true },                     // H100/A100 默认 bf16（fp16 需配 loss scale）
+  "zero_optimization": {
+    "stage": 3,                                    // 1=切优化器 2=再切梯度 3=全切（最省显存）
+    "contiguous_gradients": true,                  // 梯度内存连续化，减碎片
+    "overlap_comm": true,                          // 通信与计算重叠（必开）
+    "reduce_scatter": true,                        // ZeRO-2+ 用 reduce-scatter（通信减半）
+    "reduce_bucket_size": 5e8,                     // 梯度桶大小（字节），过大延迟通信/过小开销高
+    "allgather_bucket_size": 5e8,                  // 权重预取桶大小（ZeRO-3）
+    "stage3_prefetch_bucket_size": 5e8,            // 提前预取下一层参数（重叠关键）
+    "stage3_param_persistence_threshold": 1e6,     // 小参数常驻不反复 gather
+    "stage3_max_live_parameters": 1e9,             // 在飞参数上限（控显存峰值）
+    "offload_optimizer": {                         // —— 以下两段是"显存极限"开关 ——
+      "device": "cpu", "pin_memory": true          // 优化器状态 offload 到 CPU（可换 nvme）
+    },
+    "offload_param": { "device": "cpu", "pin_memory": true }
+  },
+  "optimizer": {
+    "type": "AdamW",
+    "params": { "lr": 2e-5, "betas": [0.9, 0.95], "weight_decay": 0.1, "eps": 1e-8 }
+  },
+  "activation_checkpointing": { "partition_activations": true },
+  "flops_profiler": { "enabled": true }            // 实测 MFU 的第一工具
+}</code></pre></div>
+<p><b>配置的三条修改纪律</b>：①<b>stage 的选择只看一件事</b>——"不开 offload 的该 stage 是否装得下"：装得下 ZeRO-2 就绝不上 ZeRO-3，装得下 ZeRO-3 就绝不开 offload（每往下一档，通信/IO 税率上升一档）；②<b>offload 是逃生舱不是性能项</b>——开了 CPU offload 的典型减速 20–50%（PCIe 带宽决定），NVMe offload 再慢一档，只在"单机卡数不可能再增"时使用；③<b>bucket 大小不必迷信默认值</b>——大 bucket 高效但占显存，30B 以下模型 5e8 默认值即可，调优优先级远低于 stage/offload 的选择。</p>
+<p>接着是训练脚本侧：transformers Trainer + DeepSpeed 集成（ accelerate 作为启动器）。多模态部分的关键是<b>数据侧的 varlen/packing 与视觉塔的冻结配置</b>。</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>from transformers import AutoProcessor, AutoModelForVision2Seq, Trainer, TrainingArguments
+from datasets import load_dataset
+import torch, accelerate
+
+# 1. 模型加载：bf16 + attn_implementation="flash_attention_2"（长序列必备）
+model = AutoModelForVision2Seq.from_pretrained(
+    "Qwen/Qwen2.5-VL-7B-Instruct",
+    torch_dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",   # 与 CP/varlen 打包配合（第 4 章）
+)
+model.config.use_cache = False                 # 训练必须关 KV cache
+# 冻结视觉塔（阶段 1 对齐预训练；阶段 2 端到端时删除这两行）
+for p in model.visual.parameters():
+    p.requires_grad = False
+
+# 2. TrainingArguments：DeepSpeed 由 accelerate 转交
+args = TrainingArguments(
+    output_dir="./vlm7b-z3",
+    per_device_train_batch_size=1,             # 序列长(含视觉token)→单卡微批小
+    gradient_accumulation_steps=16,            # 凑等效大 batch（bubble 公式的 M！）
+    gradient_checkpointing=True,               # 激活显存换 33% 算力
+    bf16=True, learning_rate=2e-5,
+    lr_scheduler_type="cosine", warmup_ratio=0.03,
+    deepspeed="ds_zero3.json",                 # 上一段的配置文件
+    dataloader_num_workers=8,                  # 图像解码 CPU 密集（第 6 节）
+    save_strategy="steps", save_steps=500,
+    logging_steps=10, report_to="tensorboard",
+)
+
+# 3. 多卡启动（命令行，不用 accelerate config 时）：
+#    deepspeed train_vlm.py --deepspeed ds_zero3.json
+#    或 accelerate launch --num_processes 8 --multi_gpu train_vlm.py
+#    多机：accelerate launch --num_processes 16 --num_machines 2 \
+#           --machine_rank ${RANK} --main_process_ip ${MASTER} train_vlm.py</code></pre></div>
+<p><b>多模态 Trainer 的四个注意事项</b>（每一处都是真实踩坑点）：①<b>视觉塔冻结 + ZeRO-3 的组合</b>——ZeRO-3 会把冻结参数也分片，前向时反复 gather 反而变慢；DeepSpeed 提供 <code>zero3_init_flag</code>/stage3 参数豁免，或直接对视觉塔用 <code>stage3_module</code> 之外的常驻方式（新版 DeepSpeed 支持对冻结模块自动豁免）；②<b>processor 的 padding 方向</b>——生成式 VLM 训练用左 padding（与生成对齐），混在 DataLoader 里错了不报错但 loss 虚高；③<b>视觉 token 数量波动大</b>——动态分辨率下同一 batch 内序列长度差异悬殊，<b>按 token 总数分桶（length grouping/bucketing）能显著减少 padding 浪费</b>，与第 6 节的 varlen 打包是同一件事的两种实现；④<b>梯度检查点与视觉塔</b>——若冻结了视觉塔就不要对它开检查点（无梯度无需重算），只对 LLM 开——省下的 33% 重计算全在 LLM 侧付账。</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># 4. 用 DeepSpeed API 手写训练循环（需要精细控制时；与 Trainer 二选一）
+import deepspeed, torch
+from torch.utils.data import DataLoader
+
+ds_engine, _, _, _ = deepspeed.initialize(
+    args=None,
+    model=model,                               # HF 模型可直接传入
+    model_parameters=[p for p in model.parameters() if p.requires_grad],
+    config_params="ds_zero3.json",             # 复用同一份配置
+)
+# 典型一步：
+#   loss = ds_engine(pixel_values=px, input_ids=ids, labels=labels).loss
+#   ds_engine.backward(loss)        # 内部完成梯度 reduce-scatter（ZeRO-2/3）
+#   ds_engine.step()                # 分片优化器更新
+# MFU 自检（与第 7 节公式对账）：
+#   elapsed = step_time * total_steps
+#   mfu = 6 * N_params * tokens_per_step / (elapsed * n_gpu * peak_flops)
+#   # 低于 25% → 查通信重叠/打包均衡/CPU 瓶颈三件套</code></pre></div>
+
+<h2 id="sec-9"><span class="sec-no">9.</span>故障排查手册：NCCL 超时、loss 尖峰与显存碎片</h2>
+<p>分布式训练的故障有三个高发区：通信层（NCCL）、数值层（loss）、显存层（碎片与 OOM）。它们共同的特点是<b>"症状离根因很远"</b>——NCCL 超时的根因可能是数据加载不均，loss 尖峰的根因可能是数据脏，显存碎片的根因可能是变长序列。本节按"症状 → 最可能的 3 个根因 → 诊断动作"的格式组织，建议与第 35 章表 35-5 配合使用。</p>
+<p><b>NCCL 超时与分布式挂死</b>。症状：训练卡在某个 step 不动，日志停在 <code>NCCL WARN Connect timed out</code> 或 watchdog 超时（默认 600s，<code>NCCL_TIMEOUT</code>/<code>timeout</code> 参数可调）。三个最可能的根因与诊断：①<b>某个 rank 崩了但没退出</b>——其余 rank 在等它，此时去看"最安静的 GPU"的日志（不是最先报错的那个）；②<b>数据加载不均</b>——某 rank 的样本极长（超大图/超长视频）导致它晚进入 collective，其余 rank 等到超时：诊断办法是在每个 rank 打印每步的 batch token 数与步耗时，看方差；③<b>网络/拓扑问题</b>——IB 网卡降级到 TCP、NCCL 走错接口（多网卡机器设 <code>NCCL_SOCKET_IFNAME</code>）、防火墙拦端口。诊断工具：<code>NCCL_DEBUG=INFO</code> 是第一动作（看初始化走的哪张卡/哪条链路）、<code>py-spy dump</code> 抓各 rank 的 Python 栈（卡在哪个 collective 一目了然）、nccl-tests 裸测带宽排除框架因素。<b>纪律：超时大多不是 NCCL 的错，NCCL 只是"最诚实的哨兵"——先怀疑 rank 间负载不均，再怀疑网络</b>。</p>
+<p><b>loss 尖峰（loss spike）与 NaN</b>。症状：训练多日后 loss 突然跳升 3–10 倍，或个别 step 出现 NaN（bf16 下常表现为 loss=0 或 inf）。根因三层：①<b>数据层</b>（最常见）——脏数据（超长样本、损坏图像、错误标签、异常重复段）触发异常梯度；诊断：从尖峰 step 回溯当批数据（训练框架要落盘每步的样本索引），人工审查——大模型训练团队的标准动作是"尖峰必回溯数据"；②<b>数值层</b>——bf16 的动态范围足够大但精度只有 8 位尾数，长训练 + 大学习率的组合可能把个别参数推到表示边界：处方是梯度裁剪（1.0）、跳过异常 step（loss > 阈值 ×2 时 skip 并降低该批权重）、必要时回滚到上一个 checkpoint 并跳过问题数据；③<b>训练动力层</b>——cosine 衰减末段 + warmup 不足、或数据混合切换点（第 34 章的课程设计）造成的分布突变：处方是混合比例的渐变过渡与足够长的 warmup。<b>恢复纪律：loss spike 后不要只"等它自己降回去"——跳升 3 倍以上且 1000 步不恢复的尖峰，大概率已造成不可逆的表示损伤，回滚比硬扛便宜</b>。</p>
+<p><b>显存碎片与"神秘 OOM"</b>。症状：<code>CUDA out of memory. Tried to allocate X GiB</code>，但 <code>nvidia-smi</code> 显示总占用还有大量余量——这是<b>碎片</b>：显存分配器有足够总量但没有连续块。三个高发根因：①<b>变长序列</b>——多模态动态分辨率让每步张量形状不同，分配器反复"分配-释放-分配不同大小"，碎片化累积（第 6 节 varlen 打包的副作用）；处方：<code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code>（PyTorch 2.1+，碎片问题的第一处方）、固定形状 padding（牺牲 padding 换稳定形状，与打包均衡权衡）；②<b>ZeRO/offload 的桶大小</b>与模型切分粒度不匹配——调 <code>reduce_bucket_size</code>/<code>allgather_bucket_size</code> 与 FSDP unit 的粒度；③<b>激活检查点边界</b>与 CUDA graph 的交互——开启后若仍碎片，检查是否混用了 <code>torch.compile</code> 的 cudagraph 模式（多模态模型常因动态形状不兼容）。<b>诊断工具</b>：<code>torch.cuda.memory_summary()</code> 看碎片率（fragmented 段占比 >30% 即确诊）、<code>torch.cuda.memory._record_memory_history()</code> 导出快照用 <b>pytorch memory viz</b> 逐算子定位（第 36 章提过的同一工具）。</p>
+<p><b>断点续训的正确姿势</b>（分布式场景的额外要求）：save 时除了模型/优化器状态，还必须保存<b>数据加载器的消费位置（sampler state）</b>与<b>随机数状态（RNG）</b>——否则恢复后重复或跳过数据、数据增强序列不一致。DeepSpeed/FSDP 的 save 也涉及分片重组问题：ZeRO-3 存的是分片权重，跨"不同卡数"恢复要用 <code>zero_to_fp32.py</code>（DeepSpeed 自带）先合并，或用 <code>load_state_dict</code> 的统一接口按同拓扑恢复。<b>大训练的黄金法则：checkpoint 频率以"最多损失 1 小时训练量"为准；每 24 小时必须演练一次真实恢复——没恢复过的 checkpoint 等于没有 checkpoint</b>。</p>
+<div class="tbl-wrap"><table>
+<caption>表 38-4　分布式训练故障速查（症状 → 根因 → 处方）</caption>
+<thead><tr><th>症状</th><th>最可能根因（按概率排序）</th><th>诊断动作</th><th>处方</th></tr></thead>
+<tbody>
+<tr><td>NCCL 超时/挂死</td><td>rank 负载不均 &gt; 某卡静默崩溃 &gt; 网络降级</td><td>NCCL_DEBUG=INFO；py-spy 抓各 rank 栈；查每 rank 步耗时方差</td><td>均衡打包分桶；修网络/IFNAME；缩短超时快速失败</td></tr>
+<tr><td>loss 尖峰</td><td>脏数据 &gt; 数值边界 &gt; 数据切换突变</td><td>回溯尖峰 step 的样本索引与内容；查梯度范数曲线</td><td>剔除问题数据回滚重训；grad clip 1.0；混合比例渐变</td></tr>
+<tr><td>NaN/loss=0</td><td>bf16 溢出 &gt; lr 过大 &gt; 数据损坏</td><td>打开 anomaly/逐层范数日志定位首爆层</td><td>降 lr/裁剪；检查数据管道；fp32 主权重确认开启</td></tr>
+<tr><td>碎片 OOM</td><td>变长序列 &gt; 桶大小不配 &gt; 动态图编译混用</td><td>memory_summary 碎片率；memory viz 快照</td><td>expandable_segments；固定形状/分桶；调桶粒度</td></tr>
+<tr><td>MFU 异常低</td><td>数据 CPU 瓶颈 &gt; 通信未重叠 &gt; 打包不均</td><td>flops_profiler；GPU 利用率时序；检查 dataloader 等待</td><td>加 worker/预解码；开 overlap/prefetch；重做打包均衡</td></tr>
+<tr><td>恢复后 loss 异常</td><td>sampler 未存 &gt; RNG 不一致 &gt; 分片恢复错拓扑</td><td>对比恢复首步的 loss 与保存前最后一步</td><td>存 sampler/RNG；同拓扑恢复或先合并分片</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-10"><span class="sec-no">10.</span>本章小结与自测</h2>
+<p><b>十条带走</b>：①训练态显存 = 16 字节/参数（权重 2 + 梯度 2 + 优化器 12），一切并行策略都在切这 16 字节与激活；②DDP 的 all-reduce 通信量 $2\Psi$ 与卡数基本无关，这是它扩展性的根基；③ZeRO-1/2/3 依次切优化器/梯度/权重，显存递减、通信递增（$2\Psi \to \Psi \to 3\Psi$）——选型是"通信换显存"的定价问题；④TP 靠列/行并行配对实现"两级之间零通信"，每层前向+反向 4 次 all-reduce，通信量正比 batch×序列，故只许待在 NVLink 域内；⑤多头注意力天然按头切分，attention 是 TP 最优雅的部分；⑥SP 切 TP 区激活、CP（Ring Attention）切进 attention 内部——多模态的视觉 token 长序列让两者从"可选"变"必选"；⑦1F1B 把在飞激活从 ∝M 压到 ∝Np，bubble 率 $\frac{N_p-1}{M+N_p-1}$，PP 度要省着用、微批要给足；⑧3D 并行的组装顺序：显存定 TP×PP，剩余全给 DP，通信拓扑反着检查；⑨算力 $6ND$、MFU = 有效 FLOPs ÷ 峰值——低于 25% 先查数据瓶颈再查通信；⑩排障顺序：NCCL 超时先查负载不均，loss 尖峰先查数据，OOM 先查碎片——基础设施的故障，九成不在被抱怨的那一层。</p>
+<p><b>与前后章的连接</b>：向前，本章的显存公式直接服务于第 35 章的三阶段预算与第 36 章的 LoRA/QLoRA 选型（LoRA 本质上是"用低秩假设砍掉 12 字节/参数的优化器税"）；向后，第 39 章的推理优化是本章的镜像问题——训练切权重（并行），推理切 KV cache（PagedAttention），两者共享"分而治之 + 通信/访存最小化"的第一性原理。MoE 模型（第 20、48 章）在 3D 之上再加专家并行（EP），其 all-to-all 通信可类比本章的 reduce-scatter 直觉。</p>
+<div class="box-quiz"><p class="box-title">✏️ 自测（8 题）</p>
+<ol>
+<li><b>7B 模型混合精度训练态的显存是多少？四个组成部分各占多少字节/参数？</b><br>要点：16 B/参数 × 7B = 112GB。权重 bf16 2B + 梯度 bf16 2B + fp32 主权重 4B + Adam 动量 m、v 各 4B = 16B/参数。</li>
+<li><b>ZeRO-2 相比 ZeRO-1 通信量为何减半？写出两个方案的通信原语差异。</b><br>要点：ZeRO-1 需要完整梯度 all-reduce（每卡都要全量梯度做本地更新前的归约，$2\Psi\frac{N-1}{N}$）；ZeRO-2 每卡只负责更新自己分片的参数，只需 reduce-scatter 拿到 $\Psi/N$ 份归约结果，通信量减半为 $\Psi\frac{N-1}{N}$。</li>
+<li><b>Megatron 的列并行 GeLU 为什么"免费"？如果换成 LayerNorm 还免费吗？</b><br>要点：GeLU 逐元素作用于列条带，分片计算与全量严格等价；LayerNorm 的均值/方差要跨整个 hidden 维统计，列分片后统计量不完整——需要额外通信（或 SP 下按序列切才能保持独立），不再免费。</li>
+<li><b>为什么 TP 不能跨机？用通信量与带宽的数字回答。</b><br>要点：每层前向+反向共 4 次 all-reduce、每次 $2bs h$ 字节级流量且是同步点；NVLink ~900GB/s 可被计算重叠掩盖，跨机 IB ~50GB/s 相差近 20 倍，同步等待将吞掉大部分计算时间。</li>
+<li><b>1F1B 相比 GPipe 的核心收益是什么？bubble 率公式与两个推论？</b><br>要点：在飞激活从 ∝微批数 M 压到 ∝流水线深度 Np（显存与 batch 解耦）；bubble 率 $(N_p-1)/(M+N_p-1)$；推论：M ≫ Np 才低 bubble、PP 度最贵要省用、大 batch/长序列才能摊薄。</li>
+<li><b>70B VLM、32 卡 H100、序列 16k（含大量视觉 token）——给出你的 3D 并行组合与理由。</b><br>要点：TP=4（hidden 大、限制在卡内）；PP=2（70B 的权重+梯度+优化器 ÷4 后仍超单卡，跨机压层）；16k 序列配合 SP/CP 压激活；DP=2（32 = 4DP × 4TP × 2PP）；若激活仍紧张再把序列维度交给 SP/CP——数字可浮动，但"先显存后吞吐"的推导顺序不可错）。</li>
+<li><b>训练 7B 模型 100B token 需要多少 FLOPs？16×H100（MFU 45%）要跑多久？</b><br>要点：$C=6ND=6\times7\times10^9\times10^{11}=4.2\times10^{21}$ FLOPs；有效算力 $16\times989\,\text{TFLOPS}\times0.45\approx7.1\times10^{15}$；$T\approx5.9\times10^5$ 秒 ≈ 6.8 天。</li>
+<li><b>NCCL 超时后第一步做什么？为什么"最先报错的信息"往往不是根因？</b><br>要点：开 NCCL_DEBUG=INFO 并抓所有 rank 的栈/日志（不只第一个报错的）；超时是"等待方"的报错，真正故障的 rank 可能静默挂死或负载过重——先找"最安静的 GPU"与各 rank 步耗时的方差。</li>
+</ol></div>
+
+<footer>
+<div class="refs">
+<h2 id="refs">参考文献与推荐阅读</h2>
+<ol>
+<li>Rajbhandari S, Rasley J, Ruwase O, He Y. <a href="https://arxiv.org/abs/1910.02054">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a>. SC 2020. arXiv:1910.02054.</li>
+<li>Shoeybi M, Patwary M, Puri R, et al. <a href="https://arxiv.org/abs/1909.08053">Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</a>. SC 2020. arXiv:1909.08053.</li>
+<li>Narayanan D, Shoeybi M, Casper J, et al. <a href="https://arxiv.org/abs/2104.04473">Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM</a>. SC 2021. arXiv:2104.04473.</li>
+<li>Huang Y, Cheng Y, Bapna A, et al. <a href="https://arxiv.org/abs/1811.06965">GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism</a>. NeurIPS 2019. arXiv:1811.06965.</li>
+<li>Huang Y, et al. <a href="https://arxiv.org/abs/2304.11277">PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel</a>. VLDB 2024. arXiv:2304.11277.</li>
+<li>Rasley J, Rajbhandari S, Ruwase O, He Y. <a href="https://github.com/microsoft/DeepSpeed">DeepSpeed: Extreme-scale model training for everyone</a>. Microsoft 开源项目（KDD 2020 教程报告）.</li>
+<li>Korthikanti V, Casper J, Lym S, et al. <a href="https://arxiv.org/abs/2105.13120">Reducing Activation Recomputation in Large Transformer Models (Megatron Sequence Parallelism)</a>. MLSys 2023. arXiv:2105.13120.</li>
+<li>Narayanan D, Harlap A, Phanishayee A, et al. <a href="https://arxiv.org/abs/1806.03377">PipeDream: Generalized Pipeline Parallelism for DNN Training</a>. SOSP 2019. arXiv:1806.03377.</li>
+<li>Li S, Zhao Y, Varma R, et al. <a href="https://arxiv.org/abs/2004.09038">PyTorch Distributed: Experiences on Accelerating Data Parallel Training</a>. VLDB 2020. arXiv:2004.09038.</li>
+<li>Liu Z, Desai A, Liao F, et al. <a href="https://arxiv.org/abs/2310.01889">Ring Attention with Blockwise Transformers for Near-Infinite Context</a>. arXiv:2310.01889.</li>
+<li>Ren J, et al. <a href="https://arxiv.org/abs/2101.06840">ZeRO-Offload: Democratizing Billion-Scale Model Training</a>. ATC 2021. arXiv:2101.06840.</li>
+<li>Rajbhandari S, et al. <a href="https://arxiv.org/abs/2104.07857">ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning</a>. SC 2021. arXiv:2104.07857.</li>
+<li>Kaplan J, McCandlish S, Henighan T, et al. <a href="https://arxiv.org/abs/2001.08361">Scaling Laws for Neural Language Models</a>. arXiv:2001.08361.</li>
+<li>Hoffmann J, Borgeaud S, Mensch A, et al. <a href="https://arxiv.org/abs/2203.15556">Training Compute-Optimal Large Language Models (Chinchilla)</a>. NeurIPS 2022. arXiv:2203.15556.</li>
+<li>Zheng L, et al. <a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for Large Language Model Serving with PagedAttention (vLLM)</a>. SOSP 2023. arXiv:2309.06180.</li>
+<li>Grattafiori A, et al. (Meta). <a href="https://arxiv.org/abs/2407.21783">The Llama 3 Herd of Models</a>. arXiv:2407.21783.</li>
+<li>DeepSeek-AI. <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 Technical Report</a>. arXiv:2412.19437.</li>
+<li>Meta AI. <a href="https://github.com/pytorch/pytorch">PyTorch Distributed 文档：DDP / FSDP / Tensor Parallel</a>. 官方文档（dtensor 与 fsdp API）.</li>
+<li>NVIDIA. <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/">NVIDIA Collective Communications Library (NCCL) User Guide</a>. 官方文档.</li>
+<li>Bai J, et al. <a href="https://arxiv.org/abs/2308.12966">Qwen-VL: A Versatile Vision-Language Model for Understanding, Localization, Text Reading, and Beyond</a>. arXiv:2308.12966.</li>
+<li>Chen Z, et al. <a href="https://arxiv.org/abs/2312.14238">InternVL: Scaling up Vision Foundation Models and Aligning for Generic Visual-Linguistic Tasks</a>. CVPR 2024. arXiv:2312.14238.</li>
+</ol>
+</div>
+<nav class="pager"></nav>
+</footer>

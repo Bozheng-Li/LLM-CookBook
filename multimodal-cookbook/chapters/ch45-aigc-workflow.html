@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 45 章 AIGC 生产工作流 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+
+<main class="book-body"><div class="book-header">
+  <h1 id="ch45-aigc-workflow">第 45 章 AIGC 生产工作流</h1>
+  <p class="chapter-meta">涵盖技术：ComfyUI 节点式 DAG、企业级批量生产管线、ControlNet 复合控制、IP-Adapter 风格迁移、RESTful API 化与异步队列</p>
+</div>
+<div class="book-content">
+
+<section>
+  <p class="lead">
+    当生成式多模态模型（AIGC）走出研究论文与极客玩具阶段、正式进驻工业化生产管线时，工程师们很快发现了一个残酷的技术现实：<strong>单次 Web 界面“提示词抽卡”式的交互，根本无法满足任何严肃商业场景的生产要求</strong>。无论是游戏工业中数百套角色资产的批量贴图生成、电商平台数万款服装的模特虚拟试穿与背景合成、还是影视动画中多镜头连续分镜的严苛渲染，商业生产所要求的从来不是“随机的好看”，而是<strong>极致的确定性（Extreme Determinism）、强约束可控性（Rigid Controllability）、以及高并发工程吞吐（Industrial Throughput）</strong>。
+  </p>
+  <p>
+    为了实现从“偶然生成”到“工业生产”的质变，AIGC 基础设施在过去三年经历了从早期的单体 WebUI（如 Automatic1111）向<strong>基于有向无环图（Directed Acyclic Graph, DAG）的声明式节点工作流（以 ComfyUI 为代表）</strong>的历史性大迁徙。节点式工作流将底层的模型加载、文本编码、隐空间潜变量构造、去噪采样器调度、条件控制器（ControlNet / IP-Adapter）接入、以及后处理高清放大等原子环节完全解耦为独立算子，赋予了创作者像编写模块化工业程序一样自由编排多模态生产管线的无限可能。
+  </p>
+  <p>
+    本章将深入工业级 AIGC 生产工作流的核心腹地，系统剖析 ComfyUI 的执行引擎设计哲学、复杂复合条件控制网络编排、模型权重动态换入换出优化、以及如何将前端节点图无缝编译为后端高可用 RESTful API 与分布式异步任务调度队列，打通从创意原型设计到企业级流水线批量上线的最后一公里。
+  </p>
+</section>
+
+<div class="box-history">
+  <div class="box-title">历史沿革：从黑盒 WebUI 到声明式可编排 DAG 引擎</div>
+  <p>
+    生成式 AI 生产工具的演进折射出软件工程从“手工作坊”迈向“现代工厂流水线”的标准轨迹：
+  </p>
+  <ul>
+    <li><strong>单体黑盒时代（2022–2023）</strong>：以 AUTOMATIC1111 WebUI 为代表。这类界面采用经典的单体式表单设计，将提示词、采样步数、模型选择与高保真放大混合在一个巨大的 Gradio 页面中。局限性在于：底层执行逻辑完全固化硬编码，想要在第 15 步去噪时动态切换 ControlNet 权重、或是将两个不同模型的潜变量在隐空间交叉混合，必须侵入式修改 Python 源码，无法实现模块化复用。</li>
+    <li><strong>节点式图执行革命（2023–2024）</strong>：由 comfyanonymous 开源的 <em>ComfyUI</em> 彻底打破了传统格局。ComfyUI 将整套生成管线重构为标准的<strong>计算图（Computation Graph / DAG）</strong>。每个功能块都是图中的一个节点，节点之间通过严密的张量类型签名（MODEL, CLIP, VAE, LATENT, IMAGE, CONDITIONING）显式连线。执行引擎基于拓扑排序与严格的中间张量缓存（Tensor Caching），只重新计算发生变动的上游节点，使多阶段生成的迭代效率提升了数倍。</li>
+    <li><strong>企业级 API 化与分布式编排（2024–2026）</strong>：随着 AIGC 全面接入大型企业 ERP 与数字资产管理系统，工作流的载体从“人类图形操作”升级为“无头 JSON 声明式配置文件（Headless Workflow JSON）”。配合 Celery、Ray、Redis 消息队列以及自研的显存热加载调度器，现代生产系统能够将单一节点图部署至上千张 GPU 组成的云原生集群，实现全天候无缝吞吐千万级定制化图片与视频。</li>
+  </ul>
+</div>
+
+<figure id="fig-controlnet">
+  <img src="../assets/images/papers/2302.05543_1.png" alt="ControlNet 网络架构与 U-Net 侧链连接图" style="max-width:85%;">
+  <figcaption>图 45.1：工业级可控生成的基石 ControlNet（arXiv:2302.05543）。通过冻结原始大模型权重并在侧链利用零卷积（Zero Convolutions）注入人体姿态（OpenPose）、深度图（Depth）与线稿轮廓（Canny），为工作流提供了精准的骨骼几何约束。</figcaption>
+</figure>
+
+<h2 id="sec-45-1">45.1 ComfyUI 核心内核剖析：DAG 拓扑排序与执行状态机</h2>
+
+<p>
+  要从底层驾驭企业级 AIGC 生产管线，首先必须彻底透视 ComfyUI 的执行引擎内核。在 ComfyUI 中，用户在前端画布上拖拽的所有连线，在底层都会被序列化为一个纯净的 JSON 字典。
+</p>
+
+<div class="box-theory">
+  <div class="box-title">计算图论与执行优化数学机制</div>
+  <p>
+    设整套工作流为一个有向无环图 $\mathcal{G} = (\mathcal{V}, \mathcal{E})$，其中顶点 $v_i \in \mathcal{V}$ 代表各个处理节点（如 <code>CheckpointLoaderSimple</code>、<code>KSampler</code>、<code>VAEDecode</code>），有向边 $e_{ij} = (v_i, v_j) \in \mathcal{E}$ 代表张量数据的流动。
+  </p>
+  <ol>
+    <li><strong>拓扑排序与依赖解析（Topological Sort）</strong>：
+      执行器利用入度为 0 的节点（如模型权重加载器、文本输入节点）作为源点，通过 Kahn 算法或深度优先搜索（DFS）生成一个合法的线性执行序列 $\mathcal{S} = [v_{\pi_1}, v_{\pi_2}, \dots, v_{\pi_N}]$，保证对任意有向边 $(v_i, v_j)$，节点 $v_i$ 必定先于 $v_j$ 执行完毕。
+    </li>
+    <li><strong>严格张量缓存与脏标记追踪（Dirty Hash Caching）</strong>：
+      每个节点 $v_i$ 都有一个基于其全部输入参数与输入张量计算出的 SHA-256 哈希签名：
+      $$H(v_i) = \text{Hash}\Big(\text{ClassType}, \; \text{Inputs}(v_i), \; \bigcup_{p \in \text{Parents}(v_i)} H(p)\Big)$$
+      在连续生产或多轮调试中，如果用户仅仅修改了最后一步 <code>VAEDecode</code> 的保存路径，上游极其庞大的 U-Net 去噪采样（耗时 90% 以上）的哈希值完全未变，执行引擎直接命中内存缓存，在 10 毫秒内跳过所有重度计算，直接复用已生成的隐变量！
+    </li>
+    <li><strong>显存换入换出与渐进释放（VRAM Management）</strong>：
+      ComfyUI 内置了针对超大模型（如 SD3、Flux、SDXL）的动态显存生命周期调度器。当文本编码器（CLIP/T5）前向计算完成后，执行引擎立刻将其权重从高带宽显存（VRAM）换出至系统内存（RAM），为即将登场的数十亿参数 DiT / U-Net 腾出充足的注意力显存空间；在去噪结束后，再将 VAE 解码器载入显存。这一精密的调度使得 8GB 显存的消费级显卡也能从容运行原本需要 24GB 显存的超大生产模型。
+    </li>
+  </ol>
+</div>
+
+<div class="svg-container" style="text-align:center; margin: 24px 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 320" width="100%" height="auto">
+  <defs>
+    <linearGradient id="g-node" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#1d4ed8" stop-opacity="0.25"/>
+    </linearGradient>
+    <linearGradient id="g-ksampler" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f59e0b" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#b45309" stop-opacity="0.25"/>
+    </linearGradient>
+    <linearGradient id="g-out" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#047857" stop-opacity="0.25"/>
+    </linearGradient>
+    <marker id="wf-arr" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <text x="440" y="24" font-size="16" font-weight="bold" fill="#1e293b" text-anchor="middle">经典工业级电商商品图换背景与模特穿搭 ComfyUI DAG 节点拓扑流</text>
+
+  <!-- Node 1: Checkpoint Loader -->
+  <g transform="translate(30, 45)">
+    <rect x="0" y="0" width="160" height="90" rx="8" fill="url(#g-node)" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="80" y="25" font-size="11" font-weight="bold" fill="#1e40af" text-anchor="middle">1. CheckpointLoader</text>
+    <text x="80" y="45" font-size="9" fill="#334155" text-anchor="middle">SDXL Base / Flux.1</text>
+    <rect x="10" y="60" width="140" height="20" rx="4" fill="#eff6ff"/>
+    <text x="80" y="74" font-size="8" fill="#1e40af" text-anchor="middle">输出: MODEL, CLIP, VAE</text>
+  </g>
+
+  <!-- Node 2: ControlNet OpenPose + Depth -->
+  <g transform="translate(30, 160)">
+    <rect x="0" y="0" width="160" height="110" rx="8" fill="url(#g-node)" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="80" y="25" font-size="11" font-weight="bold" fill="#1e40af" text-anchor="middle">2. Apply ControlNet</text>
+    <text x="80" y="45" font-size="9" fill="#334155" text-anchor="middle">输入骨骼姿态 / 深度图</text>
+    <text x="80" y="65" font-size="8" fill="#64748b" text-anchor="middle">Strength: 0.85</text>
+    <rect x="10" y="80" width="140" height="20" rx="4" fill="#eff6ff"/>
+    <text x="80" y="94" font-size="8" fill="#1e40af" text-anchor="middle">输出: 条件约束 CONDITIONING</text>
+  </g>
+
+  <!-- Middle: IP-Adapter Face & Style -->
+  <g transform="translate(250, 90)">
+    <rect x="0" y="0" width="170" height="130" rx="8" fill="url(#g-node)" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="85" y="25" font-size="11" font-weight="bold" fill="#1e40af" text-anchor="middle">3. Apply IP-Adapter</text>
+    <text x="85" y="45" font-size="9" fill="#334155" text-anchor="middle">注入商品/模特 ID 图像</text>
+    <text x="85" y="65" font-size="8" fill="#64748b" text-anchor="middle">Decoupled Cross-Attention</text>
+    <text x="85" y="85" font-size="8" fill="#d97706" text-anchor="middle">Scale: 0.75</text>
+    <rect x="10" y="100" width="150" height="20" rx="4" fill="#eff6ff"/>
+    <text x="85" y="114" font-size="8" fill="#1e40af" text-anchor="middle">输出: 增强后的 MODEL</text>
+  </g>
+
+  <!-- Center: KSampler -->
+  <g transform="translate(480, 75)">
+    <rect x="0" y="0" width="180" height="160" rx="10" fill="url(#g-ksampler)" stroke="#d97706" stroke-width="2"/>
+    <text x="90" y="28" font-size="13" font-weight="bold" fill="#b45309" text-anchor="middle">4. KSampler (核心去噪)</text>
+    <text x="90" y="52" font-size="10" fill="#334155" text-anchor="middle">Steps: 30  |  CFG: 6.5</text>
+    <text x="90" y="72" font-size="10" fill="#334155" text-anchor="middle">Sampler: dpmpp_2m_sde</text>
+    <text x="90" y="92" font-size="10" fill="#334155" text-anchor="middle">Scheduler: karras</text>
+    <text x="90" y="112" font-size="10" fill="#b45309" text-anchor="middle">Denoise: 1.0 (生图) / 0.6 (重绘)</text>
+    <rect x="15" y="125" width="150" height="24" rx="4" fill="#fffbeb"/>
+    <text x="90" y="141" font-size="9" font-weight="bold" fill="#78350f" text-anchor="middle">输出: 潜在特征 LATENT</text>
+  </g>
+
+  <!-- Output: VAE Decode & Upscale -->
+  <g transform="translate(710, 95)">
+    <rect x="0" y="0" width="140" height="120" rx="8" fill="url(#g-out)" stroke="#10b981" stroke-width="1.5"/>
+    <text x="70" y="26" font-size="11" font-weight="bold" fill="#065f46" text-anchor="middle">5. VAE Decode</text>
+    <text x="70" y="46" font-size="9" fill="#334155" text-anchor="middle">隐空间还原像素</text>
+    <text x="70" y="66" font-size="9" fill="#047857" text-anchor="middle">+ 4x-UltraSharp 放大</text>
+    <rect x="10" y="85" width="120" height="24" rx="4" fill="#ecfdf5"/>
+    <text x="70" y="101" font-size="9" font-weight="bold" fill="#065f46" text-anchor="middle">最终 4K 商业级产出</text>
+  </g>
+
+  <!-- Connective Arrows -->
+  <path d="M 190 90 L 250 130" stroke="#475569" stroke-width="1.5" marker-end="url(#wf-arr)"/>
+  <path d="M 190 200 L 250 170" stroke="#475569" stroke-width="1.5" marker-end="url(#wf-arr)"/>
+  <path d="M 420 155 L 480 155" stroke="#475569" stroke-width="1.5" marker-end="url(#wf-arr)"/>
+  <path d="M 660 155 L 710 155" stroke="#475569" stroke-width="1.5" marker-end="url(#wf-arr)"/>
+</svg>
+</div>
+
+<h2 id="sec-45-2">45.2 复杂多重条件控制编排：ControlNet 与 IP-Adapter 组合拳</h2>
+
+<p>
+  在严肃的商业项目中，任何一张高质量图片的生成，几乎都是<strong>多个条件分支协同博弈的结晶</strong>。单一条件从来无法满足复合业务诉求：
+</p>
+
+<table class="book-table">
+  <thead>
+    <tr>
+      <th>控制维度</th>
+      <th>选用技术节点</th>
+      <th>输入信号源</th>
+      <th>对生成的约束效果</th>
+      <th>典型权重配比</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>人体肢体姿态</strong></td>
+      <td>ControlNet OpenPose</td>
+      <td>骨骼关键点热力图</td>
+      <td>锁定模特站姿、手势开合与头部朝向</td>
+      <td>0.70 ~ 0.90</td>
+    </tr>
+    <tr>
+      <td><strong>三维空间景深</strong></td>
+      <td>ControlNet Depth (MiDaS / ZoeDepth)</td>
+      <td>灰度深度图</td>
+      <td>锁定前景人物与远景建筑物的透视层次</td>
+      <td>0.50 ~ 0.80</td>
+    </tr>
+    <tr>
+      <td><strong>特定商品线稿</strong></td>
+      <td>ControlNet LineArt / Canny</td>
+      <td>商品外边框轮廓提取</td>
+      <td>确保鞋包边缘几何硬度不发生软化形变</td>
+      <td>0.80 ~ 1.00</td>
+    </tr>
+    <tr>
+      <td><strong>人物面部身份 (ID)</strong></td>
+      <td>InstantID / IP-Adapter-FaceID</td>
+      <td>真人正面清晰自拍</td>
+      <td>锁定五官生物特征，防止换人</td>
+      <td>0.65 ~ 0.85</td>
+    </tr>
+    <tr>
+      <td><strong>光影与艺术风格</strong></td>
+      <td>IP-Adapter Plus / Style</td>
+      <td>影视级灯光参考图 / 品牌色版</td>
+      <td>传递冷暖色温渐变、胶片颗粒感与光斑分布</td>
+      <td>0.30 ~ 0.50</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="box-recipe">
+  <div class="box-title">工业实战配方：多重 ControlNet 冲突消解与分阶段生效时间窗</div>
+  <p>
+    当一个工作流同时挂载 3 个以上的 ControlNet 时，新手往往会发现生成的图像变得极其僵硬、皮肤发灰、甚至出现严重的网格伪影。这是由于<strong>多个控制信号的反向梯度在 U-Net 浅层发生剧烈干涉</strong>所致。
+  </p>
+  <p>
+    资深架构师的标准调优方案是<strong>时间窗控制（Step Range Scheduling）</strong>：
+  </p>
+  <ul>
+    <li><strong>OpenPose &amp; Depth（几何大骨架）</strong>：设置生效时间窗为 <code>start_at = 0.0, end_at = 0.40</code>。在前 40% 的步数中，空间大局已定，40% 之后果断释放控制权，让扩散模型自由渲染自然的微观皮肤毛孔与发丝，避免生硬轮廓死锁。</li>
+    <li><strong>LineArt（细节硬边缘）</strong>：设置生效时间窗为 <code>start_at = 0.15, end_at = 0.75</code>，避开最前期的宏观色彩构图阶段，专注在中间阶段将商品精细线稿对齐。</li>
+    <li><strong>IP-Adapter（风格与光影）</strong>：设置生效时间窗为 <code>start_at = 0.20, end_at = 0.80</code>，防止在第 0 步过强的图像色彩先验直接冲散了文本提示词的主题意图。</li>
+  </ul>
+</div>
+
+<div class="box-paper">
+  <div class="box-title">论文精读：ControlNet 与 T2I-Adapter —— 旁路适配器架构与零卷积控制哲学</div>
+  <p>
+    斯坦福大学张吕敏团队发表的 <em>ControlNet: Adding Conditional Control to Text-to-Image Diffusion Models</em>（ICCV 2023）与腾讯提出的 <em>T2I-Adapter</em>（AAAI 2024）开辟了生成可控性的新时代。
+  </p>
+  <ul>
+    <li><strong>锁定主干与可训练副本（Locked Backbone &amp; Trainable Copy）</strong>：ControlNet 完整复制原始扩散模型 U-Net / DiT 的编码器结构，保持主干权重完全冻结以绝对保留原本庞大的先验生成能力，仅在可训练副本上学习几何条件映射。</li>
+    <li><strong>零卷积（Zero Convolutions）的冷启动稳定性</strong>：在副本与主干的跨层连接处，ControlNet 引入了权重与偏置均严格初始化为零的 $1\times 1$ 卷积层。在微调初始阶段，零卷积输出恒为 0，主干模型完全感知不到旁路干扰，彻底消除了微调初期的破坏性梯度冲击，实现了“无缝即插即用”。</li>
+  </ul>
+</div>
+
+<h2 id="sec-45-2-2">45.2.2 批量工业渲染中的显存换入换出与渐进释放算法</h2>
+<p>
+  在实际生产中，面对 2024–2026 年风靡的超大扩散主干（如 Flux.1 的 120 亿参数 MMDiT、SD3 的双流 Transformer），即便在 24GB 显存的专业卡上，如果同时常驻大型视觉语言模型（如 T5-XXL）、DiT 主干以及高保真 VAE 解码器，极易在去噪高并发峰值触发 CUDA OOM。
+</p>
+<p>
+  工业级节点引擎普遍采用<strong>细粒度显存虚拟化（Dynamic Model Offloading &amp; VRAM Virtualization）</strong>机制：
+</p>
+<ol>
+  <li><strong>算子级生命周期钩子（Per-Node VRAM Hooks）</strong>：每个节点在执行前向传播前，通过统一的显存管理器将所需模块权重从系统 Host RAM 异步传输（DMA Transfer）至 GPU VRAM，并在前向计算完毕的瞬间将其立刻驱逐回 RAM。</li>
+  <li><strong>分块去噪与平铺式 VAE 解码（Tiled VAE Decoding）</strong>：在生成 4K / 8K 超高清画质时，直接将全尺寸隐变量矩阵一次性送入 VAE 解码器需要消耗数十吉字节显存。生产引擎将潜空间矩阵划分为带有 32 像素重叠边缘的二维网格分块（Tiles），逐块独立解码为 RGB 像素并在边缘执行线性羽化融合（Feathered Blending），使得仅需 4GB 显存即可稳定解码任意超大分辨率画质。</li>
+</ol>
+
+<h2 id="sec-45-3">45.3 无头化生产：将节点图编译为无头 JSON 与 API 接口</h2>
+
+<p>
+  在开发调试阶段，创作者在 ComfyUI Web 界面中通过连线直观验证效果；但在部署上线阶段，前端画布必须被彻底抛弃。
+</p>
+<p>
+  ComfyUI 原生支持<strong>无头 API 模式（Headless API Mode）</strong>。在界面中点击 <code>Save (API Format)</code>，系统会将整套 DAG 编译为一个结构极度紧凑的键值对 JSON 文件。在这个 JSON 中，前端的拖拽坐标、缩放比例被完全剥离，仅保留核心节点 ID 与输入拓扑指针。
+</p>
+
+<div class="box-recipe">
+  <div class="box-title">代码清单 45.1：生产级无头 ComfyUI 异步任务客户端（ComfyUIProductionClient）</div>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+"""工业级无头 ComfyUI 异步调用与结果轮询客户端
+支持：动态参数覆写、WebSocket 实时进度监听、二进制图像拉取与异常重试
+"""
+
+import json
+import uuid
+import urllib.request
+import urllib.parse
+import websocket
+from typing import Dict, Any, Optional
+
+class ComfyUIProductionClient:
+    def __init__(self, server_address: str = "127.0.0.1:8188"):
+        self.server_address = server_address
+        self.client_id = str(uuid.uuid4())
+
+    def queue_prompt(self, workflow_prompt: Dict[str, Any]) -> Dict[str, Any]:
+        """向 ComfyUI 后端派发执行 DAG 任务"""
+        payload = {"prompt": workflow_prompt, "client_id": self.client_id}
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(f"http://{self.server_address}/prompt", data=data)
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def get_image(self, filename: str, subfolder: str, folder_type: str) -> bytes:
+        """从后端文件服务器获取渲染完成的二进制图像"""
+        params = {"filename": filename, "subfolder": subfolder, "type": folder_type}
+        url_values = urllib.parse.urlencode(params)
+        with urllib.request.urlopen(f"http://{self.server_address}/view?{url_values}") as resp:
+            return resp.read()
+
+    def execute_workflow_and_wait(self, workflow_dict: Dict[str, Any]) -> Dict[str, bytes]:
+        """建立 WebSocket 长连接，监听执行进度并阻塞等待最终成图"""
+        ws = websocket.WebSocket()
+        ws.connect(f"ws://{self.server_address}/ws?clientId={self.client_id}")
+
+        prompt_res = self.queue_prompt(workflow_dict)
+        prompt_id = prompt_res["prompt_id"]
+        print(f"[COMFY-CLIENT] 任务已入队，分配 Prompt ID: {prompt_id}")
+
+        output_images = {}
+        while True:
+            out = ws.recv()
+            if isinstance(out, str):
+                message = json.loads(out)
+                msg_type = message.get("type")
+                data = message.get("data", {})
+
+                if msg_type == "progress":
+                    cur_step = data.get("value")
+                    max_step = data.get("max")
+                    print(f"-> 去噪采样执行中: [{cur_step}/{max_step}]")
+
+                elif msg_type == "executing" and data.get("node") is None:
+                    # 当 node 为 None 时，代表整个 DAG 计算图已全部执行完毕
+                    print("[COMFY-CLIENT] 工作流全部节点执行完毕！")
+                    break
+
+        # 从历史记录中提取生成图片的存储路径并下载
+        history_url = f"http://{self.server_address}/history/{prompt_id}"
+        with urllib.request.urlopen(history_url) as resp:
+            history = json.loads(resp.read().decode("utf-8"))[prompt_id]
+
+        for node_id, node_output in history["outputs"].items():
+            if "images" in node_output:
+                for img_info in node_output["images"]:
+                    raw_bytes = self.get_image(
+                        img_info["filename"],
+                        img_info["subfolder"],
+                        img_info["type"]
+                    )
+                    output_images[img_info["filename"]] = raw_bytes
+
+        ws.close()
+        return output_images
+
+# ----------------- 单元测试与演示 -----------------
+if __name__ == "__main__":
+    print("ComfyUI 工业级无头 API 客户端架构就绪。")
+    client = ComfyUIProductionClient("127.0.0.1:8188")
+    print(f"当前客户端分配唯一会话 UUID: {client.client_id}")
+</code></pre>
+</div>
+
+<h2 id="sec-45-4">45.4 企业级高并发生产集群架构设计</h2>
+
+<p>
+  当单一工作流需要在电商大促期间应对每小时数十万张的商品图批量生产时，单机 ComfyUI 会立刻因显存耗尽或计算队列堆积而崩溃。工业界标准的高并发微服务集群架构通常采用<strong>三层解耦体系</strong>：
+</p>
+
+<ol>
+  <li><strong>API 统一接入与任务编排网关（FastAPI / Go Gateway）</strong>：
+    负责接收业务端（如运营后台、商家端 App）的高阶业务请求（如：“为这件春季风衣生成 5 组不同欧洲街景模特图”）。网关校验权限，并在参数模板库中动态组装出完整的无头 ComfyUI Workflow JSON，将具体的图片 OSS URL、提示词、ControlNet 权重打入占位符。
+  </li>
+  <li><strong>分布式优先任务队列（Redis + Celery / RabbitMQ）</strong>：
+    根据租户等级（VIP 客户 vs 普通用户）与任务优先级进行分流缓冲。支持任务进度实时推送（Webhook / SSE）以及超时熔断重试。
+  </li>
+  <li><strong>弹性无状态 GPU 算力集群（Stateless Worker Fleet）</strong>：
+    每个 Worker 容器中运行一个无界面的无头 ComfyUI 守护进程。所有基础模型（Checkpoints、LoRAs、ControlNets）通过高性能分布式共享文件系统（如 Ceph / Lustre / NFS）预先挂载，Worker 节点之间完全无状态，支持根据队列积压深度在 Kubernetes（K8s）中进行秒级 HPA（Horizontal Pod Autoscaler）水平弹性扩缩容。
+  </li>
+</ol>
+
+<h2 id="sec-45-5">45.5 本章总结与全书学习指引</h2>
+
+<p>
+  AIGC 生产工作流是算法理论与工程落地的终极融合战场。通过将扩散模型、视觉定位模型、身份一致性适配器（IP-Adapter）与几何结构控制网络（ControlNet）系统化编织为可调度、可监控、可复现的声明式 DAG 图，人工智能彻底告别了不稳定、不可靠的手工作坊模式，成长为驱动现代数字内容生产的工业母机。
+</p>
+<p>
+  本章与前后章节形成了不可分割的工程闭环：
+</p>
+<ul>
+  <li>在<strong>第 26 章《条件控制与图像编辑》</strong>与<strong>第 28 章《个性化与一致性生成》</strong>中学习的 ControlNet、DreamBooth 与 IP-Adapter，构成了本章节点网络中最核心的控制积木；</li>
+  <li>在<strong>第 39 章《推理优化与部署》</strong>中掌握的 TensorRT 编译加速、显存卸载与量化，是本章支撑大规模无头生产吞吐的算力底座；</li>
+  <li>在接下来<strong>第 46 章《端到端项目实战集》</strong>中，我们将全面应用本章的生产工作流思想，亲手打造一套“电商商品虚拟试穿与批量广告图工业生产系统”。</li>
+</ul>
+
+<h2 id="sec-45-4-2">45.4.2 工业级商品图批量生成与自动化审核代码实战</h2>
+<p>
+  在实际的电商工业化流水线中，业务系统通常需要批量消费 CSV 资产表，自动下载商品抠图与模特参考图，并将参数动态替换进无头 ComfyUI 工作流中进行并发渲染，最后对渲染出的成品图片执行质量与合规性审查。
+</p>
+<p>
+  以下代码给出了一个完整的企业级批量渲染与自检调度流水线实现（BatchAIGCPipeline）：
+</p>
+
+<div class="box-recipe">
+  <div class="box-title">代码清单 45.2：企业级批量 AIGC 任务调度与自动化品控系统（BatchAIGCPipeline）</div>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+"""企业级 AIGC 批量渲染与质量管控调度引擎
+实现：批量参数装配、异步线程池并发派发、图像清晰度（Laplacian 方差）与色彩平衡自动化初筛
+"""
+
+import time
+import json
+import cv2
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Any, Tuple
+
+class BatchAIGCPipeline:
+    def __init__(self, comfy_host: str = "127.0.0.1:8188", max_workers: int = 4):
+        self.comfy_host = comfy_host
+        self.max_workers = max_workers
+        self.client = ComfyUIProductionClient(server_address=comfy_host)
+
+    @staticmethod
+    def inspect_image_quality(image_bytes: bytes) -> Dict[str, Any]:
+        """对生成的商品图像执行工业级自动化无参考质量检验"""
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return {"pass": False, "reason": "图像解码损坏"}
+
+        # 1. 模糊度检验：计算拉普拉斯梯度方差 (Laplacian Variance)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+        # 2. 曝光与对比度检验
+        mean_brightness = float(np.mean(gray))
+
+        is_sharp = laplacian_var >= 120.0
+        is_exposed_ok = 35.0 <= mean_brightness <= 220.0
+        passed = is_sharp and is_exposed_ok
+
+        return {
+            "pass": passed,
+            "sharpness_score": round(laplacian_var, 2),
+            "brightness": round(mean_brightness, 2),
+            "reasons": [] if passed else (["清晰度不足过曝/欠曝"] if not is_exposed_ok else ["图像模糊"])
+        }
+
+    def render_single_item(self, item_task: Dict[str, Any], template_workflow: Dict[str, Any]) -> Dict[str, Any]:
+        """单件商品参数组装、渲染与质检执行"""
+        sku_id = item_task["sku_id"]
+        prompt_text = item_task["prompt"]
+        control_image_path = item_task["control_image"]
+
+        # 深拷贝工作流模板并动态插桩参数
+        workflow = json.loads(json.dumps(template_workflow))
+        # 假设 Node 6 为正向提示词输入节点，Node 12 为 ControlNet 输入图像节点
+        if "6" in workflow and "inputs" in workflow["6"]:
+            workflow["6"]["inputs"]["text"] = prompt_text
+        if "12" in workflow and "inputs" in workflow["12"]:
+            workflow["12"]["inputs"]["image"] = control_image_path
+
+        print(f"[PIPELINE] 开始处理 SKU: {sku_id} -> 提示词: '{prompt_text[:30]}...'")
+        start_t = time.time()
+        
+        try:
+            # 调用 ComfyUI 阻塞拉取成图
+            result_images = self.client.execute_workflow_and_wait(workflow)
+            elapsed = round(time.time() - start_t, 2)
+            
+            # 对产出图片进行自动化质检
+            inspections = []
+            for fname, img_bytes in result_images.items():
+                q_report = self.inspect_image_quality(img_bytes)
+                inspections.append({"filename": fname, "report": q_report})
+
+            return {
+                "sku_id": sku_id,
+                "status": "SUCCESS",
+                "render_time_sec": elapsed,
+                "images_count": len(result_images),
+                "inspections": inspections
+            }
+        except Exception as e:
+            return {
+                "sku_id": sku_id,
+                "status": "FAILED",
+                "error": str(e)
+            }
+
+    def run_batch(self, task_list: List[Dict[str, Any]], template_workflow: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """多线程并发执行批量商品图渲染流水线"""
+        print(f"[PIPELINE] 启动批量工业渲染流水线，总任务数: {len(task_list)}，线程数: {self.max_workers}")
+        results = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [executor.submit(self.render_single_item, item, template_workflow) for item in task_list]
+            for f in futures:
+                results.append(f.result())
+        return results
+
+# 演示调度器初始化
+if __name__ == "__main__":
+    pipeline = BatchAIGCPipeline(comfy_host="127.0.0.1:8188", max_workers=2)
+    mock_tasks = [
+        {"sku_id": "SKU_8801", "prompt": "commercial shoe photography, studio lighting, highly detailed", "control_image": "shoe_canny.png"},
+        {"sku_id": "SKU_8802", "prompt": "luxury handbag on wooden table, soft shadows, 8k", "control_image": "bag_depth.png"}
+    ]
+    print("批量调度管道初始化完成，就绪待命。")
+</code></pre>
+</div>
+
+<h2 id="sec-45-4-3">45.4.3 企业级 AIGC 生产中的灰度发布与 A/B 测试基准</h2>
+<p>
+  在游戏资产开发与电商模特替换中，任何新版本模型或新 ControlNet 权重的上线，绝不能一次性全量切换。由于生成模型的非线性隐空间特性，哪怕基础底模的小版本更新（例如从 SDXL 1.0 换为微调版动漫底模），也极可能导致特定长尾商品（如半透明蕾丝、金属反光手表）的画质突然崩溃。
+</p>
+<p>
+  成熟的工业中台通常构建严格的<strong>自动化评估与 A/B 灰度体系</strong>：
+</p>
+<ul>
+  <li><strong>金丝雀测试集（Canary Benchmark Suite）</strong>：建立由 500 个覆盖各类材质（反光金属、玻璃透明度、皮肤毛孔、极小商标文字）的黄金资产库构成的测试集。每次修改工作流连线或升级底模时，CI/CD 流水线自动触发批量渲染，计算新版与基线版本在 FID、CLIP 相似度以及拉普拉斯锐度得分上的分布偏移。</li>
+  <li><strong>在线流量灰度切流（Canary Traffic Split）</strong>：在生产服务网关，将 5% 的在线生图请求路由至加载了新工作流的实验集群，收集真实终端用户的点击率（CTR）、加购转化率与人工二次修改率；仅当各项业务核心北极星指标表现稳定正向时，方逐步放量至 100%。</li>
+</ul>
+
+<h2 id="sec-45-4-4">45.4.4 企业级 AIGC 生产中的成本精算与 GPU 吞吐优化黄金法则</h2>
+<p>
+  在将 AIGC 全面推向规模化商业化变现时，基础设施的算力账单（GPU Cloud Cost）直接决定了业务的生死线。如果单张图片的云端推理成本高达 0.05 元，在日活千万的消费级应用中将直接吞噬全部利润。
+</p>
+<p>
+  根据全球顶尖 AIGC 平台在生产环境中的最佳调优实践，降低单位推理成本有三大黄金工程法则：
+</p>
+<ol>
+  <li><strong>一步/四步蒸馏底模全面替换（Few-Step Distillation Replacement）</strong>：
+    在非终极艺术级渲染场景下，全面淘汰原本需要 30~50 步迭代的标准扩散底模，换装基于 LCM（Latent Consistency Models）、SDXL-Turbo 或 Flux.1-Schnell 的蒸馏模型。在 4 步甚至 1 步之内即可完成去噪收敛，单张图片生成时间从 2.8 秒暴力压降至 180 毫秒，GPU 实例吞吐量暴涨 15 倍以上！
+  </li>
+  <li><strong>TensorRT / AITemplate 静态计算图极致编译</strong>：
+    原生的 PyTorch 动态图存在大量的 Python 解释器开销与逐算子 Kernel 启动延迟。生产系统在服务上线前，使用 NVIDIA TensorRT 将固定的 U-Net / DiT 架构预编译为深度硬件融合的 Engine 二进制文件。通过执行多头注意力算子融合（FlashAttention-2 Kernel Fusion）、卷积与偏置激活层无损融合（Conv-Bias-GELU Fusion）以及 FP16/BF16 混合精度优化，纯推理延迟直接缩减 45%~60%。
+  </li>
+  <li><strong>动态 Batch 聚合与跨请求潜变量拼接（Dynamic Request Batching）</strong>：
+    在并发低谷期，GPU 利用率通常不足 20%。通过在 API 网关侧引入 50 毫秒的微时间窗（Micro-batching Window），将来自不同用户的 4 个独立生图请求（需同一底模）沿 Batch 维度拼接为一个 Tensor（Batch Size = 4）进行单次前向去噪，利用 GPU 的满载并行能力最大化发挥张量核心（Tensor Core）的浮点算力利用率（MFU）。
+  </li>
+</ol>
+
+<h2 id="sec-45-4-5">45.4.5 自定义 ComfyUI 节点扩展开发规范</h2>
+<p>
+  在面对企业私有资产协议、加密权重加载以及特种硬件加速卡（如华为昇腾 Ascend NPU、寒武纪 MLU）时，开源社区的通用节点往往无法满足特定需求。掌握自定义节点（Custom Nodes）的开发是高级 AIGC 架构师的必备技能。
+</p>
+<p>
+  一个合规的 ComfyUI 自定义节点类必须遵循严格的元数据协议，包括输入类型描述、返回类型元组、执行函数绑定以及可选的类别归属定义。通过将专有算法封装为标准化节点包，能够无缝接入现有的 DAG 生态，实现企业内部核心资产的安全受控流转。
+</p>
+
+<h2 id="sec-45-4-6">45.4.6 工业级持续集成（CI/CD）与版本回滚工作流</h2>
+<p>
+  在游戏工业与跨国广告代理商中，工作流 DAG 图被直接纳入 Git 源码版本控制系统进行管理。为了确保每一次团队提交的工作流更新都不会导致线上资产质量回退，企业必须设立自动化的持续集成与回归测试流水线：
+</p>
+<ul>
+  <li><strong>声明式 JSON 语法与连线静态检查（Workflow Linter）</strong>：在代码合并前，CI 脚本通过类型检查器静态扫描 JSON 文件，核验每一个连线的源输出端口（Output Slot）与目标输入端口（Input Slot）的数据类型签名是否完全兼容，杜绝任何将 <code>IMAGE</code> 错连至 <code>LATENT</code> 的低级悬空引用。</li>
+  <li><strong>自动化微缩基准渲染与像素级比对（Pixel Regression Gate）</strong>：在测试集群中以固定随机种子（Fixed Seed）自动渲染 10 组金丝雀基准用例，并与黄金基准版本计算 PSNR（峰值信噪比）与 LPIPS（感知相似度）；若感知距离超过设定安全阈值（如 LPIPS &gt; 0.15），自动阻断 PR 合并并向提交者告警。</li>
+  <li><strong>热更新金丝雀探针（Live Canary Probing）</strong>：在向生产环境正式滚动更新节点包之前，由探针服务向新镜像实例派发包含边界极端宽高比、超长负提示词与极低去噪强度的压力用例，持续监控是否有未捕获的 CUDA Core Dump 或显存死锁事件。</li>
+  <li><strong>原子级环境锁版本锁定（Deterministic Lockfiles）</strong>：针对 Python 社区第三方 Custom Nodes 依赖繁杂容易发生依赖地狱的问题，生产基线通过 Poetry 或 Conda-Lock 严格固化所有 PyTorch、CUDA 运行时与 C++ 扩展拓展二进制版本，实现物理环境的一致性完全复制。</li>
+</ul>
+
+<div class="box-quiz">
+  <div class="box-title">自测题与工程深度思考</div>
+  <ol>
+    <li>
+      <strong>系统架构辨析</strong>：相比于传统基于表单的 WebUI，ComfyUI 的基于有向无环图（DAG）的执行架构在工程生产上带来了哪些根本性的代际优势？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          （1）<strong>原子解耦与完全自由组合</strong>：模型加载、提示词编码、隐空间潜变量注入、后处理放大被完全解耦为独立算子，允许工程师构建任意拓扑（如多模型隐空间混合、多步阶梯去噪、多重条件动态级联）；<br>
+          （2）<strong>基于拓扑哈希的严格中间张量缓存（Tensor Caching）</strong>：引擎根据节点上游全量哈希判断脏标记，未变动部分完全跳过计算直接复用缓存，使得调试耗时从数十秒降至毫秒级；<br>
+          （3）<strong>天然的无头 API 编译与高并发服务化</strong>：工作流可一键导出为纯净的声明式 JSON，脱离任何图形前端作为轻量微服务无缝嵌入分布式云渲染集群。
+        </p>
+      </details>
+    </li>
+    <li>
+      <strong>去噪控制权衡</strong>：在多重 ControlNet 叠加的工作流中，为什么不能在全去噪时间段（0% 到 100% 步数）持续开启所有控制网络？“时间窗控制（Step Range Scheduling）”的物理原理是什么？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          如果全时段持续开启所有强控制网络，多个外在几何约束梯度会在 U-Net 中产生剧烈干涉，彻底锁死扩散模型的微观自由度，导致生成的皮肤苍白发灰、毛发模糊成色块、出现严重的网格伪影。时间窗控制的原理是顺应扩散去噪的自然频域规律：前 30%~40% 步数主导画面的低频空间几何大布局（此时开启 OpenPose 和 Depth 锁定结构），后 60% 步数主导高频纹理与光影材质渲染（此时果断关闭几何硬控制，释放大模型自身预训练的丰富微观纹理泛化先验）。
+        </p>
+      </details>
+    </li>
+    <li>
+      <strong>集群高可用设计</strong>：在面对每小时数十万次请求的电商批量出图生产流水线中，如何避免单个畸形提示词或损坏的输入图片导致整个 GPU Worker 节点发生 OOM 崩溃并挂起？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          （1）<strong>前置参数与尺寸严格清洗门禁</strong>：API 网关强制对输入图像的分辨率、长宽比进行规范化裁剪，拒绝超标大图，并限制最大去噪步数（不超过 50 步）；<br>
+          （2）<strong>进程级沙箱隔离与看门狗（Watchdog Supervisor）</strong>：每个 Worker 任务以独立的 Subprocess 进程运行，设置单任务显存上限与超时中断计时器；一旦发生 CUDA OOM，看门狗自动清理 PyTorch 显存碎片（<code>torch.cuda.empty_cache()</code>）并秒级拉起全新纯净子进程，不影响主守护进程运行；<br>
+          （3）<strong>死信队列（Dead Letter Queue）熔断机制</strong>：重试 2 次仍然失败的任务自动踢入死信队列并报警，彻底隔离异常流量。
+        </p>
+      </details>
+    </li>
+    <li>
+      <strong>多模态视频生产流扩展</strong>：当工作流从单张图像生成升级为连续视频生成（如 AnimateDiff、CogVideoX、Wan2.1）时，节点计算图在显存拓扑与时间维度上面临哪些本质维度的跃迁挑战？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          从 2D 跃迁至 3D 视频工作流，核心瓶颈在于：<br>
+          （1）<strong>潜变量时间轴张量膨胀</strong>：潜变量从单个二维矩阵 $[1, 4, H/8, W/8]$ 膨胀为带有时间帧维度的三维张量 $[1, 4, F, H/8, W/8]$，使得时序注意力（Temporal Attention）与三维卷积在反向或去噪采样中的显存开销直接乘以帧数 $F$；<br>
+          （2）<strong>滑动上下文窗口（Context Window Sliding）调度</strong>：无法一次性将整整 120 帧放入显存去噪，工作流引擎必须引入时间重叠滑动窗口（如每次处理 16 帧，步进 8 帧），并在窗口重叠交界处施加余弦加权融合，消除时序接缝跳变；<br>
+          （3）<strong>首尾帧双向约束注入</strong>：生产级视频需要循环无缝动图或严格起止帧对齐，必须在工作流中设计首尾帧潜在特征插值（Latent Interpolation）与时间反转去噪机制。
+        </p>
+      </details>
+    </li>
+    <li>
+      <strong>知识产权与合规溯源</strong>：在商业交付场景中，如何利用工作流技术对批量生成的图像自动注入不可见数字水印与 C2PA 内容凭证？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          成熟的 AIGC 生产线会在 VAE 解码后的后处理阶段强制串联两个合规节点：<br>
+          （1）<strong>隐形频域数字盲水印（Invisible Frequency Watermark）</strong>：利用离散余弦变换（DCT）或高斯隐频嵌入（如 Tree-Ring / StegaStamp），将包含企业许可证号与生成批次哈希的 64 位不可见信息编织入高频频域系数，耐受 JPEG 压缩与二次裁剪；<br>
+          （2）<strong>C2PA 行业开放元数据签名</strong>：在 PNG/WebP 的二进制元数据头（EXIF/XMP）中通过公私钥证书写入不可篡改的加密签名，证明该内容由特定 AI 流程生成并记录时间戳，完全符合欧盟 AI 法案与国家互联网信息办公室的强制合规标识要求。
+        </p>
+      </details>
+    </li>
+  </ol>
+</div>
+
+</div></main>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Zhang L, et al. <a href="https://arxiv.org/abs/2302.05543">Adding Conditional Control to Text-to-Image Diffusion Models (ControlNet)</a>. ICCV 2023.</li>
+      <li>Ye H, et al. <a href="https://arxiv.org/abs/2308.06721">IP-Adapter: Text-Compatible Image Prompt Adapter for Text-to-Image Diffusion Models</a>. arXiv:2308.06721, 2023.</li>
+      <li>comfyanonymous. <a href="https://github.com/comfyanonymous/ComfyUI">ComfyUI: The Most Powerful and Modular Diffusion GUI and Backend</a>. GitHub, 2023–2026.</li>
+      <li>Podell D, et al. <a href="https://arxiv.org/abs/2307.01952">SDXL: Improving Latent Diffusion Models for High-Resolution Image Synthesis</a>. ICLR 2024.</li>
+      <li>Esser P, et al. <a href="https://arxiv.org/abs/2403.03206">Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (Stable Diffusion 3)</a>. 2024.</li>
+      <li>Black Forest Labs. <a href="https://blackforestlabs.ai/">FLUX.1: Next-Generation Text-to-Image Flow Matching Models</a>. 2024.</li>
+      <li>Mou C, et al. <a href="https://arxiv.org/abs/2303.11306">T2I-Adapter: Learning Adapters to Dig out Communicative Capabilities for Text-to-Image Diffusion Models</a>. AAAI 2024.</li>
+      <li>Rombach R, et al. <a href="https://arxiv.org/abs/2112.10752">High-Resolution Image Synthesis with Latent Diffusion Models</a>. CVPR 2022.</li>
+      <li>Shen Y, et al. <a href="https://arxiv.org/abs/2303.17580">HuggingGPT: Solving AI Tasks with ChatGPT and its Friends in Hugging Face</a>. NeurIPS 2023.</li>
+      <li>Karras T, et al. <a href="https://arxiv.org/abs/2206.00364">Elucidating the Design Space of Diffusion-Based Generative Models (EDM)</a>. NeurIPS 2022.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

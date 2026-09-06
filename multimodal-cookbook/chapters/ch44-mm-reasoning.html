@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 44 章 多模态推理与视觉思维链 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第八部分 · 前沿专题</div>
+  <h1 class="chapter-title">第 44 章　多模态推理与视觉思维链</h1>
+  <div class="chapter-meta"><span>预计阅读 100 分钟</span><span>难度 ★★★★★</span><span>前置：第 15–17 章（MLLM）、第 40 章（MathVista）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">视觉推理的特殊性：感知瓶颈 vs 推理瓶颈</a></li>
+  <li><a href="#sec-2">Visual CoT：把"看"放进思维链</a></li>
+  <li><a href="#sec-3">长思考范式迁移：o3 视觉思维、QVQ 与视觉 PRM</a></li>
+  <li><a href="#sec-4">Test-time Compute：视觉任务的推理时扩展</a></li>
+  <li><a href="#sec-5">工具增强推理：给模型配上尺子和圆规</a></li>
+  <li><a href="#sec-6">训练方法：CoT SFT、视觉 RL 与过程奖励</a></li>
+  <li><a href="#sec-7">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>推理（reasoning）是当前多模态模型与人类差距最大的能力——"看懂图"已经解决得不错，"看着图想清楚"仍然困难。本章先厘清一个关键区分（<b>感知瓶颈 vs 推理瓶颈</b>——很多"推理错误"其实是"没看清"），然后沿"Visual CoT → 长思考（o3/QVQ/PRM）→ test-time compute → 工具增强"四条技术线展开，最后落到训练方法（CoT SFT、视觉 RL、过程奖励）。<b>与第 40 章 MathVista 的归因方法配合使用：先定位瓶颈在哪一层，再选本章的对应药方</b>。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>视觉推理的特殊性：感知瓶颈 vs 推理瓶颈</h2>
+<p>一道视觉数学题做错，原因可能是"没看清"（感知）或"没想通"（推理）——两者的药方完全不同，混为一谈是推理优化最常见的浪费。<b>区分方法（第 40 章归因框架的推理特化）</b>：①<b>感知瓶颈的症状</b>——把数字读错（把 7 看成 1）、把位置看反、小字漏读；修复手段是分辨率/OCR 数据/token 压缩（第 22 章）；②<b>推理瓶颈的症状</b>——读数全对但运算链错误（3.5+2.8 算成 6.3）、步骤间逻辑跳跃、忽略约束条件；修复手段是本章全部内容（CoT/RL/工具）。<b>定量感受</b>：MathVista 的错误分析（GPT-4V 的 150 条人工标注错误）显示约 26% 是"视觉感知错误"、约 45% 是"推理错误"、其余为知识/对齐问题——<b>推理错误占大头但感知错误占比足以颠覆任何"只调推理"的策略</b>。<b>视觉推理的特殊难点</b>：①<b>证据不可读</b>——文本推理的关键信息是显式 token，视觉推理的关键信息（几何关系、函数形态）必须先"感知提取"再"符号操作"，两步都可能错；②<b>中间结果不可信</b>——文本 CoT 的中间步骤是模型自己写的（自洽），视觉 CoT 的中间步骤可能基于"看错"的感知（自欺）；③<b>验证更难</b>——文本推理结果可代回验证，视觉推理的"验算"（重看图）成本高且可能重复同一感知错误。<p><b>几何/图表/函数三类任务的"瓶颈画像"</b>：几何→辅助线推理（无绘图工具时靠文本想象，正确率低）；图表→读数精度与趋势抽象的平衡；函数→参数-形态双向映射（生成式验证几乎无模型支持）。三类任务的最优工具组合不同：几何→坐标+绘图、图表→代码重绘+数值提取、函数→程序化采样验证——工具箱按目标任务配齐。</p>
+<p><b>三类任务的"瓶颈画像"与反例</b>：几何→辅助线推理（无绘图工具时靠文本想象）需坐标+绘图工具；图表→读数精度与趋势抽象的平衡，需代码重绘+数值提取；函数→参数-形态双向映射，需程序化采样验证。<b>反例：不能定义验证程序的任务（主观比较/审美判断）工具无法救——"能不能写出验证程序"是"要不要上工具"的一票否决判据</b>。</p>
+<p><b>错误归因的实操协议</b>（接第 40 章方法，3 步定位瓶颈）：①<b>读数核验</b>——把题目中的关键数值/位置人工列成清单，检查模型推理链中引用的数值是否一致——不一致=感知瓶颈；②<b>盲算测试</b>——把数值口头告诉模型（"已知 x=2.1 和 x=2.9"）让它只做推理——答对则感知是瓶颈，仍错则推理是瓶颈；③<b>放大复测</b>——把关键区域裁剪放大后重问——分数回升=分辨率问题而非能力问题。<b>三步约 20 分钟即可给一道错题定性，100 道错题的定性分布就是你的"资源分配地图"</b>。</p>
+
+<div class="box-theory"><p class="box-title">📐 理论：视觉思维链的"两层循环"形式化</p>
+<p>文本 CoT 是单层序列：$\text{问题} \to t_1 \to t_2 \to \cdots \to t_k \to \text{答案}$（token 流自回归）。视觉 CoT 本质是<b>双层循环</b>：外层是"感知-推理交替"——$P_1 \to R_1 \to P_2 \to R_2 \to \cdots$（$P_i$=一次视觉采样/观察动作，$R_i$=一段推理），内层是"感知内部的精度调整"（zoom、重看）。形式化：每步 $R_i$ 依赖联合历史 $(q, P_1, R_1, \ldots, P_i)$，且 $P_{i+1}$ 由 $R_i$ 决定<b>下一步看哪里</b>（主动视觉，active perception）。<b>这个形式化解释了三件事</b>：①为什么"多图输入"不等于"视觉推理"——没有"由推理驱动的下一眼看哪里"的循环，多图只是静态拼接；②为什么 o3 的"图像缩放/裁剪工具调用"是范式跃迁——它把 $P_{i+1}$ 从固定采样变成了由推理驱动的主动感知；③为什么视觉 CoT 数据要按"观察动作+推理步骤"结构化标注（第 2 节）——数据结构决定模型能否学到这个循环。</p></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>Visual CoT：把"看"放进思维链</h2>
+<p>Visual CoT（视觉思维链）的第一代是"顺带描述"：让模型先描述图像再回答——对感知对齐有帮助但"描述"与"问题"无关，等于白写。第二代是<b>"任务相关"的视觉 CoT</b>：思维链中的每一步观察都被要求<b>指向问题的答案路径</b>（"要比较两条曲线的交点→先定位交点区域→放大读取坐标→计算差值"）。代表工作 <b>Visual CoT（Shao 等，NeurIPS 2024）</b>构建了带"标注框+子问答"的 CoT 数据集（VCoT-238k）：每个思维步骤都附<b>bounding box</b>（看哪里）+<b>子问题-子答案</b>（看什么/得出什么），训练模型输出"结构化的看-想序列"。<b>三代进化（2025）</b>：<b>"视觉草稿"</b>——模型在推理中生成中间图（画辅助线、标注区域、裁剪子图）再继续推理——"草稿纸"从文本扩展到视觉，o3 的交互式画图是其闭源巅峰，开源侧则以"生成标注图+再推理"的两段式实现。<b>Visual CoT 的评测闭环</b>：除了最终答案正确率，还应评测<b>"中间观察的正确率"</b>（box 是否框住了相关信息）——中间步骤的评测是过程奖励（第 6 节）的数据基础。</p><p><b>中间步骤评测的三项指标</b>：①观察命中率（box 与 GT 区域 IoU≥0.5 比例）；②子答案正确率（定位链中第一个错误步骤）；③链一致性（最终答案与子答案链的矛盾率）。<b>第三项最易被忽视也最致命</b>：训练时若过程与答案弱耦合，模型学到"表演式 CoT"——评测对链一致性加权才能暴露。</p><p><b>中间步骤评测的三项指标</b>：①观察命中率（box 与 GT 区域 IoU≥0.5 比例）；②子答案正确率（定位链中第一个错误步骤）；③链一致性（最终答案与子答案链的矛盾率）。<b>第三项最易被忽视也最致命</b>：训练时若过程与答案弱耦合，模型学到"表演式 CoT"——评测对链一致性加权才能暴露。</p>
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 640 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Visual CoT 双层循环流程图">
+<rect x="0" y="0" width="640" height="340" fill="#f8fafc"/>
+<text x="320" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">Visual CoT：感知-推理交替的双层循环</text>
+<!-- problem -->
+<rect x="40" y="52" width="110" height="44" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+<text x="95" y="70" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e3a8a">问题 q</text>
+<text x="95" y="86" text-anchor="middle" font-size="9.5" fill="#1e3a8a">两条曲线交点距离？</text>
+<!-- perception 1 -->
+<rect x="210" y="40" width="130" height="52" rx="8" fill="#fef3c7" stroke="#d97706"/>
+<text x="275" y="58" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#92400e">感知 P₁（看）</text>
+<text x="275" y="74" text-anchor="middle" font-size="9" fill="#92400e">定位交点区域</text>
+<text x="275" y="86" text-anchor="middle" font-size="9" fill="#92400e">[box: 左上区域]</text>
+<!-- reasoning 1 -->
+<rect x="400" y="40" width="130" height="52" rx="8" fill="#d1fae5" stroke="#10b981"/>
+<text x="465" y="58" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#065f46">推理 R₁（想）</text>
+<text x="465" y="74" text-anchor="middle" font-size="9" fill="#065f46">交点约在 x=2 附近</text>
+<text x="465" y="86" text-anchor="middle" font-size="9" fill="#065f46">但坐标读数需更精</text>
+<!-- perception 2 (zoom) -->
+<rect x="210" y="130" width="130" height="52" rx="8" fill="#fef3c7" stroke="#d97706"/>
+<text x="275" y="148" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#92400e">感知 P₂（放大）</text>
+<text x="275" y="164" text-anchor="middle" font-size="9" fill="#92400e">裁剪 x∈[1,3] 区域</text>
+<text x="275" y="176" text-anchor="middle" font-size="9" fill="#92400e">主动视觉：由 R₁ 决定</text>
+<!-- reasoning 2 -->
+<rect x="400" y="130" width="130" height="52" rx="8" fill="#d1fae5" stroke="#10b981"/>
+<text x="465" y="148" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#065f46">推理 R₂（算）</text>
+<text x="465" y="164" text-anchor="middle" font-size="9" fill="#065f46">交点 (2.1, 3.4) 与</text>
+<text x="465" y="176" text-anchor="middle" font-size="9" fill="#065f46">(2.9, 3.4) → 距离 0.8</text>
+<!-- answer -->
+<rect x="210" y="225" width="130" height="44" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="275" y="243" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">答案：0.8</text>
+<text x="275" y="260" text-anchor="middle" font-size="9" fill="#4c1d95">附完整观察-推理轨迹</text>
+<!-- arrows -->
+<path d="M 150 74 L 210 66" stroke="#2563eb" stroke-width="2" marker-end="url(#c1)"/>
+<path d="M 340 66 L 400 66" stroke="#d97706" stroke-width="2" marker-end="url(#c2)"/>
+<path d="M 465 92 C 465 115, 400 130, 340 145" stroke="#10b981" stroke-width="2" fill="none" marker-end="url(#c3)"/>
+<text x="430" y="118" font-size="9.5" fill="#10b981">主动感知：决定下一步看哪</text>
+<path d="M 340 156 L 400 156" stroke="#d97706" stroke-width="2" marker-end="url(#c2)"/>
+<path d="M 465 182 C 465 210, 400 235, 340 245" stroke="#10b981" stroke-width="2" fill="none" marker-end="url(#c3)"/>
+<!-- contrast note -->
+<rect x="40" y="290" width="560" height="36" rx="8" fill="#f1f5f9" stroke="#94a3b8"/>
+<text x="320" y="308" text-anchor="middle" font-size="10" fill="#475569">对比：静态多图拼接（无循环）≠ 视觉推理；Visual CoT 的本质是「由推理驱动的主动感知」</text>
+<defs>
+<marker id="c1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2563eb"/></marker>
+<marker id="c2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#d97706"/></marker>
+<marker id="c3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#10b981"/></marker>
+</defs>
+</svg>
+<figcaption>图 44-1　Visual CoT 的双层循环：感知 P₁（带 box 的定位观察）→推理 R₁→主动感知 P₂（由 R₁ 决定"放大哪里"）→推理 R₂→答案。与静态多图拼接的本质区别是"由推理驱动的主动感知"循环。</figcaption>
+</figure>
+</div>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：用"反向构造"生成结构化视觉 CoT 数据</p>
+<p><b>原理</b>：正向标注"看哪里"需要专家，反向构造只需"已有答案+检测器"——成本降 10 倍。<b>步骤</b>：①选种子 QA 对（含精确答案的数学/计数/定位题，1 万条起）；②<b>证据定位</b>——用 Grounding DINO/GroundingGPT 检测"答案涉及的对象"得 bbox（计数题→所有实例框；几何题→交点/关键线区域）；③<b>子问题分解</b>——用强 LLM 把原题拆成"定位-读取-计算"三段子问题，每段的答案可从种子题的已知信息验证；④<b>轨迹组装</b>——"观察(box+子答案) → 推理(衔接文本) → … → 最终答案"的结构化轨迹；⑤<b>验证闸</b>——轨迹中的每个子答案必须与种子答案自洽，box 用 IoU 核验（错框即废弃）。<b>成本</b>：1 万条轨迹约 $200–500 + 1 人周复核——<b>结构化 CoT 数据的规模化门槛已经降到个人团队可承受</b>。</p></div><p>数据 schema 的前瞻性设计：轨迹（文本+<box> 内联）与图像附件分离存储——同一轨迹可换高清原图重渲染，训练分辨率升级时数据可复用。<b>数据 schema 要能穿越两代模型</b>。</p>
+<p><b>反向构造的"质量陷阱"</b>：检测器定位的 bbox 是"答案相关物"而非"最优观察顺序"——反向数据教的是"结果论观察"，缺少"假设-验证式观察"。缓解：对 10–20% 样本补"扰动重定位"变体（GT box 换相邻干扰区域，正确轨迹应含"发现异常→重新定位"）——<b>数据里的"弯路"比例决定模型的纠错能力</b>。</p>
+
+<h2 id="sec-3"><span class="sec-no">3.</span>长思考范式迁移：o3 视觉思维、QVQ 与视觉 PRM</h2>
+<p>2024–2025 年 LLM 的"长思考"革命（o1/R1 系：推理时生成数千 token 的思考链+强化学习训练）向多模态迁移的三条线：<b>①o3 的视觉思维（闭源标杆）</b>——模型在推理中<b>主动操作图像</b>：缩放、裁剪、旋转、在图上画辅助线、多轮"看-想-再看"，配合程序执行；实测在 MMMU/MathVista 类任务上，其"操作图像"的次数与正确率强相关——<b>"会看"被具象化为"会用图像工具"</b>。<b>②QVX/QVQ 系（开源推理模型）</b>——把 R1 式长 CoT 与视觉输入结合：开源侧先用"文本推理模型+视觉前端蒸馏"实现长思考，视觉细节的"主动获取"仍靠外部工具循环。<b>③视觉过程奖励模型（Visual PRM）</b>——文本侧的 PRM（Process Reward Model，对思维链每一步打分而非只看最终答案）向视觉扩展：每步的"观察是否正确（box 对不对）+推理是否成立"都需要judgment——<b>Visual PRM 是"视觉 CoT 数据规模化"的判卷器</b>（与第 37 章 RLAIF-V 的"断言核验"同构）。<b>长思考迁移的三个工程要点</b>：①视觉 token 的思考成本更高（每步"看"都是数千 token 的 prefill）；②错误恢复更难（感知错误会传染整条链）；③评测必须区分"思考长度带来的收益"与"思考长度带来的幻觉累积"。</p>
+
+<p><b>开源长思考的实现路径分化</b>（QVQ 系与 R1 系的视觉化策略对比）：①<b>"先想后看"路线</b>——文本推理模型为主干、视觉编码器仅作前端（图像转描述/token 后交给推理主干）——实现快、推理强，但"主动感知"能力弱（看不到局部细节，除非外接裁剪工具）；②<b>"边看边想"路线</b>——原生 VLM 底座直接做长思考 RL（视觉 token 在思考链中始终在场）——感知推理耦合好，但训练贵（视觉 token 拉长序列）；③<b>"两阶段混合"</b>——先用路线①完成推理能力训练，再用"裁剪-精读"工具弥补感知细节——成本与能力的折中，2025 年开源社区的主流。<b>选择依据</b>：任务的"感知依赖度"（第 40 章 MathVerse 式测量）——低依赖任务路线①足够，高依赖任务必须②③。</p><p><b>路线①的"感知盲区"实测</b>：图像转"文字描述"再推理的管线，在需要看局部细节的任务上系统性失败（OCR 数字、图表精确读数）——描述阶段已把信息压缩丢失。路线②的"贵"具体在：视觉 token 使思考序列长 3–10 倍，RL 成本同比放大——<b>两条路线成本-能力曲线的交点，就是"感知依赖度"的决策阈值</b>。</p><p><b>蒸馏路线的局限要标注</b>：蒸馏数据教的是旗舰模型的"操作风格"而非"操作能力"——可能模仿出格式正确但选点错误的操作；且"先粗后细"不适用于所有任务（OCR 直接全局精读更优）。<b>蒸馏的合理定位：提供"策略先验"供 RL 微调，而非替代 RL 的策略发现</b>。</p>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：过程奖励的"视觉特化"难点</p>
+<p><b>文本 PRM 的成功配方</b>（Lightman 等 PRM800K）：人工对每一步数学推理标注"对/错"，PRM 学习步骤级判断，搜索时以 PRM 为主导选路。<b>迁移到视觉的三处"水土不服"</b>：①<b>步骤的定义模糊</b>——文本推理步骤=一句陈述，视觉推理步骤="一次观察+一段解读"，切分粒度争议大（观察粒度粗了漏错、细了标注爆炸）；②<b>"对"的定义双重</b>——"推理对"（逻辑自洽）与"观察对"（真的看到了）是两个不同维度，同一个 box 可能"框对了区域但读错了数"——PRM 需要双头输出；③<b>标注成本</b>——步骤级视觉标注需要"看图核验每一步"，人工成本约为文本 PRM 的 3–5 倍。<b>缓解路线</b>：MC 估计自动标注（蒙特卡洛 rollout：把某步之后随机续写 N 次，用最终正确率估计该步质量——无需人工，但方差大需多次采样）+ 人工只标注"MC 分歧大"的难例——<b>主动学习式的人机分工把 Visual PRM 的数据成本压到可承受</b>。<p><b>PRM 数据的"三源混合"</b>：MC 估计（自动、量大、噪声高）60% + 人工核验难例（贵、质高）10% + 规则可验步骤（工具返回值对错——零成本硬标签）30%——<b>规则的硬标签校准 MC 的软标签，是三源配方的关键</b>。</p><p><b>视觉 PRM 的双头输出</b>：头一判"推理对"（逻辑/数学自洽——文本能力即可判）；头二判"观察对"（box 与图像内容匹配——必须带图判卷）；总分=两头的加权和（权重按任务调整：感知重的任务（OCR/计数）头二权重大）。<b>只判推理不判观察的 PRM 会把"看得错但想得顺"的路径判对——这是视觉 PRM 与文本 PRM 的根本分界</b>。</p></p></div>
+
+<h2 id="sec-4"><span class="sec-no">4.</span>Test-time Compute：视觉任务的推理时扩展</h2>
+<p>Test-time compute scaling（推理时算力扩展——更多思考 token、更多采样、更多搜索）在视觉任务上的三个独特杠杆：<b>①分辨率维度</b>——文本推理时扩展只能"多想"，视觉推理可以"多看"（更高分辨率/多次裁剪/多帧采样）——"用分辨率换正确率"的曲线是视觉特有的 test-time scaling（TTS）；实测在 MathVista 类任务上，"重采样+自验证"的 4 倍算力可获得 5–12 个点的正确率提升，但"单纯加大分辨率"存在饱和与反噬（过高分辨率触发 token 爆炸反而稀释注意力）。<b>②多路径采样+验证器</b>——best-of-N：生成 N 条推理路径，用 Visual PRM/自一致性（self-consistency）选优——文本任务的成熟范式，视觉上的差异是"验证器需要多模态"（核验"观察是否正确"）。<b>③搜索式推理</b>——把推理过程建成树（分支=不同观察策略/解题路径），MCTS+PRM 引导——计算成本最高、上限也最高，适合高价值场景。<b>视觉 TTS 的经济学</b>：与文本不同，视觉 TTS 的"多看"成本是 prefill 算力（第 39 章物理），"多想"成本是 decode——两者的成本比决定最优混合策略；<b>test-time 算力的最优分配（看几次 vs 想多久）是视觉推理系统设计的核心自由度</b>。</p><p><b>MCTS 的"视觉分支因子"</b>：文本 MCTS 的分支=不同推理方向（几个候选），视觉 MCTS 的分支=不同观察策略（看哪里×怎么放大）——候选观察的生成本身需要一个小型检索/提议模型（提议"可能相关区域"）。<b>视觉搜索的提议模型质量决定搜索效率——这是"模型套模型"的系统复杂度来源，也是开源侧搜索式推理落后于 o3 的根本原因</b>。</p>
+<p><b>自一致性（Self-Consistency）的视觉适配</b>：文本 SC 靠"多数答案一致"投票；视觉场景的三种改良——①<b>观察多样性采样</b>（N 条路径用不同裁剪/分辨率起点，保证观察覆盖而非同质重复）；②<b>加权投票</b>（PRM 分数作为每条路径的票权，而非一人一票）；③<b>证据交叉验证</b>（多条路径引用同一观察才算"证实"，孤立观察降权——对抗"一次看错、多路复述"的感知传染）。<b>实验口径：视觉 SC 在计数/几何任务上比文本任务收益更稳定（+5–15 分），因为"多看几遍"比"多想几遍"更直接地降低随机感知错误</b>。</p><p><b>三种改良各自治什么</b>：观察多样性采样治"覆盖不足"；PRM 加权投票治"路径质量不齐"；证据交叉验证治"感知传染"（一次看错被多路复述——孤立观察降权）。<b>三者可叠加为"多样性采样→PRM 加权→证据聚类"三级管线</b>。</p><p><b>成本对照</b>：观察多样性采样≈零额外成本；PRM 加权≈每路径一次 PRM 前向；证据聚类≈可忽略。<b>边际成本递增、收益递减——"采样多样性"这个免费项应永远开满</b>。</p>
+
+<p><b>视觉 TTS 曲线的形状与文本 TTS 的差异</b>：文本 TTS 曲线"对数增长、无峰"（想得更多至少不会更差——基本成立）；视觉 TTS 曲线存在<b>"过看反噬"</b>——观察次数超过某阈值后，低质量观察（重复同一区域、无效裁剪）开始污染上下文，正确率反而下降。<b>两条应对</b>：①观察去重（相似裁剪的 embedding 去重，防止上下文被冗余观察淹没）；②观察质量门控（PRM 对新观察打分，低分观察不进上下文）。<b>"算力预算的最优分配点"在任务间差异巨大</b>：细节读取类（OCR/计数）的预算边际收益主要在"多看"，符号推理类（代数/逻辑）主要在"多想"——预算分配器应按任务类型路由。</p><p><b>两段分辨率的"成本节省账"</b>：粗看 672px（token 少 4 倍）→确认关键区域→局部 1344px 裁剪——总 token 约为全程高分辨率的 1/3 而关键信息无损。<b>"先粗后细"既是模型策略也是 token 预算策略——与第 39 章 RAG 两段分辨率、第 31 章帧采样混合策略完全同源</b>。</p>
+
+<div class="tbl-wrap"><table>
+<caption>表 44-1　视觉推理方法对比（按干预层）</caption>
+<thead><tr><th>方法</th><th>干预层</th><th>训练需求</th><th>推理成本</th><th>典型增益</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>任务相关 Visual CoT</td><td>数据/训练</td><td>CoT SFT 数据 10 万+级</td><td>中等（思考 token）</td><td>+5–10 分</td><td>通用推理底座</td></tr>
+<tr><td>主动视觉（zoom/裁剪工具）</td><td>推理/Agent</td><td>工具调用训练</td><td>高（多轮 prefill）</td><td>+8–15 分（细节类）</td><td>高分辨率/图表</td></tr>
+<tr><td>Best-of-N + Visual PRM</td><td>推理</td><td>PRM 训练</td><td>N 倍推理</td><td>+5–12 分</td><td>高价值场景</td></tr>
+<tr><td>搜索式推理（MCTS）</td><td>推理</td><td>PRM+搜索框架</td><td>极高</td><td>+10–20 分（上限）</td><td>竞赛级任务</td></tr>
+<tr><td>工具增强（代码/SAM）</td><td>推理/Agent</td><td>工具 SFT</td><td>取决于工具</td><td>+10–25 分（特定类）</td><td>计算/分割类</td></tr>
+<tr><td>RL（GRPO 视觉版）</td><td>训练</td><td>可验证奖励任务</td><td>—</td><td>+8–18 分</td><td>有可验证信号的任务</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>工具增强推理：给模型配上尺子和圆规</h2>
+<p>人类做几何题用尺规、做统计用计算器——视觉推理的工具增强遵循同样的分工逻辑：<b>①代码解释器</b>——"读出图表数值后，生成 matplotlib 重绘/计算相关系数"——把"数值计算"从 LLM 的弱项交给确定性工具，MathVista 上计算类任务的标配；<b>②SAM 辅助分割</b>——"先分割出目标物体再数/再比"——把"数数"从注意力猜测变成"分割掩码计数"，计数幻觉（第 37 章）的最有效工具解法；<b>③坐标/几何工具</b>——检测器给出精确 bbox 后用几何公式计算（距离/角度/面积）——把"空间关系"从语言猜测变成坐标运算；<b>④检索工具</b>——"这是什么品种"类知识密集题，先裁剪+检索再回答（与第 42 章多模态 RAG 打通）。<b>工具增强的训练范式</b>：早期是"工具 SFT"（示范如何调用）；2025 年后的主流是<b>"RL 中学会用工具"</b>——把"工具返回结果"纳入推理环境，模型通过强化学习学会"何时调用、调什么参数、如何利用返回值"（o3 的工具使用即此类训练的产物）。<b>工具增强的评测陷阱</b>：工具的可靠性成为系统天花板（SAM 分割错了模型必错）——评测时必须区分"模型错误"与"工具错误"，否则优化方向会错位。</p>
+<p><b>工具链的"可靠性预算"</b>（多工具系统的系统级精度账）：端到端正确率 ≈ 模型路由正确率 × Π(各工具可靠率) × 整合正确率。示例：模型 90% 正确调用 × 代码执行 99% × 分割 85% × 整合 90% ≈ 68%——<b>工具链的乘法效应意味着"最弱工具"决定系统上限</b>。两个工程对策：①工具结果校验（SAM 掩码的面积/数量 sanity check，异常则回退到模型直答）；②冗余工具（计数任务同时用分割计数与检测计数，一致才采纳）。<b>工具增强不是"免费午餐"，而是把可靠性工程引入推理系统——与第 39 章"模型错误 vs 工具错误分桶"的评测纪律互为表里</b>。</p><p><b>SAM 的"辅助验证"用法</b>（不止"替模型看"）：①计数交叉验证（模型说 5 个杯子，SAM 分割计数作第二意见，不一致触发重看）；②定位锚定（掩码 bbox 作为"观察合法性"的客观判据，PRM 的 box 评分直接用掩码算 IoU）；③关系计算（两掩码的相对位置用几何公式判定）。<b>把感知工具从"执行者"升级为"验证者"，是工具增强的第二层价值</b>。</p><p><b>工具失败的三级回退</b>：一级——超时/报错→换备选工具（SAM 失败换检测器计数）；二级——结果可疑（掩码面积异常）→模型直答并声明不确定性；三级——全部工具不可用→纯模型推理降级（答案标注"未经验证"）。<b>回退链在系统设计期定义而非运行时即兴——工具增强系统的"可靠性 SLA"由此而来</b>。</p><p><b>工具增强的"引用边界"</b>：工具结果在答案中的引用必须显式（"由代码计算得..."/"由分割计数为..."）——可审计性（第 41 章透明度）与错误归因（第 39 章分桶）都依赖"每个数字知道来自谁"。<b>无引用边界的工具结果混入正文=系统失去自证能力</b>。</p><p><b>工具引入前的"替代性测试"</b>：先测无工具基线的错误分布与该工具的覆盖重合度——工具的预期收益 = 可解决错误类占比 × 工具可靠率；两数都不高就别接（接了也是"仪式性工具调用"）。</p><p><b>工具使用的训练阶段论</b>：SFT 阶段（学会调用语法与典型模式）→ RL 阶段（学会"何时值得调"——工具调用有延迟成本，RL 能学到"简单题直答、难题调工具"的自适应策略，这是纯 SFT 教不会的）；推理时（工具结果的批判性消费——返回值与自己的预期矛盾时触发重查而非盲从）。<b>"何时调"的自适应是 RL 相对 SFT 的核心增益</b>：实测自适应策略比"每题必调"节省 60% 工具调用而正确率持平——工具预算的经济学。</p>
+
+
+
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="工具增强视觉推理架构图">
+<rect x="0" y="0" width="640" height="300" fill="#f8fafc"/>
+<text x="320" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">工具增强视觉推理：模型编排，工具执行</text>
+<!-- model core -->
+<rect x="250" y="60" width="140" height="70" rx="10" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="320" y="82" text-anchor="middle" font-size="12" font-weight="bold" fill="#4c1d95">推理模型</text>
+<text x="320" y="100" text-anchor="middle" font-size="9.5" fill="#4c1d95">观察-思考-调用-整合</text>
+<text x="320" y="116" text-anchor="middle" font-size="9.5" fill="#4c1d95">（RL 学会工具策略）</text>
+<!-- tools -->
+<rect x="40" y="160" width="120" height="44" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+<text x="100" y="178" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#1e3a8a">代码解释器</text>
+<text x="100" y="194" text-anchor="middle" font-size="9" fill="#1e3a8a">精确计算/重绘</text>
+<rect x="180" y="160" width="120" height="44" rx="8" fill="#d1fae5" stroke="#10b981"/>
+<text x="240" y="178" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#065f46">SAM 分割</text>
+<text x="240" y="194" text-anchor="middle" font-size="9" fill="#065f46">掩码计数/比对</text>
+<rect x="320" y="160" width="120" height="44" rx="8" fill="#fef3c7" stroke="#d97706"/>
+<text x="380" y="178" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#92400e">坐标/几何工具</text>
+<text x="380" y="194" text-anchor="middle" font-size="9" fill="#92400e">bbox 距离/角度</text>
+<rect x="460" y="160" width="120" height="44" rx="8" fill="#fee2e2" stroke="#ef4444"/>
+<text x="520" y="178" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#991b1b">多模态检索</text>
+<text x="520" y="194" text-anchor="middle" font-size="9" fill="#991b1b">裁剪+知识查询</text>
+<!-- image input -->
+<rect x="60" y="60" width="110" height="70" rx="8" fill="#f1f5f9" stroke="#64748b"/>
+<text x="115" y="88" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#334155">输入图像</text>
+<text x="115" y="106" text-anchor="middle" font-size="9" fill="#334155">可多轮裁剪放大</text>
+<!-- answer -->
+<rect x="250" y="240" width="140" height="40" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="320" y="264" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">最终答案+依据</text>
+<!-- arrows -->
+<path d="M 170 95 L 250 95" stroke="#64748b" stroke-width="2" marker-end="url(#t1)"/>
+<path d="M 300 130 L 120 160" stroke="#8b5cf6" stroke-width="2" marker-end="url(#t2)"/>
+<path d="M 310 130 L 240 160" stroke="#8b5cf6" stroke-width="2" marker-end="url(#t2)"/>
+<path d="M 330 130 L 375 160" stroke="#8b5cf6" stroke-width="2" marker-end="url(#t2)"/>
+<path d="M 350 130 L 505 160" stroke="#8b5cf6" stroke-width="2" marker-end="url(#t2)"/>
+<path d="M 100 204 C 140 240, 200 255, 250 258" stroke="#2563eb" stroke-width="2" fill="none" marker-end="url(#t3)"/>
+<path d="M 520 204 C 480 240, 440 255, 390 258" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#t4)"/>
+<text x="320" y="290" text-anchor="middle" font-size="10" fill="#475569">分工：模型负责"何时调、怎么用"，工具负责"算得准、分得精" —— 评测需区分模型错误与工具错误</text>
+<defs>
+<marker id="t1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#64748b"/></marker>
+<marker id="t2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8b5cf6"/></marker>
+<marker id="t3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2563eb"/></marker>
+<marker id="t4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#ef4444"/></marker>
+</defs>
+</svg>
+<figcaption>图 44-2　工具增强视觉推理架构：推理模型作为编排者（何时调、怎么用——通过 RL 学会），四类工具各司其职（计算/分割/几何/检索）；评测时必须区分模型错误与工具错误，否则优化方向错位。</figcaption>
+</figure>
+</div>
+
+<h2 id="sec-6"><span class="sec-no">6.</span>训练方法：CoT SFT、视觉 RL 与过程奖励</h2>
+<p>三条训练路线的递进关系：<b>①CoT SFT</b>——用结构化视觉 CoT 数据（观察动作+推理步骤）做监督微调——教会"格式与风格"，上限受数据质量约束；<b>②视觉 RL（GRPO 视觉版）</b>——R1 式的"可验证奖励强化学习"：数学题答案可验证、图表计算可程序核验——在<b>有可验证奖励信号</b>的视觉任务上，GRPO/RLVR 直接优化"答案正确率"，实测比 SFT 高 5–10 个点且泛化更好；关键工程点是<b>奖励信号的构造</b>（答案匹配+格式奖励+长度惩罚的组合，视觉任务还需"观察合法性"奖励——box 是否框对区域）；<b>③过程奖励（PRM）</b>——最终答案奖励（ORM）的稀疏性问题在视觉任务更严重（长观察-推理链），PRM 对每步打分提供密集信号——训练 PRM 需要步骤级标注（人工或 MC 估计），<b>Visual PRM 的"观察正确性"判断是其与文本 PRM 的本质差异</b>。<b>三者的组合拳（2025 年开源最佳实践）</b>：CoT SFT 冷启动 → RLVR 主优化 → PRM 辅助验证（推理时 best-of-N 或训练时 reward shaping）。<b>与第 37 章 DPO 的关系</b>：DPO 适合"偏好可判但正确性难验证"的行为对齐（幻觉、语气），RLVR 适合"可验证"的推理任务——两者是互补而非替代。</p><p><b>三段组合拳的"衔接陷阱"</b>：SFT→RL 处，SFT 教的格式在 RL 高熵探索下崩坏（对策：RL 奖励保留格式项）；RL→PRM 处，PRM 判定标准须与 RL 奖励对齐（两把尺子不一致，best-of-N 会选出"PRM 喜欢但答案错"的路径）。<b>每处衔接都需要"标准对齐检查"——与第 34 章"层与层的接口"教训同构</b>。</p>
+<p><b>CoT SFT 数据的"梯度配比"</b>：①难度梯度（简单:中:难 ≈ 3:5:2，第 34 章原则）；②观察类型覆盖（全局描述/局部裁剪/zoom/标注四类动作都要示范）；③轨迹长度 3–8 步为宜（过长教"绕路"、过短教"跳步"）；④错误恢复示范——刻意包含"发现读错→回头重看"的轨迹（第 33 章 VLA 数据同款智慧）。<b>SFT 数据的结构决定 RL 的探索起点——数据里没有的行为模式，RL 几乎无法无中生有</b>。</p><p><b>RLVR 任务选择的三问</b>：①答案可自动核验吗（数值/选项/程序结果）——不可核验别进 RLVR（用 DPO）；②核验的等价类全吗（0.5=1/2=50%——不全=奖励噪声）；③难度分布有梯度吗（全难题→奖励全 0→学不动；梯度任务+课程升温是 GRPO 稳定前提）。<b>三问全过再上 RL——视觉推理的 RL 失败案例一半栽在任务选择而非算法</b>。</p><p><b>奖励解析的"测试先行"纪律</b>：RL 启动前用 1000 条采样轨迹跑解析率测试——答案/box/格式三项解析成功率 ≥98%/95%/95%，不达标先修解析器再开跑（否则把噪声当梯度喂给模型）。<b>解析率单测进 CI——奖励函数是"生产的代码"</b>。</p><p><b>VCoT 轨迹的"视角多样性"检查</b>：同类题目的观察序列是否高度雷同（模板化）——用观察序列 embedding 方差量化；方差过低=在教"背路径"而非"学观察"。修复：同一题生成 2–3 条不同观察顺序的等价轨迹（多解法增广）——<b>轨迹多样性是 SFT→RL 迁移效率的隐藏变量</b>。</p>
+
+<p><b>CoT SFT 数据的"梯度配比"</b>：①难度梯度（简单:中:难 ≈ 3:5:2，第 34 章原则）；②观察类型覆盖（全局描述/局部裁剪/zoom/标注四类动作都要示范）；③轨迹长度 3–8 步为宜（过长教"绕路"、过短教"跳步"）；④错误恢复示范——刻意包含"发现读错→回头重看"的轨迹（第 33 章 VLA 数据同款智慧）。<b>SFT 数据的结构决定 RL 的探索起点——数据里没有的行为模式，RL 几乎无法无中生有</b>。</p>
+
+<div class="box-code"><p class="box-title">💻 代码：视觉 RLVR 的奖励函数骨架（GRPO 训练循环）</p>
+<pre><code class="language-python"># reward.py —— 视觉可验证奖励的组合设计
+import re
+from math import isclose
+
+def visual_math_reward(sample: dict, response: str) -> float:
+    """组合奖励：答案正确 + 格式合规 + 观察合法 + 简洁性"""
+    r = 0.0
+    # ① 答案奖励（主信号，可验证）
+    pred = extract_final_answer(response)          # 解析 oxed{...} 或答案段
+    if pred is not None and isclose_num(pred, sample["answer"], rel=1e-3):
+        r += 1.0
+    # ② 观察合法性奖励（视觉特有：box 是否框住关键区域）
+    boxes = extract_boxes(response)                 # 解析 <box> 标注
+    if boxes:
+        iou = max_iou_with_gt(boxes, sample["gt_regions"])
+        r += 0.3 * iou                              # 观察质量密集信号
+    # ③ 格式奖励（结构化 CoT：有观察-推理分段）
+    if has_observe_think_structure(response):
+        r += 0.1
+    # ④ 长度惩罚（防"冗长刷分"）
+    r -= 0.0002 * max(0, len(response) - 2000)
+    return r
+
+# GRPO 训练循环要点（TRL/veRL 框架）：
+#   1. 对每个 (图像, 问题) 采样 G=8 条推理轨迹（temperature 1.0）
+#   2. 组内奖励标准化：advantage_i = (r_i - mean(r)) / std(r)
+#   3. 策略梯度更新（KL 罚约束不偏离参考策略）
+#   4. 观察合法性奖励需要 gt_regions —— 仅有答案的数据可先用
+#      "答案正确+格式" 两项，观察奖励随 PRM 蒸馏逐步加入</code></pre>
+<p>奖励设计的三个实战要点：①<b>答案解析要鲁棒</b>（数学答案的等价形式：0.5=1/2=50%——解析失败=奖励噪声，是 RL 训练不稳定的头号来源）；②<b>观察奖励的权重从小开始</b>（0.1–0.3），等主奖励稳定后再调——早期给观察重权会诱导"画框凑分"；③<b>KL 罚与奖励尺度的平衡</b>（KL 系数过大→学不动，过小→崩语言能力，参考 R1 配方 0.0001–0.001 起扫）。</p></div>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：Visual CoT 的数据结构化（Shao et al., NeurIPS 2024）</p>
+<p><b>核心主张</b>：视觉思维链的"观察"必须被<b>显式结构化</b>（bounding box+子问答），而非让模型自由发挥"先描述再回答"——后者观察与问题脱钩，推理链与视觉证据松耦合。<b>数据构建</b>：VCoT-238k——从已有 VQA 数据集反向构造：对每个 QA 对，用检测器+人工标注出"回答该问题需要看的关键区域"（box），并生成"定位-子问答"两段式思维链；覆盖 12 类任务（计数/多对象/空间关系/图表/OCR…）。<b>实验结论</b>：结构化 CoT SFT 相比"自由描述式 CoT SFT"，在需要精确定位的任务上提升显著（+7–15 分），且模型输出的"中间观察"可被自动评测（box IoU）——<b>过程可评测性是结构化数据的隐藏红利</b>（红利在部署侧同样兑现：结构化观察让"模型看了哪里"可审计——医疗/法律场景的推理过程可追溯是准入前提，第 41 章可归因原则在推理域的延伸）。<b>深远影响</b>：确立了"观察结构化"作为视觉 CoT 的数据标准，2025 年的视觉推理数据集（含 o 系蒸馏数据）都沿用"box+子问答"结构。<b>局限</b>：box 标注成本高；"看哪里"的最优策略可能不止一个（标注的单一 box 或许限制了更优观察路径的学习——RL 阶段可缓解）。</p></div>
+
+<h2 id="sec-7"><span class="sec-no">7.</span>本章小结</h2>
+<p>视觉推理的工程体系由"诊断-数据-训练-推理"四段构成：<b>诊断</b>——用第 40 章归因方法区分感知/推理瓶颈（26% vs 45% 的错误分布决定资源分配）；<b>数据</b>——Visual CoT 的"box+子问答"结构化范式（观察可评测）；<b>训练</b>——CoT SFT 冷启动、RLVR 主优化（可验证任务）、PRM 密集信号的三段组合；<b>推理</b>——test-time compute 的"看-想"分配（多看=分辨率/裁剪、多想=采样/搜索）+工具增强（把弱项交给确定性工具）。<b>与 LLM 推理的同构与差异</b>：范式完全迁移（CoT/RL/PRM/TTS），但视觉多了"主动感知"这个自由度——这是机会（看几次、看哪里可优化）也是负担（感知错误传染、验证更难）。<b>下一章转向 AIGC 生产工作流：从"推理的思考"到"生成的产线"</b>。</p><p><b>本章与相邻章节的接口</b>：向后依赖——感知诊断用第 40 章、工具与部署用第 39 章、RL 基础设施用第 38 章、RLVR 数据来自第 34 章合成管线；向前支撑——第 43 章 Agent 的任务分解是本章工具增强的 Action 化、第 48 章 2026 前沿的"原生思维"是本章范式的下一站。<b>动手路径（一周）</b>：Day1-2 跑通 MathVista 归因分桶；Day3-4 反向构造 1k 条 Visual CoT 并 SFT；Day5 接入 SAM+代码工具对比；周末做 best-of-N+SC 对比——一周后你对"视觉推理怎么提升"的判断将从"听说的"变成"测过的"。</p><p><b>本章关键数字小结</b>：感知错误约占视觉推理错误的 26%（MathVista 口径）；结构化 CoT 相比自由描述 +7–15 分（定位类）；视觉 TTS 的 4 倍算力可换 +5–12 分；工具自适应策略省 60% 调用；PRM 三源配比 60/10/30——<b>记住这些量级，预期管理就脱离了"拍脑袋"</b>。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：视觉推理系统的"上线前体检单"</p>
+<p>①归因体检——100 道错题的感知/推理分桶，两瓶颈比例已知；②CoT 链体检——观察命中率/链一致性达标；③工具体检——模型与工具错误分桶清晰，最弱工具可靠率已知；④TTS 体检——"多看/多想"预算分配曲线画过，拐点已知；⑤RL 体检——奖励解析成功率 >98%（解析失败=奖励噪声）。<b>五项体检对应五节内容——可靠性由"每一环都有数字"保证</b>。</p></div>
+
+<div class="box-tip"><p class="box-title">💡 技巧：视觉推理系统的"上线前体检单"</p>
+<p>①归因体检——100 道错题的感知/推理分桶，两瓶颈比例已知；②CoT 链体检——观察命中率/链一致性达标；③工具体检——模型与工具错误分桶清晰，最弱工具可靠率已知；④TTS 体检——"多看/多想"预算分配曲线画过，拐点已知；⑤RL 体检——奖励解析成功率 >98%（解析失败=奖励噪声）。<b>五项体检对应五节内容——可靠性由"每一环都有数字"保证</b>。</p></div>
+
+<p><b>FAQ</b>：问——视觉长思考与文本长思考，谁的成本高？<br><b>答案</b>：每 token 的 decode 成本相同，但视觉思考的每步观察都触发数千 token 的 prefill（第 39 章物理），且视觉思考的"重启成本"高（感知错误需要重看而非重写）——<b>每 token 一样贵、每步贵得多</b>，这是视觉 TTS 预算需更谨慎的物理根源。</p>
+<p><b>FAQ</b>：结构化 CoT 会不会限制模型发现"更优观察路径"？<br><b>答案</b>：单一标注路径会轻微压缩探索空间——两种缓解：多解法增广（同题多条等价轨迹）+ RL 后续放开（奖励只看结果、过程自由探索）。<b>SFT 的结构是脚手架，RL 拆脚手架——两阶段缺一都不行</b>。</p>
+
+<p><b>FAQ</b>：长思考模型的"过拟合评测"风险如何防控？<br><b>答案</b>：长思考会"记住"训练题的解法路径——评测必须用"去冗余版"（MathVerse 式）与"新收集题"分层报告（第 40 章动态评测思想）；凡是推理基准，训练集与评测集的时间隔离窗口 ≥3 个月。</p>
+<p><b>FAQ</b>：小模型（<3B）也值得上 TTS 吗？<br><b>答案</b>：小模型的 TTS 收益结构不同——"多想"收益低（能力天花板）、"多次独立采样+投票"收益反而高（小模型的错误随机性大，集成收益大）。<b>小系统的 TTS 预算优先投"多路采样"而非"长思考"</b>。</p>
+
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>1.</b> 感知瓶颈与推理瓶颈的症状与药方？为什么必须先诊断？<br><b>答案要点</b>：感知=读错数/看反位置→分辨率/OCR 数据；推理=算错/逻辑跳→CoT/RL/工具；约 26% vs 45% 的错误占比决定资源分配，混治则浪费。</p>
+<p><b>2.</b> Visual CoT 双层循环的形式化？"主动感知"指什么？<br><b>答案要点</b>：外层感知-推理交替 $P_i \to R_i$，内层精度调整；$P_{i+1}$ 由 $R_i$ 决定"下一步看哪里"——与静态多图拼接的本质区别。</p>
+<p><b>3.</b> 结构化 CoT 数据（box+子问答）的两个收益？隐藏红利是什么？<br><b>答案要点</b>：观察与问题耦合（不白描述）、定位类任务提升 7–15 分；隐藏红利=中间观察可自动评测（box IoU）——过程可评测性。</p>
+<p><b>4.</b> o3 式"会看"的具象化是什么？三个工程要点？<br><b>答案要点</b>：主动操作图像（缩放/裁剪/画线）；要点=视觉 token 思考成本高、感知错误传染、评测需区分收益与幻觉累积。</p>
+<p><b>5.</b> 视觉 TTS 的三个独特杠杆？"看"与"想"的成本各是什么？<br><b>答案要点</b>：分辨率/重采样+验证器/搜索式推理；"看"=prefill 算力（第 39 章物理），"想"=decode 访存——成本比决定最优分配。</p>
+<p><b>6.</b> 四类工具各解决什么弱项？工具增强的评测陷阱？<br><b>答案要点</b>：代码=计算、SAM=计数、坐标=空间、检索=知识；陷阱=工具错误与模型错误混淆——需分桶归因。</p>
+<p><b>7.</b> RLVR 与 DPO 的适用分界？视觉 RLVR 的奖励构造要点？<br><b>答案要点</b>：RLVR 适合可验证任务（答案可核验），DPO 适合偏好可判但验证难的行为对齐；视觉奖励=答案匹配+格式+长度+"观察合法性"（box 正确）。</p>
+<p><b>10.</b> 视觉 SC 的三种改良？为何收益更稳？<br><b>答案要点</b>：观察多样性采样、PRM 加权投票、证据交叉验证；"多看几遍"直接降低随机感知错误。</p>
+<p><b>12.</b> 视觉 PRM 的双头输出是什么？为什么是根本分界？<br><b>答案要点</b>：头一判推理自洽（文本能力可判）、头二判观察正确（须带图判卷）；只判推理会把"看错但想顺"的路径判对。</p>
+<p><b>13.</b> 观察退火课程是什么？防什么病？<br><b>答案要点</b>：观察预算随训练进度递增（先直答后扩展观察）；防"为看而看"的低质量观察依赖与上下文污染。</p>
+<p><b>11.</b> "何时调工具"为什么只能 RL 学？<br><b>答案要点</b>：调用时机是成本-收益权衡，SFT 只示范固定模式；RL 在奖励中内含工具成本才能学出自适应。</p>
+
+<p><b>10.</b> 视觉 SC 的三种改良？为何收益更稳？<br><b>答案要点</b>：观察多样性采样、PRM 加权投票、证据交叉验证；"多看几遍"直接降低随机感知错误。</p>
+<p><b>11.</b> "何时调工具"为什么只能 RL 学？<br><b>答案要点</b>：调用时机是成本-收益权衡，SFT 只示范固定模式；RL 在奖励中内含工具成本才能学出自适应。</p>
+
+<p><b>9.</b> 工具链的"乘法效应"指什么？两个对策？<br><b>答案要点</b>：端到端正确率≈各环节可靠率连乘，最弱工具决定上限；对策=工具结果 sanity check 回退 + 冗余工具一致才采纳。</p>
+<p><b>8.</b> 三段训练组合拳的顺序与各段作用？<br><b>答案要点</b>：CoT SFT 冷启动（格式）→ RLVR 主优化（正确率）→ PRM 辅助（密集信号，用于 best-of-N 或 reward shaping）。</p></div>
+
+<p>练习：选取你在用的 VLM，在 MathVista 上取 100 道错题做"三步归因"（第 1 节协议），把结果画成感知/推理堆叠柱状图——这张图决定你该优先买分辨率、补数据还是上工具，是本章内容的变现入口。</p><p>补充一个"归因复训"纪律：每接入新模型版本、每换主力任务类型，100 题归因要重跑一遍——<b>感知/推理的错误占比会随模型升级漂移，上一版的结论会误导下一版</b>（例如加了 OCR 数据后感知错误降至 10%，此时推理错误成为新瓶颈——资源应转向本章内容）。归因是"定期的体检"而非"一次的诊断"。</p><p>最后一课：推理系统的"上限思维"——视觉推理的每项技术都有天花板（CoT 数据质量上限、RL 奖励质量上限、工具可靠率上限），叠加后的系统上限=各环节上限的乘积（第 5 节乘法账的推理版）。<b>设计新方案前先算"这套组合的理论上限够不够业务要求"——不够就在设计层换组件，而不是在运行层硬调参</b>。上限思维让视觉推理的方案评审从"看起来很聪明"变成"算得出够不够"。</p>
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Shao M, et al. <a href="https://arxiv.org/abs/2412.02052">Visual CoT: Advancing Multi-Modal Language Models with a Frontier Dataset and Benchmark</a>. NeurIPS 2024. arXiv:2412.02052.</li>
+      <li>Lu P, et al. <a href="https://arxiv.org/abs/2310.02215">MathVista: Evaluating Mathematical Reasoning in Visual Contexts</a>. NeurIPS 2023. arXiv:2310.02215.</li>
+      <li>OpenAI. <a href="https://openai.com/index/openai-o3-mini/">o3 系列：视觉思维与图像工具使用</a>. 2024–2025.</li>
+      <li>DeepSeek-AI. <a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via RL</a>. 2025. arXiv:2501.12948.</li>
+      <li>Alibaba Qwen Team. <a href="https://github.com/QwenLM/QVQ">QVQ-Max / QVQ-72B 视觉推理模型</a>. 2024–2025.</li>
+      <li>Lightman H, et al. <a href="https://arxiv.org/abs/2305.20050">Let's Verify Step by Step (PRM800K 与过程奖励)</a>. ICLR 2024. arXiv:2305.20050.</li>
+      <li>Uesato J, et al. <a href="https://arxiv.org/abs/2212.08602">Solving Math Word Problems with Process- and Outcome-Based Feedback</a>. 2022. arXiv:2212.08602.</li>
+      <li>Shao Z, et al. <a href="https://arxiv.org/abs/2402.03300">DeepSeekMath: GRPO 与可验证奖励 RL 的数学推理</a>. 2024. arXiv:2402.03300.</li>
+      <li>Chen Z, et al. <a href="https://arxiv.org/abs/2411.14432">视觉过程奖励模型 / VisualPRM 系列</a>. 2024–2025.</li>
+      <li>Zhou Y, et al. <a href="https://arxiv.org/abs/2502.09202">Visual-tool 增强推理 / VisualSKB 系</a>. 2025.</li>
+      <li>Kirillov A, et al. <a href="https://arxiv.org/abs/2304.02643">Segment Anything (SAM 作为推理工具)</a>. ICCV 2023. arXiv:2304.02643.</li>
+      <li>Gou Z, et al. <a href="https://arxiv.org/abs/2401.12246">TORA: Tool-Integrated Reasoning Agents for Mathematical Problem Solving</a>. ICLR 2024. arXiv:2401.12246.</li>
+      <li>Yang A, et al. <a href="https://arxiv.org/abs/2404.11553">MathScale / 工具增强数学推理管线</a>. 2024.</li>
+      <li>Wei J, et al. <a href="https://arxiv.org/abs/2201.11903">Chain-of-Thought Prompting Elicits Reasoning in LLMs</a>. NeurIPS 2022. arXiv:2201.11903.</li>
+      <li>Snell C, et al. <a href="https://arxiv.org/abs/2408.03314">Scaling LLM Test-Time Compute Optimally Can be More Effective than Scaling Model Parameters</a>. 2024. arXiv:2408.03314.</li>
+      <li>Wang X, et al. <a href="https://arxiv.org/abs/2203.11171">Self-Consistency Improves Chain of Thought Reasoning</a>. ICLR 2023. arXiv:2203.11171.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

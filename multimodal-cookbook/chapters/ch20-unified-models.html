@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 20 章 统一理解与生成模型 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+
+<main class="book-body"><div class="book-header">
+  <h1 id="ch20-unified-models">第 20 章 统一理解与生成模型</h1>
+  <p class="chapter-meta">涵盖模型：Unified-IO, Chameleon, Show-o, Emu3, Janus/Janus-Pro · 核心机制：离散自回归统一、表征解耦、梯度平衡</p>
+</div>
+<div class="book-content">
+
+<section>
+  <p class="lead">
+    长期以来，多模态人工智能领域存在一道明显的人为鸿沟：<strong>多模态理解（Multimodal Understanding）</strong>与<strong>多模态生成（Multimodal Generation）</strong>被分别构建在两套截然不同的架构基石之上。以 LLaVA、Qwen-VL、InternVL 为代表的视觉理解大模型，普遍采用“连续视觉特征提取器（CLIP / SigLIP）+ 线性投影层 + 自回归因果语言模型”的组合，本质上是将高维视觉信号压缩为紧凑的语义嵌入，单向注入到语言模型的上下文中；而以 Stable Diffusion、Flux、SD3 为代表的文生图与文生视频模型，则全面拥抱连续隐空间的扩散模型（Latent Diffusion）或流匹配模型（Flow Matching），借助去噪网络将高斯噪声逐步拟合为连续像素特征。
+  </p>
+  <p>
+    这种两阶段的分离式架构（Two-Stage Pipeline）在工程实现上带来了严重的模块割裂：当用户需要一个能够“先理解输入草图与复杂修改要求、再生成精准新图像、随后对所生成图像进行视觉问答与再次迭代编辑”的全能智能体时，系统往往需要串联一个 VLM 进行意图解析、一个 Prompt 重写器将指令扩写为生成提示词、一个 Diffusion 模型进行图像生成、再串联一个 VLM 进行验收评估。在这个级联链条中，跨模型的语义损耗、无法端到端联合反向传播微调、以及庞大的多模型推理显存占用，成为了制约多模态通用人工智能（AGI）迈向原生体验的核心瓶颈。
+  </p>
+  <p>
+    2024 年至 2026 年，以 Meta Chameleon、Show-o、BAAI Emu3、DeepSeek Janus 以及 Janus-Pro 为代表的<strong>统一多模态大模型（Unified Multimodal Models）</strong>横空出世。它们提出了多模态建模的终极假说：<strong>无论是离散的文本符号，还是二维/三维连续的视觉像素，都可以统一量化为离散序列中的下一个 Token 预测（Next-Token Prediction），或者在一个统一的注意力场中通过自回归与掩码去噪实现端到端的交织理解与生成</strong>。本章将系统解构统一多模态模型的发展演进、表征冲突的本质成因、主流架构流派的工程设计、梯度动态与稳定性调优策略，并提供一套工业级可复现的微型统一理解生成模型代码实战。
+  </p>
+</section>
+
+<div class="box-history">
+  <div class="box-title">历史沿革：从任务特定的序列化到全能自回归统一</div>
+  <p>
+    统一多模态模型的演进经历了三个标志性的技术浪潮：
+  </p>
+  <ul>
+    <li><strong>第一浪潮：早期的序列到序列探索（2022–2023）</strong>。Allen Institute 推出的 <em>Unified-IO</em> 与 Google 的 <em>OFA (Once-for-All)</em>、<em>Flamingo</em> 首次尝试将检测框、分割掩码、图像像素与自然语言全部打包为统一的 Encoder-Decoder 序列。然而，由于当时的视觉离散编码器（如早期 VQ-GAN）量化精度差、重建失真严重，且解码器缺乏强大的自回归扩散混合能力，其生成质量远落后于同期的扩散模型，理解精度亦落后于专用检测模型。</li>
+    <li><strong>第二浪潮：原生全词表自回归的突破（2024）</strong>。Meta 发布的 <em>Chameleon</em> 彻底打破了模态边界。它将文本 BPE 词表与通过 Gumbel-Softmax 训练的视觉离散 VQ-VAE 词表直接拼接，构建了一个完全对称的纯因果 Transformer（Pure Decoder-Only Transformer）。Chameleon 证明了只要在大规模交织数据（Interleaved Web Data）上进行充分预训练，纯自回归模型不仅能写诗作赋，还能以原生任意位置交织图文（Any-to-Any）的方式稳定输出高保真图像。同年，BAAI 发布的 <em>Emu3</em> 更是宣称“Next-Token Prediction is All You Need”，纯自回归直接在图像生成和视频生成上超越了 SDXL，并在视觉理解基准上媲美专门的 LLaVA-1.6。</li>
+    <li><strong>第三浪潮：混合建模与表征解耦的理性回归（2024下半年–2026）</strong>。在纯自回归统一模型的狂飙突进中，工业界迅速发现了两大顽疾：其一，自回归生成 1024 个图像 Token 的推理延迟显著高于 20 步的流匹配扩散模型；其二，语义理解需要高度抽象的高层不变性特征（如 SigLIP），而图像生成需要对微观像素纹理高度敏感的重建特征（如 VQ-Tokenizer），将二者强行塞入单个编码通道会引发灾难性的“表征拔河（Representation Tug-of-War）”。针对此痛点，<em>Show-o</em> 引入了因果自回归与离散掩码扩散的双模式注意力机制；而 DeepSeek 推出的 <em>Janus</em> 与 <em>Janus-Pro</em> 则提出了优雅的<strong>表征解耦（Decoupled Visual Representation）</strong>范式，在保留单一 LLM 核心作为通用决策大脑的前提下，彻底理顺了理解与生成的特征流冲突，在极低参数代价下登顶统一多模态模型性能榜首。</li>
+  </ul>
+</div>
+
+<figure id="fig-unified-io">
+  <img src="../assets/images/papers/2206.08916_0.png" alt="Unified-IO 统一序列到序列架构总览" style="max-width:85%;">
+  <figcaption>图 20.1：早期统一多模态模型的里程碑 Unified-IO（arXiv:2206.08916）。采用统一的序列到序列 Transformer 将目标检测、密集姿态估计、图像着色、深度预测与文本问答统一建模为离散 Token 映射。</figcaption>
+</figure>
+
+<h2 id="sec-20-1">20.1 统一模型的根本动力：为什么需要 Any-to-Any 原生架构？</h2>
+
+<p>
+  在探讨统一模型的数学与工程实现之前，首先必须回答一个关键问题：既然将顶尖的理解模型（如 GPT-4V/Qwen2.5-VL）与顶尖的生成模型（如 Flux/Midjourney）通过 API 串联在工程上非常简单，学术界与工业前沿为何依然执着于投入数千万美元训练单一端到端统一大模型？这背后的驱动力根植于以下四个不可妥协的物理与认知法则：
+</p>
+
+<ol>
+  <li><strong>消除级联信息瓶颈（Cascade Information Loss）</strong>：
+    在级联系统中，理解模块必须将对图像的感知结论压缩为自然语言文本（Text Prompt），再传递给生成模型。然而，人类语言的信息带宽存在理论上限——所谓“一图胜千言（A picture is worth a thousand words）”。视觉输入中的空间微观几何关系、微妙的光影渐变、材质的粗糙度与非言语化构图意图，几乎不可能通过几百个文本词汇无损传递。在统一模型中，视觉中间隐层状态（Hidden States）直接流向解码模块，保留了完全连续的张量表征与注意力梯度，实现了跨模态的真正无损传导。
+  </li>
+  <li><strong>双向协同效应（Bidirectional Synergistic Reinforcement）</strong>：
+    认知神经科学表明，人类大脑视觉皮层的感知回路与生成/想象回路在神经元层面上高度重叠——具备高超素描绘画能力的艺术家，往往对透视规律、阴影明暗与人体解剖结构有着比常人深刻得多的理解力。计算实验同样证实：在严苛的多任务数据配比下，模型为了生成高质量、物理一致的逼真三维结构图像，其隐层必须自发学会空间几何与因果动力学；反过来，这种深层的物理空间常识又显著反哺了物体计数、空间位置推理以及遮挡还原等细粒度理解任务。
+  </li>
+  <li><strong>任意交织生成的端到端支持（Arbitrary Interleaved Generation）</strong>：
+    现实世界中最自然的交互形态绝非单调的一问一答，而是图文交织的连续篇章。例如撰写一本图文并茂的教科书、设计一个动态的网页布局、或者制定一份带图示的操作说明书。分离式架构无法决定“何时该插图、该插什么样的图、图文如何呼应”，只能依靠粗糙的规则脚本控制；而原生统一模型将文本 Token 与视觉 Token 视为词表中平等的公民，能够自主在任意位置预测 <code>&lt;image_start&gt;</code>、输出连续图像 Token、随后无缝切换回文本 Token 继续撰写解说文字。
+  </li>
+  <li><strong>极致的端侧部署效率与 KV 缓存复用</strong>：
+    在智能座舱、移动端与具身机器人等严苛的边缘计算场景下，设备显存与内存带宽极其宝贵。加载两个独立的百亿参数模型几乎不可行。统一模型只需常驻一套 Transformer 主干权重与统一的 KV Cache，即可在单次前向传播中完成从环境感知理解到动作/图像渲染生成的全生命周期闭环。
+  </li>
+</ol>
+
+<h2 id="sec-20-2">20.2 表征冲突困境：语义抽象 vs. 像素保真度的理论对决</h2>
+
+<p>
+  尽管统一架构的前景极为诱人，但在很长一段时间内，统一模型的综合表现始终无法匹敌专用模型（专用 VLM 在 MMMU 上领跑，专用 Diffusion 在 GenEval 上领跑）。这一长期停滞的技术死结，在学术界被称为<strong>多模态表征冲突（Representation Tug-of-War Dilemma）</strong>。
+</p>
+
+<div class="box-theory">
+  <div class="box-title">理论剖析：信息论视角下的表征瓶颈定理</div>
+  <p>
+    从信息论与表征学习的数学本质来看，理解任务与生成任务对视觉隐空间施加了完全相反的优化压力：
+  </p>
+  <p>
+    设输入原始图像为 $X \in \mathbb{R}^{H \times W \times 3}$，文本语义为 $Y$，视觉隐表征为 $Z = f_\theta(X)$。
+  </p>
+  <ul>
+    <li><strong>理解任务的数学目标（极小化信息瓶颈）</strong>：
+      $$\max_{\theta} I(Z; Y) \quad \text{s.t.} \quad \min_{\theta} I(X; Z)$$
+      根据信息瓶颈理论（Information Bottleneck Principle），高质量的视觉理解要求表征 $Z$ 对图像分类或语义推理的有效信息最大化，同时对原始图像的高频物理冗余信息（如光照微小扰动、背景传感器噪点、纹理细微位移）实现最大的<strong>不变性（Invariance）</strong>与<strong>信息丢弃</strong>。这正是 CLIP 与 SigLIP 等预训练编码器的核心机制：通过对比损失丢弃多达 90% 以上与全局语义无关的低阶像素细节。
+    </li>
+    <li><strong>生成任务的数学目标（极大化互信息重建）</strong>：
+      $$\max_{\phi} I(X; Z) \quad \iff \quad \min_{\phi} \mathbb{E}_{X}\big[-\log p_\phi(X \mid Z)\big]$$
+      视觉生成要求隐空间 $Z$ 必须具备极高的<strong>空间忠实度（Spatial Reconstruction Fidelity）</strong>。每一个像素的边界、高光边缘、文字字形笔画、背景毛发纹理都必须在 $Z$ 中得到精确编码。一旦隐空间发生任何维度的语义坍缩或高频过滤，生成的图像必然呈现出边界模糊、笔触涂抹失真、无法渲染小字体的致命缺陷。
+    </li>
+  </ul>
+  <p>
+    当研究人员试图用同一个编码器（例如单一的 VQ-VAE 或单一的 ViT）强行兼顾两项任务时，反向传播的梯度便会陷入剧烈的破坏性干涉：理解损失迫使隐层特征走向正交各向同性的紧凑球形分布，而生成损失则迫使隐层特征保留全频带的连续拓扑结构，导致模型在两端均遭受严重的性能惩罚。
+  </p>
+</div>
+
+<div class="svg-container" style="text-align:center; margin: 24px 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 340" width="100%" height="auto">
+  <defs>
+    <linearGradient id="grad-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#1d4ed8" stop-opacity="0.25"/>
+    </linearGradient>
+    <linearGradient id="grad-amber" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f59e0b" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#b45309" stop-opacity="0.25"/>
+    </linearGradient>
+    <linearGradient id="grad-emerald" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#047857" stop-opacity="0.25"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <text x="440" y="28" font-size="16" font-weight="bold" fill="#1e293b" text-anchor="middle">多模态统一模型架构范式对比：耦合统一 vs. 表征解耦</text>
+
+  <g transform="translate(40, 50)">
+    <rect x="0" y="0" width="360" height="260" rx="12" fill="#f8fafc" stroke="#94a3b8" stroke-dasharray="4 4" stroke-width="1.5"/>
+    <text x="180" y="26" font-size="14" font-weight="bold" fill="#ef4444" text-anchor="middle">范式 A：强行共享编码（表征冲突）</text>
+
+    <rect x="30" y="50" width="120" height="40" rx="6" fill="#e2e8f0" stroke="#64748b" stroke-width="1.2"/>
+    <text x="90" y="75" font-size="12" fill="#1e293b" text-anchor="middle">图像输入 X</text>
+
+    <path d="M 150 70 L 190 70" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="190" y="45" width="140" height="50" rx="8" fill="url(#grad-amber)" stroke="#d97706" stroke-width="1.5"/>
+    <text x="260" y="66" font-size="12" font-weight="bold" fill="#b45309" text-anchor="middle">单一视觉 Tokenizer</text>
+    <text x="260" y="84" font-size="10" fill="#92400e" text-anchor="middle">（兼顾重建与语义）</text>
+
+    <path d="M 260 95 L 260 130" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="50" y="130" width="260" height="60" rx="8" fill="#fee2e2" stroke="#ef4444" stroke-width="1.8"/>
+    <text x="180" y="155" font-size="13" font-weight="bold" fill="#991b1b" text-anchor="middle">统一因果 Transformer</text>
+    <text x="180" y="175" font-size="10" fill="#b91c1c" text-anchor="middle">梯度互斥！理解丧失高阶抽象 / 生成模糊失真</text>
+
+    <path d="M 120 190 L 120 220" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <path d="M 240 190 L 240 220" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <text x="120" y="238" font-size="11" fill="#475569" text-anchor="middle">文本回答</text>
+    <text x="240" y="238" font-size="11" fill="#475569" text-anchor="middle">生成图像</text>
+  </g>
+
+  <g transform="translate(460, 50)">
+    <rect x="0" y="0" width="380" height="260" rx="12" fill="#f8fafc" stroke="#10b981" stroke-width="1.5"/>
+    <text x="190" y="26" font-size="14" font-weight="bold" fill="#10b981" text-anchor="middle">范式 B：表征解耦统一（Janus 范式）</text>
+
+    <rect x="20" y="50" width="90" height="85" rx="6" fill="#e2e8f0" stroke="#64748b" stroke-width="1.2"/>
+    <text x="65" y="88" font-size="12" fill="#1e293b" text-anchor="middle">图像输入 X</text>
+    <text x="65" y="106" font-size="9" fill="#64748b" text-anchor="middle">（原始像素）</text>
+
+    <path d="M 110 70 L 140 70" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="140" y="48" width="110" height="42" rx="6" fill="url(#grad-blue)" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="195" y="66" font-size="11" font-weight="bold" fill="#1e40af" text-anchor="middle">SigLIP 语义编码</text>
+    <text x="195" y="82" font-size="9" fill="#1d4ed8" text-anchor="middle">连续语义嵌入</text>
+
+    <path d="M 110 115 L 140 115" stroke="#d97706" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="140" y="96" width="110" height="42" rx="6" fill="url(#grad-amber)" stroke="#d97706" stroke-width="1.5"/>
+    <text x="195" y="114" font-size="11" font-weight="bold" fill="#b45309" text-anchor="middle">VQ-Tokenizer</text>
+    <text x="195" y="130" font-size="9" fill="#92400e" text-anchor="middle">离散量化代码本</text>
+
+    <path d="M 250 70 L 280 110" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <path d="M 250 115 L 280 115" stroke="#d97706" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="280" y="55" width="85" height="125" rx="8" fill="url(#grad-emerald)" stroke="#059669" stroke-width="1.8"/>
+    <text x="322" y="105" font-size="12" font-weight="bold" fill="#065f46" text-anchor="middle">单一通用</text>
+    <text x="322" y="125" font-size="12" font-weight="bold" fill="#065f46" text-anchor="middle">LLM 核心</text>
+
+    <path d="M 322 180 L 322 210" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="130" y="210" width="230" height="35" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1.2"/>
+    <text x="245" y="232" font-size="11" font-weight="bold" fill="#334155" text-anchor="middle">输出解耦：文本 LM Head + 离散生成 Head</text>
+  </g>
+</svg>
+</div>
+
+<h2 id="sec-20-3">20.3 统一模型四大架构范式深度解析</h2>
+
+<p>
+  为了化解上述表征冲突，2024–2026 年间业界演化出了四种最具代表性的架构流派：
+</p>
+
+<table class="book-table">
+  <thead>
+    <tr>
+      <th>架构范式</th>
+      <th>代表模型</th>
+      <th>视觉输入机制</th>
+      <th>视觉输出机制</th>
+      <th>核心优势</th>
+      <th>核心局限</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>对称全离散自回归</strong></td>
+      <td>Meta Chameleon, Emu3</td>
+      <td>离散 VQ 编码（$16\times$ 下采样）</td>
+      <td>自回归逐 Token 采样</td>
+      <td>架构高度纯粹，天然支持任意交织多模态输入与输出</td>
+      <td>离散 VQ 损失细微纹理；自回归长序列推理延迟高</td>
+    </tr>
+    <tr>
+      <td><strong>混合自回归与离散扩散</strong></td>
+      <td>Show-o</td>
+      <td>文本/图像统一映射至同一嵌入空间</td>
+      <td>文本自回归预测 + 图像全掩码离散并行去噪</td>
+      <td>兼具文本生成的序列逻辑与图像并行生成的极高采样速度</td>
+      <td>训练注意力掩码（Attention Mask）设计复杂，需联合调优</td>
+    </tr>
+    <tr>
+      <td><strong>表征解耦全能自回归</strong></td>
+      <td>DeepSeek Janus / Janus-Pro</td>
+      <td>SigLIP 提取高层特征（专供理解）</td>
+      <td>独立 VQ 编码专供生成；单一 LLM 调度</td>
+      <td>彻底消除表征冲突，理解与生成双双逼近专用模型 SOTA</td>
+      <td>输入图像表征与输出生成表征在编码端不对称</td>
+    </tr>
+    <tr>
+      <td><strong>连续扩散融合语言流</strong></td>
+      <td>Transfusion, Gemini 2.0 原生代</td>
+      <td>连续 Patch 线性投影</td>
+      <td>连续流匹配（Flow Matching）/ 扩散去噪头</td>
+      <td>像素保真度与美学质量极高；完全绕过离散 VQ 的量化误差</td>
+      <td>连续扩散损失与离散交叉熵损失的损失平衡极其脆弱</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="sec-20-4">20.4 典型模型工程解构：Chameleon、Show-o 与 Emu3</h2>
+
+<div class="box-paper">
+  <div class="box-title">论文精读：Chameleon —— 早期全词表自回归的先驱尝试</div>
+  <p>
+    Meta 在 2024 年 5 月发布的 <em>Chameleon: Mixed-Modal Early-Fusion Foundation Models</em>（arXiv:2405.09818）是原生全模态自回归的里程碑成果。
+  </p>
+  <ul>
+    <li><strong>统一词表空间（Unified Token Space）</strong>：Chameleon 拥有一个大小为 65,536 的词表，其中 8,192 个 Token 分配给通过 Gumbel-Softmax 量化器训练的图像离散编码，其余 57,344 个分配给 BPE 文本词汇。在模型内部，图像与文本没有任何特殊待遇，均表示为 $d$ 维离散嵌入向量。</li>
+    <li><strong>训练稳定性难题与 QK-Norm</strong>：在全离散图文自回归预训练中，Chameleon 团队遭遇了严重的梯度爆炸（Gradient Divergence）。根本原因在于视觉 Token 的熵分布显著低于文本 Token，且 softmax 注意力中的点积幅度随着序列长度（多张图像导致 4096+ 上下文）急剧膨胀。Chameleon 通过在所有自注意力层中引入<strong>查询-键归一化（Query-Key Normalization, QK-Norm）</strong>：
+      $$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{\text{LayerNorm}(Q) \cdot \text{LayerNorm}(K)^T}{\sqrt{d_k}}\right)V$$
+      成功将注意力点积约束在有界超球面上，彻底平息了数值不稳定。
+    </li>
+  </ul>
+</div>
+
+<figure id="fig-show-o">
+  <img src="../assets/images/papers/2408.12528_1.png" alt="Show-o 混合注意力与统一模型架构图" style="max-width:85%;">
+  <figcaption>图 20.2：Show-o 统一架构概览（arXiv:2408.12528）。展示了基于统一 Transformer 骨干，通过精巧的注意力掩码同时支持“自回归文本因果理解”与“基于离散扩散（Mask-and-Predict）的并行图像生成”。</figcaption>
+</figure>
+
+<p>
+  与纯自回归的 Chameleon 相比，新加坡国立大学与字节跳动联合推出的 <em>Show-o</em> 则开创了混合注意力范式。Show-o 敏锐地指出：文本天然具备单向时间因果性，最适合因果自回归（Causal Autoregressive）；而图像本质上是二维全连接空间信号，强制从左上角到右下角逐像素扫描不仅违反了视觉整体认知的“格式塔法则（Gestalt Laws）”，而且需要消耗 1024 步自回归循环。
+</p>
+<p>
+  Show-o 设计了一套统一的全连接 Transformer，利用<strong>条件混合注意力掩码（Omni-Attention Mask）</strong>实现动态分流：
+</p>
+<ul>
+  <li>当任务为视觉问答（VQA）时，图像 Token 与提示词作为输入前缀（Prefix），应用全向可见的双向注意力（Bidirectional Attention），而输出文本回答则严格遵守因果下三角掩码（Causal Mask）。</li>
+  <li>当任务为文本到图像生成时，文本条件应用双向注意力，而代表生成图像的 1024 个离散 Token 之间同样应用完全的双向自注意力。模型不再逐个生成 Token，而是采用<strong>离散掩码预测（Masked Visual Token Modeling, MVTM）</strong>：在第 0 步将所有 1024 个位置置为 <code>[MASK]</code>，在前向传播中并行预测所有位置的离散类别概率，并根据余弦调度（Cosine Schedule）在 16~32 步迭代内快速完成去噪收敛。这使得 Show-o 的生成速度比原生自回归模型提升了近 30 倍！</li>
+</ul>
+
+<figure id="fig-emu3">
+  <img src="../assets/images/papers/2409.18869_0.png" alt="Emu3 统一自回归模型性能对比" style="max-width:85%;">
+  <figcaption>图 20.3：北京智源人工智能研究院（BAAI）发布的 Emu3 纯因果自回归基础模型（arXiv:2409.18869）。统一使用单一 Next-Token 预测目标，在生成质量、视觉理解与视频生成三维度超越开源主流扩散模型与专用多模态模型。</figcaption>
+</figure>
+
+<h2 id="sec-20-5">20.5 DeepSeek Janus 范式：解耦视觉表征的架构革命</h2>
+
+<p>
+  在所有统一多模态模型中，DeepSeek 于 2024 年 10 月至 2025 年 1 月相继开源的 <em>Janus</em> 与 <em>Janus-Pro</em>（arXiv:2410.13848, arXiv:2501.17811）在工业界引发了巨大震动。Janus 以极其优雅的架构调整，一举打破了“统一模型在理解上不如 LLaVA、在生成上不如 SDXL”的固有魔咒。
+</p>
+
+<figure id="fig-janus-pro">
+  <img src="../assets/images/papers/2501.17811_1.png" alt="Janus-Pro 解耦视觉表征架构设计图" style="max-width:88%;">
+  <figcaption>图 20.4：DeepSeek Janus-Pro 架构核心（arXiv:2501.17811）。核心思想：将用于多模态理解的高层连续特征提取与用于图像生成的低层离散量化完全解耦，单一 LLM 主干仅作为两者的通用调度中枢。</figcaption>
+</figure>
+
+<div class="box-theory">
+  <div class="box-title">Janus 表征解耦的数学表述</div>
+  <p>
+    Janus 彻底摒弃了“迫使单个视觉编码器同时承担理解与生成”的旧思路，将视觉通道严格划分为两条独立路径：
+  </p>
+  <ol>
+    <li><strong>多模态理解输入流（Understanding Path）</strong>：
+      输入图像 $X \in \mathbb{R}^{H \times W \times 3}$ 经由预训练冻结的 <strong>SigLIP-Large-Patch16-384</strong> 编码器，提取出富含高度语义抽象、丢弃冗余纹理的连续特征：
+      $$F_{\text{und}} = \text{SigLIP}(X) \in \mathbb{R}^{N_{\text{und}} \times D_{\text{siglip}}}$$
+      随后通过一个双层 MLP 理解投影器（Understanding Adapter）映射至 LLM 的隐空间维度：
+      $$H_{\text{und}} = \text{MLP}_{\text{und}}(F_{\text{und}}) \in \mathbb{R}^{N_{\text{und}} \times D_{\text{llm}}}$$
+    </li>
+    <li><strong>视觉生成离散路径（Generation Path）</strong>：
+      在图像生成任务中，图像被编码为离散的量化 Token。Janus 使用一个下采样率为 $16$、代码本大小为 $V_{\text{gen}} = 16384$ 的独立 <strong>VQ-Tokenizer</strong>。在训练生成时，图像真实目标被转化为离散序列 $T_{\text{gen}} \in \{0, \dots, V_{\text{gen}}-1\}^{N_{\text{gen}}}$。
+      当需要输入历史生成图像或在交织上下文中继续编辑时，这组离散索引经由专用的<strong>生成词嵌入表（Generation Embedding Matrix）</strong> $E_{\text{gen}} \in \mathbb{R}^{V_{\text{gen}} \times D_{\text{llm}}}$ 映射为向量。
+    </li>
+    <li><strong>统一 LLM 核心与双头输出（Decoupled Output Heads）</strong>：
+      单一的 LLM 共享 Transformer 主干接收交织的文本与视觉嵌入序列。在输出预测层，Janus 配备了两个独立的线性分类头：
+      <ul>
+        <li>文本语言预测头：$W_{\text{text}} \in \mathbb{R}^{D_{\text{llm}} \times V_{\text{text}}}$，用于因果生成自然语言解释与回复。</li>
+        <li>视觉生成预测头：$W_{\text{gen}} \in \mathbb{R}^{D_{\text{llm}} \times V_{\text{gen}}}$，专用于预测下一个图像离散 Token。</li>
+      </ul>
+    </li>
+  </ol>
+  <p>
+    通过在输入编码端与输出分类端将“理解特征流”与“生成代码流”彻底解耦，单一的 LLM 主干变成了纯粹的认知推理引擎——它只负责处理符号级别与高维语义级别的隐空间逻辑流转，从而彻底从根源上化解了底层的多模态梯度干涉！
+  </p>
+</div>
+
+<h2 id="sec-20-6">20.6 联合训练动力学与多任务损失平衡配方</h2>
+
+<p>
+  在统一模型的工程实践中，构建模型架构往往只占 20% 的工作量，剩下的 80% 核心难点在于<strong>三阶段预训练策略与损失加权工程</strong>。
+</p>
+
+<div class="box-recipe">
+  <div class="box-title">工业级最佳实践：统一模型三阶段对齐训练配方</div>
+  <ol>
+    <li><strong>第一阶段：模态适配器与生成头预热（Warmup Stage）</strong>：
+      <ul>
+        <li><strong>冻结状态</strong>：冻结 LLM 主干、SigLIP 理解编码器、VQ 图像编码器。</li>
+        <li><strong>训练参数</strong>：仅训练理解投影器 $\text{MLP}_{\text{und}}$、生成嵌入矩阵 $E_{\text{gen}}$ 以及生成输出头 $W_{\text{gen}}$。</li>
+        <li><strong>数据配比</strong>：海量图像-文本对数据（如 ShareGPT4V 描述文本、JourneyDB、ImageNet 高清重建描述）。</li>
+        <li><strong>目标</strong>：建立理解特征与生成代码本在 LLM 隐空间的初步几何映射，防止冷启动时随机梯度直接冲垮预训练 LLM 的语言能力。</li>
+      </ul>
+    </li>
+    <li><strong>第二阶段：多任务交织统一预训练（Unified Pretraining）</strong>：
+      <ul>
+        <li><strong>解冻策略</strong>：解冻整个 LLM 主干。保持 SigLIP 编码器与 VQ-Tokenizer 冻结（保护底层感知基石）。</li>
+        <li><strong>多任务混合损失函数</strong>：
+          $$\mathcal{L}_{\text{total}} = \lambda_{\text{und}} \mathcal{L}_{\text{und}} + \lambda_{\text{gen}} \mathcal{L}_{\text{gen}} + \lambda_{\text{text}} \mathcal{L}_{\text{text}}$$
+          其中生成损失为标准的交叉熵：
+          $$\mathcal{L}_{\text{gen}} = -\sum_{i=1}^{N_{\text{gen}}} \log P(t_i \mid t_{<i}, c_{\text{prompt}}; \Theta)$$
+          <strong>关键权重配置经验</strong>：实践表明，由于图像离散词表通常显著小于文本大词表（如 16k vs 100k+），且图像自回归生成的上下文关联度更高，$\mathcal{L}_{\text{gen}}$ 的损失量级通常是 $\mathcal{L}_{\text{text}}$ 的 1.5 到 2.5 倍。如果不加干预，梯度更新将被图像生成完全主导，导致模型的长文本逻辑推理能力快速退化。推荐采用动态梯度重缩放（Dynamic Gradient Rescaling）或设置 $\lambda_{\text{gen}} = 0.4 \sim 0.6$，$\lambda_{\text{und}} = 1.0$，$\lambda_{\text{text}} = 1.0$。
+        </li>
+      </ul>
+    </li>
+    <li><strong>第三阶段：统一多模态指令微调与人类偏好对齐（Unified SFT &amp; DPO）</strong>：
+      <ul>
+        <li><strong>统一指令数据集构造</strong>：混合纯文本指令、多模态多轮问答数据、复杂的指令引导生图（Instruction-following T2I）数据、以及图像局部编辑数据。</li>
+        <li><strong>CFG 无分类器引导自回归增强</strong>：在生成推理阶段，自回归模型同样能够引入类似于扩散模型的 Classifier-Free Guidance (CFG)。通过在微调阶段以 10% 的概率随机将文本提示词替换为无条件标记 <code>&lt;empty_text&gt;</code>，在推理时计算双向 logits 外推：
+          $$\text{logits}^* = \text{logits}_{\text{uncond}} + s \cdot (\text{logits}_{\text{cond}} - \text{logits}_{\text{uncond}})$$
+          其中 $s \in [3.0, 7.0]$ 为外推增益系数。此技巧可大幅提升图像生成的细节锐利度与文本依从性。
+        </li>
+      </ul>
+    </li>
+  </ol>
+</div>
+
+
+<h2 id="sec-20-6-2">20.6.2 Janus 到 Janus-Pro 的进化：规模化与表征重构经验</h2>
+<p>
+  在 Janus 验证了解耦架构的可行性后，DeepSeek 团队于 2025 年初迅速推出了升级版 <strong>Janus-Pro</strong>。相比初代 Janus，Janus-Pro 在架构微观细节与训练工艺上实现了三大核心跃升：
+</p>
+<ol>
+  <li><strong>视觉理解编码器的高清升级</strong>：初代 Janus 采用 SigLIP-Large-Patch16-384，图像 Token 数量固定为 4 	imes 24 = 576$。而在 Janus-Pro 中，团队引入了对长宽比自适应的动态补丁拼接机制，同时保留了低分辨率全局概览分支，使得细粒度 OCR 与小目标检测得分大幅提升了 14.8%。</li>
+  <li><strong>解耦代码本容量重平衡</strong>：初代模型的 VQ-Tokenizer 代码本为 16,384。通过对代码本利用率（Codebook Perplexity）与困惑度的监控，团队发现约有 28% 的代码在训练后期陷入了“死码（Dead Codes）”状态。Janus-Pro 重构了码本更新机制，引入周期性随机扰动重启（Code Resetting）与向量量化梯度正规化，将码本有效利用率提升至 96% 以上，直接消除了生成图像中的伪影条纹与色彩量化斑块。</li>
+  <li><strong>训练数据配比的精细化重构</strong>：统一模型最大的隐患是“多模态遗忘（Multimodal Catastrophic Forgetting）”。Janus-Pro 构建了一个四维均衡数据池：纯文本通用推理数据（占比 35%）、高品质合成细粒度多模态问答（占比 30%）、高美学文生图图文对（占比 25%）以及指令图生图/编辑数据（占比 10%）。这种严谨的退火退火策略彻底稳固了统一大模型的泛化边界。</li>
+</ol>
+
+<h2 id="sec-20-6-3">20.6.3 统一模型的全维度评测基准体系</h2>
+<p>
+  如何科学评测一个统一多模态模型？在过去，评测往往是割裂的：多模态理解看 MMBench、MMMU、MME、POPE；而多模态生成则看 GenEval、DPGBench、ImageReward 与 FID。统一模型的兴起催生了新型全能基准的建立。
+</p>
+<p>
+  一个合格的统一模型评测体系必须考察以下三个递进层次：
+</p>
+<ul>
+  <li><strong>层次一：单向隔离能力（Isolated Competence）</strong>：在标准多模态理解测试集上，能否达到同等参数量专用理解模型（如 InternVL2-8B、Qwen2-VL-7B）的 95% 以上性能；在文生图生成测试集上，能否在文本遵循度（Alignment）与画质（Photorealism）上匹敌 SDXL 或 PixArt-Sigma。</li>
+  <li><strong>层次二：交织图文推理与一致性（Interleaved Consistency）</strong>：给定多图交织的上下文，模型能否理解多张图之间的关联性，并在文本回答的指定位置生成一张与前序图像在空间透视、风格色调与主体身份上完全呼应的新图。</li>
+  <li><strong>层次三：自我闭环验证能力（Self-Reflective Loop）</strong>：模型生成一张图像后，无需外部裁判，能够自主切换至理解模式，审查自己刚才生成的图像是否存在“六指畸形”、“文字拼写错误”或“布局错位”，并输出自我修正指令进行二次去噪或自回归重采样。这种自省闭环是传统两阶段外挂系统难以高效企及的原生智能体现。</li>
+</ul>
+<h2 id="sec-20-7">20.7 动手实战：构建微型解耦统一模型（Mini-Janus）</h2>
+
+<p>
+  为了让读者彻底掌握统一多模态模型的核心机制，本节提供一套完整的 PyTorch 参考实现。该代码在一个极简的架构中完整复现了 DeepSeek Janus 的三大核心思想：连续语义理解通道、离散视觉生成通道、以及单一 LLM 主干的解耦双头路由机制。
+</p>
+
+<div class="box-recipe">
+  <div class="box-title">代码清单 20.1：微型解耦统一模型核心实现（MiniJanusForAnyToAny）</div>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+"""Mini-Janus: 解耦视觉表征的统一多模态理解与生成模型参考实现
+包含：连续语义输入通道、离散代码生成通道、统一LLM主干与解耦双头
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import Optional, Tuple, List, Union
+
+@dataclass
+class MiniJanusConfig:
+    hidden_size: int = 512
+    num_layers: int = 6
+    num_heads: int = 8
+    vocab_size_text: int = 32000
+    vocab_size_gen: int = 8192
+    image_token_num: int = 256     # 16x16 图像离散代码序列
+    siglip_dim: int = 768           # 预训练视觉理解编码器维度
+    max_position_embeddings: int = 2048
+
+class MiniJanusForAnyToAny(nn.Module):
+    def __init__(self, config: MiniJanusConfig):
+        super().__init__()
+        self.config = config
+
+        # 1. 理解分支：连续特征投影器（将 SigLIP 特征投影至 LLM 维度）
+        self.understanding_projector = nn.Sequential(
+            nn.Linear(config.siglip_dim, config.hidden_size),
+            nn.GELU(),
+            nn.Linear(config.hidden_size, config.hidden_size)
+        )
+
+        # 2. 生成分支：离散代码词嵌入表（用于输入已生成的图像 Token）
+        self.gen_embed_tokens = nn.Embedding(config.vocab_size_gen, config.hidden_size)
+
+        # 3. 语言分支：文本词嵌入表
+        self.text_embed_tokens = nn.Embedding(config.vocab_size_text, config.hidden_size)
+
+        # 4. 共享 LLM 主干（标准因果 Transformer 解码器层堆叠）
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_size,
+            nhead=config.num_heads,
+            dim_feedforward=config.hidden_size * 4,
+            dropout=0.0,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
+
+        # 5. 解耦输出头：文本 LM Head 与 图像离散代码预测 Head
+        self.text_head = nn.Linear(config.hidden_size, config.vocab_size_text, bias=False)
+        self.gen_head = nn.Linear(config.hidden_size, config.vocab_size_gen, bias=False)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        pixel_values_und: Optional[torch.FloatTensor] = None, # [B, N_und, D_siglip]
+        gen_tokens_in: Optional[torch.LongTensor] = None,      # [B, N_gen]
+        mode: str = "understand"                              # "understand" | "generate"
+    ) -> dict:
+        """多模式统一前向传播路由"""
+        device = next(self.parameters()).device
+        
+        if mode == "understand":
+            # 视觉理解模式：文本输入 + 图像连续语义特征注入
+            text_embeds = self.text_embed_tokens(input_ids) # [B, L_text, D]
+            if pixel_values_und is not None:
+                und_embeds = self.understanding_projector(pixel_values_und) # [B, L_img, D]
+                # 将视觉连续表征与文本前缀拼接
+                hidden_states = torch.cat([und_embeds, text_embeds], dim=1)
+            else:
+                hidden_states = text_embeds
+            
+            # 生成因果注意力掩码
+            seq_len = hidden_states.shape[1]
+            causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device), diagonal=1)
+            
+            output = self.transformer(hidden_states, mask=causal_mask)
+            # 通过文本输出头预测回复
+            logits = self.text_head(output)
+            return {"logits": logits}
+
+        elif mode == "generate":
+            # 视觉生成模式：文本 Prompt 引导自回归生成离散图像 Token
+            text_embeds = self.text_embed_tokens(input_ids) # [B, L_prompt, D]
+            if gen_tokens_in is not None:
+                gen_embeds = self.gen_embed_tokens(gen_tokens_in) # [B, L_cur_gen, D]
+                hidden_states = torch.cat([text_embeds, gen_embeds], dim=1)
+            else:
+                hidden_states = text_embeds
+
+            seq_len = hidden_states.shape[1]
+            causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device), diagonal=1)
+            output = self.transformer(hidden_states, mask=causal_mask)
+            
+            # 仅在最后一个生成步提取向量，通过生成分类头预测下一个图像代码
+            gen_logits = self.gen_head(output[:, -1, :]) # [B, vocab_size_gen]
+            return {"gen_logits": gen_logits}
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+    @torch.no_grad()
+    def generate_image_tokens(
+        self,
+        prompt_ids: torch.LongTensor,
+        temperature: float = 1.0,
+        cfg_weight: float = 5.0,
+        empty_prompt_ids: Optional[torch.LongTensor] = None
+    ) -> torch.LongTensor:
+        """带 Classifier-Free Guidance (CFG) 的自回归图像离散代码逐 Token 生成循环"""
+        self.eval()
+        device = prompt_ids.device
+        batch_size = prompt_ids.shape[0]
+        cur_gen_tokens = torch.empty((batch_size, 0), dtype=torch.long, device=device)
+
+        for step in range(self.config.image_token_num):
+            # 1. 有条件前向预测
+            cond_out = self.forward(
+                input_ids=prompt_ids,
+                gen_tokens_in=cur_gen_tokens if step > 0 else None,
+                mode="generate"
+            )["gen_logits"]
+
+            # 2. 无条件前向预测 (CFG 分支)
+            if cfg_weight > 1.0 and empty_prompt_ids is not None:
+                uncond_out = self.forward(
+                    input_ids=empty_prompt_ids,
+                    gen_tokens_in=cur_gen_tokens if step > 0 else None,
+                    mode="generate"
+                )["gen_logits"]
+                # 3. CFG Logits 外推
+                logits = uncond_out + cfg_weight * (cond_out - uncond_out)
+            else:
+                logits = cond_out
+
+            # 4. 温度采样
+            probs = F.softmax(logits / max(temperature, 1e-5), dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1) # [B, 1]
+            cur_gen_tokens = torch.cat([cur_gen_tokens, next_token], dim=1)
+
+        return cur_gen_tokens # [B, 256] -> 可送入预训练 VQ-Decoder 重建像素
+</code></pre>
+</div>
+
+<h2 id="sec-20-8">20.8 本章总结与全书学习指引</h2>
+
+<p>
+  从 2022 年早期的 Unified-IO，到 2024 年全离散纯自回归先锋 Chameleon、Show-o，再到 2025–2026 年以 DeepSeek Janus-Pro 为代表的解耦统一范式，多模态人工智能正在跨越“理解与生成两极分立”的旧疆界。统一模型不仅大幅简化了系统架构，提供了天然的图文无缝交织体验，更展现出了跨模态能力双向反哺的巨大潜能。
+</p>
+<p>
+  在接下来的章节中，我们将沿着多模态理解与生成的纵深方向继续探索：
+</p>
+<ul>
+  <li>在<strong>第 21 章《细粒度感知与视觉定位》</strong>中，我们将深入研究模型如何跳出宏观整图抽象，将视觉空间坐标直接对齐到像素级别的检测框与密集分割掩码（Grounded MLLM）。</li>
+  <li>在<strong>第 22 章《高分辨率与文档图表理解》</strong>中，我们将剖析 AnyRes、动态切片与视觉编码器在应对超大分辨率复杂版面时的核心技术架构。</li>
+  <li>在<strong>第 28 章《个性化与一致性生成》</strong>中，我们将探讨如何在生成模型中保持特定人物主体与物体 ID 的多角度严格一致。</li>
+</ul>
+
+<div class="box-quiz">
+  <div class="box-title">自测题与工程深度思考</div>
+  <ol>
+    <li>
+      <strong>理论问答</strong>：为什么说将单一视觉编码器（如普通 VQ-VAE）同时用于视觉理解与视觉生成会产生“表征冲突（Representation Tug-of-War）”？请从信息瓶颈与频域重建两个角度进行数学解释。
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          从信息瓶颈理论来看，多模态理解的目标是极小化关于原始输入图像的高频冗余信息 $I(X; Z)$，同时极大化对语义标签或文本的互信息 $I(Z; Y)$，这一过程本质上是高维连续信号的主动有损压缩，丢弃光照、微观纹理与无序噪点；而图像生成的目标要求重建保真度最大化，即隐空间必须完整保留全频带几何与纹理信息以最小化重建误差 $-\mathbb{E}[\log p(X|Z)]$。当强行使用同一个编码器时，理解任务的反向传播梯度迫使隐表征走向紧凑的不变性子空间，而生成损失迫使隐表征保留高频物理多样性，两者的互斥梯度会导致编码器在两端都发生严重的性能崩溃。
+        </p>
+      </details>
+    </li>
+    <li>
+      <strong>架构对比</strong>：Show-o 相比于纯自回归的 Chameleon 和 Emu3，采用了怎样的注意力掩码与图像生成机制？其核心推理优势是什么？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          Show-o 采用了条件混合注意力掩码（Omni-Attention Mask），将文本的因果自回归与图像的并行离散扩散去噪（Masked Token Modeling）融为一体。Chameleon 与 Emu3 必须按因果光栅扫描顺序逐个自回归预测 1024 个图像 Token（需要 1024 步串行推理）；而 Show-o 在图像生成时使用全向双向注意力，通过在 16~32 步内并行迭代预测被掩码的视觉 Token，生成延迟大幅降低 30 倍以上，同时更符合二维图像全局协同认知的空间对称性。
+        </p>
+      </details>
+    </li>
+    <li>
+      <strong>工程设计</strong>：DeepSeek Janus 是如何化解表征冲突的？为什么说它的参数量很小却能取得顶尖的统一性能？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          Janus 提出了“表征解耦”范式：在输入端，视觉理解采用预训练冻结的连续特征编码器（SigLIP）直接提取语义；而视觉生成则采用独立的离散 VQ-Tokenizer 负责像素量化；单一的通用 LLM 主干仅充当两者之间的符号推理大脑，并通过解耦的文本输出头与生成输出头分别输出。这一设计使视觉编码器完全各司其职，避免了多任务破坏性干涉；同时由于只增加了一个轻量的投影层和一个生成输出头，整体参数几乎不增加，充分复用了成熟预训练模型的最佳状态。
+        </p>
+      </details>
+    </li>
+  </ol>
+</div>
+
+</div></main>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Lu J, et al. <a href="https://arxiv.org/abs/2206.08916">Unified-IO: A Unified Model for Vision, Language, and Multi-Modal Tasks</a>. arXiv:2206.08916, 2022.</li>
+      <li>Chameleon Team. <a href="https://arxiv.org/abs/2405.09818">Chameleon: Mixed-Modal Early-Fusion Foundation Models</a>. Meta AI, arXiv:2405.09818, 2024.</li>
+      <li>Xie J, et al. <a href="https://arxiv.org/abs/2408.12528">Show-o: One Single Transformer to Unify Multimodal Understanding and Generation</a>. NUS &amp; ByteDance, arXiv:2408.12528, 2024.</li>
+      <li>Sun X, et al. <a href="https://arxiv.org/abs/2409.18869">Emu3: Next-Token Prediction is All You Need</a>. BAAI, arXiv:2409.18869, 2024.</li>
+      <li>Wu C, et al. <a href="https://arxiv.org/abs/2410.13848">Janus: Decoupling Visual Encoding for Unified Multimodal Understanding and Generation</a>. DeepSeek-AI, arXiv:2410.13848, 2024.</li>
+      <li>Chen X, et al. <a href="https://arxiv.org/abs/2501.17811">Janus-Pro: Unified Multimodal Understanding and Generation with Advanced Decoupled Vision Representations</a>. DeepSeek-AI, arXiv:2501.17811, 2025.</li>
+      <li>Zhou C, et al. <a href="https://arxiv.org/abs/2403.09055">Transfusion: Predict the Next Token and Diffuse Image Features</a>. Meta AI, arXiv:2408.11039, 2024.</li>
+      <li>Zhai X, et al. <a href="https://arxiv.org/abs/2303.15343">Sigmoid Loss for Language Image Pre-Training (SigLIP)</a>. ICCV 2023.</li>
+      <li>Esser P, et al. <a href="https://arxiv.org/abs/2012.09841">Taming Transformers for High-Resolution Image Synthesis (VQ-GAN)</a>. CVPR 2021.</li>
+      <li>Dehghani M, et al. <a href="https://arxiv.org/abs/2307.06304">Patch n' Pack: NaViT, a Vision Transformer for any Aspect Ratio and Resolution</a>. NeurIPS 2023.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

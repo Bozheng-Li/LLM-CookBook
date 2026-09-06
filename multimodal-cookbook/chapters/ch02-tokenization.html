@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 2 章 Tokenization：文本 BPE 与视觉 Token 化 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第一部分 · 基础篇：单模态基石</div>
+  <h1 class="chapter-title">第 2 章　Tokenization：文本 BPE 与视觉 Token 化</h1>
+  <div class="chapter-meta"><span>预计阅读 80 分钟</span><span>难度 ★★☆☆☆</span><span>前置：无</span></div>
+</header>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>Transformer 只认识一种输入：<b>token 序列</b>。无论是英文句子、中文段落，还是一张 1024×1024 的图片，进入模型之前都必须被切成一串离散符号并映射为向量。这一步远比它看起来重要：文本侧，BPE 词表决定了中文/代码/数学公式的"计费单价"与模型拼写能力；多模态侧，"一张图值多少 token"直接决定了上下文预算、显存占用与训练成本——一张高分辨率图动辄上千个视觉 token，相当于几千字的文章。本章前半程把文本 tokenization 讲透（BPE 完整手工演算、WordPiece/Unigram/SentencePiece、特殊 token 与聊天模板），后半程给出视觉 token 化的两大路线：<b>连续路线</b>（ViT patch embedding，主流 VLM 采用）与<b>离散路线</b>（VQ-VAE/VQGAN 视觉词表，Chameleon、Emu3 等原生多模态模型采用），并用统一公式估算任意配置下的图像 token 数。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>为什么要有 Tokenization：词、字符与子词的三难权衡</h2>
+<p>把文本变成符号序列有三种朴素方案，各有致命缺陷：</p>
+<p><b>按词切分</b>：词表需要覆盖所有词。英语有数百万低频词与变体（<code>tokenization</code>/<code>tokenizing</code>），中文分词本身是难题；更糟的是新词（人名、网络用语、代码标识符）不断出现，导致词表外（Out-of-Vocabulary, OOV）问题——OOV 词只能丢弃或映射为 <code>[UNK]</code>，信息直接丢失。词表大到百万级时，embedding 矩阵（$|V| \times d$）也吃掉海量参数。</p>
+<p><b>按字符切分</b>：序列无限延长。一个英文单词平均 5 字符、一段中文每字一个符号，1024 token 的上下文只装得下一两百个词——自注意力的 $O(L^2)$ 复杂度让长序列代价高昂；而且单字符语义太弱，模型需要更多层数才能"拼出"词义。</p>
+<p><b>子词切分（Subword）</b>：折中方案——高频词保持完整（<code>the</code>、<code>的</code>），低频词拆成有意义的部件（<code>tokenization → token + ization</code>），任何新词都能被部件覆盖，序列长度适中。这就是现代 LLM 的共同选择，其两个代表算法 BPE 与 Unigram 都源自 1994 年 Gage 提出的 BPE 压缩思想在 NLP 的复兴（Sennrich et al., ACL 2016，arXiv:1508.07909，首次用于机器翻译）。</p>
+<p>一个容易被忽视的事实是：tokenization 的"质量"是<b>模型能力的隐性上限</b>。GPT-2 时代词表几乎不含中文 token，一个汉字被拆成 3 个 UTF-8 字节 token，同样的中文内容计费与上下文开销是英文的数倍；早期 LLM "不会数 strawberry 里有几个 r"，部分原因正是它看到的不是字母而是合并后的 token。2024 年后主流开源模型词表普遍扩到 100K–256K（LLaMA-3 约 128K、Qwen 约 152K），中文与代码的压缩率显著改善。</p>
+
+<div class="box-history"><p class="box-title">🕰 历史一刻：从数据压缩到神经网络输入</p>
+<p>BPE（Byte Pair Encoding）1994 年由 Philip Gage 发表在 <i>A New Algorithm for Data Compression</i>，本是给文本压缩用的：反复把最频繁出现的字节对替换成新符号。2015–2016 年，Rico Sennrich 等人把它搬进神经机器翻译（arXiv:1508.07909），一举解决 OOV；2019 年 GPT-2 用<b>字节级</b> BPE（先按 UTF-8 字节表示一切文本）彻底消灭了 OOV。同一条"最频繁对合并"的算法，三十年来从压缩工具变成所有 LLM 的输入接口，最后又扩展到视觉——第 7 节你会看到，Chameleon 连图片都是用 BPE 思想"合并"出来的。</p></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>BPE 完整算法与手工演算</h2>
+<h3 id="sec-2-1">2.1 训练算法：两行循环</h3>
+<p>BPE 训练只做一件事：<b>统计当前语料中最频繁的相邻符号对，把它合并成一个新符号，重复</b>。形式化：给定词频词典 $\{w_i: c_i\}$（先把每个词拆成字符序列），重复以下步骤直到词表达到目标大小：</p>
+<div class="math-block">$$\text{(1) 统计：} \mathrm{count}(a,b) = \sum_{i} c_i \cdot n_i(a,b) \quad\text{（$n_i$ 为词 $w_i$ 中相邻对 $(a,b)$ 的出现次数）}$$
+$$\text{(2) 合并：} a^* , b^* = \arg\max_{(a,b)} \mathrm{count}(a,b) \;\Rightarrow\; \text{新建符号 } z = a^*b^*, \text{替换语料中所有出现}$$</div>
+<p>训练产物是两部分：<b>词表</b>（基础字符 + 所有合并产生的符号）与<b>合并规则表</b>（按学习顺序排列）。推理（encode）时新词必须按<b>训练时学到规则的顺序</b>逐条应用合并——顺序本身就是规则的一部分。</p>
+<h3 id="sec-2-2">2.2 手工演算：四个词训出一个小词表</h3>
+<p>用 Sennrich 论文的经典例子完整演算。语料（词尾加结束符 <code>&lt;/w&gt;</code> 以区分词中与词尾形态）：<code>low×5, lower×2, newest×6, widest×3</code>。初始拆分与相邻对统计：</p>
+<div class="tbl-wrap"><table>
+<caption>表 2-1　BPE 手工演算：初始语料、合并过程与编码结果</caption>
+<thead><tr><th>轮次</th><th>最高频相邻对（频次）</th><th>合并后语料状态</th></tr></thead>
+<tbody>
+<tr><td>初始</td><td>—</td><td>l o w &lt;/w&gt; ×5；l o w e r &lt;/w&gt; ×2；n e w e s t &lt;/w&gt; ×6；w i d e s t &lt;/w&gt; ×3</td></tr>
+<tr><td>合并 1</td><td>(e,s) → 9（与 (s,t)、(t,&lt;/w&gt;) 并列 9，平局任意打破）</td><td>n e w <b>es</b> t；w i d <b>es</b> t（low 系不变）</td></tr>
+<tr><td>合并 2</td><td>(es,t) → 9</td><td>n e w <b>est</b>；w i d <b>est</b></td></tr>
+<tr><td>合并 3</td><td>(est,&lt;/w&gt;) → 9（newest 6 次 + widest 3 次；词尾位置才出现）</td><td>n e w <b>est&lt;/w&gt;</b>；w i d <b>est&lt;/w&gt;</b>——注意 <code>widest</code> 中的 w 与 est 不相邻（隔着 i d），不会被误合并</td></tr>
+<tr><td>合并 4</td><td>(l,o) → 7（low 5 + lower 2）</td><td><b>lo</b> w；<b>lo</b> w e r</td></tr>
+<tr><td>合并 5</td><td>(lo,w) → 7</td><td><b>low</b>；<b>low</b> e r</td></tr>
+</tbody></table></div>
+<p>五轮之后词表包含基础字符、<code>&lt;/w&gt;</code> 与 <code>es, est, est&lt;/w&gt;, lo, low</code>。现在看推理：编码训练集内的 <code>newest</code> 得到 <code>n e w est</code>；编码<b>从未见过</b>的 <code>lowest</code>：按规则顺序应用——(e,s)→es、(es,t)→est、(l,o)→lo、(lo,w)→low——得到 <code>low est</code>；编码 <code>slowest</code> 得到 <code>s low est</code>。OOV 问题被部件化解决：这就是 BPE 的全部魔力。值得留意合并 3 的"词尾感知"：<code>(est,&lt;/w&gt;)</code> 只在词尾位置成对，频次统计天然区分了词中与词尾形态；而机械的频次统计完全不管语义——LLM 偶尔在拼写类任务上出错（如数字切片不等长、字母计数），根源都能追到这类切片行为。</p>
+
+<figure><svg viewBox="0 0 760 340" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <defs><marker id="arrB" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">BPE 合并过程：每轮把最高频相邻对合并为新符号（以 newest / widest 为例）</text>
+  <g font-family="sans-serif">
+    <!-- row 0: 初始 -->
+    <text x="20" y="66" fill="#334155" font-size="13">初始</text>
+    <g fill="#f8fafc" stroke="#94a3b8">
+      <rect x="90" y="48" width="26" height="26" rx="5"/><rect x="120" y="48" width="26" height="26" rx="5"/><rect x="150" y="48" width="26" height="26" rx="5"/><rect x="180" y="48" width="26" height="26" rx="5"/><rect x="210" y="48" width="26" height="26" rx="5"/><rect x="240" y="48" width="26" height="26" rx="5"/><rect x="270" y="48" width="44" height="26" rx="5"/>
+      <rect x="400" y="48" width="26" height="26" rx="5"/><rect x="430" y="48" width="26" height="26" rx="5"/><rect x="460" y="48" width="26" height="26" rx="5"/><rect x="490" y="48" width="26" height="26" rx="5"/><rect x="520" y="48" width="26" height="26" rx="5"/><rect x="550" y="48" width="26" height="26" rx="5"/><rect x="580" y="48" width="44" height="26" rx="5"/>
+    </g>
+    <g fill="#1e293b" font-size="13" text-anchor="middle">
+      <text x="103" y="66">n</text><text x="133" y="66">e</text><text x="163" y="66">w</text><text x="193" y="66">e</text><text x="223" y="66">s</text><text x="253" y="66">t</text><text x="292" y="66">&lt;/w&gt;</text>
+      <text x="413" y="66">w</text><text x="443" y="66">i</text><text x="473" y="66">d</text><text x="503" y="66">e</text><text x="533" y="66">s</text><text x="563" y="66">t</text><text x="602" y="66">&lt;/w&gt;</text>
+    </g>
+    <text x="660" y="66" fill="#64748b" font-size="12">×6 / ×3</text>
+    <text x="380" y="92" fill="#d97706" font-size="12" text-anchor="middle">统计：出现频次最高的相邻对是 (e,s) = 9（(s,t)、(t,&lt;/w&gt;) 同为 9，平局任选其一）</text>
+    <line x1="380" y1="98" x2="380" y2="112" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrB)"/>
+    <!-- row 1: 合并1 -->
+    <text x="20" y="138" fill="#334155" font-size="13">合并 1</text>
+    <rect x="90" y="120" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="120" y="120" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="150" y="120" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="180" y="120" width="56" height="26" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="2"/><rect x="240" y="120" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="270" y="120" width="44" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/>
+    <rect x="400" y="120" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="430" y="120" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="460" y="120" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="490" y="120" width="56" height="26" rx="5" fill="#fffbeb" stroke="#d97706" stroke-width="2"/><rect x="550" y="120" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="580" y="120" width="44" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/>
+    <g fill="#1e293b" font-size="13" text-anchor="middle">
+      <text x="103" y="138">n</text><text x="133" y="138">e</text><text x="163" y="138">w</text><text x="208" y="138">es</text><text x="253" y="138">t</text><text x="292" y="138">&lt;/w&gt;</text>
+      <text x="413" y="138">w</text><text x="443" y="138">i</text><text x="473" y="138">d</text><text x="518" y="138">es</text><text x="563" y="138">t</text><text x="602" y="138">&lt;/w&gt;</text>
+    </g>
+    <text x="380" y="164" fill="#d97706" font-size="12" text-anchor="middle">合并 (e,s) → es；下一轮最高频对是 (es,t) = 9</text>
+    <line x1="380" y1="170" x2="380" y2="184" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrB)"/>
+    <!-- row 2: 合并2 -->
+    <text x="20" y="210" fill="#334155" font-size="13">合并 2</text>
+    <rect x="90" y="192" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="120" y="192" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="150" y="192" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="180" y="192" width="56" height="26" rx="5" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/><rect x="240" y="192" width="44" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/>
+    <rect x="400" y="192" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="430" y="192" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="460" y="192" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="490" y="192" width="56" height="26" rx="5" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/><rect x="550" y="192" width="44" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/>
+    <g fill="#1e293b" font-size="13" text-anchor="middle">
+      <text x="103" y="210">n</text><text x="133" y="210">e</text><text x="163" y="210">w</text><text x="208" y="210">est</text><text x="262" y="210">&lt;/w&gt;</text>
+      <text x="413" y="210">w</text><text x="443" y="210">i</text><text x="473" y="210">d</text><text x="518" y="210">est</text><text x="572" y="210">&lt;/w&gt;</text>
+    </g>
+    <text x="380" y="236" fill="#10b981" font-size="12" text-anchor="middle">合并 (es,t) → est；此时 (est,&lt;/w&gt;) = 9 成为最高频对</text>
+    <line x1="380" y1="242" x2="380" y2="256" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrB)"/>
+    <!-- row 3: 合并3 -->
+    <text x="20" y="282" fill="#334155" font-size="13">合并 3</text>
+    <rect x="90" y="264" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="120" y="264" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="150" y="264" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="180" y="264" width="80" height="26" rx="5" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+    <rect x="400" y="264" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="430" y="264" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="460" y="264" width="26" height="26" rx="5" fill="#f8fafc" stroke="#94a3b8"/><rect x="490" y="264" width="80" height="26" rx="5" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+    <g fill="#1e293b" font-size="13" text-anchor="middle">
+      <text x="103" y="282">n</text><text x="133" y="282">e</text><text x="163" y="282">w</text><text x="220" y="282">est&lt;/w&gt;</text>
+      <text x="413" y="282">w</text><text x="443" y="282">i</text><text x="473" y="282">d</text><text x="530" y="282">est&lt;/w&gt;</text>
+    </g>
+    <text x="380" y="308" fill="#8b5cf6" font-size="12" text-anchor="middle">合并 (est,&lt;/w&gt;) → est&lt;/w&gt;；随后 (l,o)→lo、(lo,w)→low（频次 7）</text>
+    <!-- row 4: 编码推理 -->
+    <rect x="90" y="318" width="70" height="26" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/><text x="125" y="336" fill="#1e3a8a" font-size="13" text-anchor="middle">low</text>
+    <rect x="164" y="318" width="70" height="26" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/><text x="199" y="336" fill="#1e3a8a" font-size="13" text-anchor="middle">est&lt;/w&gt;</text>
+    <text x="248" y="336" fill="#64748b" font-size="12">← 未登录词 lowest 拆成「low + est」</text>
+    <rect x="470" y="318" width="30" height="26" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/><text x="485" y="336" fill="#1e3a8a" font-size="13" text-anchor="middle">s</text>
+    <rect x="504" y="318" width="70" height="26" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/><text x="539" y="336" fill="#1e3a8a" font-size="13" text-anchor="middle">low</text>
+    <rect x="578" y="318" width="70" height="26" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/><text x="613" y="336" fill="#1e3a8a" font-size="13" text-anchor="middle">est&lt;/w&gt;</text>
+    <text x="656" y="336" fill="#64748b" font-size="12">← slowest</text>
+  </g>
+</svg><figcaption>图 2-1　<b>BPE 合并过程示意（语料：low×5, lower×2, newest×6, widest×3）</b>。每轮统计最高频相邻对并合并（橙→绿→紫为各轮被合并区域）；推理时按训练顺序应用规则，未登录词 lowest/slowest 被拆成已知部件，OOV 消失。实际 LLM 的词表就是把这套循环跑 5 万–25 万轮得到的。</figcaption></figure>
+
+<h3 id="sec-2-3">2.3 字节级 BPE：把 OOV 彻底埋葬</h3>
+<p>字符级 BPE 有个小尾巴：基础字符表是有限的，遇到训练语料没出现过的 Unicode 字符仍会 OOV。GPT-2（2019）的解决方案简单粗暴：<b>先把文本无损映射为 UTF-8 字节流（基础符号恰 256 个，覆盖一切字符串），再在字节上跑 BPE</b>。代价是常见字符要"绕道"：英文每个字母本来就是 1 字节没问题；中文常用字是 3 字节，若词表没有中文字节合并序列，一个汉字 = 3 个 token。这也是各模型词表"军备竞赛"的由来：Qwen 系列词表约 152K，为中文、代码与数学符号单独学了海量合并序列；LLaMA-3 用 128K 词表把多语言压缩率大幅优化。作为对照，用 Python 的 <code>tiktoken</code>（OpenAI 分词库）数一数就能感受到差距——同一句中文，GPT-2 词表可能是 6+ token，现代词表 2–3 token。</p>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+
+# 从零训练一个字节级 BPE（HuggingFace tokenizers 库，与 GPT-2 同款算法）
+tok = Tokenizer(models.BPE(unk_token=None))            # 字节级 BPE 无需 UNK
+tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+tok.decoder = decoders.ByteLevel()                     # 解码时正确还原空格/中文
+
+trainer = trainers.BpeTrainer(
+    vocab_size=500,                                     # 演示用小词表；LLM 实际 3 万–25 万
+    special_tokens=["&lt;|endoftext|&gt;", "&lt;|user|&gt;", "&lt;|assistant|&gt;"],
+    show_progress=False,
+)
+corpus = ["low low low lower newest newest newest widest", "另一个例子：多模态大模型"] * 200
+tok.train_from_iterator(corpus, trainer)
+
+print(tok.encode("lowest").tokens)      # 类似 ['low', 'est'] 的切片 —— 按训练顺序应用合并规则
+print(tok.encode("多模态").tokens)       # 小词表下退化为 UTF-8 字节 token（3 字节/汉字）
+print(tok.decode(tok.encode("lowest").ids))   # 'lowest' —— 无损还原</code></pre></div>
+
+<h2 id="sec-3"><span class="sec-no">3.</span>WordPiece、Unigram 与 SentencePiece</h2>
+<h3 id="sec-3-1">3.1 WordPiece：换一个评分函数的 BPE</h3>
+<p>BERT（2018）使用的 WordPiece 与 BPE 框架相同（合并最频繁对），只有一处差异——<b>合并的评分不是原始频次，而是"似然增益"</b>：</p>
+<div class="math-block">$$\mathrm{score}(a, b) = \frac{\mathrm{count}(ab)}{\mathrm{count}(a)\cdot \mathrm{count}(b)}$$</div>
+<p>直觉：如果 $a$、$b$ 各自出现很多但拼起来很少，说明二者共现只是巧合，不值得合并；只有"拼起来比分开常见得多"的对才合并。这会偏向保留<b>语义内聚</b>的子词。推理端 WordPiece 用贪心最长匹配（longest-match-first），未登录词退化为字符并加 <code>##</code> 前缀标记词中位置，彻底无法覆盖时输出 <code>[UNK]</code>——BERT 词表（30522）因此仍存在 UNK，而字节级 BPE 没有。</p>
+<h3 id="sec-3-2">3.2 Unigram：概率模型 + 剪枝</h3>
+<p>Unigram（Kudo, ACL 2018，arXiv:1804.10959）思路完全相反：不从小符号逐步合并，而是<b>从一个超大候选词表出发逐步删除</b>。假设每个 token 独立产生（一元语言模型），词 $x$ 的概率是其所有可能切分 $S(x)$ 概率之和：</p>
+<div class="math-block">$$P(x) = \sum_{s \in S(x)} P(s), \qquad P(s) = \prod_{t \in s} p(t)$$</div>
+<p>训练用 EM 风格交替：<b>E 步</b>用 Viterbi（动态规划，转移方程 $V(i) = \max_j V(j)\cdot p(x_{j+1..i})$，复杂度 $O(|x|^2)$）或全切分求和，统计每个 token 的期望贡献；<b>M 步</b>按贡献重估 $p(t) = \frac{\text{贡献}(t)}{\sum_t \text{贡献}(t)}$；然后按"删除该 token 会让语料似然下降多少"排序，砍掉尾部（或对每次合并/删除做似然比检验）。Unigram 的额外礼物是<b>子词正则化（subword regularization）</b>：训练时按概率采样次优切分，免费获得数据增强，对小数据集鲁棒性提升明显。T5、ALBERT 与许多多语言模型采用 Unigram。</p>
+<h3 id="sec-3-3">3.3 SentencePiece：语言无关的工程封装</h3>
+<p>SentencePiece（Kudo &amp; Richardson, EMNLP 2018，arXiv:1808.06226）不是新算法，而是把上述算法做成<b>语言无关、端到端可逆</b>的工具箱：输入原始文本流（不做预分词、不假设空格分词），把空格当作普通字符 <code>▁</code>（U+2581）参与训练，从而中文、日文、泰文等无空格语言一视同仁；解码完全可逆，<code>encode(decode(x)) == x</code>。LLaMA 系列、T5、XLM-R 都是 SentencePiece 用户（LLaMA 用 SentencePiece-BPE，50000 词表）。三者的取舍总结如下表。</p>
+
+<div class="tbl-wrap"><table>
+<caption>表 2-2　三大子词算法对比</caption>
+<thead><tr><th>维度</th><th>BPE</th><th>WordPiece</th><th>Unigram</th></tr></thead>
+<tbody>
+<tr><td>建词表方向</td><td>自底向上合并</td><td>自底向上合并</td><td><b>自顶向下剪枝</b></td></tr>
+<tr><td>核心准则</td><td>相邻对频次最高</td><td>频次/(频率乘积) 似然比</td><td>删除后语料似然损失最小</td></tr>
+<tr><td>概率模型</td><td>无（贪心）</td><td>无（贪心）</td><td>有（一元 LM + Viterbi）</td></tr>
+<tr><td>切分唯一性</td><td>按规则顺序确定</td><td>贪心最长匹配</td><td>可多解（可采样 → 数据增强）</td></tr>
+<tr><td>代表模型</td><td>GPT-2/3/4、LLaMA、Qwen</td><td>BERT、DistilBERT、Electra</td><td>T5、ALBERT、mBART</td></tr>
+<tr><td>OOV 处理</td><td>字节级变体后无 OOV</td><td>退化为字符 → <code>[UNK]</code> 兜底</td><td>覆盖字符集内无 OOV</td></tr>
+</tbody></table></div>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>from transformers import AutoTokenizer
+
+# 三个时代、三种词表的对照实验
+toks = {
+    "GPT-2 (50257)":  AutoTokenizer.from_pretrained("openai-community/gpt2"),
+    "BERT (30522)":   AutoTokenizer.from_pretrained("google-bert/bert-base-chinese"),
+    "Qwen2.5 (152K)": AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct"),
+}
+text = "多模态大模型 Multimodal Large Language Model"
+
+for name, tok in toks.items():
+    ids = tok(text)["input_ids"]
+    print(f"{name:18s} token 数 = {len(ids):3d}  ->  {tok.convert_ids_to_tokens(ids)[:12]}")
+# 典型输出：GPT-2 把每个汉字拆成 3 个字节 token（中文开销最大）；
+# BERT-Chinese 按字切分；Qwen 词表含中文常用词，token 数最少。
+
+# 分词器是"无损往返"的，永远用 decode 验证你的预处理没有悄悄改字符：
+assert toks["Qwen2.5 (152K)"].decode(toks["Qwen2.5 (152K)"](text)["input_ids"]) == text</code></pre></div>
+
+<div class="box-tip"><p class="box-title">💡 技巧：把 tokenizer 当显微镜</p>
+<p>调试任何 LLM/VLM 输入问题的第一步：打印 <code>tok.convert_ids_to_tokens(ids)</code>。常见发现包括——系统提示词里的换行被合并成 <code>ĊĊ</code>；数字被切成不等长片段（<code>1234</code> 可能是 <code>12</code>+<code>34</code>，导致算术不稳定）；代码缩进被 <code>ĠĠĠĠ</code> 表示且不同文件风格不一。多模态模型还有专属彩蛋：<code>&lt;|image_pad|&gt;</code> 的数量就是视觉 token 数，一条 <code>print</code> 就能验证图像到底占了多少上下文。线上服务计费与限流也按 token 计，中文项目先实测压缩率再估算成本。</p></div>
+<h2 id="sec-4"><span class="sec-no">4.</span>特殊 Token 与聊天模板：多模态的"语法标记"</h2>
+<h3 id="sec-3-4">4.1 文本侧：从 <code>[CLS]</code> 到 ChatML</h3>
+<p>除了从语料学到的子词，每个分词器词表里还有一小撮<b>人工添加的特殊 token</b>（special tokens）：它们不参与 BPE 合并、永远作为整体出现，承担结构化职能。<code>[CLS]</code>/<code>[SEP]</code>/<code>[MASK]</code>/<code>[PAD]</code> 是 BERT 的四大件；GPT 系用 <code>&lt;|endoftext|&gt;</code> 标记文档边界；对话模型普遍采用 ChatML 风格的多角色标记（Qwen 的 <code>&lt;|im_start|&gt;</code>/<code>&lt;|im_end|&gt;</code>、Llama 3 的 <code>&lt;|begin_of_text|&gt;</code> + header token、Mistral 的 <code>[INST]</code>）。这些 token 本质上是给纯序列模型"恢复"出对话结构——模型从没有结构的信息流里学出"系统提示之后该听用户的、<code>im_end</code> 之后就该闭嘴"的行为。</p>
+<p>把这些标记拼进输入的规则叫<b>聊天模板（chat template）</b>：一段存在 tokenizer 配置里的 Jinja2 模板。手动拼字符串是最常见的训练/推理事故来源（角色标记打错一个字符，模型就当普通文本处理），务必使用 <code>apply_chat_template</code>。</p>
+<h3 id="sec-4-1">4.2 多模态特殊 token：图像在文本流里的"占位符"</h3>
+<p>多模态模型在词表里追加了图像专属标记，最典型的是 LLaVA 的 <code>&lt;image&gt;</code> 与 Qwen2-VL 的三件套 <code>&lt;|vision_start|&gt;</code> + <code>&lt;|image_pad|&gt;</code>×N + <code>&lt;|vision_end|&gt;</code>。机制值得精确理解：<b>占位符扩张（placeholder expansion）</b>——用户输入里只有 1 个 <code>&lt;image&gt;</code> 标记，processor/模型前向时会按图像实际尺寸把它扩张成 N 个连续的 embedding（LLaVA 用 576 个 patch 特征直接替换，Qwen2-VL 则把 <code>&lt;|image_pad|&gt;</code> 重复 N 次），再与文本 embedding 拼接成统一序列。视频有专门的 <code>&lt;|video_pad|&gt;</code>；Grounding 模型还嵌 <code>&lt;box&gt;</code>/<code>&lt;|box_start|&gt;</code> 类坐标标记（第 21 章）。新增特殊 token 必须同步做 <code>resize_token_embeddings</code>（为它们在 embedding 矩阵里加行）并在训练中让模型学会其含义——LLaVA 论文专门验证了：随机初始化的 <code>&lt;image&gt;</code> embedding 在第一阶段对齐训练中被"推"到词嵌入空间里文本描述密集的区域。</p>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>from transformers import AutoTokenizer, AutoProcessor
+import requests
+from PIL import Image
+
+# 1) 纯文本聊天模板：永远不要手拼角色标记
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+messages = [
+    {"role": "system", "content": "你是一个多模态助手。"},
+    {"role": "user", "content": "&lt;image&gt;\n这张图里有什么？"},
+]
+print(tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
+# &lt;|im_start|&gt;system
+# 你是一个多模态助手。&lt;|im_end|&gt;
+# &lt;|im_start|&gt;user
+# &lt;image&gt;
+# 这张图里有什么？&lt;|im_end|&gt;
+# &lt;|im_start|&gt;assistant
+#
+
+# 2) Qwen2-VL 处理器：占位符扩张的真实管线（图像 -> &lt;|image_pad|&gt; × N）
+proc = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+mm_msg = [{"role": "user", "content": [
+    {"type": "image"},
+    {"type": "text", "text": "这是什么？"},
+]}]
+prompt = proc.apply_chat_template(mm_msg, tokenize=False, add_generation_prompt=True)
+img = Image.open(requests.get("https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg", stream=True).raw)
+inputs = proc(text=[prompt], images=[img], return_tensors="pt")
+pad_id = proc.tokenizer.convert_tokens_to_ids("&lt;|image_pad|&gt;")
+n_vis = (inputs["input_ids"] == pad_id).sum().item()
+print("序列总长:", inputs["input_ids"].shape[1], "| 视觉 token 数:", n_vis)
+# 图像越大 n_vis 越大（动态分辨率）；这就是"一张图值多少 token"的直接测量方法</code></pre></div>
+
+<div class="box-warn"><p class="box-title">⚠️ 陷阱：多模态 token 化的四个高频事故</p>
+<p><b>（1）占位符与特征错位</b>：自己重写前向时，<code>&lt;image&gt;</code> 占位符数量与视觉编码器输出 patch 数对不上（忘了 merge/忘了 tile），表现为模型"看不懂图"但文本正常。<b>（2）loss 掩码</b>：SFT 时只对<b>回答部分</b>计算交叉熵，系统提示、用户问题与图像 token 都要置为 -100——忘了掩码会训练出"复读问题"的模型。<b>（3）图内文字 vs 提示注入</b>：图像 OCR 出的文本是"不可信输入"，与特殊 token 拼接时可能构造出伪指令（第 41 章 prompt injection）。<b>（4）计费/限流按扩张后的 token 数</b>：API 侧一张高分辨率图折算成百上千 token，比提示词本身贵得多，先查文档的图像 token 计算规则（如 GPT-4V 按 512px tile 计）。</p></div>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>视觉 Token 化路线 A：Patch Embedding（ViT 式，连续向量）</h2>
+<p>现在进入本章的视觉部分。多模态模型里"图像变成 token"有两条根本不同的路线：<b>路线 A</b> 把图像切块后映射成<b>连续向量</b>（不做离散化），供 LLM 直接当输入特征；<b>路线 B</b> 把图像编码成<b>离散符号</b>——图像自己也有一个"词表"。主流理解型 VLM（LLaVA、Qwen-VL、InternVL）全部走路线 A；原生生成型模型（Chameleon、Emu3、DALL-E）走路线 B。</p>
+<p>路线 A 的标准形式来自 ViT（Dosovitskiy et al., ICLR 2021，arXiv:2010.11929）：把图像 $x \in \mathbb{R}^{H \times W \times 3}$ 切成 $N$ 个 $P \times P$ 的图块（patch），展平后线性投影成 $d$ 维向量，加上位置嵌入：</p>
+<div class="math-block">$$\mathbf{z}_0 = \left[\mathbf{x}_{\text{class}};\; \mathbf{x}_p^1 \mathbf{E};\; \mathbf{x}_p^2 \mathbf{E};\; \dots;\; \mathbf{x}_p^N \mathbf{E}\right] + \mathbf{E}_{pos}, \qquad N = \frac{H}{P}\cdot\frac{W}{P}, \quad \mathbf{E} \in \mathbb{R}^{(P^2 C)\times d}$$</div>
+<p>一个精巧的巧合：ViT-B 的配置 $P=16, d=768$，每块展平维度 $16\times16\times3 = 768$ 恰好等于模型宽度——所以"展平+线性层"可以用一个 <b>stride=kernel_size=P 的卷积</b>一步实现，这也是所有开源实现（timm、transformers）的写法。<code>[CLS]</code> token 借鉴 BERT，用于汇聚全局信息；位置嵌入默认用可学习的一维序列（ViT 原文发现 1D 与 2D 效果相当）。</p>
+
+<figure><img src="../assets/images/papers/2010.11929_0.png" loading="lazy" alt="ViT 模型总览：图像切 patch、线性嵌入、加位置编码后送入标准 Transformer"><figcaption>图 2-2　<b>ViT 总览：图像 → patch 序列 → 标准 Transformer</b>（来源：Dosovitskiy et al., An Image is Worth 16x16 Words, arXiv:2010.11929）。图像被切成固定大小 patch（图中 9×9=36 块，实际 ViT 常用 14×14=196 块），每个 patch 线性嵌入为 1 个 token；[CLS] 与位置嵌入一并加入。这套"切块即 token 化"的流程被此后几乎所有 VLM 的视觉塔继承。</figcaption></figure>
+
+<figure><svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <defs><marker id="arrP" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">Patch 切分与 Token 数量估算（224×224 输入，P=16）</text>
+  <!-- image square -->
+  <rect x="60" y="50" width="168" height="168" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <g stroke="#93c5fd" stroke-width="1">
+    <line x1="72" y1="50" x2="72" y2="218"/><line x1="84" y1="50" x2="84" y2="218"/><line x1="96" y1="50" x2="96" y2="218"/><line x1="108" y1="50" x2="108" y2="218"/><line x1="120" y1="50" x2="120" y2="218"/><line x1="132" y1="50" x2="132" y2="218"/><line x1="144" y1="50" x2="144" y2="218"/><line x1="156" y1="50" x2="156" y2="218"/><line x1="168" y1="50" x2="168" y2="218"/><line x1="180" y1="50" x2="180" y2="218"/><line x1="192" y1="50" x2="192" y2="218"/><line x1="204" y1="50" x2="204" y2="218"/><line x1="216" y1="50" x2="216" y2="218"/>
+    <line x1="60" y1="62" x2="228" y2="62"/><line x1="60" y1="74" x2="228" y2="74"/><line x1="60" y1="86" x2="228" y2="86"/><line x1="60" y1="98" x2="228" y2="98"/><line x1="60" y1="110" x2="228" y2="110"/><line x1="60" y1="122" x2="228" y2="122"/><line x1="60" y1="134" x2="228" y2="134"/><line x1="60" y1="146" x2="228" y2="146"/><line x1="60" y1="158" x2="228" y2="158"/><line x1="60" y1="170" x2="228" y2="170"/><line x1="60" y1="182" x2="228" y2="182"/><line x1="60" y1="194" x2="228" y2="194"/><line x1="60" y1="206" x2="228" y2="206"/>
+  </g>
+  <rect x="120" y="110" width="24" height="24" fill="#d97706" fill-opacity="0.55" stroke="#b45309"/>
+  <text x="144" y="240" text-anchor="middle" font-size="12" fill="#334155" font-family="sans-serif">224×224 图像 → 14×14 = 196 个 patch</text>
+  <text x="144" y="258" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">每块 16×16×3 = 768 维（橙色块为示例）</text>
+  <!-- arrow -->
+  <line x1="248" y1="134" x2="296" y2="134" stroke="#64748b" stroke-width="2" marker-end="url(#arrP)"/>
+  <text x="272" y="124" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">卷积投影</text>
+  <!-- token row -->
+  <g font-family="sans-serif" font-size="13">
+    <rect x="310" y="104" width="64" height="30" rx="6" fill="#8b5cf6" fill-opacity="0.15" stroke="#8b5cf6" stroke-width="1.6"/><text x="342" y="124" text-anchor="middle" fill="#5b21b6">[CLS]</text>
+    <rect x="380" y="104" width="52" height="30" rx="6" fill="#fff" stroke="#2563eb" stroke-width="1.6"/><text x="406" y="124" text-anchor="middle" fill="#1e3a8a">P₁</text>
+    <rect x="438" y="104" width="52" height="30" rx="6" fill="#fff" stroke="#2563eb" stroke-width="1.6"/><text x="464" y="124" text-anchor="middle" fill="#1e3a8a">P₂</text>
+    <rect x="496" y="104" width="52" height="30" rx="6" fill="#fff" stroke="#2563eb" stroke-width="1.6"/><text x="522" y="124" text-anchor="middle" fill="#1e3a8a">P₃</text>
+    <text x="568" y="124" fill="#475569">…</text>
+    <rect x="590" y="104" width="52" height="30" rx="6" fill="#fff" stroke="#2563eb" stroke-width="1.6"/><text x="616" y="124" text-anchor="middle" fill="#1e3a8a">P₁₉₆</text>
+    <text x="470" y="92" text-anchor="middle" font-size="12" fill="#475569">每个 token = 768 维向量（连续值，非离散符号）</text>
+    <text x="470" y="156" text-anchor="middle" font-size="12" fill="#64748b">再加可学习位置嵌入 E_pos（1D 序列，长度 197）</text>
+    <rect x="310" y="186" width="332" height="72" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="326" y="210" font-size="12" fill="#334155">token 数公式：N = (H/P) × (W/P)</text>
+    <text x="326" y="230" font-size="12" fill="#334155">LLaVA-1.5：336/14=24 → 24²=576 个视觉 token</text>
+    <text x="326" y="250" font-size="12" fill="#334155">高分辨率 1024×768、P=16 → 64×48=3072（需压缩！）</text>
+  </g>
+</svg><figcaption>图 2-3　<b>Patch 切分与 token 数量估算</b>。视觉 token 是<b>连续向量</b>：每个 patch 被 768 维特征描述，没有"词表"可言。token 数随分辨率平方增长——这正是多模态上下文预算的紧张来源，也是第 15 章连接器压缩研究的存在理由。</figcaption></figure>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch
+import torch.nn as nn
+
+class PatchEmbed(nn.Module):
+    """ViT 式 patch embedding：stride=P 卷积一步完成「切块 + 展平 + 线性投影」"""
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+        super().__init__()
+        self.grid = img_size // patch_size                  # 每边 patch 数
+        self.num_patches = self.grid * self.grid
+        self.proj = nn.Conv2d(in_chans, embed_dim,
+                              kernel_size=patch_size, stride=patch_size)
+        self.pos = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))  # 可学习位置嵌入
+        nn.init.trunc_normal_(self.pos, std=0.02)
+
+    def forward(self, x):                # x: [B, 3, H, W]
+        feats = self.proj(x)             # [B, d, H/P, W/P] —— 每个空间位置一个 token
+        tokens = feats.flatten(2).transpose(1, 2)   # [B, N, d]
+        return tokens + self.pos[:, : tokens.size(1)]
+
+pe = PatchEmbed(img_size=224, patch_size=16)
+out = pe(torch.randn(2, 3, 224, 224))
+print(out.shape)        # torch.Size([2, 196, 768])
+
+def count_vis_tokens(H, W, patch=14, merge=1):
+    """任意 VLM 的视觉 token 估算：merge 为后续 2×2/4×4 压缩比例（每边）"""
+    return (H // patch) * (W // patch) // (merge * merge)
+
+print(count_vis_tokens(336, 336, patch=14))          # 576  （LLaVA-1.5，无压缩）
+print(count_vis_tokens(896, 672, patch=14, merge=2)) # 768  （Qwen2-VL 风格 2×2 合并）
+print(count_vis_tokens(1024, 768, patch=16, merge=2))# 1536</code></pre></div>
+
+<div class="box-tip"><p class="box-title">💡 技巧：分辨率、patch 大小与"感知粒度"</p>
+<p>同样的图像，$P=14$ 与 $P=16$ 的差异不只是 token 数：小 patch 保留更细的文字与小物体信息，但 token 数按 $1/P^2$ 膨胀。LLaVA-1.5 把 CLIP 的 224 输入升到 336，仅此一改就在众多基准上白捡几个点；Qwen2-VL 干脆放弃固定分辨率，每个图用"尽量还原原生分辨率"的动态网格（NaViT 式 patch n' pack，第 14 章）。实践准则：<b>文本密集的输入（文档、图表）按"能看清字"给分辨率，语义场景（分类、检索）分辨率可以很低</b>。另一个经验：2×2 合并（token 数 ÷4）几乎是"免费"的——信息冗余度高，Qwen2-VL 与 InternVL 都默认做。</p></div>
+
+<h2 id="sec-6"><span class="sec-no">6.</span>视觉 Token 化路线 B：离散视觉词表（VQ-VAE / VQGAN）</h2>
+<p>路线 B 的目标激进得多：<b>让图像过一遍"分词器"</b>，把 $H\times W\times 3$ 的像素张量变成一串离散码（比如 1024 个、每个取值 0–8191），这样图像就能和文本用同一套自回归目标（预测下一个 token）训练与生成。核心问题是离散化的梯度障碍：argmin 查表不可导。解决方案是 2017 年的 VQ-VAE。</p>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：VQ-VAE（van den Oord et al., NeurIPS 2017，arXiv:1711.00937）</p>
+<p><b>问题</b>：VAE 的连续潜变量采样会带来"模糊"与不可控，而离散表示（像语言一样）更利于先验建模；但离散变量无法直接反向传播。<b>方法</b>：编码器输出 $\mathbf{z}_e(\mathbf{x})$ 后做<b>最近邻查表</b>量化为码本（codebook）向量 $\mathbf{e}_k$，解码器只看量化后的 $\mathbf{z}_q$；训练目标为三项之和：<br>
+$$\mathcal{L} = \underbrace{-\log p(\mathbf{x}\mid \mathbf{z}_q)}_{\text{重建}} + \underbrace{\lVert \mathrm{sg}[\mathbf{z}_e] - \mathbf{e}\rVert_2^2}_{\text{码本损失（动 e）}} + \beta\underbrace{\lVert \mathbf{z}_e - \mathrm{sg}[\mathbf{e}]\rVert_2^2}_{\text{承诺损失（拴住编码器）}}$$
+其中 sg[·] 是 stop-gradient。<b>关键结果</b>：在 CIFAR-10/ImageNet/Omniglot 上以极少的离散潜变量（如 32×32×1）实现逼真重建，并为无监督表示学习提供了可用向量。<b>为什么重要</b>：它发明了"图像的词表"——今天 Chameleon、Emu3 的视觉 tokenizer、第 20 章统一模型、BEiT 的预训练，全部建立在这个量化思想上。<b>延伸阅读</b>：VQ-VAE-2（层级码本）、VQGAN（加判别器）、DALL-E 的 dVAE（8192 码本 + Gumbel-softmax）。</p></div>
+
+<h3 id="sec-6-1">6.1 直通估计器（Straight-Through Estimator）推导</h3>
+<p>量化算子 $q(\mathbf{z}) = \mathbf{e}_{k^*},\; k^* = \arg\min_j \lVert \mathbf{z} - \mathbf{e}_j\rVert_2$ 是分段常值函数：对输入的导数几乎处处为 0，梯度无法从解码器流回编码器。VQ-VAE 的处理是<b>直通估计器（Straight-Through Estimator, STE）</b>：前向时用量化值，反向时假装量化不存在——把解码器对 $\mathbf{z}_q$ 的梯度原样拷贝给 $\mathbf{z}_e$：</p>
+<div class="math-block">$$\text{实现：} \mathbf{z}_q^{\text{ste}} = \mathbf{z}_e + \mathrm{sg}[\mathbf{z}_q - \mathbf{z}_e] \qquad\Longrightarrow\qquad \frac{\partial \mathcal{L}}{\partial \mathbf{z}_e} = \frac{\partial \mathcal{L}}{\partial \mathbf{z}_q}$$</div>
+<p>验证一下：$\mathbf{z}_q^{\text{ste}}$ 前向数值上等于 $\mathbf{z}_q$（$\mathbf{z}_e + (\mathbf{z}_q-\mathbf{z}_e) = \mathbf{z}_q$）；求导时 $\mathrm{sg}[\cdot]$ 部分为常数，$\partial \mathbf{z}_q^{\text{ste}}/\partial \mathbf{z}_e = \partial\mathbf{z}_e/\partial\mathbf{z}_e = I$，梯度直通。数学上这是"恒等映射作为量化导数的零阶代理"，与第 23 章 Gumbel-softmax、二值网络的 STE 同属一族。码本本身不可导（查表），所以用两个"搬运损失"训练：码本损失把 $\mathbf{e}$ 拉向编码器输出（K-means 质心更新视角），承诺损失让编码器输出别乱跑；实践中更稳定的做法是 <b>EMA 更新</b>——码本向量取其被分配样本的指数滑动平均，完全绕开码本损失的梯度问题。</p>
+<p>离散化还有著名的失败模式：<b>码本坍塌</b>——绝大部分码从未被使用（死码），重建只依赖少数几个高频码，图像细节全丢。工程对策：死码重启（把长期未用的码重新初始化为当前 batch 的随机编码器输出）、EMA + 高熵正则、以及控制码本维度别太大。</p>
+
+<figure><img src="../assets/images/papers/1711.00937_0.png" loading="lazy" alt="VQ-VAE 架构与码本嵌入空间可视化"><figcaption>图 2-4　<b>VQ-VAE 架构：编码器 → 最近邻量化 → 解码器</b>（来源：van den Oord et al., arXiv:1711.00937）。右半部分展示了嵌入空间与最近邻分配：编码器输出（蓝色）被吸附到码本向量（黄色）上，解码器只消费离散码。这个"查表"步骤就是图像的"分词"。</figcaption></figure>
+
+<figure><img src="../assets/images/papers/1711.00937_1.png" loading="lazy" alt="VQ-VAE 在 ImageNet 128 上的重建效果"><figcaption>图 2-5　<b>VQ-VAE 重建质量</b>（来源：arXiv:1711.00937，ImageNet 128×128，潜空间 32×32×1）。左列为原图，右列为从 1024 个离散码重建的结果——每个 128×128 图像被压缩成 1024 个"视觉单词"，信息损失主要在高频纹理，语义结构完整保留。</figcaption></figure>
+
+<h3 id="sec-6-2">6.2 VQGAN：给离散词表装上"高清镜头"与"语言模型"</h3>
+<p>VQ-VAE 的重建对生成任务还不够锐利（MSE 型重建偏爱糊图）。VQGAN（Esser et al., CVPR 2021，arXiv:2012.09841，原题 Taming Transformers）做了两件事：<b>（1）感知级重建</b>——在重建损失外叠加感知损失（LPIPS，用 VGG 特征比较）与<b>分块判别器</b>（patch-GAN，只判别局部块的真实性），并用自适应权重平衡两者：$\lambda = \nabla_{L_{\text{GAN}}}\mathcal{L}_{\text{rec}} \big/ \nabla_{L_{\text{GAN}}}\mathcal{L}_{\text{GAN}}$，保证感知项的梯度量级永远主导；<b>（2）自回归先验</b>——训练一个 Transformer 在码序列上做下一码预测，于是"文生图"变成：文本编码 + Transformer 逐码生成 + 解码器出图。VQGAN 的下采样率 $f=16$（256×256 图 → 16×16 = 256 个码，码本 1024–16384 按配置），码序列比像素短三个数量级，Transformer 才"管得过来"。</p>
+
+<figure><img src="../assets/images/papers/2012.09841_0.png" loading="lazy" alt="VQGAN：卷积码本学习 + Transformer 学习码的组合先验"><figcaption>图 2-6　<b>VQGAN 两阶段流程</b>（来源：Esser et al., Taming Transformers, arXiv:2012.09841）。第一阶段（上）：卷积 VQGAN 学码本，感知损失+分块判别器保证重建锐利；第二阶段（下）：Transformer 在离散码上学组合先验，文本等条件通过编码注入。DALL-E（2021）与 Chameleon（2024）都是这一框架的直系后代。</figcaption></figure>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class VectorQuantizer(nn.Module):
+    """最小可用 VQ 层（B, D, H, W 输入），含 STE 与码本/承诺双损失"""
+    def __init__(self, num_codes=1024, code_dim=256, beta=0.25):
+        super().__init__()
+        self.codebook = nn.Embedding(num_codes, code_dim)   # 视觉词表
+        nn.init.uniform_(self.codebook.weight, -1 / num_codes, 1 / num_codes)
+        self.beta = beta
+
+    def forward(self, z_e):                     # z_e: [B, D, H, W] 编码器输出
+        flat = z_e.permute(0, 2, 3, 1).reshape(-1, z_e.size(1))     # [BHW, D]
+        dist = (flat.unsqueeze(1) - self.codebook.weight.unsqueeze(0)) ** 2
+        dist = dist.sum(-1)                                          # [BHW, K] 到各码的距离
+        idx = dist.argmin(dim=1)                                     # 最近邻查表（不可导）
+        z_q = self.codebook(idx).view_as(z_e.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        loss_codebook = F.mse_loss(z_q, z_e.detach())            # 拉 e 向 z_e（EMA 可替代）
+        loss_commit = self.beta * F.mse_loss(z_e, z_q.detach())  # 拴住编码器
+        z_q_ste = z_e + (z_q - z_e).detach()                     # STE：前向 z_q，反向直通
+        return z_q_ste, idx.view(z_e.size(0), -1), loss_codebook + loss_commit
+
+vq = VectorQuantizer()
+z_e = torch.randn(2, 256, 16, 16, requires_grad=True)   # 256×256 图像 → 16×16=256 个码
+z_q, codes, vq_loss = vq(z_e)
+print(codes.shape, codes.min().item(), codes.max().item())  # [2, 256]，取值 0–1023
+print("重建用张量形状:", z_q.shape, "| VQ 损失:", vq_loss.item())</code></pre></div>
+
+<p>路线 B 在多模态理解侧还有一个重要后代：BEiT（arXiv:2106.08254）把图像先离线量化成视觉 token，再在 token 上做 BERT 式掩码预训练——证明"离散视觉词表"同样支撑理解型预训练（后被 MAE 的连续掩码路线部分取代，第 14 章对比）。</p>
+
+<figure><img src="../assets/images/papers/2106.08254_0.png" loading="lazy" alt="BEiT 预训练：图像先经 dVAE 量化为视觉 token，再做掩码预测"><figcaption>图 2-7　<b>BEiT：图像词表上的掩码预训练</b>（来源：Bao et al., BEiT, arXiv:2106.08254）。输入图像先经 DALL-E 式 dVAE（8192 码）切成"视觉单词"，随机掩码后让模型预测被遮位置的视觉 token——这是 BERT 的 MLM 在图像上的精确镜像。</figcaption></figure>
+
+<h2 id="sec-7"><span class="sec-no">7.</span>连续 vs 离散：对比、选择与上下文预算</h2>
+<p>两条路线的本质差异可以浓缩成一张对比图：<b>连续 token</b> 保真度高（每个 patch 都是高维特征，信息无损传递给 LLM），但没有"生成"能力（LLM 无法采样输出一个向量图块），只能靠外挂解码器（扩散模型）出图；<b>离散 token</b> 与文本共享同一套预测目标，理解与生成在同一框架内闭环，但每张图的 1024 个码固定吞掉 1024 个上下文位置，且量化有不可逆信息损失。</p>
+
+<figure><svg viewBox="0 0 760 340" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <text x="380" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">连续视觉 token（理解型 VLM） vs 离散视觉 token（原生生成型）</text>
+  <!-- left: continuous -->
+  <rect x="30" y="46" width="340" height="256" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="200" y="72" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a" font-family="sans-serif">路线 A：连续向量（LLaVA / Qwen-VL）</text>
+  <g font-family="sans-serif" font-size="12" fill="#334155">
+    <rect x="50" y="90" width="86" height="30" rx="6" fill="#fff" stroke="#2563eb"/><text x="93" y="110" text-anchor="middle">图像</text>
+    <line x1="136" y1="105" x2="166" y2="105" stroke="#64748b" stroke-width="1.6"/>
+    <rect x="168" y="90" width="86" height="30" rx="6" fill="#fff" stroke="#2563eb"/><text x="211" y="110" text-anchor="middle">ViT 编码器</text>
+    <line x1="254" y1="105" x2="284" y2="105" stroke="#64748b" stroke-width="1.6"/>
+    <rect x="286" y="90" width="64" height="30" rx="6" fill="#d97706" fill-opacity="0.18" stroke="#d97706"/><text x="318" y="110" text-anchor="middle">MLP 连接</text>
+    <rect x="50" y="132" width="140" height="26" rx="6" fill="#fff" stroke="#93c5fd"/><text x="120" y="150" text-anchor="middle" fill="#1e3a8a">576 个连续特征向量</text>
+    <rect x="198" y="132" width="152" height="26" rx="6" fill="#fff" stroke="#93c5fd"/><text x="274" y="150" text-anchor="middle" fill="#1e3a8a">与文本 embedding 拼接</text>
+    <text x="200" y="184" text-anchor="middle">✓ 保真度高、与感知任务对齐</text>
+    <text x="200" y="206" text-anchor="middle">✓ 检索/对齐任务效率高</text>
+    <text x="200" y="228" text-anchor="middle">✗ LLM 无法"输出"图像</text>
+    <text x="200" y="250" text-anchor="middle">✗ 图像 token 数与分辨率绑定</text>
+    <text x="200" y="280" text-anchor="middle" fill="#64748b">生成图像需外挂扩散解码器</text>
+  </g>
+  <!-- right: discrete -->
+  <rect x="390" y="46" width="340" height="256" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="560" y="72" text-anchor="middle" font-size="14" font-weight="bold" fill="#5b21b6" font-family="sans-serif">路线 B：离散码（Chameleon / Emu3）</text>
+  <g font-family="sans-serif" font-size="12" fill="#334155">
+    <rect x="410" y="90" width="86" height="30" rx="6" fill="#fff" stroke="#8b5cf6"/><text x="453" y="110" text-anchor="middle">图像</text>
+    <line x1="496" y1="105" x2="526" y2="105" stroke="#64748b" stroke-width="1.6"/>
+    <rect x="528" y="90" width="88" height="30" rx="6" fill="#fff" stroke="#8b5cf6"/><text x="572" y="110" text-anchor="middle">VQGAN 编码</text>
+    <line x1="616" y1="105" x2="646" y2="105" stroke="#64748b" stroke-width="1.6"/>
+    <rect x="648" y="90" width="64" height="30" rx="6" fill="#10b981" fill-opacity="0.15" stroke="#10b981"/><text x="680" y="110" text-anchor="middle">查表量化</text>
+    <rect x="410" y="132" width="120" height="26" rx="6" fill="#fff" stroke="#c4b5fd"/><text x="470" y="150" text-anchor="middle" fill="#5b21b6">1024 个离散码</text>
+    <rect x="538" y="132" width="174" height="26" rx="6" fill="#fff" stroke="#c4b5fd"/><text x="625" y="150" text-anchor="middle" fill="#5b21b6">∈ 词表（如 0–8191）</text>
+    <text x="560" y="184" text-anchor="middle">✓ 与文本同一套下一 token 预测</text>
+    <text x="560" y="206" text-anchor="middle">✓ 理解与生成天然统一</text>
+    <text x="560" y="228" text-anchor="middle">✗ 量化信息损失（文字变糊）</text>
+    <text x="560" y="250" text-anchor="middle">✗ 每图固定 1024 token 上下文开销</text>
+    <text x="560" y="280" text-anchor="middle" fill="#64748b">Chameleon 为此加 QK-norm 稳定训练</text>
+  </g>
+  <text x="380" y="326" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">混合路线存在：SEED 用连续语义 token 供 LLM 生成、再交扩散解码器；Janus 为理解/生成配两套视觉编码器（第 20 章）</text>
+</svg><figcaption>图 2-8　<b>连续与离散视觉 token 化对比</b>。选型经验：只做理解/对话选路线 A；要"像写文章一样生成图像"或做统一模型选路线 B；生成质量要求高但架构要统一的，用"离散语义 token + 扩散解码"的混合方案。</figcaption></figure>
+
+<h3 id="sec-7-1">7.1 图像 token 数量估算与上下文预算</h3>
+<p>统一估算公式（覆盖主流设计）：</p>
+<div class="math-block">$$N_{\text{vis}} = \frac{H}{P} \cdot \frac{W}{P} \cdot \frac{1}{r^2} \cdot T_{\text{tile}} \qquad\qquad \begin{aligned} &P:\ \text{patch 大小（常用 14 或 16）} \\ &r:\ \text{合并比例（每边；2×2 合并则 } r=2\text{）} \\ &T_{\text{tile}}:\ \text{切块数（AnyRes 高分辨率策略下} \gt 1\text{）} \end{aligned}$$</div>
+<p>代入实际模型（数字均可在对应论文/文档复核）：</p>
+<div class="tbl-wrap"><table>
+<caption>表 2-3　主流模型的视觉 token 策略对比（数字以论文/官方文档为准，取典型配置）</caption>
+<thead><tr><th>模型</th><th>视觉输入</th><th>策略</th><th>每图 token 数</th><th>上下文</th></tr></thead>
+<tbody>
+<tr><td>LLaVA-1.5</td><td>336×336 固定</td><td>CLIP ViT-L/14，无压缩</td><td>576</td><td>4K</td></tr>
+<tr><td>Qwen2-VL / 2.5-VL</td><td>原生任意分辨率</td><td>NaViT 式动态网格 + 2×2 合并</td><td>≈ (H/28)×(W/28)，可配 min/max 像素</td><td>32K+（可扩展）</td></tr>
+<tr><td>InternVL2 / 2.5</td><td>448×448 × 多 tile</td><td>动态 tile + Pixel Shuffle（÷4）</td><td>256 / tile</td><td>8K–32K</td></tr>
+<tr><td>MiniCPM-V 2.6</td><td>高分辨率切分</td><td>LLM 侧 adapter 压缩（多至 96 token/图）</td><td>≈96（视频每帧更低）</td><td>端侧友好</td></tr>
+<tr><td>GPT-4V（API）</td><td>512px tile 切分</td><td>low/high 两档细节</td><td>low=85；high=85+170/tile</td><td>128K</td></tr>
+<tr><td>Chameleon</td><td>512×512 生成/输入</td><td>VQGAN 离散码（码本 8192）</td><td>1024（固定）</td><td>4K</td></tr>
+</tbody></table></div>
+<p>算一笔账感受预算压力：假设对话上下文 4096 token，系统提示与对话占 800，剩余 3300。用 LLaVA-1.5（576/图）可以放 5 张图；换成 1344×896 的高分辨率图经 Qwen2-VL 动态网格（(1344/28)×(896/28) = 48×32 = 1536 token）只够 2 张；若是 Chameleon 的离散码（1024/图）同样只剩 3 张。视频更极端：16 帧 × 576 token = 9216，尚未压缩就已超过多数 4K 配置——所以第 31 章的帧采样与 token 压缩是视频理解的生死线。反过来，<b>视觉 token 不是纯粹的负担</b>：LLaVA-1.5 的消融显示保留全部 576 token 优于激进压缩，因为问答细节（计数、位置关系）散落在小 patch 里；"该压多少"取决于任务粒度，这正是第 15 章连接器设计的核心权衡。</p>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：给你的多模态应用定 token 预算</p>
+<p><b>第 1 步</b>：明确任务的"最小可读分辨率"——纯语义问答 336–448px 足够；含文字/图表 ≥1024px 或启用 tile。<b>第 2 步</b>：按上表公式算 $N_{\text{vis}}$，留出 30% 上下文给生成与多轮历史。<b>第 3 步</b>：多图场景优先选带动态分辨率/压缩的模型（Qwen2-VL、InternVL2），而不是固定 576 token 的模型。<b>第 4 步</b>：视频应用先做帧采样（uniform 8–16 帧）再考虑每帧压缩到 64–196 token。<b>第 5 步</b>：上线前用第 4.2 节的 <code>&lt;|image_pad|&gt;</code> 计数法实测每种输入的真实 token 数，写入监控——多模态服务 80% 的超时与超额账单来自高分辨率图像。</p></div>
+
+<h2 id="sec-8"><span class="sec-no">8.</span>本章自测</h2>
+<div class="box-quiz"><p class="box-title">✏️ 自测（先独立作答，再看答案要点）</p>
+<p><b>1.</b> 在语料 {low×5, lower×2, newest×6, widest×3} 上，BPE 前 5 次合并依次是什么？平局如何处理？<br>
+<b>答案要点</b>：(e,s)→es（与 (s,t)、(t,&lt;/w&gt;) 并列 9，任选其一）；(es,t)→est；(est,&lt;/w&gt;)→est&lt;/w&gt;（9）；(l,o)→lo；(lo,w)→low。平局按实现定义打破（如先出现者优先），规则顺序影响最终词表。</p>
+<p><b>2.</b> 字节级 BPE 为什么"彻底消灭 OOV"？中文在一个没有中文字节的词表里代价是什么？<br>
+<b>答案要点</b>：UTF-8 把任意字符串无损映射到 256 个字节符号，任何新字符都是字节组合；中文常用字占 3 字节，无中文合并序列时 1 汉字 ≈ 3 token，序列变长、计费变高、注意力被稀释。</p>
+<p><b>3.</b> WordPiece 与 BPE 的合并评分差异是什么？Unigram 与前两者的根本不同？<br>
+<b>答案要点</b>：WordPiece 用似然比 count(ab)/(count(a)·count(b))，BPE 用原始频次；Unigram 从大词表自顶向下剪枝，有显式概率模型（一元 LM），切分可不唯一，可做子词正则化数据增强。</p>
+<p><b>4.</b> 写出 VQ-VAE 的三项损失并解释 STE 的实现技巧；为什么码本会"坍塌"，怎么救？<br>
+<b>答案要点</b>：重建项 + 码本损失 ‖sg[z_e]−e‖²（EMA 可替代）+ 承诺损失 β‖z_e−sg[e]‖²；STE 用 z_e + sg[z_q−z_e] 实现前向取量化值、反向直通。坍塌：多数码死掉、重建信息退化；对策：死码重启、EMA 更新、控制码本维度。</p>
+<p><b>5.</b> 计算：ViT-L/14 在 336×336 输入下的视觉 token 数；Qwen2-VL 在 1344×896 输入下（2×2 合并）的 token 数。<br>
+<b>答案要点</b>：(336/14)² = 576；(1344/28)×(896/28) = 48×32 = 1536。高分辨率输入的 token 开销按面积线性增长，多图/视频场景必须压缩或降采样。</p>
+<p><b>6.</b> 为什么理解型 VLM（LLaVA）选连续视觉 token，而 Chameleon 必须用离散码？各自最大的代价？<br>
+<b>答案要点</b>：连续 token 保真、适合对齐理解，但 LLM 无法采样输出向量 → 不能自回归生图；离散码让图像进入与文本相同的下一 token 预测框架，理解生成统一，但量化有信息损失（文字/细节变糊）且每图固定吞约 1024 token 上下文。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Gage P. A New Algorithm for Data Compression. C Users Journal 1994.（无 arXiv，BPE 原始文献）</li>
+      <li>Sennrich R, Haddow B, Birch A. <a href="https://arxiv.org/abs/1508.07909">Neural Machine Translation of Rare Words with Subword Units</a>. ACL 2016. arXiv:1508.07909.</li>
+      <li>Kudo T. <a href="https://arxiv.org/abs/1804.10959">Subword Regularization: Improving Neural Network Translation Models with Multiple Subword Candidates (Unigram)</a>. ACL 2018. arXiv:1804.10959.</li>
+      <li>Kudo T, Richardson J. <a href="https://arxiv.org/abs/1808.06226">SentencePiece: A Simple and Language Independent Subword Tokenizer and Detokenizer</a>. EMNLP 2018. arXiv:1808.06226.</li>
+      <li>Schuster M, Nakajima K. Japanese and Korean Voice Search (WordPiece). ICASSP 2012.（无 arXiv）</li>
+      <li>Radford A, et al. Language Models are Unsupervised Multitask Learners (GPT-2). OpenAI 2019.（无 arXiv，字节级 BPE 出处）</li>
+      <li>Dosovitskiy A, et al. <a href="https://arxiv.org/abs/2010.11929">An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale (ViT)</a>. ICLR 2021. arXiv:2010.11929.</li>
+      <li>van den Oord A, Vinyals O, Kavukcuoglu K. <a href="https://arxiv.org/abs/1711.00937">Neural Discrete Representation Learning (VQ-VAE)</a>. NeurIPS 2017. arXiv:1711.00937.</li>
+      <li>Esser P, Rombach R, Ommer B. <a href="https://arxiv.org/abs/2012.09841">Taming Transformers for High-Resolution Image Synthesis (VQGAN)</a>. CVPR 2021. arXiv:2012.09841.</li>
+      <li>Ramesh A, et al. <a href="https://arxiv.org/abs/2102.12092">Zero-Shot Text-to-Image Generation (DALL-E, dVAE)</a>. ICML 2021. arXiv:2102.12092.</li>
+      <li>Bao H, et al. <a href="https://arxiv.org/abs/2106.08254">BEiT: BERT Pre-Training of Image Transformers</a>. ICLR 2022. arXiv:2106.08254.</li>
+      <li>Team Gemini, et al. / Chameleon Team. <a href="https://arxiv.org/abs/2405.09818">Chameleon: Mixed-Modal Early-Fusion Foundation Models</a>. arXiv 2024. arXiv:2405.09818.</li>
+      <li>Liu H, et al. <a href="https://arxiv.org/abs/2304.08485">Visual Instruction Tuning (LLaVA)</a>. NeurIPS 2023. arXiv:2304.08485.</li>
+      <li>Liu W, et al. <a href="https://arxiv.org/abs/2310.03744">Improved Baselines with Visual Instruction Tuning (LLaVA-1.5)</a>. CVPR 2024. arXiv:2310.03744.</li>
+      <li>Wang P, et al. <a href="https://arxiv.org/abs/2409.12191">Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution</a>. arXiv 2024. arXiv:2409.12191.</li>
+      <li>Chen Z, et al. <a href="https://arxiv.org/abs/2312.14238">InternVL: Scaling up Vision Foundation Models and Aligning for Generic Visual-Linguistic Tasks</a>. CVPR 2024. arXiv:2312.14238.</li>
+      <li>Dehghani M, et al. <a href="https://arxiv.org/abs/2307.06304">Patch n' Pack: NaViT, the Vision Transformer for any Aspect Ratio and Resolution</a>. arXiv 2023. arXiv:2307.06304.</li>
+      <li>Alayrac J-B, et al. <a href="https://arxiv.org/abs/2204.14198">Flamingo: a Visual Language Model for Few-Shot Learning</a>. NeurIPS 2022. arXiv:2204.14198.</li>
+      <li>Li J, et al. <a href="https://arxiv.org/abs/2301.12597">BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models</a>. ICML 2023. arXiv:2301.12597.</li>
+      <li>Wang W, et al. <a href="https://arxiv.org/abs/2409.18869">Emu3: Next-Token Prediction is All You Need</a>. arXiv 2024. arXiv:2409.18869.</li>
+      <li>Yao Y, et al. <a href="https://arxiv.org/abs/2408.01800">MiniCPM-V: A GPT-4V Level MLLM on Your Phone</a>. arXiv 2024. arXiv:2408.01800.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

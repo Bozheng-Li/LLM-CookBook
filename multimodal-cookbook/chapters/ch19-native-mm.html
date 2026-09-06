@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 19 章 原生多模态与早期融合 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第三部分 · 多模态大模型架构全景</div>
+  <h1 class="chapter-title">第 19 章　原生多模态与早期融合</h1>
+  <div class="chapter-meta"><span>预计阅读 80 分钟</span><span>难度 ★★★★☆</span><span>前置：第 13 章（融合）、第 17 章（开源谱系）、第 2 章（VQ Token 化）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">"原生"的定义：适配器路线的三重天花板</a></li>
+  <li><a href="#sec-2">Chameleon：离散 token 早期融合的工程实录</a></li>
+  <li><a href="#sec-3">Fuyu：最激进的无编码器路线</a></li>
+  <li><a href="#sec-4">Transfusion：一个 Transformer 内的两种生成范式</a></li>
+  <li><a href="#sec-5">Emu 系：从上下文学习到自回归统一</a></li>
+  <li><a href="#sec-6">理论分析：早期融合与晚期融合的表示效率</a></li>
+  <li><a href="#sec-7">训练稳定性与数据配比：原生的真实代价</a></li>
+  <li><a href="#sec-7a">原生路线的评测与失败模式</a></li>
+  <li><a href="#sec-7b">2025–2026 的产品化观察</a></li>
+  <li><a href="#sec-8">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>第 15–17 章的主流架构（编码器 + 连接器 + LLM）在工程上大获全胜，但它们都是"嫁接"出来的：视觉与语言在各自的预训练里长大，相遇时已经定型。本章讨论更激进的问题：<b>能不能让模型从出生（预训练第一天）就同时看图和读文？</b>这就是原生多模态（natively multimodal）与早期融合（early fusion）。2024 年是这个方向的爆发年——Chameleon、Fuyu、Transfusion、Emu3 几乎同时出现，各自给出了不同的技术答案；GPT-4o 与 Gemini 的"原生"叙事也在此背景下获得技术注脚。本章逐一解剖这些方案，并用表示效率的理论视角回答：早期融合是未来，还是昂贵的弯路？</p>
+<p>"为什么是 2024 年"也值得问。三个条件的成熟使原生路线从论文概念变成可执行工程：<b>①tokenizer 达标</b>——VQGAN 系的重建质量跨过"生成图像可用"的门槛；<b>②数据管道成熟</b>——图文对、交错网页、视频-文本的大规模清洗管线（第 34 章）被 CLIP/LAION 时代打磨完毕；<b>③稳定性知识积累</b>——大模型训练的 spike 治理、norm 设计（第 7、8 章）已有 playbook。三者齐备后，原生路线的"难"从原理性困难降级为工程性困难——这是所有技术路线成熟的标志。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>"原生"的定义：适配器路线的三重天花板</h2>
+<p>先厘清术语。<b>适配器路线（adapter-based）</b>：独立视觉编码器（常已对齐，如 CLIP）+ 连接器 + 语言模型，视觉是"外挂"。它在 2023–2024 横扫开源社区，但有三个结构性天花板：<b>①信息瓶颈前置</b>——视觉信息被压缩进几百个 token 后不再有"反悔"的机会，编码器看不见的细节 LLM 永远看不见（第 14 章已论证）；<b>②目标函数割裂</b>——视觉编码器的目标（对比/重建）与 LLM 的目标（下一词预测）不同，连接器只能在两个已定型的表示空间之间"和稀泥"；<b>③任务形态受限</b>——理解容易、生成难：适配器路线的模型几乎都不能输出图像，因为语言模型的输出空间里没有图像的容身之处。</p>
+<p><b>原生多模态</b>的三种理解层次（从弱到强）：<b>弱原生</b>——预训练早期就混合多模态数据（多数旗舰已做到，如 Qwen-VL 的三阶段）；<b>中原生</b>——单一模型统一处理多模态输入<b>与输出</b>（理解+生成一体）；<b>强原生</b>——所有模态在同一 tokenizer/序列空间中无差别处理（Chameleon 式）。本章的主角覆盖后两个层次。判断一个模型"多原生"的最快方法：看它的损失函数——只有文本 loss？还是图文共用一个生成目标？</p>
+<p>三重天花板还可以用数字来感受。<b>瓶颈之痛</b>：CLIP-ViT-L 的 576 token 相当于把一张图压到"一句话"的预算——适配器路线的"看到"从定义上就是"摘要式地看到"。<b>目标割裂之痛</b>：CLIP 的对比目标只需要保留"足以与文本区分"的信息，"图里有几把椅子"这类细节如果在 caption 里不可辨，编码器就没动力编码——而 MLLM 的下游恰恰要问这类问题。<b>任务形态之痛</b>：2023 年用户问得最多的问题是"它能画图吗？"，适配器架构的答案永远是"不能"——这不是工程偷懒，而是输出空间的结构性缺失。原生路线的动机不是学术洁癖，而是这三个痛点的真实存在。</p>
+<p>把"原生能多好"说得更具体，有三个可验证的优势形态：<b>①交错理解</b>——多图多轮中跨图的指代与推理（"第一张图的风格画第二张图的内容"），适配器路线因为每图独立编码而天然薄弱；<b>②生成式感知</b>——用"生成"验证"理解"（让模型画出它理解的几何题，画错即理解错），这是纯理解架构无法自检的盲区；<b>③统一的表示经济性</b>——同一组参数同时服务两种模态，理论容量利用率更高（在数据充足时）。这三点也是评测原生模型时最该看的"原生特有"指标——通用基准的分数差异只是故事的次要部分。</p>
+<div class="box-history"><p class="box-title">🕰 历史一刻：2024 年 5 月，两条新闻的交汇</p>
+<p>2024 年 5 月，OpenAI 发布 GPT-4o（"o" = omni），主打端到端的原生全模态（文本/音频/视觉实时交互）；同月 Meta 放出 Chameleon 论文，公开了离散 token 早期融合的完整训练配方。一闭一开，都在回答同一个问题：适配器路线的成熟，是否恰恰意味着它已经是"上一代技术"？GPT-4o 用产品行为投票，Chameleon 用工程细节投票——本章讨论的正是这场投票背后的技术逻辑。值得注意的是结果的微妙：到 2026 年，开源社区的主流仍是适配器路线（或其强化版），原生路线的全面胜利尚未到来——为什么？本章末尾给出解释。</p></div>
+
+<div class="box-tip"><p class="box-title">💡 技巧：判断论文里"原生"成色的三个检查点</p>
+<p>读任何宣称"原生多模态"的论文，先查三件事：<b>①预训练目标是否统一</b>——找损失函数定义，图文是否共享同一个目标（或至少同参数联合训练）；<b>②预训练数据是否从头混合</b>——看训练配置表的数据课程，"后训练才见图"的不算；<b>③输出空间是否含视觉</b>——能不能画图/出语音，不能则为"原生理解"。三问之后，"原生"的营销水分基本挤干——这不是抠字眼，而是三个检查点分别对应本章三个技术方案的根本差异。</p></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>Chameleon：离散 token 早期融合的工程实录</h2>
+<p>Chameleon（Meta，arXiv:2405.09818）是强原生路线最完整的公开技术报告。核心设计：<b>用同一个 token 流处理文本与图像</b>。文本用 BPE（128K 词表），图像用 VQ tokenizer（基于第 2 章的 VQ-GAN 谱系，8192 码本，1024 token/图，8192 图像 token 不与文本共享）——两种 token 拼进统一序列，从头预训练。理解与生成对称：读图是"图像→token 序列"，生图是"token 序列→图像"，<b>同一个下一 token 预测目标覆盖两种模态</b>。架构本身几乎不变（Transformer 解码器），所有革命都在数据、tokenizer 与训练稳定性上。</p>
+<p>数据侧的设计同样关键。Chameleon 的预训练混合以"文本打底、图文逐步加码"为原则：语言数据（约一半）保持原有的去重与课程，图像-文本对经过 CLIP 分数过滤与重新标注（利用其自家的 captioner 提升文本质量），交错序列（网页式图文混排）则负责教会模型"图文轮流说话"的节奏。一个反直觉的细节：<b>交错数据的比例并不高</b>（个位数百分比），但对"看图说话的对话感"影响巨大——这暗示交错"格式"本身是重要的学习信号，而不只是数据量的堆叠。</p>
+<p>数据侧的设计同样关键。Chameleon 的预训练混合以"文本打底、图文逐步加码"为原则：语言数据保持原有的去重与课程，图像-文本对经过 CLIP 分数过滤与重新标注，交错序列（网页式图文混排）负责教会模型"图文轮流说话"的节奏。一个反直觉的细节：<b>交错数据的比例并不高</b>（个位数百分比），但对"看图说话的对话感"影响巨大——这暗示交错"格式"本身是重要的学习信号，而不只是数据量的堆叠。</p>
+<p>论文最有价值的部分是它对<b>训练不稳定</b>的坦白：早期融合的训练在纯文本阶段后引入图像，出现 loss spike 与发散。两大修复：<b>①QK-Norm</b>——对注意力的 Q、K 做 RMSNorm（替换 logit 缩放），抑制注意力 logits 的爆炸——图像 token 的激活分布比文本更重尾（VQ 码字的稀疏跳变），未约束的 QK 点积容易把 softmax 推入饱和区、梯度消失进而发散；<b>②Z-loss 正则</b>——惩罚 logits 的 $\log\sum\exp(z)$ 幅度，约束 softmax 分母的稳定性。加上"前 15% 训练无图像数据"的课程设计，7B/34B 两档模型才稳定跑完 4.4T–6.9T token 的多模态混合。<b>这段"踩坑实录"是全章最值得精读的部分</b>——它把早期融合的真实工程代价摆上了台面。</p>
+<p>成绩方面，Chameleon-34B 在多项基准上表现强劲（COCO caption 微调后 SOTA、TextVQA 45.4），更重要的演示是<b>"生成式交错输出"</b>：回答里可以自由穿插图像与文本（如"这里有你需要的零件图<图>"），这是适配器路线结构性做不到的产品形态。局限也很诚实：34B 版本的图像生成质量仍低于同期的专用文生图模型（SDXL/Imagen），若干知识基准暴露了多模态训练对语言能力的稀释（alignment tax）——"两头都要强"在 2024 年仍是未完成的目标。</p>
+<figure><img src="../assets/images/papers/2405.09818_1.png" loading="lazy" alt="Chameleon 交错生成示例"><figcaption>图 19-4　<b>Chameleon 的交错生成</b>：任务示例展示模型在回答中自由穿插文本与图像——统一 token 流的产品级意义（来源：Team Chameleon, arXiv:2405.09818）。</figcaption></figure>
+<figure><svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+  <defs><marker id="a19" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">统一 token 流：理解与生成对称</text>
+  <text x="120" y="64" text-anchor="middle" font-size="12" fill="#1e40af" font-family="sans-serif">文本 BPE（128K）</text>
+  <text x="120" y="84" text-anchor="middle" font-size="11" fill="#64748b" font-family="sans-serif">"一只猫坐在"</text>
+  <rect x="60" y="96" width="120" height="34" rx="6" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="120" y="118" text-anchor="middle" font-size="10.5" fill="#1e3a8a" font-family="sans-serif">t1 t2 t3 …</text>
+  <text x="400" y="64" text-anchor="middle" font-size="12" fill="#92400e" font-family="sans-serif">图像 VQ（8192 码本）</text>
+  <text x="400" y="84" text-anchor="middle" font-size="11" fill="#64748b" font-family="sans-serif">1024 token/图，独立词表</text>
+  <rect x="300" y="96" width="200" height="34" rx="6" fill="#fffbeb" stroke="#d97706"/>
+  <text x="400" y="118" text-anchor="middle" font-size="10.5" fill="#92400e" font-family="sans-serif">v1 v2 v3 … v1024</text>
+  <line x1="180" y1="113" x2="296" y2="113" stroke="#64748b" stroke-width="1.5" marker-end="url(#a19)"/>
+  <rect x="150" y="170" width="460" height="44" rx="10" fill="#f5f3ff" stroke="#8b5cf6"/>
+  <text x="380" y="190" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#5b21b6" font-family="sans-serif">统一 Transformer 解码器（因果注意力）</text>
+  <text x="380" y="206" text-anchor="middle" font-size="10.5" fill="#7c3aed" font-family="sans-serif">QK-Norm + Z-loss：让重尾的图像 logits 不再引爆 softmax</text>
+  <line x1="380" y1="140" x2="380" y2="166" stroke="#64748b" stroke-width="2" marker-end="url(#a19)"/>
+  <text x="255" y="245" text-anchor="middle" font-size="11.5" fill="#047857" font-family="sans-serif">← 理解：图 token 进序列</text>
+  <text x="510" y="245" text-anchor="middle" font-size="11.5" fill="#e11d48" font-family="sans-serif">生成：预测图 token → VQ 解码成图 →</text>
+  <text x="380" y="272" text-anchor="middle" font-size="11" fill="#94a3b8" font-family="sans-serif">同一个下一 token 预测目标，没有分离的"视觉头"或"生成头"</text>
+</svg><figcaption>图 19-1　<b>Chameleon 的统一 token 流</b>：文本与图像 token 在同一序列、同一因果目标下处理；QK-Norm 与 Z-loss 是稳定训练的两大支柱。</figcaption></figure>
+<div class="box-paper"><p class="box-title">📄 论文精读：Chameleon（Team Chameleon, arXiv:2405.09818）</p>
+<p><b>问题</b>：能否用统一的离散 token 空间与下一 token 预测目标，从零预训练一个"理解+生成"的原生多模态模型，并保持文本能力不倒退？<b>方法</b>：图像 VQ tokenizer（8192 码本、1024 token/图）+ BPE 文本统一序列；QK-Norm + Z-loss；"先文本后多模态"的课程；7B（4.4T token）与 34B（6.9T token）两档。<b>关键结果</b>：34B 在理解与生成双侧进入当时第一梯队，首次公开演示高质量的图文交错输出；附录的稳定性与超参数披露是开源社区的公共财富。<b>为什么重要</b>：它是"强原生路线可行"的最完整公开证明；踩坑记录把"原生比适配器难多少"变成可量化的工程知识。<b>延伸阅读</b>：对照 Emu3（纯 AR 独立复现）与 Transfusion（双目标改进），三条路线合读才能拼出完整地图。</p></div>
+
+<h2 id="sec-3"><span class="sec-no">3.</span>Fuyu：最激进的无编码器路线</h2>
+<p>Adept 的 Fuyu-8B（2023 年 11 月，博客发布）把原生路线推到逻辑极端：<b>不要视觉编码器</b>。图像的 patch 经一个线性层直接映射进解码器——没有 ViT、没有 CLIP 预训练、没有连接器，"编码"被完全交还给 LLM 本体。设计动机：①支持任意分辨率与架构最简（图表/GUI 截图等"非自然图像"不需要 ImageNet 式先验）；②训练管线统一（只有一条 LM 损失）。代价同样极端：8B 的 LLM 要同时学"语言"与"从零开始的视觉感知"，图像理解的上限显著受限于模型规模与视觉数据量——Fuyu 在通用基准上落后同期适配器路线约一档，但在 UI 截图理解等目标场景表现出人意料。</p>
+<p>从架构细节看，Fuyu 的极简是一条完整的推理链：图像直接 resize 到任意偶数尺寸 → 切 patch → 线性投影 → 与文本 token 拼接进因果 Transformer → 下一词预测一路到底。没有独立的视觉位置编码，没有模态类型嵌入（模型"自己学"哪些 token 是图的）。这种激进设计在多模态 Agent 场景（UI 截图/图表）获得了意外契合——但也正是这些场景的数据规模不足以让 LLM 从零学好感知，最终 Fuyu 线的迭代停在 2023 年底。它的遗产被后来的"线性视觉投影"研究继承。</p>
+<p>Fuyu 的价值不在分数而在<b>思想实验价值</b>：它测出了"LLM 自学视觉"的下限。结论是——用 10B 级模型 + 万亿 token 级数据，自学视觉是"能用但浪费"的；视觉感知有其内在的统计结构（局部性、层级性），ViT 式的专用预训练等于"先修完视觉的通识课再上大学"。这个结论与第 6 节的理论分析（早融合的表示效率优势需要更大规模才能兑现）互相印证——事实上 Fuyu 可以看作"把原生路线的门槛条件（大数据）当作默认前提"的设计，前提不满足时它的短板就全部暴露。<b>工程上真正存活下来的是 Fuyu 的"无编码器思想"的高分辨率变体</b>：Qwen2.5-VL 的原生动态分辨率在形式上就是"Fuyu 式直进 + ViT 式预训练"的折中——保留专用视觉塔，但让它吃任意分辨率的 patch 而非固定网格。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：一张表看懂"谁的视觉先验在哪一层"</p>
+<p>判断任何架构的"视觉先验位置"：<b>适配器路线</b>——先验在编码器（CLIP 的 4 亿对）、LLM 零视觉先验；<b>Chameleon 式</b>——先验在 tokenizer 与统一预训练（图像作为"外语"学进去）；<b>Fuyu 式</b>——先验全在 LLM 预训练数据里；<b>混合式（Qwen2.5-VL）</b>——先验在编码器（预训练 ViT）+ LLM 的多模态联训。先验位置决定了"换任务时该微调什么"：适配器路线换重感知任务要动编码器，Chameleon 式只需要数据，Fuyu 式要重训本体。</p></div>
+
+<h2 id="sec-4"><span class="sec-no">4.</span>Transfusion：一个 Transformer 内的两种生成范式</h2>
+<p>Transfusion 的推理侧设计同样精巧：文本照常逐 token 生成；当模型输出"开始图像"的标记时，切换到扩散模式——初始化一段纯噪声的图像潜变量块，执行 $T$ 步去噪（每步是完整的双向注意力前向，文本部分 KV 缓存复用），完成后回到文本生成。两种模式共享同一套权重，切换由内容决定——这是"上下文驱动的多模态执行流"，比"一个理解模型+一个生成模型的级联"优雅得多。消融显示：双向注意力的图像段比"强行因果"的图像段生成质量高一个档次；λ 从 0.01 到 1 的扫描中，0.1 附近是理解/生成的帕累托平衡点——这个"损失配比"超参数的敏感性，是混合目标路线的额外调参负担。</p>
+<p>Chameleon 的统一自回归有个隐性代价：<b>图像 token 的 AR 生成质量低于扩散模型</b>——逐 token 生成图像在全局一致性（纹理、对称、细粒度结构）上不如扩散的全局去噪。Transfusion（Meta，arXiv:2408.11039）给出第三条路：<b>文本走 LM 损失、图像走扩散损失，共享同一个 Transformer</b>。</p>
+<div class="box-theory"><p class="box-title">📐 理论推导：Transfusion 的双目标与双向注意力设计</p>
+<p>设序列中文本 token $t_{1..L}$、图像潜变量块 $x_{1..N}$（经 VAE 编码，每块是一个 patch 的连续向量）。总损失是两个目标之和：</p>
+<div class="math-block">$$\mathcal{L} = \underbrace{\mathcal{L}_{\mathrm{LM}}(\text{文本段，下一词预测})}_{\text{因果注意力}} \;+\; \lambda\, \underbrace{\mathcal{L}_{\mathrm{Diffusion}}(\text{图像段，加噪去噪})}_{\text{双向注意力}}$$</div>
+<p>关键的架构决策在<b>注意力掩码</b>：文本段之间因果（语言生成需要单向）；<b>图像块之间双向</b>（扩散去噪需要全图信息）；文本对先前图像块可见（理解需要）。训练时对图像块独立加噪（每块独立采样时间步 $t$），模型用 DiT 式的 adaLN/上下文条件输出噪声预测。两个精妙细节：①<b>模态间不需要重算</b>——图像去噪的迭代在推理时只重复图像段的前向，文本 KV 可缓存；②λ 的平衡（原文 0.1 量级）决定"理解 vs 生成"的资源分配。效果：在同等算力下，Transfusion 的图像生成质量超过同规模 AR 模型（Chameleon 式），文本能力不受损——<b>"扩散管生成质量，LM 管语义理解"的分工被证明可行</b>。它与第 20 章 Janus 的"解耦视觉编码器"形成互补：Janus 解耦在"表示层"，Transfusion 解耦在"目标函数层"。</p>
+<p>与 Chameleon 式离散路线的对比还有一层信息论含义：VAE 潜变量是<b>连续</b>的，每块携带的信息量由 VAE 的瓶颈决定，不存在"码本塌缩到少数码字"的表示浪费；但代价是生成时的采样迭代（多步去噪）与序列化困难（图像潜变量难以像 token 那样自然地承载"语义推理"）。Transfusion 的工程答案是把扩散目标"装进" LM 的训练循环里，让两个空间的表示由同一组参数协调——2025 年后的后续工作（Janus-Flow、BAGEL 等统一模型）基本都沿这条"混合目标"主线迭代，说明它已成为统一路线的主流工程形态。</p></div>
+<figure><img src="../assets/images/papers/2408.11039_0.png" loading="lazy" alt="Transfusion 双目标总览"><figcaption>图 19-2　<b>Transfusion 总览</b>：文本 token 走因果 LM 损失、图像潜变量走扩散损失，共享一个 Transformer；掩码设计让文本因果、图像双向（来源：Zhou et al., arXiv:2408.11039）。</figcaption></figure>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>Emu 系：从上下文学习到自回归统一</h2>
+<p>BAAI 的 Emu 系（Emu/Emu2 arXiv:2312.13289、Emu3 arXiv:2409.18869）走的是"渐进式原生"路线。<b>Emu2</b>：把连续视觉特征（EVA 编码）作为"视觉 token"放进 LLM 序列（回归式生成走扩散解码器），用 1.4 万亿多模态 token 训练出 37B 模型，演示了"生成式多模态上下文学习"——把示例图放进上下文，模型能完成"图生图"式的 few-shot 任务。<b>Emu3</b> 则彻底离散化：<b>文本、图像、视频全部用下一个 token 预测</b>（图像用 SBER-MoVQGAN tokenizer，视频是时间维度的图像序列），5B 模型 + 8.7 万亿 token 的纯 AR 训练，同时做到理解、图像生成与视频生成——它是"AR 统一论"的最有力证据：只要 tokenizer 与数据规模到位，扩散并非必需。</p>
+<p>Emu3 的关键消融给了社区两个重要结论：<b>①</b>"vision tokenizer 的码本质量"是 AR 统一路线的第一瓶颈（重建质量直接封顶生成质量——第 2 章的 VQ 谱系因此重新变热）；<b>②</b>视频 AR 生成的时序一致性来自"时间维度的位置编码设计"而非模型结构。它也与 Chameleon 一起定义了原生路线的两大分支：<b>离散 AR 统一</b>（Chameleon/Emu3/LlamaGen）与<b>连续+扩散混合</b>（Transfusion/Janus-Flow）——第 20 章的统一模型章节将在此分类上展开。</p>
+<p>在应用侧，Emu3 展示了一个特别有启发性的能力：<b>用 AR 生成做"视觉思维链"</b>——模型可以先生成一张中间草图再基于它继续推理/生成，这预示了"原生模型的推理可以包含生成动作"的范式（与 o3 的缩放查看形成有趣对照：一个是"生成中间表示辅助推理"，一个是"主动调用感知工具辅助推理"，殊途同归）。这类能力在纯理解架构上无法实现，因为它的输出空间里没有"图"。</p>
+<p>Emu 系还有一处容易被忽视的设计演进：<b>Emu2 的"回归式"视觉特征</b>——图像以连续特征（而非离散 token）进入序列，需要生成时回归出扩散模型的条件。这条"连续特征 + 外接生成器"的中间路线，实际上是适配器路线与强原生路线的杂交：理解侧继承 EVA 编码器的质量，生成侧外包给专用扩散模型。Emu3 转向全离散则是"押注 tokenizer 进步"的战略决策——只要 tokenizer 的重建与语义质量持续提升，纯 AR 的简洁性红利就会持续放大。</p>
+<figure><img src="../assets/images/papers/2409.18869_0.png" loading="lazy" alt="Emu3 与开源旗舰对比"><figcaption>图 19-3　<b>Emu3 的成绩单</b>：纯下一 token 预测在理解、图像生成、视频生成三线同时进入开源第一梯队，验证"AR 统一论"（来源：Wang et al., Emu3, arXiv:2409.18869）。</figcaption></figure>
+
+<div class="box-history"><p class="box-title">🕰 历史一刻：2024 年，VQ tokenizer 的"文艺复兴"</p>
+<p>VQ-VAE（2017）与 VQGAN（2021）本是图像生成的"老技术"，在扩散模型崛起后一度边缘化——Stable Diffusion 选择了连续 VAE + UNet 去噪的路线。2024 年 Chameleon/Emu3 的原生浪潮让 VQ tokenizer 戏剧性回归：<b>它不再只是"压缩器"，而是多模态统一语言的"字母表"</b>。这个角色转变把老技术问题重新变成前沿问题：码本规模、重建感知质量、语义与外观的兼顾（SEED 系的语义码本，第 20 章）。到 2026 年，"为多模态 LLM 设计 tokenizer"已经成为独立的研究方向——历史在这里完成了一个循环：老技术因为新的系统语境而重新年轻。这个循环也给研究者一个提醒：判断一项技术的价值，要放在"系统语境"里而非绝对性能里——VQ 在纯生成竞赛里输给扩散，在统一架构里却找到了不可替代的位置。</p></div>
+
+<h2 id="sec-6"><span class="sec-no">6.</span>理论分析：早期融合与晚期融合的表示效率</h2>
+<p>把三条路线放进一个理论框架里比较。设模态 $m$ 的"原始信息量"为 $H_m$、模型的容量为 $C$，核心问题是：<b>容量怎么分配给"各模态的感知"与"跨模态的对齐"？</b></p>
+<p><b>适配器路线</b>把对齐压缩在连接器的少量参数里——容量利用率高（感知与语言各用现成的），但对齐上限低（接口处是信息瓶颈，且两个预训练空间的"语义坐标系"不同）。<b>原生路线</b>让对齐渗透在全部参数里——上限高（无接口瓶颈，语义坐标系从头统一），但容量利用率低：在多模态数据占比不足时，大量容量仍在重复学习文本结构；且视觉 token 的序列长度（1024+/图）使注意力成本显著高于纯文本。<b>定量含义</b>：原生路线的优势需要一个"数据规模门槛"——多模态 token 占比足够大后，统一表示的复利才开始兑现。这解释了经验观察：<b>小规模上适配器路线几乎总是赢，超大规模上原生路线开始反超</b>（GPT-4o/Gemini 的"原生"选择本质上是"它们的数据与算力已经越过了门槛"）。</p>
+<div class="tbl-wrap"><table>
+<caption>表 19-1　三条路线的系统对比</caption>
+<thead><tr><th>维度</th><th>适配器（LLaVA/Qwen-VL）</th><th>离散 AR 统一（Chameleon/Emu3）</th><th>混合目标（Transfusion/Janus-Flow）</th></tr></thead>
+<tbody>
+<tr><td>视觉进入方式</td><td>编码器特征经连接器注入</td><td>VQ token 直接进序列</td><td>连续潜变量 + 扩散损失</td></tr>
+<tr><td>理解质量</td><td>强（继承 CLIP 对齐）</td><td>中（受 tokenizer 上限）</td><td>强</td></tr>
+<tr><td>生成质量</td><td>无（或外挂）</td><td>中上（AR 纹理一致性弱）</td><td>强（扩散全局一致性）</td></tr>
+<tr><td>训练稳定性</td><td>好</td><td>难（QK-Norm/Z-loss 必备）</td><td>中（双目标平衡难）</td></tr>
+<tr><td>数据门槛</td><td>低（百万级 SFT 即可）</td><td>高（万亿级混合）</td><td>高</td></tr>
+<tr><td>推理成本</td><td>低</td><td>高（图像 token 多）</td><td>中（扩散迭代可并行）</td></tr>
+<tr><td>代表规模</td><td>2B–70B</td><td>7B–34B</td><td>7B–56B</td></tr>
+<tr><td>代表模型</td><td>LLaVA / Qwen-VL / InternVL</td><td>Chameleon / Emu3</td><td>Transfusion / Janus-Flow / BAGEL</td></tr>
+</tbody></table></div>
+<div class="box-theory"><p class="box-title">📐 理论视角：为什么图像 token 是"贵"的</p>
+<p>语言 token 的信息密度高（一个词往往对应一个概念），图像 patch 的信息密度低（16×16 像素大部分是冗余的纹理）。信息论地看，若图像的信息熵集中在低频结构，VQ tokenizer 的 1024 token 中有效熵可能只占几百 token——<b>AR 统一路线的序列成本是"按冗余付费"</b>。三种缓解：①更好的 tokenizer（把熵压缩进更少 token，如更高压缩率的 VQ/扩散式 tokenizer）；②token 合成（Janus 的理解/生成分离编码器，各自用最经济的表示）；③混合目标（Transfusion 让图像留在连续空间，绕开离散化熵损失）。这也回答了"为什么 2026 年主流仍是适配器"：<b>在 tokenizer 便宜下来之前，按冗余付费的路线只有在算力过剩时才划算</b>。</p></div>
+<p>实证侧也有交叉证据。MM1（arXiv:2403.09611）的消融显示：同等算力下，"CLIP 编码器 + 适配器"的混合预训练在多数理解基准上胜过完全从零的多模态预训练——因为对比预训练以极低的算力成本"预付"了对齐的大部分工作。而原生阵营的反例是 Gemini 系的持续强势：当预训练数据中多模态占比足够高且质量高，从头统一的优势开始显现。<b>结论不是谁对谁错，而是"对齐预训练"与"统一预训练"是同一条效率曲线上的不同区段</b>——你的预算落在哪个区段，决定哪条路线更优。</p>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：原生路线的"最小可行入门"（两周计划）</p>
+<p><b>第一周</b>：tokenizer——用预训练 VQGAN（Emu3 开源的 MoVQGAN 或 taming-transformers）把 1 万张图转成 token 序列，计算码本利用率（目标 >30%）；用现成 1B LM 在"图像 token+文本"混合序列上做 10 亿 token 续训，观察 loss 稳定性与文本 PPL 是否退化。<b>第二周</b>：复现 QK-Norm/Z-loss 效果——同一设置下去掉两者，记录 spike 频率；对比"先文本后图像"vs"全程混合"两种课程。产出：《小规模原生训练观察报告》。这个实验建立"原生路线的体感"——它到底比适配器难在哪，做过一次就不会再迷信任何一方的宣传。</p></div>
+
+<div class="box-theory"><p class="box-title">📐 理论推导：双向图像段的注意力成本账</p>
+<p>Transfusion 式混合的一个隐藏优势在注意力成本。设文本长 $L$、图像块 $N$（$N\gg L$ 是常态）。纯 AR（Chameleon 式）：注意力成本 $rac{1}{2}(L+N)^2 d$（因果三角），且每生成一个图像 token 都要重新 attend 全部前文；扩散式（Transfusion 式）：文本部分 $rac{1}{2}L^2 d$ + 图像双向 $N^2 d$ + 跨模态 $LN d$，但<b>去噪的 $T$ 步之间图像表示独立重算、文本 KV 只算一次</b>。在 $N=1024$、$L=200$ 的典型配比下，两者的理论量级接近，但扩散式的并行度高（$T$ 步可并发、无序列依赖），在 Hopper 级硬件上的实际吞吐显著优于 AR 逐 token 的访存受限解码（第 8 章 roofline）。这个"理论成本相近、硬件效率占优"的账，是混合目标路线在工程上的隐性加分项。</p></div>
+
+<h2 id="sec-7"><span class="sec-no">7.</span>训练稳定性与数据配比：原生的真实代价</h2>
+<p>综合 Chameleon/Emu3/Transfusion 的披露，原生路线的工程代价集中在四件事：<b>①损失尖峰治理</b>——图像 token 引入重尾 logits，QK-Norm + Z-loss + 梯度裁剪的组合拳是标配（第 7 章的 spike 处置在此全面升级）；<b>②数据配比课程</b>——先用纯文本稳住语言底座，再渐进引入图像（Chameleon 前 15% 无图），配比失衡会让语言能力"倒退"（alignment tax 的多模态版）；经验区间是文本：多模态 ≈ 1:1 起步、语言不低于 40%，且交错数据虽占比小但不可缺；<b>③tokenizer 是新的一等公民</b>——码本规模、重建质量、码本利用率（codebook usage）的监控成为日常，tokenizer 升级等于模型重训；<b>④评测双线</b>——理解与生成分开打分，防止"生成拉垮理解"或反之的隐性退化。<b>给实践者的现实建议</b>：7B 以下规模、以理解为主的场景，适配器路线仍是首选；原生路线的入门实验建议从"Emu3 式小规模复现"（第 49 章 L3 缩比）或直接使用 Chameleon/Emu3 的开源权重开始，而不是从零训。</p>
+<p>训练中的监控面板建议分四格：<b>①文本 loss</b>（held-out 文本 PPL——语言税的哨兵）；<b>②图像重建/生成 loss</b>（分 tokenizer 与模型两段看）；<b>③注意力熵</b>（按模态分组统计——饱和与坍缩的哨兵）；<b>④梯度范数与 spike 计数</b>（稳定性哨兵）。四格中任何一格异常都对应第 7A 节的一类失败模式——这个"仪表盘到诊断"的映射，让原生训练的日常运维有章可循。</p>
+
+<p>把三份报告的训练配置并排读，还有一个有趣的对比：Chameleon（6.9T token/34B）与 Emu3（8.7T/5B）的"数据规模/参数规模"比都在 200–1700 区间的极端过训练带——远超 Chinchilla 的 20 倍标准。原因与第 7 章的推理感知过训练一致：统一模型的多模态任务（尤其生成）对模型"内化程度"的要求更高，且生成质量对欠训练极其敏感。<b>原生路线因此天然是"重数据"路线</b>——这不是缺点而是结构属性：它用数据代替了结构先验（编码器）与对齐捷径（连接器）。</p>
+<p>三份技术报告之外，开源社区对原生路线的独立检验也值得一读：OpenEmu/Chameleon 复现项目普遍报告"复现分数低于原论文 5–15%"，主要缺口在<b>数据管线</b>而非模型（原论文的数据质量与课程顺序难以完整复原）。这再次呼应第 34 章的主题：数据工程是原生路线真正的护城河——模型结构都是公开的，"怎么喂"才是秘密。</p>
+
+<h2 id="sec-7a"><span class="sec-no">7A.</span>原生路线的评测与失败模式</h2>
+<p>原生模型需要双线评测，且两线会互相"抢算力"。理解线沿用第 40 章基准（MMMU/MMBench/DocVQA）；生成线用 GenEval/VBench 类；<b>交叉线</b>才是原生独有的——图文交错任务（先描述再画示意图）、"指着自己生成的内容回答"的自指一致性、"用图修正文字"的多模态自我修正。交叉任务缺少标准化基准，社区常用人工评估，这也是原生路线进展难以精确比较的原因之一。</p>
+<p>五类典型失败模式：<b>①模态退化</b>——多模态数据占比过低，模型"忘记"怎么生图；诊断：分模态 loss 分开监控。<b>②tokenizer 玻璃化</b>——生成图像出现规则性纹理伪影（码本塌缩或重建上限）；诊断：先单独测 tokenizer 重建质量再怪模型。<b>③注意力饱和</b>——长图 token 稀释文本注意力；诊断：注意力熵监控（按模态分组的熵统计）。<b>④语言税</b>——混合训练后文本基准下降；诊断：held-out 文本 PPL 双跟踪。<b>⑤交错错乱</b>——图文时序错位、图不对应文；诊断：交错一致性探针。出问题时先对号，再开药；若多条同时命中，优先处理数据侧（配比/质量），再动结构侧（norm/位置编码）——数据问题的修复收益总是更大。</p>
+<div class="tbl-wrap"><table>
+<caption>表 19-2　原生模型的"四格仪表盘"与对应诊断</caption>
+<thead><tr><th>监控格</th><th>健康形态</th><th>异常信号</th><th>对应失败模式</th></tr></thead>
+<tbody>
+<tr><td>文本 PPL</td><td>平稳或缓降</td><td>回升/平台期</td><td>④语言税 → 调数据配比</td></tr>
+<tr><td>图像生成 loss</td><td>缓降且与 tokenizer 上限匹配</td><td>停滞在高位</td><td>②tokenizer 玻璃化 → 先查重建闭环</td></tr>
+<tr><td>注意力熵（按模态）</td><td>文本/图像各自稳定</td><td>某模态熵骤降</td><td>①模态退化或 ③饱和 → 查数据/位置编码</td></tr>
+<tr><td>梯度范数 & spike</td><td>偶发、可回滚</td><td>频发</td><td>稳定性 → QK-Norm/Z-loss/裁剪复查</td></tr>
+</tbody></table></div>
+<div class="box-warn"><p class="box-title">⚠️ 陷阱：把 tokenizer 的锅甩给模型</p>
+<p>AR 统一路线的生成质量"卡在重建上限"是最常见的误诊：tokenizer 的重建质量决定生成质量的理论天花板，模型再大也变不出来。排障的正确顺序：<b>先用 tokenizer 走一遍"图→token→重建图"的闭环</b>，重建不满意先升级 tokenizer（更高压缩、更大码本、感知损失加权），再调模型。Emu3 与 Chameleon 都把 tokenizer 作为独立工程章节对待——这不是巧合，而是依赖结构使然。</p></div>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：原生 vs 适配器的"五问决策卡"</p>
+<p>拿这五个问题给你的项目打分，三问以上答"是"才考虑原生：<b>①</b>产品需要模型<b>生成</b>图像/视频/语音吗？<b>②</b>需要跨模态的交错连贯性（指着自己画的图继续说）吗？<b>③</b>有多模态占比 ≥30% 的训练数据与万亿级 token 预算吗？<b>④</b>能承受 tokenizer 迭代带来的重训成本吗？<b>⑤</b>理解类指标已接近适配器路线的天花板（需要新增长点）吗？评分低不代表原生不好，只代表"现在还轮不到它"——把这张卡存档，每半年重新打一次分。</p></div>
+
+<h2 id="sec-7b"><span class="sec-no">7B.</span>2025–2026 的产品化观察：原生走到哪了</h2>
+<p>把这一年的产品信号汇总，可以看到原生路线的真实渗透节奏：<b>①语音先行</b>——GPT-4o 与 Gemini Live 的实时语音是最先兑现的"原生"能力，因为音频的 token 化（RVQ，第 30 章）比图像成熟且序列短；<b>②图像生成 API 化</b>——GPT-4o 原生生图（2025 年 3 月的吉卜力风潮）证明"理解模型内生高质量生成"在产品上可行，其技术路线（自回归+扩散混合或改进 tokenizer）虽未公开，但市场反馈证明用户在意的是"同一个模型理解并生成"的连贯体验；<b>③开源侧的折中</b>——Qwen3-VL、InternVL3.5 等旗舰在理解侧持续逼近闭源，但生成侧仍以"外接生成模型"的管道方案为主——适配器路线的产品惯性可见一斑。<b>④Agent 场景的隐性原生需求</b>——GUI 操作要求"看到什么就操作什么"的闭环，生成侧需求弱但感知侧要求极高，这解释了为什么 Agent 旗舰（UI-TARS 系）多为"适配器强化感知"而非全面原生。</p>
+<p>给"要不要现在转向原生"的团队一个决策框架：<b>你的产品需要模型生成交互资产（图/视频）吗？</b>不需要 → 适配器路线的性价比仍是碾压性的。需要，且质量要求中等 → 混合管道（理解模型+生成模型，第 45 章工作流）成熟可靠。需要，且"理解-生成连贯性"是核心体验（创作工具、教育产品）→ 原生路线开始值得投入，从开源 Chameleon/Emu3 权重微调起步。<b>需要，且要求端到端语音/实时</b> → 这是原生路线的核心腹地，目前闭源领先最多，开源需评估自研成本。</p>
+<p>把观察收敛成一张"成熟度表"：语音原生——产品级成熟（4o/Gemini Live）；图像原生生图——产品级可用（4o 生图、Chameleon 演示）；视频原生生成——技术演示期（Sora 类）；文档/Agent 场景原生——无需原生，适配器足够。这个成熟度分层解释了一个看似矛盾的现象：为什么"原生多模态"喊了两年，多数开发者的日常仍是适配器模型？因为<b>多数开发者的任务集中在"理解类"，而理解类的原生优势尚未跨过性价比门槛</b>。判断转折点的信号：当开源原生模型在理解基准上稳定追平同尺寸适配器模型时——按 2026 年的趋势，这个信号可能出现在未来一两年内。</p>
+
+<h2 id="sec-8"><span class="sec-no">8.</span>本章小结</h2>
+<p>本章解剖了原生多模态的三个技术方案与一个理论框架：Chameleon 证明离散 token 早期融合可行并公开了稳定性配方（QK-Norm/Z-loss/数据课程）；Fuyu 探测了"无编码器"的下限——视觉先验不能省，只能换位置；Transfusion 用双目标掩码设计让"LM 管理解、扩散管生成"在同一 Transformer 内共存；Emu3 用纯 AR 补齐了统一路线的最后一环。理论层面，"对齐容量的分配"视角解释了三条路线的适用域：<b>小规模适配器赢，超规模原生赢，而分水岭由数据规模与 tokenizer 效率决定</b>。到 2026 年，原生路线已经从"激进实验"演化为"旗舰预训练的默认选项之一"，但开源社区的主流实践仍以适配器为性价比之选——这个"落后半步"的格局，正是当前多模态工程生态的真实形态——也是机会所在：原生路线的工程知识与开源工具链仍然稀缺，早期投入者将在 2027 年的格局里占据身位。下一章把"统一"推到极致：理解与生成的完全统一、以及任何模态到任何模态的 any-to-any。</p>
+
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>1.</b> Chameleon 的两大训练稳定性修复是什么？各自的机理？<br><b>答案要点</b>：QK-Norm——对 Q/K 做 RMSNorm 抑制注意力 logits 爆炸（图像 token 分布重尾）；Z-loss——惩罚 softmax 分母的幅度，防数值发散。配合纯文本先行的数据课程。</p>
+<p><b>2.</b> Fuyu 实验的"思想实验价值"是什么？<br><b>答案要点</b>：测出 LLM 自学视觉的下限——10B 级+万亿数据可用但浪费，说明视觉先验不可省只能换位置；其无编码器思想以"原生动态分辨率"形式活在后续模型里。</p>
+<p><b>3.</b> 写出 Transfusion 的总损失与掩码设计要点。<br><b>答案要点</b>：$\mathcal{L}=\mathcal{L}_{\mathrm{LM}}+\lambda\mathcal{L}_{\mathrm{Diff}}$；文本段因果、图像段双向、文本可见先前图像；图像块独立加噪、adaLN 条件。</p>
+<p><b>4.</b> "对齐容量的分配"框架如何解释"小规模适配器赢、超规模原生赢"？<br><b>答案要点</b>：适配器把对齐压缩在连接器（容量利用率高、上限低）；原生把对齐分散到全参数（上限高、利用率低），多模态数据占比过门槛后统一表示的复利才兑现。</p>
+<p><b>5.</b> 为什么说 AR 统一路线是"按冗余付费"？三种缓解？<br><b>答案要点</b>：图像 patch 信息密度低、VQ 序列含大量冗余 token；缓解：更好 tokenizer（熵压缩）、理解/生成分离编码器（Janus）、混合目标留连续空间（Transfusion）。</p>
+<p><b>6.</b> 原生路线的四件工程代价是什么？<br><b>答案要点</b>：损失尖峰治理（QK-Norm/Z-loss/裁剪）、数据配比课程（语言先稳）、tokenizer 成为一等公民（升级=重训）、理解/生成双线评测防隐性退化。</p>
+<p><b>7.</b> 交叉评测为什么对原生模型是刚需？举一个例子。<br><b>答案要点</b>：单侧评测无法暴露"模态间协作"的退化；如"先文字描述再生成示意图"要同时考核文本准确性、生成质量与图文一致性——单侧分数好可能是另一侧崩坏的掩护。</p>
+<p><b>8.</b> 为什么说"对齐预训练与统一预训练是同一条效率曲线上的不同区段"？<br><b>答案要点</b>：对比预训练以低成本"预付"对齐（适配器路线受益）；数据与算力越过分水岭后，从头统一的上限优势开始兑现（原生受益）；MM1 消融与 Gemini 强势分别是两端的经验证据。</p>
+<p><b>9.</b> 你的产品是儿童教育应用（需要"讲一个故事并画出插图"，图文必须连贯），三条路线怎么选？<br><b>答案要点</b>：核心体验是理解-生成连贯性 → 原生路线开始值得投入；务实路径是先用"强理解模型+强生成模型+连贯性工程（角色卡、风格锚定，第 28/45 章）"上线，同时小规模试点原生模型（Chameleon/Emu3 系微调），一旦连贯性体验明显更优再迁移。</p>
+<p><b>10.</b> Chameleon 用"前 15% 训练不含图像"的课程，而 Emu3 用全程混合也成功。如何理解这种差异？<br><b>答案要点</b>：稳定性问题与数据分布、tokenizer 设计、模型规格强相关，不是原生的必然属性；Chameleon 34B+大码本更易失稳，Emu3 5B+改进 tokenizer 分布更温和。结论：课程是手段不是教条，判断依据是前期 spike 监控。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Team C, et al. <a href="https://arxiv.org/abs/2405.09818">Chameleon: Mixed-Modal Early-Fusion Foundation Models</a>. arXiv 2024. arXiv:2405.09818.</li>
+      <li>Fuyu-8B. <a href="https://www.adept.ai/blog/fuyu-8b">Fuyu-8B: A Multimodal Architecture for AI Agents</a>. Adept Blog 2023.</li>
+      <li>Zhou C, et al. <a href="https://arxiv.org/abs/2408.11039">Transfusion: Predict the Next Token and Diffuse Images with One Multi-Modal Model</a>. arXiv 2024. arXiv:2408.11039.</li>
+      <li>Wang X, et al. <a href="https://arxiv.org/abs/2409.18869">Emu3: Next-Token Prediction is All You Need</a>. arXiv 2024. arXiv:2409.18869.</li>
+      <li>Sun Q, et al. <a href="https://arxiv.org/abs/2312.13289">Generative Multimodal Models are In-Context Learners (Emu2)</a>. CVPR 2024. arXiv:2312.13289.</li>
+      <li>Esser P, et al. <a href="https://arxiv.org/abs/2012.09841">Taming Transformers for High-Resolution Image Synthesis (VQGAN)</a>. CVPR 2021. arXiv:2012.09841.</li>
+      <li>Zhang H, et al. <a href="https://arxiv.org/abs/2410.13848">Janus: Decoupling Visual Encoding for Unified Multimodal Understanding and Generation</a>. arXiv 2024. arXiv:2410.13848.</li>
+      <li>Chen X, et al. <a href="https://arxiv.org/abs/2501.17811">Janus-Pro: Unified Multimodal Understanding and Generation with Data and Model Scaling</a>. arXiv 2025. arXiv:2501.17811.</li>
+      <li>OpenAI. <a href="https://openai.com/index/hello-gpt-4o/">Hello GPT-4o</a>. 2024.</li>
+      <li>Dehghani M, et al. <a href="https://arxiv.org/abs/2303.15343">SigLIP 相关缩放研究 / Patch n' Pack 参见 NaViT</a>. 2023.</li>
+      <li>Zhai X, et al. <a href="https://arxiv.org/abs/2307.06304">Getting ViT in Shape: Scaling Laws for Compute-Optimal Model Design (NaViT)</a>. NeurIPS 2023. arXiv:2307.06304.</li>
+      <li>Liu A, et al. <a href="https://arxiv.org/abs/2406.04334">DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Expert Language Model（QK-Norm 工程实践的源头之一）</a>. arXiv 2024. arXiv:2406.04334.</li>
+      <li>Wang J, et al. <a href="https://arxiv.org/abs/2209.04432">ReZero/深稳定性初始化研究系列（门控与 norm 的训练稳定性）</a>. 2022.</li>
+      <li>Bai J, et al. <a href="https://arxiv.org/abs/2310.11453">Qwen-VL: A Versatile Vision-Language Model（弱原生的三阶段范式）</a>. arXiv 2023. arXiv:2308.12966.</li>
+      <li>He K, et al. <a href="https://arxiv.org/abs/2111.06377">Masked Autoencoders Are Scalable Vision Learners</a>. CVPR 2022. arXiv:2111.06377.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

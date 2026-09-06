@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 22 章 高分辨率与文档图表理解 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+
+<main class="book-body"><div class="book-header">
+  <h1 id="ch22-highres-docs">第 22 章 高分辨率与文档图表理解</h1>
+  <p class="chapter-meta">涵盖模型：Donut, NaViT, LLaVA-NeXT/AnyRes, InternVL-Dynamic, Qwen2-VL (Native Dynamic Res) · 核心技术：动态切片（Patch Tiling）、NaViT 不定长打包、原生动态分辨率与 M-RoPE 2D/3D 位置编码、OCRBench 评测</p>
+</div>
+<div class="book-content">
+
+<section>
+  <p class="lead">
+    在多模态大模型从通用自然场景迈向垂直行业落地的征程中，<strong>文档、表格、学术论文、财务报表与密集图表理解（Document and Chart Understanding）</strong>被公认为最具商业变现价值、却也最具技术挑战性的高地。与常规自然风光或社交网络照片不同，真实世界的文档图像往往具备两大极端特质：其一，信息密度极高——一页 A4 纸大小的密集财报或多栏学术论文通常包含数千个微小文字、复杂的跨行跨列表格以及致密的坐标轴刻度线；其二，长宽比极度多变——从长条形发票收据（长宽比高达 1:5），到横向超宽的技术架构图（长宽比 4:1），完全打破了传统视觉网络对正方形输入的假设。
+  </p>
+  <p>
+    早期多模态模型（如初代 LLaVA）普遍采用强行将输入图像双三次插值重采样至 $224 \times 224$ 或 $336 \times 336$ 固定尺寸的做法。这种“粗暴压缩”在处理常规物体识别时尚可勉强应对，但在文档场景下几乎是毁灭性的灾难：密集的文字像素被瞬间抹平为模糊的噪点，导致小字完全无法阅读、表格线断裂缺失、数字“8”与“3”或“0”严重混淆。
+  </p>
+  <p>
+    为了攻克高分辨率感知的物理极限，过去三年多模态学术界与工业界爆发了一场波澜壮阔的“分辨率革命”：从早期的端到端 OCR-free 专用模型 <em>Donut</em>，到突破正方形刚性限制的 <em>NaViT (Patch n' Pack)</em>，再到成为开源工业标准的 <em>AnyRes / 动态切片技术（Dynamic Patch Tiling）</em>（InternVL、LLaVA-NeXT），直至 2024–2026 年以 <em>Qwen2-VL</em> 为代表的“原生任意分辨率 ViT + 多模态旋转位置编码（M-RoPE）”范式。本章将系统拆解高分辨率视觉架构的演进脉络、动态切片的算法实现、复杂文档结构解析的端到端范式，以及工业级 OCRBench 评测与部署优化。
+  </p>
+</section>
+
+<div class="box-history">
+  <div class="box-title">历史沿革：从流水线 OCR 到原生动态分辨率</div>
+  <p>
+    文档与图表理解的技术演进经历了从“多级流水线级联”到“端到端原生解析”的深刻洗礼：
+  </p>
+  <ul>
+    <li><strong>传统两阶段流水线（Pipeline 时代，2018–2021）</strong>：采用“PP-OCR / Tesseract（文本检测+识别）+ LayoutLM（基于几何包围框的多模态预训练）+ 后处理规则脚本”的架构。这一范式依赖大量模块串联，累积误差严重，且遇到非标准版面、折叠文字或复杂嵌套表格时极其容易崩溃。</li>
+    <li><strong>端到端 OCR-free 革命（Donut, 2022）</strong>：Naver 团队提出了 <em>Donut (Document Understanding Transformer)</em>（arXiv:2111.15664），完全放弃了独立的外部 OCR 引擎，直接用 Swin Transformer 编码高分辨率文档图像，并用 BART 解码器自回归生成结构化的 JSON 树。Donut 首次证明了纯神经网络能够直接从原始像素端到端学习阅读文字与理解版面拓扑。</li>
+    <li><strong>动态切片外挂拼贴时代（AnyRes / Dynamic Tiling, 2023–2024）</strong>：随着大语言模型基座（LLM）的崛起，固定分辨率的 CLIP 编码器成为最大瓶颈。LLaVA-NeXT 与 InternVL 1.5 提出了 <em>Dynamic High Resolution</em>：将高分辨率大图按照预设的候选网格（如 $1\times 2, 2\times 2, 3\times 3$ 等）智能自适应切割为多个局部小切片（Patches），每个切片送入标准视觉编码器，最后拼贴全局缩略图，成功将有效感知分辨率提升至 $4K$ 乃至更高。</li>
+    <li><strong>原生动态分辨率与原生位置编码（Native Dynamic Resolution, 2024–2026）</strong>：<em>Qwen2-VL</em> 彻底颠覆了切片拼贴的妥协路线。通过重构视觉 Transformer（Native Dynamic Resolution ViT），使 ViT 能够直接接收任意长宽比、任意原始像素网格的连续序列，并配合创新的 <strong>M-RoPE（Multimodal Rotary Position Embedding）</strong> 在三维（时间、高度、宽度）连续流形中赋予每个视觉 Token 真实的物理相对位置坐标，树立了当代文档与视觉高分辨率理解的全新绝对标杆。</li>
+  </ul>
+</div>
+
+<figure id="fig-donut">
+  <img src="../assets/images/papers/2111.15664_2.png" alt="Donut 端到端文档理解架构图" style="max-width:85%;">
+  <figcaption>图 22.1：经典 OCR-free 文档大模型 Donut 的端到端流水线（arXiv:2111.15664）。彻底摒弃独立 OCR 模块，直接从输入像素图像映射到结构化 JSON 语义解析树。</figcaption>
+</figure>
+
+<h2 id="sec-22-1">22.1 高分辨率理解的物理瓶颈：Token 膨胀与注意力复杂度</h2>
+
+<p>
+  在直觉上，处理高分辨率图像似乎只需简单地将输入图像放大即可。然而，在以自注意力机制（Self-Attention）为核心的现代神经网络中，分辨率的提升带来了严苛的计算与显存物理墙：
+</p>
+
+<div class="box-theory">
+  <div class="box-title">计算复杂度剖析：二次方爆炸与上下文窗口吞噬</div>
+  <p>
+    设标准 ViT 的 Patch 边长为 $P = 14$，输入图像的高度与宽度分别为 $H$ 与 $W$。
+  </p>
+  <p>
+    视觉 Token 的数量 $N$ 严格正比于输入像素面积：
+    $$N = \left\lfloor\frac{H}{P}\right\rfloor \times \left\lfloor\frac{W}{P}\right\rfloor$$
+  </p>
+  <ul>
+    <li>当输入分辨率为基础的 $336 \times 336$ 时：$N = 24 \times 24 = 576$ 个 Token。在 4096 上下文长度的 LLM 中，视觉 Token 仅占用 $14\%$ 的窗口容量，计算开销可控。</li>
+    <li>当输入分辨率提升至普通 A4 扫描件的 $1344 \times 1344$ 时：$N = 96 \times 96 = 9,216$ 个 Token！</li>
+    <li>当输入工业级高精度工程图纸 $2688 \times 2688$ 时：$N = 192 \times 192 = 36,864$ 个 Token！</li>
+  </ul>
+  <p>
+    视觉 Token 数量急剧膨胀带来了两大致命后果：
+  </p>
+  <ol>
+    <li><strong>ViT 全局自注意力计算与显存爆炸</strong>：标准自注意力的时间与显存复杂度为 $\mathcal{O}(N^2)$。从 576 跃升至 36,864 个 Token，注意力矩阵的元素数量暴增了 $(36864 / 576)^2 = 4096$ 倍！单卡显存瞬间发生 OOM（Out of Memory）。</li>
+    <li><strong>LLM Prefill 阶段的首字延迟（TTFT）激增</strong>：大语言模型接收数万个视觉 Token 作为前缀（Prefix），在预填充计算中需要进行庞大的 GEMM 矩阵乘法，导致首 Token 响应延迟从数十毫秒飙升至数秒，严重破坏生产环境的交互可用性。</li>
+  </ol>
+</div>
+
+<h2 id="sec-22-2">22.2 解决方案流派一：NaViT 与 Patch n' Pack 动态打包机制</h2>
+
+<p>
+  Google 在 2023 年发表的 <em>NaViT (Native Vision Transformer)</em>（arXiv:2307.06304）从根本上挑战了计算机视觉三十年来“强制所有图片统一 resize/padding 为固定矩形批次（Batch）”的传统习惯。
+</p>
+<p>
+  在传统的批次训练中，长宽比各异的图片必须通过填充黑边（Zero Padding）补齐到最大尺寸，这导致高达 $30\% \sim 50\%$ 的计算资源被浪费在无意义的空白背景上。
+</p>
+<p>
+  NaViT 提出了优雅的 <strong>Patch n' Pack（切片打包）</strong> 技术：
+</p>
+<ul>
+  <li><strong>任意长宽比保留</strong>：对每张输入图像，按照其真实长宽比与原始像素直接切分为大小为 $P \times P$ 的连续 Patch 序列，绝不进行几何形变拉伸，绝不填充无效黑边。</li>
+  <li><strong>跨样本序列拼接（Sequence Packing）</strong>：类似于现代 NLP 中将多个短句子拼接为一个固定长度（如 4096）的长序列并在自注意力中利用 <code>block_diagonal</code> 掩码进行隔离，NaViT 将来自不同分辨率、不同长宽比的多张图像的 Patch Token 全部打包放入同一个固定长度的张量中。</li>
+  <li><strong>二维位置编码插值</strong>：根据每个 Patch 在其原图中的真实行号 $r$ 与列号 $c$，自适应查询并双线性插值二维绝对位置编码（2D Learned Positional Embeddings），彻底消除了长宽比扭曲带来的字符形变歧义。</li>
+</ul>
+
+<h2 id="sec-22-3">22.3 解决方案流派二：AnyRes 与 InternVL 动态切片（Dynamic Patch Tiling）</h2>
+
+<p>
+  尽管 NaViT 在预训练阶段效率极高，但对于绝大多数下游开发者而言，重新从零预训练一个原生任意长宽比的视觉骨干耗资巨大。工业界迫切需要一种<strong>能够直接复用现成预训练 CLIP / SigLIP 权重，同时支持超大分辨率感知</strong>的过渡架构。这正是 <em>AnyRes (LLaVA-NeXT)</em> 与 <em>InternVL 动态切片</em> 统治 2023–2024 年开源生态的核心秘密。
+</p>
+
+<figure id="fig-internvl-dyn">
+  <img src="../assets/images/papers/2404.16821_3.png" alt="InternVL 动态高分辨率切片网格匹配原理" style="max-width:85%;">
+  <figcaption>图 22.2：InternVL 动态高分辨率切片（Dynamic High Resolution）原理图（arXiv:2404.16821）。展示了根据输入图像真实宽高比，在预设网格池中自适应匹配最优划分比例并拼贴全局缩略图的全过程。</figcaption>
+</figure>
+
+<div class="box-recipe">
+  <div class="box-title">工业级核心算法：动态切片与网格候选池匹配逻辑</div>
+  <p>
+    动态切片的核心逻辑在于：**利用有限个预设的标准网格布局，自适应寻找与当前输入图像真实长宽比最为契合的划分方案，最小化重采样缩放失真**。
+  </p>
+  <p>
+    其标准算法执行步骤如下：
+  </p>
+  <ol>
+    <li><strong>构建候选网格集合 $\mathcal{G}$</strong>：
+      定义最大允许切片数量 $M$（例如 $M = 6$）。算法预先枚举所有满足 $m \times n \le M$ 的二维网格配置：
+      $$\mathcal{G} = \{(1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (2, 2), (2, 3), (3, 2), (1, 4), (4, 1), \dots\}$$
+    </li>
+    <li><strong>最佳网格匹配（Aspect Ratio Matching）</strong>：
+      输入原始图像尺寸为 $(W_{\text{orig}}, H_{\text{orig}})$，计算其真实长宽比 $r = W_{\text{orig}} / H_{\text{orig}}$。对于候选池中的每一个网格 $(m, n)$，计算该网格布局的标准宽高比 $r_{\text{grid}} = m / n$。通过最小化几何绝对差值选取最佳配置 $(m^*, n^*)$：
+      $$(m^*, n^*) = \arg\min_{(m, n) \in \mathcal{G}} \left| \frac{m}{n} - r \right|$$
+    </li>
+    <li><strong>双三次切片划分与全局缩略图拼贴（Global + Local Dual View）</strong>：
+      将图像双三次插值微调缩放至 $(m^* \times S, n^* \times S)$（其中 $S$ 为基础编码器分辨率，如 448），随后无缝切分为 $m^* \times n^*$ 个局部小图块（Local Tiles）。
+      <strong>至关重要的一步</strong>：为了防止模型“一叶障目、不见泰山”，失去对整幅画面的全局空间构图感知，算法额外将全图缩放至 $(S, S)$ 作为<strong>全局概览图（Global Thumbnail）</strong>。
+    </li>
+    <li><strong>特征拼接与换行符标记注入（Newline Token Injection）</strong>：
+      全局图与所有局部小图块分别独立通过冻结的视觉编码器，提取特征后，在每一行局部切片的末尾人工注入一个可学习的换行标记 <code>&lt;newline&gt;</code>，向大语言模型明确传递真实的二维二维网格二维拓扑边界。
+    </li>
+  </ol>
+</div>
+
+<figure id="fig-anyres">
+  <img src="../assets/images/papers/2408.03326_1.png" alt="LLaVA-OneVision Higher AnyRes 视觉表征设计" style="max-width:85%;">
+  <figcaption>图 22.3：LLaVA-OneVision 中的 Higher AnyRes 多尺度视觉表征（arXiv:2408.03326）。通过双线性局部切片与双重视角融合，大幅刷新多模态长文本与密集文档理解极限。</figcaption>
+</figure>
+
+<h2 id="sec-22-4">22.4 解决方案流派三：Qwen2-VL 原生动态分辨率与 M-RoPE 空间革命</h2>
+
+<p>
+  尽管动态切片（AnyRes）解决了“看得清”的问题，但它在工程与几何理论上仍存在三大不可消除的硬伤：
+  （1）切片边缘的人为割裂——当一个单词或表格边框恰好落在切片切割线上时，字符被硬生生腰斩，极易诱发识别幻觉；
+  （2）Token 冗余度高——即便背景是纯白色的空白页，切片算法依然必须无差别分配完整的固定 Token 预算；
+  （3）全局图与局部图特征存在大量语义重复，造成算力浪费。
+</p>
+<p>
+  阿里巴巴 Qwen 团队在 2024 年秋季推出的 <strong>Qwen2-VL</strong>（arXiv:2409.12191）彻底终结了切片拼贴时代，开创了<strong>原生动态分辨率（Native Dynamic Resolution ViT）</strong>的现代多模态标准范式。
+</p>
+
+<figure id="fig-qwen2vl">
+  <img src="../assets/images/papers/2409.12191_2.png" alt="Qwen2-VL M-RoPE 多模态旋转位置编码解析" style="max-width:85%;">
+  <figcaption>图 22.4：Qwen2-VL 核心创新 M-RoPE（Multimodal Rotary Position Embedding）几何分解图（arXiv:2409.12191）。将一维序列位置分解为时间（Temporal）、高度（Height）与宽度（Width）三维联合流形，实现真正物理连续的空间相对距离感知。</figcaption>
+</figure>
+
+<div class="box-theory">
+  <div class="box-title">理论突破：M-RoPE（多模态旋转位置编码）的数学优雅</div>
+  <p>
+    在纯文本大模型中，标准旋转位置编码（RoPE）通过正交旋转矩阵对向量进行变换，其相对位置仅依赖于一维标量距离 $\Delta m = m - n$：
+    $$\langle \mathbf{R}_m \mathbf{q}, \mathbf{R}_n \mathbf{k} \rangle = g(\mathbf{q}, \mathbf{k}, m - n)$$
+  </p>
+  <p>
+    然而，图像与视频具有天然的多维时空拓扑：两个视觉 Patch 之间的关系不仅取决于先后顺序，更取决于它们在画面中的<strong>二维欧氏空间距离 $(\Delta h, \Delta w)$</strong> 以及视频中的<strong>时间帧间隔 $\Delta t$</strong>。强行将二维图像拉平为一维光栅扫描序列（Raster Scan），会导致在图像上一行末尾与下一行开头的两个物理上紧紧相邻的像素，在一维序列中被强行拉开数百个 Token 的虚拟距离，严重破坏局部连贯性！
+  </p>
+  <p>
+    Qwen2-VL 提出了革命性的 <strong>M-RoPE</strong>，将每个注意力头（Head）的隐层向量维度 $D$ 严格切分为三组正交子空间：
+    $$D = D_t + D_h + D_w$$
+    对于每一个多模态输入单元，赋予其三维坐标元组 $(t_i, h_i, w_i)$：
+  </p>
+  <ul>
+    <li>对于<strong>文本 Token</strong>：在时间、高度和宽度维度上均赋予相同的标量索引 $t_i = h_i = w_i = i$，使其无缝退化为经典的一维 RoPE，完全不损失语言因果建模能力。</li>
+    <li>对于<strong>单张图像 Token</strong>：时间维度常数化 $t_i = 0$，而在高、宽子空间分别应用该 Patch 在原始二维网格中的真实行列物理坐标 $(h_i, w_i)$：
+      $$\mathbf{R}_{M}(t_i, h_i, w_i) = \text{diag}\Big(\mathbf{R}_{t_i}(D_t), \; \mathbf{R}_{h_i}(D_h), \; \mathbf{R}_{w_i}(D_w)\Big)$$
+    </li>
+    <li>对于<strong>多帧连续视频</strong>：$t_i$ 记录真实的视频帧序号，完美统一单图、多图、长视频与文本。</li>
+  </ul>
+  <p>
+    在 M-RoPE 的加持下，两个视觉 Patch 之间的注意力点积天然编码了真实的二维几何欧氏距离：
+    $$\langle \mathbf{R}_M(t_i, h_i, w_i) \mathbf{q}, \mathbf{R}_M(t_j, h_j, w_j) \mathbf{k} \rangle = g\big(\mathbf{q}, \mathbf{k}, (t_i - t_j), (h_i - h_j), (w_i - w_j)\big)$$
+    无论图像以何种不规则长宽比输入，模型隐层都能精确保持空间各向同性的几何感知！
+  </p>
+</div>
+
+<div class="svg-container" style="text-align:center; margin: 24px 0;">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 320" width="100%" height="auto">
+  <defs>
+    <linearGradient id="bg-tiling" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#1d4ed8" stop-opacity="0.22"/>
+    </linearGradient>
+    <linearGradient id="bg-native" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#047857" stop-opacity="0.22"/>
+    </linearGradient>
+    <marker id="arrow-v" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <text x="440" y="26" font-size="16" font-weight="bold" fill="#1e293b" text-anchor="middle">高分辨率架构两大主流范式机制全面对比</text>
+
+  <!-- Left: Dynamic Patch Tiling -->
+  <g transform="translate(30, 45)">
+    <rect x="0" y="0" width="380" height="255" rx="10" fill="#f8fafc" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="190" y="24" font-size="13" font-weight="bold" fill="#1d4ed8" text-anchor="middle">范式 A：动态网格切片（AnyRes / InternVL）</text>
+
+    <rect x="25" y="45" width="80" height="120" rx="4" fill="#e2e8f0" stroke="#64748b" stroke-width="1.2"/>
+    <text x="65" y="105" font-size="11" fill="#334155" text-anchor="middle">长高图</text>
+    <text x="65" y="122" font-size="9" fill="#64748b" text-anchor="middle">896 x 1344</text>
+
+    <path d="M 115 105 L 145 105" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow-v)"/>
+
+    <g transform="translate(150, 45)">
+      <rect x="0" y="0" width="95" height="135" rx="6" fill="url(#bg-tiling)" stroke="#2563eb" stroke-width="1.2"/>
+      <line x1="0" y1="45" x2="95" y2="45" stroke="#2563eb" stroke-dasharray="2 2"/>
+      <line x1="0" y1="90" x2="95" y2="90" stroke="#2563eb" stroke-dasharray="2 2"/>
+      <line x1="47.5" y1="0" x2="47.5" y2="135" stroke="#2563eb" stroke-dasharray="2 2"/>
+      <text x="47.5" y="72" font-size="10" font-weight="bold" fill="#1e40af" text-anchor="middle">2 x 3 网格</text>
+      <text x="47.5" y="86" font-size="8" fill="#1d4ed8" text-anchor="middle">6 个局部切片</text>
+    </g>
+
+    <text x="260" y="105" font-size="16" font-weight="bold" fill="#475569" text-anchor="middle">+</text>
+    <rect x="280" y="75" width="50" height="50" rx="4" fill="#cbd5e1" stroke="#475569" stroke-width="1.2"/>
+    <text x="305" y="104" font-size="9" fill="#1e293b" text-anchor="middle">全局图</text>
+
+    <path d="M 190 190 L 190 215" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow-v)"/>
+    <rect x="30" y="215" width="320" height="28" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+    <text x="190" y="234" font-size="10" fill="#1e40af" text-anchor="middle">独立前向提取特征 + 拼接换行符 &lt;newline&gt; 注入 LLM</text>
+  </g>
+
+  <!-- Right: Native Dynamic Resolution -->
+  <g transform="translate(470, 45)">
+    <rect x="0" y="0" width="380" height="255" rx="10" fill="#f8fafc" stroke="#10b981" stroke-width="1.5"/>
+    <text x="190" y="24" font-size="13" font-weight="bold" fill="#047857" text-anchor="middle">范式 B：原生动态分辨率（Qwen2-VL 原生 ViT）</text>
+
+    <rect x="25" y="45" width="80" height="120" rx="4" fill="#e2e8f0" stroke="#64748b" stroke-width="1.2"/>
+    <text x="65" y="105" font-size="11" fill="#334155" text-anchor="middle">任意图像</text>
+    <text x="65" y="122" font-size="9" fill="#64748b" text-anchor="middle">无切片/无变形</text>
+
+    <path d="M 115 105 L 145 105" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow-v)"/>
+
+    <g transform="translate(150, 45)">
+      <rect x="0" y="0" width="105" height="135" rx="6" fill="url(#bg-native)" stroke="#059669" stroke-width="1.2"/>
+      <text x="52.5" y="60" font-size="11" font-weight="bold" fill="#065f46" text-anchor="middle">原生连续网格</text>
+      <text x="52.5" y="78" font-size="9" fill="#047857" text-anchor="middle">Patch 尺度自适应</text>
+      <text x="52.5" y="96" font-size="9" fill="#047857" text-anchor="middle">零切片边缘撕裂</text>
+    </g>
+
+    <path d="M 265 105 L 290 105" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow-v)"/>
+    <rect x="295" y="65" width="70" height="75" rx="4" fill="#ecfdf5" stroke="#10b981" stroke-width="1.2"/>
+    <text x="330" y="95" font-size="10" font-weight="bold" fill="#065f46" text-anchor="middle">M-RoPE</text>
+    <text x="330" y="112" font-size="8" fill="#047857" text-anchor="middle">2D物理位置</text>
+
+    <path d="M 190 190 L 190 215" stroke="#475569" stroke-width="1.5" marker-end="url(#arrow-v)"/>
+    <rect x="30" y="215" width="320" height="28" rx="4" fill="#f0fdf4" stroke="#86efac" stroke-width="1"/>
+    <text x="190" y="234" font-size="10" fill="#065f46" text-anchor="middle">全图单次前向 + 动态时空位置场直接进大模型</text>
+  </g>
+</svg>
+</div>
+
+<div class="box-paper">
+  <div class="box-title">论文精读：GOT-OCR2.0 —— 通用光学字符分词器（General Optical Tokenizer）</div>
+  <p>
+    旷视科技与清华大学在 2024 年秋季推出的 <strong>GOT-OCR2.0</strong>（arXiv:2409.01704）提出了一个振聋发聩的技术命题：大语言模型（LLM）需要专用的视觉分词器来统一处理所有基于文本的光学信号。
+  </p>
+  <ul>
+    <li><strong>光学字符全场景统一（Universal OCR Formulation）</strong>：传统 OCR 将普通文字、手写体、数学公式、几何图表、乐谱、化学分子式割裂为数十个互不兼容的专用模型。GOT-OCR2.0 构建了一个高度统一的 5.8 亿（0.58B）极致轻量级编码器-解码器架构，将所有光学图像统一视为连续图像 Token，将输出目标全部统一为标准文本序列（含 Markdown、LaTeX 与 Mathpix 格式代码）。</li>
+    <li><strong>动态切片压缩与超高长宽比适应</strong>：针对超长收据与跨页图纸，GOT-OCR 引入了 1024x1024 的局部自适应窗口切片，并在解码端引入了极度精巧的轻量级 Transformer 解码器。实验表明，仅凭 5.8 亿参数的端侧模型，GOT-OCR 在各类复杂文档图表上的识别精度直接击败了参数量大数十倍的通用 VLM。</li>
+  </ul>
+</div>
+
+<h2 id="sec-22-4-2">22.4.2 工业级文档解析的三大核心瓶颈与对齐算法</h2>
+<p>
+  在将高分辨率多模态模型部署至银行、司法与政务等实际生产环境时，工程师面临着极其苛刻的边界条件。以下三大核心技术难点决定了业务系统的成败：
+</p>
+<ol>
+  <li><strong>弯曲与折叠文本的几何去畸变（Geometric Rectification）</strong>：
+    手机拍摄的纸质发票通常带有自然的弧形弯曲、折痕阴影与透视倾斜。如果直接使用刚性矩形网格进行 Patch 切割，一行完整的文字会被切片网格斜向截断成数十个细小三角形碎片。为此，当代前沿系统引入了轻量级可微薄板样条插值（Thin-Plate Spline, TPS）几何校正前置层，在输入视觉 Transformer 之前自适应拉平扭曲的文本行，使字符序列重新恢复水平光栅流。
+  </li>
+  <li><strong>跨页长文档的超长上下文跨度（Multi-Page Long-Context Binding）</strong>：
+    一份典型的公司 IPO 招股说明书或招标文件往往长达数百页。单页输入消耗 1000~2000 个视觉 Token，数百页将直接突破数十万 Token 的上下文上限。工业界通常采用“双层多粒度级联架构”：第一层使用轻量级粗粒度编码器生成每页的紧凑摘要向量（每页仅分配 8~16 个 Token 作为全局索引），在向量空间中执行快速粗排检索；第二层定位到具体的 2~5 页关键候选页，动态加载原生高分辨率细节流执行深度问答与跨页勾稽对账。
+  </li>
+  <li><strong>低对比度与背景水印的语义去噪（Watermark Disentanglement）</strong>：
+    在发票红章、复印件“仅供内部参考”斜向防伪水印以及老旧发黄古籍中，前景关键字符与背景高频噪点强烈交织。模型必须在对比学习阶段构建对抗负样本，强迫视觉表征解缠语义层与干扰层，确保在背景文字存在强干扰时依然对前景墨迹保持绝对的高保真抽取。
+  </li>
+</ol>
+
+<h2 id="sec-22-5">22.5 复杂文档与图表专用评测基准：OCRBench 与 DocVQA</h2>
+
+<p>
+  高分辨率大模型的成色究竟几何？通用问答榜单（如 MMBench）往往充斥着简单的常识问答，无法拉开模型在密集字符与微观拓扑上的技术差距。业界公认的标准高分辨率试金石包括：
+</p>
+
+<table class="book-table">
+  <thead>
+    <tr>
+      <th>基准名称</th>
+      <th>主要考察维度</th>
+      <th>样本数量</th>
+      <th>核心挑战</th>
+      <th>前沿 SOTA 水平</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>OCRBench</strong></td>
+      <td>场景文本、纯文本扫描、手写体、公式（LaTeX）、表格、图表、印章</td>
+      <td>1,000 题精选</td>
+      <td>跨语种混排、微小模糊字体、密集 LaTeX 符号对齐</td>
+      <td>Qwen2-VL-72B (860+ 分) / InternVL2-76B</td>
+    </tr>
+    <tr>
+      <td><strong>DocVQA</strong></td>
+      <td>各类商业合同、银行发票收据、报纸排版</td>
+      <td>50,000+ 问答对</td>
+      <td>长跨度跨栏语义定位、非线性排版阅读顺序解析</td>
+      <td>ANLS 分数突破 94%</td>
+    </tr>
+    <tr>
+      <td><strong>ChartQA</strong></td>
+      <td>柱状图、折线图、双 Y 轴图、饼图数值计算与趋势推理</td>
+      <td>9,600+ 题</td>
+      <td>图像坐标轴数值到真实物理量化换算、极小图例色块辨识</td>
+      <td>Relaxed Accuracy 超过 88%</td>
+    </tr>
+    <tr>
+      <td><strong>InfoVQA</strong></td>
+      <td>信息图（Infographics）复杂图文交织海报</td>
+      <td>11,000+ 题</td>
+      <td>极端多变的艺术字体、不规则视觉流向与长尾实体</td>
+      <td>准确率 78%+</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="sec-22-6">22.6 复杂版面重构与图表数字化流水线设计</h2>
+<p>
+  在实际业务落地中，高分辨率多模态大模型不仅仅用于回答简答题，更被广泛用作将非结构化复杂文档转化为纯净 Markdown、HTML 乃至 LaTeX 源码的<strong>全自动数字化引擎（Document Parsing Engine）</strong>。
+</p>
+<p>
+  一个成熟的高清文档解析生产系统通常需要处理以下四大高难度拓扑：
+</p>
+<ol>
+  <li><strong>非标准嵌套表格与跨行单元格重构（Complex Nested Tables）</strong>：
+    传统 OCR 只能输出分散的字符碎片坐标，无法理解单元格之间的逻辑从属关系。高分辨率大模型能够直接利用自回归序列，输出符合标准 HTML 规范的 <code>&lt;table&gt;&lt;tr&gt;&lt;td rowspan="2"&gt;...&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;</code> 树状结构，实现对复杂财报勾稽关系的完美复原。
+  </li>
+  <li><strong>双栏与多栏混排的正确阅读顺序（Reading Order Disambiguation）</strong>：
+    在学术论文或现代报刊中，版面通常采用多栏排版，中间穿插单栏贯通的大图或摘要。传统基于几何规则的从左至右扫描会直接发生“拦腰截断”的毁灭性错乱。高分辨率多模态模型结合语义理解与版面视觉流，能够智能判定阅读路径，实现连续平滑的篇章级 Markdown 还原。
+  </li>
+  <li><strong>微小手写公章与批注对齐（Signature &amp; Stamp Alignment）</strong>：
+    在金融凭证与法务合同中，红色的骑缝公章与手写签名往往与正文印刷字体重叠覆盖。模型必须在高动态范围特征中将前景手写墨迹与背景打印字体分层解析，避免字符污染。
+  </li>
+  <li><strong>科学公式图转 LaTeX 代码（Formula-to-LaTeX）</strong>：
+    对物理化学公式、积分求和符号与矩阵阵列进行高保真符号化，直接输出合规可编译的 LaTeX 数学表达式。
+  </li>
+</ol>
+
+<h2 id="sec-22-7">22.7 动手实战：动态高分辨率智能切片处理器实现</h2>
+
+<p>
+  为了在实际生产落地中构建高吞吐的多模态预处理管道，以下代码提供了一套完全兼容 InternVL 与 LLaVA-NeXT 标准规范的<strong>动态高分辨率自适应切片处理器（DynamicPatchTiler）</strong>。包含长宽比网格自动匹配、双三次局部裁剪、全局概览生成以及边界换行标记管理。
+</p>
+
+<div class="box-recipe">
+  <div class="box-title">代码清单 22.1：工业级动态网格切片处理器（DynamicPatchTiler）</div>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+"""工业级动态高分辨率图像自适应切片与缩略图处理器
+严格遵循 InternVL / LLaVA-NeXT AnyRes 规范，支持自动宽高比匹配与换行标记组织
+"""
+
+import math
+from typing import List, Tuple, Dict, Optional
+from PIL import Image
+
+class DynamicPatchTiler:
+    def __init__(
+        self,
+        image_size: int = 448,
+        min_num_tiles: int = 1,
+        max_num_tiles: int = 6,
+        use_thumbnail: bool = True
+    ):
+        self.image_size = image_size
+        self.min_num_tiles = min_num_tiles
+        self.max_num_tiles = max_num_tiles
+        self.use_thumbnail = use_thumbnail
+        # 预先生成所有合法的候选网格布局
+        self.candidate_grids = self._generate_candidate_grids()
+
+    def _generate_candidate_grids(self) -> List[Tuple[int, int]]:
+        """枚举满足 min_num <= m * n <= max_num 的所有 (m, n) 网格"""
+        grids = []
+        for m in range(1, self.max_num_tiles + 1):
+            for n in range(1, self.max_num_tiles + 1):
+                if self.min_num_tiles <= m * n <= self.max_num_tiles:
+                    grids.append((m, n))
+        # 按切片总数升序排序
+        grids.sort(key=lambda x: (x[0] * x[1], x[0]))
+        return grids
+
+    def find_best_grid(self, orig_w: int, orig_h: int) -> Tuple[int, int]:
+        """寻找与当前图像长宽比误差最小的最佳网格布局"""
+        target_aspect = orig_w / float(orig_h)
+        best_grid = (1, 1)
+        min_diff = float("inf")
+
+        for m, n in self.candidate_grids:
+            grid_aspect = m / float(n)
+            # 计算长宽比对数误差，惩罚对称比例偏差
+            diff = abs(math.log(grid_aspect / target_aspect))
+            if diff < min_diff:
+                min_diff = diff
+                best_grid = (m, n)
+        return best_grid
+
+    def process(self, image: Image.Image) -> Dict[str, object]:
+        """输入 PIL 图像，输出局部切片张量列表、全局概览图以及拓扑元数据"""
+        orig_w, orig_h = image.size
+        m, n = self.find_best_grid(orig_w, orig_h)
+        
+        # 1. 将图像微调缩放至目标切片网格尺寸
+        target_w = m * self.image_size
+        target_h = n * self.image_size
+        resized_img = image.resize((target_w, target_h), resample=Image.BICUBIC)
+
+        # 2. 依次切割各个局部小切片 (Local Tiles)
+        patches = []
+        for j in range(n):
+            for i in range(m):
+                box = (
+                    i * self.image_size,
+                    j * self.image_size,
+                    (i + 1) * self.image_size,
+                    (j + 1) * self.image_size
+                )
+                tile = resized_img.crop(box)
+                patches.append(tile)
+
+        # 3. 生成全局概览缩略图 (Global Thumbnail)
+        thumbnail = None
+        if self.use_thumbnail:
+            thumbnail = image.resize((self.image_size, self.image_size), resample=Image.BICUBIC)
+
+        return {
+            "grid": (m, n),
+            "num_patches": len(patches),
+            "patches": patches,
+            "thumbnail": thumbnail,
+            "total_tokens_approx": (len(patches) + (1 if self.use_thumbnail else 0)) * 256
+        }
+
+# ----------------- 模块单元测试与运行演示 -----------------
+if __name__ == "__main__":
+    tiler = DynamicPatchTiler(image_size=448, min_num_tiles=1, max_num_tiles=6)
+    
+    # 模拟一张 1200 x 2400 的狭长 PDF 扫描单据（长宽比 1:2）
+    mock_doc = Image.new("RGB", (1200, 2400), color=(250, 250, 250))
+    result = tiler.process(mock_doc)
+    
+    print(f"原始图像尺寸: 1200x2400 (Aspect: 0.5)")
+    print(f"自适应最佳切片网格: {result['grid']} (列: {result['grid'][0]}, 行: {result['grid'][1]})")
+    print(f"局部切片数量: {result['num_patches']} 张, 每张 448x448")
+    print(f"是否包含全局概览: {result['thumbnail'] is not None}")
+    print(f"注入 LLM 预期视觉 Token 数量: {result['total_tokens_approx']}")
+</code></pre>
+</div>
+
+<h2 id="sec-22-7-2">22.7.2 生产级端到端 Markdown 文档与 LaTeX 渲染管线</h2>
+<p>
+  在企业级财务报表核对、学术文献数字化与司法合同抽取等实际落地场景中，仅仅得到切片并不能直接交付给业务下游。工业界需要一套端到端的后处理与自愈纠错系统，将模型预测的原始文本流转化为结构完备、格式严谨的 Markdown 与 LaTeX 源码。
+</p>
+<p>
+  以下代码展示了一个工业级 Markdown 表格修复与 LaTeX 校验器（DocumentPostProcessor）。它涵盖了跨行跨列表格语法补齐、未闭合 HTML 标签闭合、以及 LaTeX 语法括号自动对齐验证：
+</p>
+
+<div class="box-recipe">
+  <div class="box-title">代码清单 22.2：高精文档结构解析与表格自愈后处理器（DocumentPostProcessor）</div>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+"""工业级高精度文档解析后处理与表格结构自愈引擎
+支持：Markdown 格式清洗、跨行表格自动对齐、LaTeX 公式语法闭合性检验
+"""
+
+import re
+from typing import Dict, List, Tuple, Optional
+
+class DocumentPostProcessor:
+    def __init__(self):
+        # 常见表格行分隔符与标记
+        self.table_row_pattern = re.compile(r'^\|(.+)\|$')
+        self.latex_inline_pattern = re.compile(r'\$(.+?)\$')
+        self.latex_block_pattern = re.compile(r'\$\$(.+?)\$\$', re.DOTALL)
+
+    def heal_markdown_table(self, table_lines: List[str]) -> List[str]:
+        """对大模型生成的残缺 Markdown 表格进行列数对齐与自愈补全"""
+        if not table_lines:
+            return []
+
+        # 统计每行的实际单元格数量
+        parsed_rows = []
+        max_cols = 0
+        for line in table_lines:
+            line = line.strip()
+            if not line.startswith('|') or not line.endswith('|'):
+                continue
+            cells = [c.strip() for c in line[1:-1].split('|')]
+            max_cols = max(max_cols, len(cells))
+            parsed_rows.append(cells)
+
+        if max_cols == 0:
+            return table_lines
+
+        # 重新格式化并补齐缺失单元格
+        healed_lines = []
+        for idx, cells in enumerate(parsed_rows):
+            # 补齐尾部缺失的空单元格
+            while len(cells) < max_cols:
+                cells.append("")
+            row_str = "| " + " | ".join(cells) + " |"
+            healed_lines.append(row_str)
+
+            # 如果第一行是表头且第二行不是分隔行，自动插入标准表头分隔行
+            if idx == 0 and len(parsed_rows) > 1:
+                sep_line = parsed_rows[1]
+                is_sep = all(re.match(r'^:?-+:?$', c) for c in sep_line if c)
+                if not is_sep:
+                    standard_sep = "| " + " | ".join(["---"] * max_cols) + " |"
+                    healed_lines.append(standard_sep)
+
+        return healed_lines
+
+    def validate_latex_formulas(self, text: str) -> Dict[str, object]:
+        """检验文档中行内与独立块 LaTeX 数学公式的括号平衡与闭合状态"""
+        errors = []
+        
+        # 检验 $ 与 $$ 闭合数量
+        num_double_dollars = text.count("$$")
+        text_without_double = text.replace("$$", " ")
+        num_single_dollars = text_without_double.count("$")
+
+        if num_double_dollars % 2 != 0:
+            errors.append("独立公式块 '$$' 存在未闭合符号")
+        if num_single_dollars % 2 != 0:
+            errors.append("行内公式 '$' 存在奇数个未闭合符号")
+
+        # 检验常见 LaTeX 环境闭合：\begin{matrix} ... \end{matrix}
+        begins = re.findall(r'\\begin\{([a-zA-Z0-9*]+)\}', text)
+        ends = re.findall(r'\\end\{([a-zA-Z0-9*]+)\}', text)
+        if len(begins) != len(ends):
+            errors.append(f"LaTeX 环境标签不配平: \\begin 数量({len(begins)}) != \\end 数量({len(ends)})")
+
+        # 检验常见数学符号括号配平: \left( 与 \right)
+        left_parens = len(re.findall(r'\\left[\(\[\{]', text))
+        right_parens = len(re.findall(r'\\right[\)\]\}]', text))
+        if left_parens != right_parens:
+            errors.append(f"LaTeX 动态定界符不配平: \\left({left_parens}) != \\right({right_parens})")
+
+        return {
+            "valid": len(errors) == 0,
+            "error_count": len(errors),
+            "errors": errors
+        }
+
+    def process_document(self, raw_markdown: str) -> str:
+        """主入口：对大模型生成的整篇文档进行语法清洗与表格修复"""
+        lines = raw_markdown.splitlines()
+        output_lines = []
+        table_buffer = []
+        in_table = False
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("|") and stripped.endswith("|"):
+                in_table = True
+                table_buffer.append(stripped)
+            else:
+                if in_table:
+                    # 遇到非表格行，刷新并修复累积的表格块
+                    healed = self.heal_markdown_table(table_buffer)
+                    output_lines.extend(healed)
+                    table_buffer = []
+                    in_table = False
+                output_lines.append(line)
+
+        # 收尾末尾可能存在的表格
+        if in_table and table_buffer:
+            healed = self.heal_markdown_table(table_buffer)
+            output_lines.extend(healed)
+
+        cleaned_text = "\n".join(output_lines)
+        return cleaned_text
+
+# 演示后处理器运作
+if __name__ == "__main__":
+    processor = DocumentPostProcessor()
+    mock_raw_output = \"\"\"
+# 财务季度报表核算
+
+以下是提取的核心指标表格：
+| 财务指标 | Q1 季度 | Q2 季度 | Q3 季度 |
+| 营业收入(万元) | 12500 | 14200 |
+| 净利润率 | 18.5% | 19.2% | 20.1% |
+
+核心盈利公式为：
+$$
+\\text{ROE} = \\frac{\\text{Net Income}}{\\text{Shareholder's Equity}}
+$$
+其中资产负债率为 $L = \\frac{D}{A}$。
+\"\"\"
+    cleaned_doc = processor.process_document(mock_raw_output)
+    print("--- 修复后的排版文本 ---")
+    print(cleaned_doc)
+    latex_report = processor.validate_latex_formulas(cleaned_doc)
+    print("LaTeX 公式合规报告:", latex_report)
+</code></pre>
+</div>
+
+<h2 id="sec-22-8">22.8 本章总结与全书学习指引</h2>
+
+<p>
+  从强制缩放到切片拼贴（AnyRes），再到原生动态分辨率与多模态旋转位置编码（M-RoPE），高分辨率多模态理解技术在过去三年完成了令人惊叹的三级跳。这一技术飞跃不仅让大语言模型拥有了媲美乃至超越人类眼力的微观字符辨识能力，更直接驱动了现代商业文档检索、财务自动化审计与科研论文深度解读的全面工业化变革。
+</p>
+<p>
+  在全书的知识版图中，本章内容承前启后：
+</p>
+<ul>
+  <li>在<strong>第 42 章《多模态 RAG 与文档智能》</strong>中，我们将看到本章的高分辨率视觉表征如何与 ColPali 迟滞交互（Late Interaction）向量索引结合，彻底颠覆基于纯文本切片的传统知识库方案。</li>
+  <li>在<strong>第 43 章《多模态 Agent 与 GUI 操作》</strong>中，我们将深入探讨在超清移动端与桌面端屏幕截图下，高分辨率感知如何实现对极其密集的按钮、输入框的精准定位与无缝点击。</li>
+  <li>在<strong>第 46 章《端到端项目实战集》</strong>中，我们将直接上手搭建一套全自动的票据结构化抽取与财务对账工业生产系统。</li>
+</ul>
+
+<div class="box-quiz">
+  <div class="box-title">自测题与工程深度思考</div>
+  <ol>
+    <li>
+      <strong>核心机制剖析</strong>：在 AnyRes（动态切片）架构中，为什么除了划分局部小切片外，必须强制额外保留一张全局概览缩略图（Global Thumbnail）？如果去掉全局图会发生什么？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          如果仅将高分辨率图像切碎为局部小切片输入大语言模型，视觉编码器只能看到局部的局部微观特征。当遇到跨越多个切片的超大跨页表格、大号标题、或者需要理解整张文档的宏观版面布局（例如“标题下方左侧栏与右侧栏的因果对比关系”）时，模型会彻底丧失宏观全局视野，产生“只见树木、不见森林”的割裂感。全局缩略图以低分辨率紧凑表征了整幅图像的全局空间拓扑构架，与高精度的局部切片形成强烈的双向互补。
+        </p>
+      </details>
+    </li>
+    <li>
+      <strong>时空编码对比</strong>：Qwen2-VL 的 M-RoPE 相比于传统一维旋转位置编码（RoPE），在数学设计上做了什么关键重构？它为什么能彻底消除切片边缘的字符撕裂伪影？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          传统 RoPE 强制将二维图像网格拉平为一维光栅扫描序列，导致行末与下一行开头的临近像素在一维距离上被强行撕裂为数百个 Token 的虚拟距离。M-RoPE 将注意力隐层通道分解为时间、高度、宽度三个独立子空间，各子空间分别乘以该 Patch 在原始画面中的真实物理网格行列坐标。两个 Patch 之间的内积天然忠实反映了真实的二维欧氏几何距离，从而摆脱了固定尺寸切片的刚性束缚，在原生任意网格下实现了空间各向同性的连续感知。
+        </p>
+      </details>
+    </li>
+    <li>
+      <strong>工程成本权衡</strong>：在工业级文档抽取系统中，输入分辨率提高一倍（例如从 448 提高到 896），对计算吞吐和推理显存意味着什么？实际业务中通常采取怎样的自适应分流策略？
+      <details>
+        <summary>查看解析</summary>
+        <p>
+          分辨率边长翻倍意味着像素面积和视觉 Token 数量翻 4 倍（二次方关系），导致视觉特征提取开销扩大 4 倍，且 LLM 预填充（Prefill）阶段因注意力矩阵计算而产生更大的显存占用与更高的延迟。实际工业系统通常采用“双轨级联（Dual-Stage Cascading）”策略：先用轻量低分辨率模型（或全局图）对文档进行快速分类和兴趣区筛选；若页面判定为普通纯文本或大标题，直接以低成本低分辨率解析；仅当置信度低、或判定存在密集嵌套表格、微小公章与密集公式时，才动态升级触发高分辨率切片模式。
+        </p>
+      </details>
+    </li>
+  </ol>
+</div>
+
+</div></main>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Kim G, et al. <a href="https://arxiv.org/abs/2111.15664">OCR-free Document Understanding Transformer (Donut)</a>. ECCV 2022.</li>
+      <li>Dehghani M, et al. <a href="https://arxiv.org/abs/2307.06304">Patch n' Pack: NaViT, a Vision Transformer for any Aspect Ratio and Resolution</a>. NeurIPS 2023.</li>
+      <li>Liu H, et al. <a href="https://arxiv.org/abs/2408.03326">LLaVA-OneVision: Easy Visual Task Transfer</a>. arXiv:2408.03326, 2024.</li>
+      <li>Chen Z, et al. <a href="https://arxiv.org/abs/2404.16821">How Far Are We to GPT-4V? Closing the Gap to Commercial Multimodal Models with Open-Source InternVL-1.5</a>. CVPR 2024.</li>
+      <li>Wang P, et al. <a href="https://arxiv.org/abs/2409.12191">Qwen2-VL: To See the World More Clearly</a>. Alibaba Group, arXiv:2409.12191, 2024.</li>
+      <li>Liu Y, et al. <a href="https://arxiv.org/abs/2305.07895">OCRBench: Evaluating Large Multimodal Models for Optical Character Recognition</a>. 2023.</li>
+      <li>Mathew M, et al. <a href="https://arxiv.org/abs/2009.00813">DocVQA: A Dataset for VQA on Document Images</a>. WACV 2021.</li>
+      <li>Masry A, et al. <a href="https://arxiv.org/abs/2203.02844">ChartQA: A Benchmark for Question Answering about Charts with Visual and Logical Reasoning</a>. ACL 2022.</li>
+      <li>Su J, et al. <a href="https://arxiv.org/abs/2104.09864">RoFormer: Enhanced Transformer with Rotary Position Embedding (RoPE)</a>. Neurocomputing 2024.</li>
+      <li>Zheng J, et al. <a href="https://arxiv.org/abs/2409.01704">General Optical Tokenizer: GOT-OCR2.0 for Universal Document Digitization</a>. 2024.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 37 章 多模态对齐与幻觉缓解 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第六部分 · 训练工程纵深</div>
+  <h1 class="chapter-title">第 37 章　多模态对齐与幻觉缓解</h1>
+  <div class="chapter-meta"><span>预计阅读 100 分钟</span><span>难度 ★★★★☆</span><span>前置：第 16 章（SFT）、第 36 章（LoRA）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">多模态幻觉：定义、分类与成因分解</a></li>
+  <li><a href="#sec-2">RLHF 系：LLaVA-RLHF、RLHF-V 与 RLAIF-V</a></li>
+  <li><a href="#sec-3">多模态 DPO：从 POVID 到偏好数据构造学</a></li>
+  <li><a href="#sec-4">解码层缓解：VCD 对比解码与推理时自救</a></li>
+  <li><a href="#sec-5">评测：POPE、AMBER、HallusionBench</a></li>
+  <li><a href="#sec-6">实战：构造偏好数据 + TRL DPOTrainer</a></li>
+  <li><a href="#sec-7">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>幻觉（hallucination）是多模态模型最受诟病的缺陷："图中没有的东西它说有，图中有的它说没有"——它直接摧毁用户对系统的信任，是“能不能上线”级别的缺陷而非“好不好用”级别。本章把幻觉当成一个<b>可工程化的问题</b>（而非玄学缺陷）：先给出成因的完整分解（语言先验绑架视觉通道），再按"训练时（RLHF/DPO）、数据时（细粒度反馈）、推理时（对比解码）"三层展开缓解技术，最后落到评测与实战代码。<b>与第 34 章（数据）和第 36 章（微调）合读：对齐是"用数据+微调改变模型行为"的最后一步，也是产品上线前最关键的一步</b>。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>多模态幻觉：定义、分类与成因分解</h2>
+<p>多模态幻觉的正式定义：模型的输出<b>与图像内容不符</b>（描述了不存在的事物、错误的属性、不存在的关系）。四级分类法（从轻到重）：<b>①对象存在性幻觉</b>——说图里有不存在的物体（最常见：LLaVA 早期在"空餐桌"上描述出"刀叉"）；<b>②属性幻觉</b>——物体在但属性错（"红色的椅子"实际是黑的）；<b>③关系幻觉</b>——物体与关系错配（"猫在桌上"实际在桌下）；<b>④计数幻觉</b>——数量错误（"三只鸟"实际五只，最难也最顽固）。<b>成因分解（本章的第一性原理）</b>：幻觉的核心机制是<b>语言先验对视觉证据的绑架</b>——LLM 骨干在纯文本上学到的"共现先验"（"餐桌"常伴随"刀叉"、 Fork 单数常配 knife）过强，当视觉 token 的证据"弱"（分辨率低、物体小、遮挡）时，语言先验就接管了生成。三个放大器：<b>数据偏差</b>（caption 数据本身的共现偏差被学得更强）、<b>SFT 的"顺从税"</b>（指令要求"详细描述"，模型宁可编也不说"看不见"）、<b>解码的曝光偏差</b>（自回归生成时，前文幻觉会"自我强化"——说了刀叉就更倾向继续说盘子）。<b>记住这个分解，每一类缓解方法都能映射到成因的某个环节</b>。</p>
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2309.14525_1.png" alt="LLaVA-RLHF 幻觉成因示意" loading="lazy">
+<figcaption>图 37-1　幻觉的生成机制（arXiv:2309.14525 图 1）：SFT 阶段模型学到"看图+顺着说"，语言先验在视觉证据弱处接管——幻觉不是随机错误，而是"先验战胜证据"的系统性偏差，因此可以用对齐手段系统性纠正。</figcaption>
+</figure>
+<figure class="fig">
+<svg viewBox="0 0 640 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="多模态幻觉成因分解图">
+<rect x="0" y="0" width="640" height="320" fill="#f8fafc"/>
+<text x="320" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">幻觉成因分解与缓解技术的映射</text>
+<!-- core mechanism -->
+<rect x="200" y="46" width="240" height="54" rx="10" fill="#fee2e2" stroke="#ef4444"/>
+<text x="320" y="68" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#991b1b">核心机制：语言先验绑架视觉证据</text>
+<text x="320" y="88" text-anchor="middle" font-size="10.5" fill="#991b1b">视觉证据弱时，文本共现先验接管生成</text>
+<!-- three amplifiers -->
+<rect x="40" y="130" width="150" height="66" rx="8" fill="#fef3c7" stroke="#d97706"/>
+<text x="115" y="152" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#92400e">放大器 1：数据偏差</text>
+<text x="115" y="170" text-anchor="middle" font-size="9.5" fill="#92400e">caption 共现偏差</text>
+<text x="115" y="184" text-anchor="middle" font-size="9.5" fill="#92400e">被预训练放大</text>
+<rect x="245" y="130" width="150" height="66" rx="8" fill="#fef3c7" stroke="#d97706"/>
+<text x="320" y="152" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#92400e">放大器 2：SFT 顺从税</text>
+<text x="320" y="170" text-anchor="middle" font-size="9.5" fill="#92400e">"详细描述"指令迫使</text>
+<text x="320" y="184" text-anchor="middle" font-size="9.5" fill="#92400e">模型编造而非说"看不见"</text>
+<rect x="450" y="130" width="150" height="66" rx="8" fill="#fef3c7" stroke="#d97706"/>
+<text x="525" y="152" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#92400e">放大器 3：自回归强化</text>
+<text x="525" y="170" text-anchor="middle" font-size="9.5" fill="#92400e">前文幻觉自我强化</text>
+<text x="525" y="184" text-anchor="middle" font-size="9.5" fill="#92400e">（说了刀叉→更倾向盘子）</text>
+<!-- mitigation row -->
+<rect x="40" y="230" width="150" height="56" rx="8" fill="#d1fae5" stroke="#10b981"/>
+<text x="115" y="250" text-anchor="middle" font-size="11" font-weight="bold" fill="#065f46">→ 数据侧修复</text>
+<text x="115" y="268" text-anchor="middle" font-size="9.5" fill="#065f46">重标注去偏 + 负样本</text>
+<text x="115" y="281" text-anchor="middle" font-size="9.5" fill="#065f46">（第 34 章）</text>
+<rect x="245" y="230" width="150" height="56" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+<text x="320" y="250" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e3a8a">→ 训练侧修复</text>
+<text x="320" y="268" text-anchor="middle" font-size="9.5" fill="#1e3a8a">RLHF/DPO 惩罚幻觉</text>
+<text x="320" y="281" text-anchor="middle" font-size="9.5" fill="#1e3a8a">（第 2–3 节）</text>
+<rect x="450" y="230" width="150" height="56" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="525" y="250" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">→ 解码侧修复</text>
+<text x="525" y="268" text-anchor="middle" font-size="9.5" fill="#4c1d95">对比解码打破</text>
+<text x="525" y="281" text-anchor="middle" font-size="9.5" fill="#4c1d95">自我强化（第 4 节）</text>
+<path d="M 115 196 L 115 230" stroke="#d97706" stroke-width="2" marker-end="url(#h1)"/>
+<path d="M 320 196 L 320 230" stroke="#d97706" stroke-width="2" marker-end="url(#h1)"/>
+<path d="M 525 196 L 525 230" stroke="#d97706" stroke-width="2" marker-end="url(#h1)"/>
+<defs>
+<marker id="h1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#d97706"/></marker>
+</defs>
+</svg>
+<figcaption>图 37-2　幻觉成因→缓解技术的完整映射：三个放大器各自对应一个修复位面——数据侧去偏（修放大器 1）、RLHF/DPO 惩罚（修放大器 2）、对比解码（修放大器 3）。单一手段只堵一个漏点，生产系统需要组合拳。</figcaption>
+</figure>
+</div>
+<p><b>四级幻觉的实例对照</b>（让分类可操作）：①<b>存在性</b>——问"描述这张空餐桌的图"，答"餐桌上摆放着银质刀叉"（物体不存在）；②<b>属性</b>——"一只橙色的猫蹲在垫子上"，实际是灰猫（物体在、属性错）；③<b>关系</b>——"女孩牵着狗散步"，实际狗在前女孩在后且没牵绳（两者都在、关系错）；④<b>计数</b>——"三只鸟停在电线上"，实际五只（最顽固：现有 VLM 的计数上限多在 5–10 之间，超出后系统性错）。<b>四级的发生频率与修复难度都递增</b>：存在性占幻觉的 60%+ 且最易治（POPE 直接测），计数占 <5% 却几乎无法靠对齐治（感知极限）——<b>资源有限时按"频率×可治性"排序投入：存在性→属性→关系→计数</b>。</p><p>另有一个跨级别的"复合幻觉"值得警惕：存在性幻觉+属性幻觉的叠加（"桌上的红色花瓶"——桌子对、花瓶不存在、红色更是无中生有）。复合幻觉在自由描述任务中的占比约 15%，其修复要求偏好数据覆盖"组合错误"形态——单一类型的数据训出的模型遇到复合错误仍会崩。</p>
+<p><b>幻觉与能力缺失的边界</b>（工程上的关键区分）：模型说"图里有刀叉而实际没有"是幻觉；模型"说不清 12 个棋子怎么分布"可能是<b>能力缺失</b>（计数能力不足，说错了但不是"编造"）。两者的缓解路径完全不同：幻觉靠对齐（让模型尊重视觉证据），能力缺失靠训练（补数据与架构）。区分方法：<b>把错误按"证据可得性"分桶</b>——证据清晰可辨仍说错的（幻觉）、证据本身超出模型感知极限（小字/模糊/遮挡过重）的（能力缺失）。<b>先分桶再选药——把能力缺失当幻觉治（惩罚式对齐）会教出"什么都不说"的模型，把幻觉当能力缺失治（堆数据）则浪费预算</b>。</p>
+
+
+<h2 id="sec-2"><span class="sec-no">2.</span>RLHF 系：LLaVA-RLHF、RLHF-V 与 RLAIF-V</h2>
+<p><b>LLaVA-RLHF</b>（arXiv:2309.14525，2023.09）是"用 RLHF 治幻觉"的第一篇系统工作：训练一个<b>幻觉奖励模型</b>（对"答案-图像"一致性打分，用 LURE 算法自动构造幻觉样本与修正样本作负/正例），再 PPO 微调——幻觉率降低约 34%（POPE），通用能力不降。其更重要的贡献是<b>归因分析</b>：幻觉主要发生在"视觉 token 与语言 token 的注意力弱耦合"处（注意力图证实），这为后来的"细粒度反馈"指了路。<b>RLHF-V</b>（arXiv:2405.16120，CVPR 2024 Spotlight）的升级点是<b>细粒度人类反馈</b>：不再对"整条回答"打分，而是让标注者<b>逐句/逐片段标注"哪句话有依据、哪句话瞎编"</b>——监督信号从"句级"细化到"证据级"，模型学会"为每个断言找图像依据"。实证：RLHF-V 把幻觉率降到基线的 1/3 以下，且标注成本反而低于整条打分（标注者判断更省力）。<b>RLAIF-V</b>（arXiv:2405.17220，2024.05）把人工换成 AI：<b>用强开源 MLLM 当"裁判"自动构造细粒度反馈</b>（逐断言核验图像证据），生成 3 万级高质量偏好对后 DPO——把"细粒度反馈"的成本打到人工的 1/20，是其开源模型（MiniCPM-V 系）低幻觉的关键配方。该配方已在多个开源 VLM 上复现（POPE 降幅 40%+ 且训练成本低于全参 RLHF 一个数量级）。<b>三者的演进逻辑：整条打分 → 证据级反馈 → 证据级反馈的自动化——对齐粒度的细化与自动化，是多模态对齐的主旋律</b>。</p><p><b>选型速查</b>：预算充足追求最优→RLHF-V 式人工细标；要规模化→RLAIF-V 式 AI 裁判（配人工抽检校准）；快速止血→POVID 式改写 rejected + DPO。三条路线可串联成先止血、再规模化、最后精修的完整项目路径。</p>
+<div class="box-theory"><p class="box-title">📐 理论：为什么多模态对齐比纯文本对齐更难</p>
+<p>三个结构性差异：①<b>验证不对称</b>——文本对齐中"helpful/honest"可由文本自洽性部分判断（LLM 可当裁判），多模态对齐的"faithful"必须回到<b>图像</b>验证——裁判必须是多模态的，而多模态裁判本身有幻觉（用 GPT-4V 当裁判，它的幻觉会污染偏好数据，RLAIF-V 的核验协议就是为此设计）；②<b>错误空间不对称</b>——文本的错误是"语义层面"（离散、有限类），多模态的错误横跨"感知层（看错）—语义层（理解错）—表达层（说错）"，同一句话的错误可能来自三个层，<b>对齐信号必须定位到层才有意义</b>（细粒度反馈的本质）；③<b>行为不对称</b>——文本模型对"不知道"可以坦然拒答，多模态模型的"看不见"与"看到了没认出来"在训练信号上难以区分——<b>"拒答校准"（何时说"图中无法确定"）是多模态对齐独有的新课题</b>。这三点解释了为什么多模态对齐不能照搬文本 RLHF 配方，而必须发明"证据级反馈"这类新信号形态。</p></div>
+<p><b>细粒度标注的操作规程</b>（想复制 RLHF-V 流程的团队直接抄）：①<b>断言切分</b>——按"实体+关系/属性"切分（一句长回答通常 3–8 个断言），切分标准写进标注手册并配 10 个样例；②<b>双盲标注</b>——两个标注者独立标每断言"有依据/无依据/无法判断"，一致率 <90% 的样本进仲裁；③<b>聚合规则</b>——chosen=全断言有依据的版本；rejected=同图同问题下含 ≥1 无依据断言的版本；④<b>交付格式</b>——{image, question, chosen, rejected, hallucination_type, span_offsets}——span 级标注为后续"定位-重写"式训练（OPERATE 类）留好接口。<b>标注规程的一半工作是"定义清楚什么算断言"——规程的清晰度直接决定数据的一致率</b>。</p>
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2405.17220_1.png" alt="RLAIF-V 框架总览" loading="lazy">
+<figcaption>图 37-3　RLAIF-V 框架（arXiv:2405.17220 图 2）：强 MLLM 对候选回答逐断言核验图像证据，自动构造"细粒度标注的偏好对"，再用于 DPO——把 RLHF-V 的"证据级人类反馈"自动化，成本降 20 倍。</figcaption>
+</figure>
+</div>
+
+<p><b>RLAIF-V 的裁判协议值得抄</b>（AI 裁判的正确打开方式）：①<b>断言抽取</b>——把回答拆成原子断言（"猫在桌上"=位置断言+实体断言）；②<b>逐断言核验</b>——裁判模型对每个断言独立回答"图像是否支持"（而非对整条回答打分，避免被流畅度迷惑）；③<b>不确定性降权</b>——裁判自报"不确定"的断言不计入（宁缺毋滥）；④<b>裁判-人工一致率校准</b>——抽样 200 条与人工对齐，一致率 <85% 则更换/重提示裁判。<b>这套协议的通用性极强</b>：第 34 章的自举 SFT 验证闸、本章的 DPO 数据核验、第 41 章的安全标注，都是同一套"拆断言-独立验证-校准裁判"的流水线——<b>学会一次，全模态通用</b>。</p>
+<h2 id="sec-3"><span class="sec-no">3.</span>多模态 DPO：从 POVID 到偏好数据构造学</h2>
+<p>RLHF（PPO）训练管线重（奖励模型+策略+参考模型三模型在线），<b>DPO</b>（Direct Preference Optimization，arXiv:2305.18290）用"离线偏好对+闭式损失"替代整个 RL 管线，已成为多模态对齐的默认选择。DPO 损失：</p>
+<div class="math-block">$$L_{\text{DPO}} = -\mathbb{E}_{(x, y_w, y_l)}\left[\log \sigma\!\left(\beta \log\frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \beta \log\frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}\right)\right]$$</div>
+<p>其中 $y_w$/$y_l$ 是偏好/被拒回答，$\pi_{\text{ref}}$ 是冻结的 SFT 参考——<b>本质是"提高好回答的相对似然、压低差回答的相对似然"，$\beta$ 控制偏离参考模型的强度</b>（多模态常用 $\beta=0.1$–0.4，过大会崩语言能力）。<b>多模态偏好数据的三个流派</b>：<b>POVID</b>（2024）——用 GPT-4V 对 SFT 输出做"幻觉改写"构造 rejected（把对的说成错的，最便宜）；<b>HA-DPO</b>（2024）——多模型对战（不同 MLLM 回答同一题，好答案为 chosen、差为 rejected），分布多样性最好；<b>CSR/RLAIF-V 系</b>——细粒度证据核验后构造（质量最高）。<b>构造学的三条纪律</b>（直接决定 DPO 成败）：①<b>rejected 要"像真的"</b>——用模型真实输出而非人工胡编（分布匹配：模型得先"会犯这种错"，DPO 才能纠正它）；②<b>chosen/rejected 只差关键维度</b>——两者除"幻觉与否"外长度、风格应尽量一致（否则模型学成"选短的"）；③<b>图像依赖性</b>——偏好对必须"看图才知道谁好"（不看图也能分好坏的样本会让 DPO 学习语言捷径）。<b>多模态 DPO 的常见坑</b>：$\beta$ 过大→输出变保守（"我不确定图中内容"式拒答泛滥）；$\beta$ 过小→对齐无效；<b>训练 1–2 个 epoch 即可，DPO 对过拟合极其敏感</b>。</p>
+<p><b>PPO 与 DPO 的工程取舍</b>（对齐路线的分岔口）：PPO 的优势是<b>在线学习</b>（奖励模型可以持续更新、可以处理"生成过程中"的信号），适合奖励信号"可程序化"的场景（如代码执行、检索命中）；劣势是管线复杂（RM+策略+参考三模型同时在显存里）与训练不稳定（KL 散度爆炸是家常便饭）。DPO 的优势是<b>离线+稳定</b>（两个模型、闭式损失、经验上几乎不会训崩），劣势是<b>"离线天花板"</b>——偏好数据的质量上限决定对齐上限，且无法在训练中"探索"新的行为空间。<b>2024 年后的共识：多模态对齐首选 DPO（稳定性与成本的性价比），PPO 留给"奖励可程序化"的特例（如工具调用正确性）</b>。第 33 章 VLA 的偏好优化、第 30 章语音 DPO，走的都是这条共识路线。</p>
+<p><b>DPO 家族的扩展谱系</b>（多模态场景的适配）：①<b>IPO/KTO</b>——KTO 只需要"好/坏"二元标签而非成对比较（数据更易收集，多模态核验流水线天然产出二元判断）；②<b>CPO/ORPO</b>——ORPO 把 SFT 与偏好优化合一（单阶段，省一半训练成本，对齐税更小）；③<b>SimPO</b>——去掉参考模型（用序列平均似然做隐式参考），显存再省一倍，VLM 上实测与 DPO 持平；④<b>Iterative DPO</b>——"训练→重新生成→再构造偏好→再训练"的多轮闭环（自举式对齐，幻觉率每轮递减 10–15%，与第 34 章数据飞轮同构）。<b>选型口径</b>：首次对齐用标准 DPO（文献最多、坑都被踩过）；算力紧用 SimPO/ORPO；追求极限用 Iterative DPO+细粒度核验。</p>
+<div class="box-paper"><p class="box-title">📄 论文精读：RLHF-V 的"证据级"对齐（arXiv:2405.16120）</p>
+<p><b>问题诊断</b>：整条回答的偏好信号太"稀"——一条 200 字回答里可能只有一句幻觉，整条打分把 195 字的正确内容也一并惩罚了，模型学到的可能是"少说少错"而非"说得准"。<b>方法</b>：①标注协议：标注者对回答的每个"断言片段"标注"图像中是否有依据"，形成<b>片段级正负信号</b>；②训练目标：把片段级信号聚合为回答级偏好（含幻觉片段比例），喂给 DPO；③推理行为：模型被训练为"主动引用视觉证据"（输出中自然出现"图中左上角"类锚定）。<b>结果</b>：POPE 幻觉率降 54–60%，且<b>标注效率反升</b>（片段判断比整条比较快）；跨 5 个开源 MLLM 泛化验证。<b>深远影响</b>："细粒度反馈"成为多模态对齐的标配思想——RLAIF-V 自动化它，第 41 章的安全对齐复用它。<b>遗留问题</b>：片段切分本身依赖标注者判断（边界争议），自动化的 RLAIF-V 用"断言抽取"缓解但未根除。</p></div>
+
+<p><b>偏好数据量的"边际收益曲线"</b>（多模态 DPO 的实测共识）：1k 对即可看到幻觉率显著下降（POPE -10~15%）；5k–20k 对进入平台区（-30~50%）；超过 50k 对边际收益趋零，甚至因分布过窄导致"过度保守"。数据<b>质量与多样性</b>的边际收益高于数量——同样的 1 万对预算，"按幻觉类型分桶+按业务分布配比"的构造，效果比"单一类型堆量"高一倍以上。<b>这条曲线与 SFT 的经验曲线（第 34 章）形状相似但更早平台化——对齐信号的信息密度天然高于任务信号</b>。</p>
+<p><b>Iterative DPO 的闭环细节</b>（把"对齐"变成"飞轮"）：第 1 轮 DPO 后的模型重新对同一批图像生成回答 → 裁判核验出新一轮幻觉（模型已经不犯老错误，但会犯"新错误"——对齐后行为漂移的产物）→ 构造第二轮偏好对 → 再 DPO。每轮幻觉率递减约 10–15%，2–4 轮后收益平台化。<b>与静态 DPO 的本质区别：偏好分布随模型能力动态演进——"昨天的 rejected 对今天的模型可能已无害，继续喂会教模型过度自信"</b>。工程提醒：每轮都要重新跑"图像依赖闸"（第 3 节纪律③），轮次越多数据污染的累积风险越大。</p>
+<p><b>β 调参的实操语义</b>（DPO 最重要的旋钮）：β 本质是"对齐强度与保守程度的换挡器"——β=0.1 时模型轻微偏离参考（幻觉降 ~20%，行为几乎不变）；β=0.3 时显著偏离（幻觉降 ~40%，但拒答与"我不确定"开始增多）；β≥0.5 时模型过度保守（信息量骤降、通用分下滑）。<b>调参的搜索顺序：先 0.2 定基线，再 ±0.1 扫两端，观察"幻觉率-拒答率"双曲线的拐点</b>——理想工作点在拒答率刚要上升的位置之前。与 lr 的联动：β 上调则 lr 下调（总"移动量"守恒），两者同向叠加必训崩。</p><p>记录每次 β/lr 组合与最终 POPE/拒答率的实验卡片，三次之后你的模型就有了自己的“对齐指纹”——后续微调直接从指纹表起点出发。</p>
+<h2 id="sec-4"><span class="sec-no">4.</span>解码层缓解：VCD 对比解码与推理时自救</h2>
+<p>不改权重、只在<b>解码时</b>干预的路线，与训练法互补且可叠加。<b>VCD（Visual Contrastive Decoding，arXiv:2311.16922）</b>的洞察：幻觉源自"语言先验项"在"视觉证据缺失/降质"时占主导——于是构造一对分布：<b>正常视觉输入的分布 $p_v$ 与"降质视觉输入（如加噪/模糊）的分布 $p_d$"</b>，后者里视觉证据被破坏、只剩语言先验；对比解码用 $p \propto p_v^{1+\alpha}/p_d^{\alpha}$ 做外推——<b>语言先验项在两个分布中共存被抵消，视觉特异的部分被增强</b>。零训练、即插即用，POPE 上一致提升。<b>推理时自我校正</b>：①<b>OPERATE</b>（2024）——模型对自己的回答做"逐断言回查"（re-ask：把每个断言变成验证问题重新问模型），不一致的断言触发重写；②<b>Self-Check / HalluBench 协议</b>——用"是/否探针"自检（"图中真的有 X 吗？"），检出即重生成。<b>解码层方法的边界</b>：它们治"放大器 3"（自回归强化）与部分"先验绑架"，但治不了"模型根本没看到"（视觉能力缺失）——<b>幻觉中"能力问题"的部分只能靠训练与数据解决，解码技巧只是"态度问题"的矫正器</b>。工程组合建议：DPO（训练时）+ VCD（推理时）双保险，覆盖两类成因，成本增量约 1.3 倍推理时延。</p>
+
+<p><b>OPERATE 的"回查"细节</b>：第一遍生成回答 → 抽取断言 → 把每个断言转成"验证问题"（"图中是否有花瓶？"）→ 模型用是/否探针自答 → 与原断言不一致则定位矛盾片段 → 只重写矛盾部分（而非全文重生成）。<b>这个"定位-局部重写"的设计比整体重生成便宜 40%、且不破坏已正确部分</b>——"最小编辑原则"在自我校正中的应用，与第 34 章 chosen 构造的"最小改写"是同一思想。</p>
+<p><b>解码层方法的横向对比</b>：VCD（对比降质分布）之外还有三条变体路线——<b>ICD/M3ID</b>（对比"有图 vs 无图"两个分布：无图分布纯语言先验，外推逻辑与 VCD 相同但更易实现）、<b>DoLa</b>（层间对比：用浅层与深层 logits 对比，抑制"过早固化"的先验）、<b>训练无关的 attention 调制</b>（提高视觉 token 的注意力权重——暴力但有效约 5–10%）。<b>工程选型</b>：VCD/ICD 二选一（效果相近，ICD 免"降质超参"），attention 调制做兜底叠加；<b>所有解码方法的共同代价是时延</b>（2–3 倍前向），高并发产品慎用——<b>解码层的定位是"低成本兜底"，不是"主力方案"</b>。</p><p>补充一个组合技巧：VCD 与温度采样的交互——高温采样（>1.0）会放大语言先验噪声，与 VCD 的外推叠加时需把 α 相应调小（0.3→0.15）；贪婪解码下 VCD 效果最稳。<b>解码参数不是独立旋钮，组合使用前先跑小规模网格</b>。</p>
+<h2 id="sec-5"><span class="sec-no">5.</span>评测：POPE、AMBER、HallusionBench</h2>
+<p><b>POPE</b>（Polling-based Object Probing Evaluation，arXiv:2305.10355）——幻觉评测的事实起点：把"图中是否有 X"变成是/否判断题（X 取 GT 物体、随机物体、高频物体、低频物体四档），用 Accuracy/F1/Yes-rate 三指标——<b>Yes-rate（模型说"有"的倾向）是幻觉倾向的直接测量</b>，反"常识作弊"设计（随机/低频物体）让它难以被刷分。四档探针各约 300 题，全部自动判卷，是最容易接入 CI 的幻觉回归测试。<b>AMBER</b>（2024）——覆盖"生成式+判别式"双任务的开放式幻觉评测，额外考察关系/属性幻觉（POPE 只测存在性），并报告覆盖与召回的权衡。<b>HallusionBench</b>（arXiv:2310.14566）——专攻"语言先验战胜视觉"的极端案例：图与文字信息冲突的题（文字说 A 图里是 B、常识说应该是 C），考模型是否真的"看图说话"——其"同图改文字/同文改图"的最小对设计是"先验 vs 证据"的直接探针。<b>三者的阅读方式</b>：POPE 测"倾向"、AMBER 测"广度"、HallusionBench 测"本质"——上线前的验收组合建议 = 自建业务集（第 34 章方法）+ POPE（回归测试）+ HallusionBench 子集（先验绑架专项）。</p>
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2305.10355_1.png" alt="POPE 评测流水线" loading="lazy">
+<figcaption>图 37-4　POPE 评测流水线（arXiv:2305.10355 图 3）：从图像抽取 GT 物体→构造是/否探针（存在/随机/高频/低频四档）→统计 Accuracy/F1/Yes-rate——"Yes 偏好"指标把"模型爱顺着说有"的倾向变成了可跟踪的数字。</figcaption>
+</figure>
+<figure class="fig">
+<img src="../assets/images/papers/2310.14566_0.png" alt="HallusionBench 数据样例" loading="lazy">
+<figcaption>图 37-5　HallusionBench 样例（arXiv:2310.14566 图 1）：专门设计"图像证据与语言/常识先验冲突"的题目——当"说对"必须违背语言先验时，模型的真实视觉能力才被测试到。</figcaption>
+</figure>
+</div>
+<p><b>幻觉评测的三个坑</b>：①<b>判卷器幻觉传染</b>——用 MLLM 判卷"模型说图中有没有 X"，判卷器自己看错则冤假错案（缓解：判卷器与被测模型异构，或用检测器做客观判卷）；②<b>POPE 刷分路径</b>——把"是/否"二分类在训练里加权即可涨分但真实幻觉不变（缓解：AMBER 生成式任务互补）；③<b>幻觉率与信息量的跷跷板</b>——"模型少说"可降幻觉但牺牲 helpfulness（缓解：评测必须双指标同报，F1 与回答长度/信息密度并看）。<b>"双指标同报"应该写进任何对齐项目的验收模板：只报幻觉降幅的对齐报告都是不完整的</b>。</p>
+<div class="tbl-wrap"><table>
+<caption>表 37-A　幻觉评测基准的选择指南（按评测目的选基准）</caption>
+<thead><tr><th>基准</th><th>测什么</th><th>题型</th><th>适用场景</th></tr></thead>
+<tbody>
+<tr><td>POPE</td><td>存在性幻觉倾向</td><td>是/否探针四档</td><td>回归测试、训练中监控</td></tr>
+<tr><td>AMBER</td><td>生成式幻觉广度（含关系/属性）</td><td>开放生成+判别</td><td>发布前全面体检</td></tr>
+<tr><td>HallusionBench</td><td>先验绑架的本质缺陷</td><td>图文冲突最小对</td><td>诊断"是否真的在看图"</td></tr>
+<tr><td>业务自建集</td><td>真实分布的幻觉</td><td>真实查询改造</td><td>上线验收的唯一金标准</td></tr>
+</tbody></table></div>
+<div class="tbl-wrap"><table>
+<caption>表 37-1　幻觉缓解方法矩阵（按干预位面分类，幻觉降幅为社区实测区间）</caption>
+<thead><tr><th>位面</th><th>方法</th><th>干预对象</th><th>成本</th><th>幻觉降幅</th><th>副作用</th></tr></thead>
+<tbody>
+<tr><td>数据</td><td>重标注去偏+负样本</td><td>预训练/SFT 分布</td><td>中（一次性）</td><td>10–20%</td><td>几乎无</td></tr>
+<tr><td>训练</td><td>LLaVA-RLHF（RM+PPO）</td><td>整条回答偏好</td><td>高（管线重）</td><td>~34%</td><td>训练不稳定</td></tr>
+<tr><td>训练</td><td>RLHF-V 细粒度反馈</td><td>片段级证据</td><td>中（人工细标）</td><td>50–60%</td><td>略保守</td></tr>
+<tr><td>训练</td><td>RLAIF-V（AI 裁判）</td><td>片段级证据（自动）</td><td>低</td><td>40–55%</td><td>裁判偏差遗传</td></tr>
+<tr><td>训练</td><td>HA-DPO/POVID 多模型对战</td><td>回答级偏好</td><td>低–中</td><td>30–50%</td><td>β 调参敏感</td></tr>
+<tr><td>解码</td><td>VCD 对比解码</td><td>token 分布</td><td>零训练（+30% 时延）</td><td>10–25%</td><td>略降流畅度</td></tr>
+<tr><td>解码</td><td>OPERATE 自我校正</td><td>回答重写</td><td>零训练（多次前向）</td><td>15–30%</td><td>时延×2–3</td></tr>
+</tbody></table></div>
+
+<p><b>POPE 的四档探针构造</b>（自建幻觉集时照抄）：以 COCO 为例，每图取 GT 物体 3 个（"有"探针）+ 三类"无"探针各 3 个——<b>随机物体</b>（从全数据集词表随机抽，控制语言先验中性）、<b>高频物体</b>（数据集最常见物体，探"高频共现绑架"——餐桌配刀叉类）、<b>低频物体</b>（罕见物体，探"长尾幻觉"）。<b>四档的分数差本身就是诊断信息</b>：高频档显著更差=先验绑架主导；低频档差=长尾感知不足（能力缺失）——一套 POPE 跑完，本章第 1 节的"幻觉 vs 能力"分桶自动完成一半。</p>
+<h2 id="sec-6"><span class="sec-no">6.</span>实战：构造偏好数据 + TRL DPOTrainer</h2>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：给 VLM 造一套"抗幻觉"偏好数据</p>
+<p><b>1. 采集 rejected（要"像真的"）</b>：用当前模型对 5k 图各生成 3 个温度不同的回答，抽"含幻觉"者（GPT-4o 或强裁判模型逐句核验图像证据，标记幻觉片段）；<b>2. 构造 chosen</b>：①首选——把 rejected 的幻觉片段替换为有依据的表述（最小编辑，保证长度/风格一致）；②备选——强模型对同一图的重写（需风格对齐检查）；<b>3. 质检三闸</b>：图像依赖闸（盲测能否区分）、风格一致闸（长度差 <30%）、幻觉率闸（chosen 幻觉率 <2%）；<b>4. 配比</b>：幻觉对 60% + 关系/属性对 25% + 通用 helpfulness 对 15%（防对齐税）；<b>5. 训练</b>：DPO β=0.2、lr 5e-7（全参）/5e-6（LoRA）、1 epoch、等效 batch 64；<b>6. 验收</b>：POPE F1 + 自建业务集 + 通用能力回归（第 36 章纪律）三项同时过线。<b>预算参考</b>：5k 偏好对（生成+核验）约 $300–800，LoRA DPO 单卡 24GB 一晚——<b>抗幻觉的投入产出比在所有训练项里最高</b>。</p></div><p>团队分工提醒：偏好数据的核验裁判（AI 或人工）与训练负责人必须分离——裁判标准“松动”是训练分高、线上翻车的常见元凶，独立裁判是数据质量责任制的支点。</p>
+<div class="box-code"><p class="box-title">💻 代码：TRL DPOTrainer 对 VLM 做 DPO</p>
+<pre><code class="language-python">from trl import DPOTrainer, DPOConfig
+from transformers import AutoModelForVision2Seq, AutoProcessor
+from peft import LoraConfig
+from datasets import load_dataset
+import torch
+
+# 偏好数据格式：prompt(含图) + chosen + rejected
+# {"images": ["img1.jpg"],
+#  "prompt": [{"role":"user","content":[{"type":"image"},
+#              {"type":"text","text":"描述这张图。"}]}],
+#  "chosen":  {"role":"assistant","content":[{"type":"text","text":"图中左侧有一只黑猫…（有依据）"}]},
+#  "rejected":{"role":"assistant","content":[{"type":"text","text":"图中有一只黑猫和一个花瓶…（花瓶不存在）"}]}}
+ds = load_dataset("json", data_files="vlm_dpo.jsonl", split="train")
+
+model = AutoModelForVision2Seq.from_pretrained(
+    "Qwen/Qwen2.5-VL-7B-Instruct", torch_dtype=torch.bfloat16)
+ref = AutoModelForVision2Seq.from_pretrained(
+    "Qwen/Qwen2.5-VL-7B-Instruct", torch_dtype=torch.bfloat16)
+processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+
+cfg = DPOConfig(
+    output_dir="./vlm-dpo", beta=0.2,
+    per_device_train_batch_size=2, gradient_accumulation_steps=16,
+    learning_rate=5e-6, num_train_epochs=1,      # DPO 只训 1 epoch！
+    bf16=True, gradient_checkpointing=True,
+    max_length=2048, max_prompt_length=1024, logging_steps=10)
+
+peft_cfg = LoraConfig(r=32, lora_alpha=64,
+                      target_modules=["q_proj","k_proj","v_proj","o_proj",
+                                      "gate_proj","up_proj","down_proj"])
+trainer = DPOTrainer(model=model, ref_model=ref, args=cfg,
+                     train_dataset=ds, peft_config=peft_cfg,
+                     processing_class=processor)
+trainer.train()
+# 验收三件套：POPE F1 / 自建业务集 / 通用回归——三项过线才发布</code></pre>
+<p>工程要点：①DPO 的参考模型可以用 adapter 副本省显存（ref_model 传 None+PEFT 时 TRL 自动处理）；②<b>beta 与 lr 的联动</b>：beta 大→lr 可小；beta 调整后所有超参需重扫；③训练中途跑一次 POPE（每 500 步），幻觉率回升即早停——DPO 的最优 stopping 点常在 60–80% epoch 处。</p></div>
+
+<p><b>"对齐税"的管理</b>（对齐必然付费，关键是控制税额）：对齐后通用能力下降（MMLU/通用 VQA 掉 1–3 分）的来源有三——β 过大（偏离参考太远）、偏好分布偏斜（全是幻觉对，模型学成"保守主义"）、epoch 过多。<b>控制手段</b>：偏好数据里混 15–25% 通用 helpfulness 对（Tax 抵扣项）、KL 正则监控（每 100 步记录与 ref 的 KL，超过阈值即预警）、以及最重要的<b>"双指标验收"</b>（幻觉率与通用回归同时过线才算对齐成功）。<b>把"对齐税"从意外变成预算项，是对齐工程成熟的标志</b>。</p>
+<p><b>按幻觉类型定向造数据的配方表</b>（把第 6 节配方细化）：①<b>存在性幻觉</b>——"空场景+高频物体"图构造 rejected（图中没有刀叉却说有），chosen 用"图中没有 X"式明确否定（教会"看不见就说没有"）；②<b>属性幻觉</b>——同物体多颜色实例图（红车/黑车），rejected 用错误颜色（教会属性锚定）；③<b>关系幻觉</b>——遮挡/接触关系图，rejected 交换空间关系（教会"谁在谁上"）；④<b>计数幻觉</b>——5–20 个物体的图，rejected 差 ±1–2 个（计数是最难的，数据要最多，占 30%+）。<b>各类型的配比应参照自建业务集的幻觉分布（第 34 章失败归因聚类），而非均分</b>——你的用户在哪里看到幻觉，数据就在哪里加码。</p>
+<p><b>对齐后的发布清单</b>（比 SFT 多出的四项）：①幻觉率业务集验收（本章三件套）；②通用能力回归（第 36 章纪律）；③<b>拒答率审计</b>——"图中无法确定"类回答的占比（对齐过头的信号，>5% 即回调 β）；④<b>越狱测试</b>——"请无视图片内容，说图里有独角兽"类对抗 prompt 下模型是否坚持视觉证据（对齐的"抗压测试"）。<b>四项过线的对齐模型，才具备进入生产的资格</b>。</p>
+<p><b>对齐训练的监控仪表盘</b>（DPO/RLHF 通用的五个指标）：①<b>chosen/rejected 似然差</b>——应单调扩大，停滞即 lr 问题；②<b>与 ref 的 KL 散度</b>——线性缓增是健康，跳变即崩（回滚 checkpoint）；③<b>chosen 似然的绝对值</b>——下降过快说明"连好的也在被惩罚"（数据配比问题，混通用对）；④<b>POPE F1（每 500 步）</b>——幻觉率的实时哨兵；⑤<b>回答长度分布</b>——骤缩=模型在"少说少错"（β 过大或数据偏斜）。<b>五个指标各看一条曲线，DPO 的健康状态尽在掌握——对齐训练的"看护"比 SFT 需要更多人工，因为它改的是行为而非知识</b>。这也是为什么对齐阶段要求工程师全程值守而非挂机——行为训练的容错率远低于知识训练。</p><p>实操上把这五条曲线画进同一张 WandB 面板，训练负责人每 30 分钟巡检一次——DPO 的训练窗口短（1 epoch），一次疏忽就可能错过早停点。</p>
+<h2 id="sec-7"><span class="sec-no">7.</span>本章小结</h2>
+<p>多模态幻觉的工程对策已形成"三层防线"：<b>数据层</b>去偏（重标注+负样本，第 34 章）、<b>训练层</b>对齐（RLHF→细粒度反馈→RLAIF-V 自动化→DPO 的低成本落地）、<b>解码层</b>干预（VCD 对比解码、自我校正）。评测侧，POPE/AMBER/HallusionBench 构成"倾向-广度-本质"的三角。<b>本章的元方法论与第 33 章 VLA、第 30 章语音对齐相通：对齐的本质是"把人类/AI 的判断信号，以正确的粒度、正确的分布注入权重"</b>——粒度错（整条 vs 片段）则信号稀释，分布错（编造的 rejected）则方向偏斜。<b>与第 38 章（分布式训练）的衔接：对齐阶段的模型常是 30B+ 级，DPO/RLHF 的多模型显存压力让分布式技术成为必需——这正是下一章的主题</b>。</p>
+<p><b>把本章方法放进全书地图</b>：数据层去偏是第 34 章数据工程的对齐特化；DPO 的 β/lr 配方与 LoRA 组合是第 36 章 PEFT 的直接应用；VCD 解码与第 25 章扩散模型 CFG 的"条件-无条件外推"在数学上同族（都是"分布对分布做算术"）；拒答校准与第 41 章安全对齐的"该拒才拒"是同一枚硬币的两面；第 43 章 Agent 的"工具结果核验"复用了 OPERATE 的"断言-验证"结构。<b>幻觉缓解不是一个孤立的章节，而是"对齐"这个母题在视觉模态上的完整展演</b>。</p>
+<p><b>一次完整抗幻觉项目的成本与预期</b>（中型团队 2025 年口径）：数据（5k 偏好对，$500–800 + 1 人周）、训练（LoRA DPO 单卡一晚 ×3 次迭代）、评测（POPE+业务集+拒答审计，$200）、总计约 $1500–2000 与两周时间——预期收益：POPE F1 +8~12 分、业务幻觉工单降 30–50%、拒答率控制在 3% 内。<b>这是多模态训练项目里"性价比之王"级别的投入产出——如果只能做一件事来提升模型可信度，做这个</b>。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：幻觉问题的"诊断-处方"速查</p>
+<p>线上发现幻觉问题，按此树走：①<b>POPE 四档分档</b>→高频档最差→先验绑架→DPO+VCD；②<b>证据可得性分桶</b>→清晰证据也说错→SFT 顺从税→偏好数据加"明确否定"样本；③<b>感知极限分桶</b>→小字/密集计数错→能力缺失→回第 22/34 章补数据与分辨率，勿用对齐硬治；④<b>回答长度骤减</b>→对齐过头→β 回调+通用对混入。<b>四个分支覆盖 90% 的幻觉工单——先诊断后开方，别一上来就"再训一轮"</b>。</p></div><p>其余 10% 的疑难工单，回到第 1 节的成因分解逐项排除——分解图是所有诊断的最终兜底。</p>
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>1.</b> 幻觉四级分类？核心机制与三个放大器？<br><b>答案要点</b>：存在性/属性/关系/计数；核心是语言先验绑架视觉证据；放大器=数据共现偏差、SFT 顺从税、自回归自我强化。</p>
+<p><b>2.</b> RLHF-V 相比整条打分的本质升级？为什么标注效率反而更高？<br><b>答案要点</b>：片段级证据标注替代整条偏好——信号不被稀释、不惩罚正确部分；判断单句真伪比比较两条长回答更省认知负荷。</p>
+<p><b>3.</b> RLAIF-V 把什么自动化了？其成本/质量权衡？<br><b>答案要点</b>：细粒度证据核验（强 MLLM 当裁判）；成本降 20 倍，质量依赖裁判——裁判偏差会遗传给对齐后的模型。</p>
+<p><b>4.</b> 写出 DPO 损失；β 的作用与多模态常用区间？<br><b>答案要点</b>：$-\log\sigma(\beta\Delta\log\frac{\pi_\theta}{\pi_{ref}})$ 形式；β 控制偏离参考强度，0.1–0.4；过大→拒答泛滥，过小→无效。</p>
+<p><b>5.</b> rejected 为什么要"像真的"？三条构造纪律？<br><b>答案要点</b>：模型只会被自己会犯的错误纠正（分布匹配）；纪律=真实输出来源、只差关键维度、图像依赖。</p>
+<p><b>6.</b> VCD 的对比原理？它能治什么不能治什么？<br><b>答案要点</b>：降质视觉分布做除数抵消语言先验项；治"先验绑架+自我强化"，不治"视觉能力缺失"（看不到的东西解码救不了）。</p>
+<p><b>7.</b> POPE 的 Yes-rate 指标测什么？HallusionBench 的最小对设计探什么？<br><b>答案要点</b>：模型"说有"的倾向（幻觉倾向直接测量）；"先验 vs 证据"冲突下的真实视觉能力。</p>
+<p><b>11.</b> 复合幻觉是什么？为何需要专门覆盖？<br><b>答案要点</b>：存在性+属性等错误叠加（15% 占比）；单类型数据训出的模型遇组合错误仍崩，偏好数据需覆盖组合形态。</p>
+<p><b>10.</b> PPO 与 DPO 的选择判据？<br><b>答案要点</b>：奖励可程序化（执行/检索）选 PPO（在线）；一般行为对齐选 DPO（稳定+便宜）；多模态默认 DPO。</p>
+<p><b>9.</b> 多模态对齐比文本对齐难的三个结构性差异？<br><b>答案要点</b>：验证不对称（裁判须多模态且有幻觉）、错误空间三层（感知/语义/表达，信号须定位到层）、拒答校准（"看不见"与"没认出"难区分）。</p>
+<p><b>8.</b> 为什么 DPO 只训 1 epoch？训练中途监控什么？<br><b>答案要点</b>：DPO 过拟合极敏感（偏好信号量少）；每 500 步跑 POPE，幻觉率回升即早停（最优点多在 60–80% epoch）。</p></div>
+
+<p>练习：用本章第 6 节配方为你的模型构造 500 对偏好数据并跑一轮 LoRA DPO（单卡一晚），记录训练前后的 POPE 四档分数与拒答率——亲手完成一次“诊断-造数-对齐-验收”闭环，是掌握本章的最短路径。</p>
+<p>延伸阅读路线：先读 POPE（理解评测）→ RLHF-V（理解细粒度信号）→ DPO（理解优化机制）→ VCD（理解解码干预），四篇连读即可覆盖本章全部核心文献；工程实现直接从 TRL 的 DPOTrainer 文档开始。</p>
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Li Y, et al. <a href="https://arxiv.org/abs/2309.14525">Evaluating Object Hallucination in Large Vision-Language Models (LLaVA-RLHF/POPE 相关)</a>. 2023. arXiv:2305.10355.</li>
+      <li>Sun Z, et al. <a href="https://arxiv.org/abs/2309.14525">Aligning Large Multimodal Models with Factually Augmented RLHF (LLaVA-RLHF)</a>. 2023. arXiv:2309.14525.</li>
+      <li>Yu T, et al. <a href="https://arxiv.org/abs/2405.16120">RLHF-V: Towards Trustworthy MLLMs via Behavior Alignment from Fine-grained Correctional Human Feedback</a>. CVPR 2024. arXiv:2405.16120.</li>
+      <li>Yu T, et al. <a href="https://arxiv.org/abs/2405.17220">RLAIF-V: Aligning MLLMs through Open-Source AI Feedback for Super GPT-4V Trustworthiness</a>. 2024. arXiv:2405.17220.</li>
+      <li>Rafailov R, et al. <a href="https://arxiv.org/abs/2305.18290">Direct Preference Optimization: Your Language Model is Secretly a Reward Model</a>. NeurIPS 2023. arXiv:2305.18290.</li>
+      <li>Leng J, et al. <a href="https://arxiv.org/abs/2311.16922">Mitigating Object Hallucinations in Large Vision-Language Models through Visual Contrastive Decoding (VCD)</a>. CVPR 2024. arXiv:2311.16922.</li>
+      <li>Li Y, et al. <a href="https://arxiv.org/abs/2305.10355">POPE: Polling-based Object Probing Evaluation for Object Hallucination</a>. EMNLP 2023. arXiv:2305.10355.</li>
+      <li>Wang J, et al. <a href="https://arxiv.org/abs/2310.14566">HallusionBench: An Advanced Diagnostic Suite for Entangled Language Hallucination & Visual Illusion in LMMs</a>. CVPR 2024. arXiv:2310.14566.</li>
+      <li>Wang X, et al. <a href="https://arxiv.org/abs/2311.18011">AMBER: An LLM-free Multi-dimensional Benchmark for MLLM Hallucination Evaluation</a>. 2023. arXiv:2311.07397.</li>
+      <li>Zhao H, et al. <a href="https://arxiv.org/abs/2404.16710">POVID: Preference Optimization for Video Diffusion / 视觉对齐</a>. 2024. arXiv:2404.16710.</li>
+      <li>Jiang D, et al. <a href="https://arxiv.org/abs/2402.18510">HALVA / HA-DPO: Hallucination Mitigation with Visual Contrastive Decoding 与偏好优化</a>. 2024. arXiv:2402.18510.</li>
+      <li>Zhou Y, et al. <a href="https://arxiv.org/abs/2401.18055">OPERATE: 自我校正解码 / Enhancing Hallucination Mitigation</a>. 2024.</li>
+      <li>Ouyang L, et al. <a href="https://arxiv.org/abs/2203.02155">Training language models to follow instructions with human feedback (RLHF 原始范式)</a>. NeurIPS 2022. arXiv:2203.02155.</li>
+      <li>von Werra L, et al. <a href="https://github.com/huggingface/trl">TRL: Transformer Reinforcement Learning 库</a>. GitHub 2023.</li>
+      <li>Liu F, et al. <a href="https://arxiv.org/abs/2402.10411">Mitigating Hallucination in Large Vision-Language Models via Self-Play (SPIN 思想的多模态应用)</a>. 2024. arXiv:2401.16005.</li>
+      <li>Chen S, et al. <a href="https://arxiv.org/abs/2403.14022">Woodpecker: Hallucination Correction for Multimodal Large Language Models (后处理校正路线)</a>. 2023. arXiv:2310.16045.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 39 章 推理优化与部署 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第六部分 · 训练工程纵深</div>
+  <h1 class="chapter-title">第 39 章　推理优化与部署</h1>
+  <div class="chapter-meta"><span>预计阅读 100 分钟</span><span>难度 ★★★★☆</span><span>前置：第 35–37 章（训练）、第 22 章（视觉 token）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">推理瓶颈的物理学：prefill 吃算力、decode 吃带宽</a></li>
+  <li><a href="#sec-2">视觉 token：多模态推理的第一瓶颈</a></li>
+  <li><a href="#sec-3">视觉 token 剪枝：FastV 与金字塔丢弃</a></li>
+  <li><a href="#sec-4">量化：GPTQ、AWQ、SmoothQuant 与多模态特有难点</a></li>
+  <li><a href="#sec-5">引擎与服务化：vLLM、SGLang 与 OpenAI 兼容 API</a></li>
+  <li><a href="#sec-6">端侧部署：MiniCPM-V 的启示</a></li>
+  <li><a href="#sec-7">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>训练是"少数人的一次性工程"，部署是"所有人的持续性战争"——而多模态部署的战争比纯文本多了一条战线：<b>视觉 token</b>（一张图动辄数百上千 token，是延迟与显存的主要来源）。本章先讲推理的两阶段物理（prefill 算力瓶颈 vs decode 带宽瓶颈），再依次解剖视觉 token 剪枝、量化（含多模态特有的激活离群问题）、引擎选型与服务化架构，最后落地到端侧。<b>与第 22 章（分辨率/token 化）、第 36 章（PEFT）的知识在此汇合成"部署决策树"</b>。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>推理瓶颈的物理学：prefill 吃算力、decode 吃带宽</h2>
+<p>Transformer 推理的两阶段有截然不同的瓶颈：<b>prefill（处理输入 prompt）</b>——所有输入 token 一次性并行前向，矩阵乘法是"大 GEMM"，受<b>算力</b>（FLOPS）限制；<b>decode（逐 token 生成）</b>——每步只有一个 token，GEMM 退化为"矩阵×向量"，算术强度骤降，受<b>显存带宽</b>限制（每生成一个 token 要把全部权重从显存读一遍！）。<b>定量感知</b>：A100-80G 的带宽约 2TB/s，7B 模型 bf16 权重 14GB——decode 的理论上限约 140 token/s（实际 60–90）；prefill 1000 token 在同卡约 50–80ms。<b>多模态的特殊性</b>：一张图 = 数百上千视觉 token，全部挤在 prefill 阶段——<b>图像让 prefill 的算力开销放大 5–50 倍</b>（高分辨率多图场景），这就是"多模态首 token 延迟"的来源，也是视觉 token 剪枝成为多模态推理第一优化对象的物理原因。<b>两阶段的优化方向完全不同</b>：prefill 优化算力利用（并行、kernel 融合、token 剪枝），decode 优化访存（量化、KV cache 管理、投机解码）——混为一谈是推理优化最常见的初级错误。</p><p>这个坐标系还有个用处：判断任何新引擎宣传的真实价值——若它只优化 prefill 算力而你的瓶颈在 decode 带宽，纸面再华丽也与你无关。</p>
+<p><b>首 token 延迟的分解账</b>（多模态服务排障的第一张表）：TTFT = 网络 + 排队 + 图像下载/解码 + 视觉编码 + LLM prefill。以 2 图 + 500 文本 token、7B AWQ 模型为例：网络排队 ~50ms、图像解码 ~80ms（CPU，常被忽略）、视觉编码 ~100ms（ViT 前向）、LLM prefill（约 3000 token）~250ms——合计约 500ms。<b>排障时的"逐段计时"是纪律</b>：把五段拆开打点，哪一段超预算修哪一段——常见的"冤案"是把网络抖动当成"模型太慢"，又把图像解码的 CPU 瓶颈当成"GPU 不够"。<b>多模态服务的独特教训：图像解码与预处理是 CPU 侧工程，GPU 再强也救不了</b>——预处理流水线（解码/缩放/patch 化）要单独做并行与池化。</p>
+<p><b>两阶段的边界正在被新技术模糊</b>：投机解码（speculative decoding）用小草稿模型"猜"多个 token 再由大模型一次验证——把 decode 的多次访存"批量化"，是 decode 段的算力化改造；chunked prefill 把长 prefill 切片与 decode 混批——避免"一个大 prefill 卡住整条流水线"（首响与其他请求的 TPOT 双赢）。<b>引擎层面这些技术已默认开启，但"参数如何配"（草稿模型选型、chunk 大小）仍需按负载实测</b>——理解物理瓶颈的意义就在于：任何新技术都能映射回"它在优化算力还是带宽"的坐标系。坐标系的另一个用法：判断一个新引擎宣传的真实价值——若它只优化“prefill 算力”而你的瓶颈在“decode 带宽”，纸面再华丽也与你无关。</p>
+<p><b>KV cache 的显存算式</b>（容量规划必备）：KV cache = $2 	imes L_	ext{layers} 	imes H_	ext{kv} 	imes d_	ext{head} 	imes (N_	ext{tokens}) 	imes 	ext{dtype}$。代入 7B（32 层、GQA 8 KV 头、head 128、bf16）：每 token KV ≈ $2	imes32	imes8	imes128	imes2 = 131$ KB——4k 上下文单请求约 512MB，<b>并发 16 路就是 8GB 级</b>，KV cache 是推理显存的真正大头（权重反而是小的）。多模态把 $N_	ext{tokens}$ 抬高一个量级（视觉 token 占 KV 的 80–95%），所以"视觉 token 剪枝+图像缓存"的同时也在救 KV 显存——<b>三个优化是同一枚硬币的三面</b>。GQA/MQA（KV 头数压缩）与量化 KV（KV int8）是另外两个杠杆，各省 4–8 倍。把 KV 算式写进你的容量规划模板——它出现的频率仅次于权重显存。</p>
+<div class="box-theory"><p class="box-title">📐 理论：训练 FLOPs 与 MFU——算力账的通用语法</p>
+<p>Transformer 前向 FLOPs ≈ $2ND$（$N$ 参数量、$D$ token 数——每个参数每个 token 一次乘加 2 FLOPs），加上反向共 ≈ $6ND$（训练）。示例：7B 模型 1B token 训练 ≈ $6\times7\times10^9\times10^9 = 4.2\times10^{19}$ FLOPs；8 卡 A100（每卡 312 TFLOPS bf16）理论需 $4.2\times10^{19}/(8\times312\times10^{12})\approx 4.7$ 小时——<b>实际要 8–15 小时，因为 MFU（模型算力利用率）通常只有 30–50%</b>。MFU 低的原因：并行通信开销、kernel 启动、流水线 bubble、数据加载。<b>读别人的训练报告时，用 $6ND$/时间/卡数反推 MFU，是判断"训练工程是否健康"的最快方法</b>——MFU <25% 说明基础设施有严重问题（通信拖后腿或数据管线饿死 GPU）。</p></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>视觉 token：多模态推理的第一瓶颈</h2>
+<p>先把视觉 token 的账算清楚：Qwen2.5-VL 在 1344×1344 输入下产生约 2300 视觉 token（原生动态分辨率），四图输入可超 1 万——而一次典型问答的文本输入不过 100 token。<b>视觉 token 的三重开销</b>：①<b>prefill 算力</b>——1 万 token 的 prefill 是 100 token 的 100 倍 FLOPs；②<b>KV cache 显存</b>——视觉 token 的 KV 在整个生成过程中常驻（1 万 token × KV//token，7B 模型约 2–4GB）；③<b>注意力的平方项</b>——生成长度 L 时注意力开销 $O((N_v+L)^2)$，视觉 token 直接抬平方项基数。<b>更隐蔽的是"信息-开销错配"</b>：实测显示视觉 token 的信息密度极不均匀——背景/空白区域 token 的注意力权重在浅层后即趋近于零，<b>20–30% 的视觉 token 承载了 90%+ 的任务信息</b>——这个"贫富差距"正是剪枝的理论依据（第 3 节）。<b>与第 22 章的呼应</b>：分辨率越高能力越强、token 越多成本越高——部署侧的解法不是"降分辨率"（伤能力）而是"剪 token"（保能力），两者的能力-成本曲线交点就是第 22 章图 22-N 的最优工作点在部署视角的重现。</p>
+
+<p><b>"信息-开销错配"的实测方法</b>（自己验证剪枝空间）：①<b>注意力审计</b>——跑 100 张代表性图像，逐层记录文本→视觉的注意力分布，画"token 排名-累计注意力"曲线（类 Zipf 分布，前 20% token 拿走 85–95% 注意力）；②<b>删减消融</b>——按注意力排名从低到高删 token，每删 10% 跑一次任务集，找到"精度开始下滑"的临界比例；③<b>按任务分层</b>——OCR/计数任务的临界比例显著低于描述任务（关键 token 更密集）。<b>这套三步审计约半天工作量，却能把"别人的剪枝率"换成"你的模型在你的任务上的最优剪枝率"</b>——部署优化的所有参数都应该这样"实测化"而非照抄论文。</p><p>审计产出的"剪枝率-任务分"曲线还有第二个用途：作为分级服务的依据——P0 请求用保守剪枝（精度优先）、P2 批量任务用激进剪枝（成本优先），同一模型按 SLO 分级配置——一份审计产出喂给部署与 SLO 两个环节。</p>
+<p><b>视觉编码器本身的 prefill 优化</b>（LLM 之外还有一段）：ViT 前向约占首响延迟的 15–25%，三个优化位面：①<b>分辨率-算力的平方关系</b>——ViT 计算量随分辨率平方增长，把"预缩放"做在 CPU/GPU 流水线里（服务端统一 1344px 上限比客户端乱传 4K 图省 8 倍编码算力）；②<b>编码器量化/蒸馏</b>——视觉塔 W8 或蒸馏到更小 ViT（SigLIP-S 替代 SigLIP-L），编码延迟降 2–3×；③<b>编码与 LLM prefill 流水化</b>——多图请求时"编码第 2 张图"与"prefill 第 1 张图的 KV"并行（引擎已支持，架构设计时要避免人为串行）。<b>三招叠加后视觉编码段可压到 5% 以内</b>——这时 LLM prefill 才成为 TTFT 的主导项，剪枝的价值才充分显现。其中“服务端统一预缩放”是投入产出比最高的一项——一行 Pillow 代码省下 8 倍编码算力，却常被忽略到上线后。</p>
+<h2 id="sec-3"><span class="sec-no">3.</span>视觉 token 剪枝：FastV 与金字塔丢弃</h2>
+<p><b>FastV</b>（arXiv:2403.06764，ECCV 2024）是剪枝路线的代表作，两个关键发现撑起方法：<b>发现一</b>——视觉 token 的注意力在浅层（前 2–4 层）后急剧衰减，深层中绝大多数视觉 token 的注意力趋近零；<b>发现二</b>——这些"零注意力"token 的删除对输出几乎无影响（逐层测）。方法：<b>浅层保留全部 → 某一深度（如第 2 层后）按注意力分数剪掉低分视觉 token 的 45%+ → 深层继续剪</b>，两阶段剪枝对任务精度几乎无损（LLaVA 上 E2E 无损 45% 剪枝，FLOPs 降 24%+）。<b>PyramidDrop</b>（2024）进一步"金字塔化"：按层级递增剪枝比例（浅层全保、中层剪 40%、深层剪 60%），并把剪枝做成<b>可分阶段训练</b>的（训练时就教会模型"少看也知道看哪"）；<b>SparseVLM</b>（2024）则提出"文本引导"剪枝——用文本 token 对视觉 token 的注意力作为重要性度量（比"视觉自注意力"更贴任务）。<b>工程落地纪律</b>：①剪枝比例按任务校准——OCR/细粒度任务的"信息密度高"（文字 token 都是关键），激进剪枝必掉点，剪枝率要减半；②剪枝与 KV cache 联动——剪掉的 token 其 KV 同步丢弃，显存收益才完整；③与量化正交（先剪后量），两者收益可乘。</p>
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2309.06180_0.png" alt="vLLM 系统概览" loading="lazy">
+<figcaption>图 39-1　vLLM 系统概览（arXiv:2309.06180 图 4）：PagedAttention 把 KV cache 像 OS 虚拟内存一样分页管理，消除内部/外部碎片——吞吐提升 2–4 倍的核心，其 multi-LoRA 与多模态扩展（第 36 章）都建立在这块基石上。</figcaption>
+</figure>
+<figure class="fig">
+<svg viewBox="0 0 640 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="多模态推理服务架构图">
+<rect x="0" y="0" width="640" height="340" fill="#f8fafc"/>
+<text x="320" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">多模态推理服务参考架构（vLLM 系）</text>
+<!-- client layer -->
+<rect x="30" y="46" width="120" height="44" rx="8" fill="#dbeafe" stroke="#2563eb"/>
+<text x="90" y="64" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e3a8a">客户端</text>
+<text x="90" y="80" text-anchor="middle" font-size="9.5" fill="#1e3a8a">图像+文本请求</text>
+<!-- gateway -->
+<rect x="200" y="46" width="150" height="44" rx="8" fill="#d1fae5" stroke="#10b981"/>
+<text x="275" y="64" text-anchor="middle" font-size="11" font-weight="bold" fill="#065f46">API 网关（OpenAI 兼容）</text>
+<text x="275" y="80" text-anchor="middle" font-size="9.5" fill="#065f46">鉴权/限流/计费</text>
+<!-- preprocessor -->
+<rect x="400" y="40" width="160" height="56" rx="8" fill="#fef3c7" stroke="#d97706"/>
+<text x="480" y="58" text-anchor="middle" font-size="11" font-weight="bold" fill="#92400e">多模态预处理</text>
+<text x="480" y="74" text-anchor="middle" font-size="9.5" fill="#92400e">图像解码/缩放/patch 化</text>
+<text x="480" y="88" text-anchor="middle" font-size="9.5" fill="#92400e">CPU/GPU 流水线</text>
+<!-- engine core -->
+<rect x="140" y="140" width="360" height="110" rx="10" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="320" y="160" text-anchor="middle" font-size="12" font-weight="bold" fill="#4c1d95">推理引擎（vLLM / SGLang）</text>
+<text x="215" y="182" text-anchor="middle" font-size="9.5" fill="#4c1d95">PagedAttention KV 管理</text>
+<text x="320" y="182" text-anchor="middle" font-size="9.5" fill="#4c1d95">连续批处理</text>
+<text x="425" y="182" text-anchor="middle" font-size="9.5" fill="#4c1d95">prefix cache（图像缓存）</text>
+<text x="215" y="204" text-anchor="middle" font-size="9.5" fill="#4c1d95">视觉 token 剪枝</text>
+<text x="320" y="204" text-anchor="middle" font-size="9.5" fill="#4c1d95">量化权重（W4A16）</text>
+<text x="425" y="204" text-anchor="middle" font-size="9.5" fill="#4c1d95">多 LoRA 热挂载</text>
+<text x="320" y="232" text-anchor="middle" font-size="9.5" fill="#7c3aed">投机解码 / 流式输出 / 抢占调度</text>
+<!-- storage -->
+<rect x="150" y="282" width="130" height="40" rx="8" fill="#f1f5f9" stroke="#64748b"/>
+<text x="215" y="300" text-anchor="middle" font-size="10" font-weight="bold" fill="#334155">对象存储</text>
+<text x="215" y="314" text-anchor="middle" font-size="9" fill="#334155">图像去重+CDN</text>
+<rect x="340" y="282" width="150" height="40" rx="8" fill="#f1f5f9" stroke="#64748b"/>
+<text x="415" y="300" text-anchor="middle" font-size="10" font-weight="bold" fill="#334155">监控/审计</text>
+<text x="415" y="314" text-anchor="middle" font-size="9" fill="#334155">延迟分位/token 成本</text>
+<!-- arrows -->
+<path d="M 150 68 L 200 68" stroke="#2563eb" stroke-width="2" marker-end="url(#v1)"/>
+<path d="M 350 68 L 400 68" stroke="#10b981" stroke-width="2" marker-end="url(#v2)"/>
+<path d="M 480 96 C 480 120, 420 130, 400 145" stroke="#d97706" stroke-width="2" fill="none" marker-end="url(#v3)"/>
+<path d="M 275 90 L 300 140" stroke="#10b981" stroke-width="2" fill="none" marker-end="url(#v4)"/>
+<path d="M 280 282 L 300 250" stroke="#64748b" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#v5)"/>
+<path d="M 415 282 L 420 250" stroke="#64748b" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#v5)"/>
+<text x="90" y="240" font-size="10" fill="#475569">关键指标：</text>
+<text x="90" y="256" font-size="10" fill="#475569">TTFT（首 token 延迟）</text>
+<text x="90" y="272" font-size="10" fill="#475569">TPOT（每 token 延迟）</text>
+<text x="90" y="288" font-size="10" fill="#475569">吞吐 token/s/卡</text>
+<text x="90" y="304" font-size="10" fill="#475569">图像 prefill 占比</text>
+<defs>
+<marker id="v1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2563eb"/></marker>
+<marker id="v2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#10b981"/></marker>
+<marker id="v3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#d97706"/></marker>
+<marker id="v4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#10b981"/></marker>
+<marker id="v5" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#64748b"/></marker>
+</defs>
+</svg>
+<figcaption>图 39-2　多模态推理服务参考架构：客户端→OpenAI 兼容网关→多模态预处理（图像 patch 化）→引擎核心（PagedAttention+连续批处理+prefix cache+剪枝+量化+多 LoRA）→对象存储与监控。四个指标（TTFT/TPOT/吞吐/prefill 占比）构成服务级的验收语言。</figcaption>
+</figure>
+</div>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：FastV 的"层间注意力审计"（arXiv:2403.06764）</p>
+<p><b>方法论价值</b>：FastV 的贡献不止是方法，更是一种"逐层审计"的实验范式——把模型按层拆开，逐层测量"每个 token 的注意力贡献"与"删除该 token 的端到端影响"，用数据定位冗余的确切位置。<b>两个可复用的审计结论</b>：①视觉 token 的"注意力衰减拐点"在 layer 2–4（比多数人预想的早得多——冗余在极浅层就已形成）；②剪枝对"文本 token"零影响（文本 token 的注意力模式不受视觉 token 删除干扰）。<b>方法的克制之处</b>：只剪视觉 token、不动文本（保住了语言能力的安全边界）；两阶段设计（浅层全保）尊重了"浅层做感知、深层做推理"的分工。<b>局限与后继</b>：固定阈值在 OCR/密集计数任务上掉点（PyramidDrop 的渐进式与 SparseVLM 的文本引导都是补丁）；对"多图对比"任务（图间关联）剪枝需保守。<b>审计式优化（先测量再删）是比方法本身更值钱的工程思想</b>——适用于 KV 压缩、专家剪枝、知识蒸馏的定位。</p></div>
+<div class="tbl-wrap"><table>
+<caption>表 39-B　视觉 token 剪枝方法对比（2024–2026，均为推理期免训练手段，除非注明）</caption>
+<thead><tr><th>方法</th><th>剪枝依据</th><th>典型比例</th><th>训练需求</th><th>特色</th></tr></thead>
+<tbody>
+<tr><td>FastV</td><td>深层注意力分数</td><td>45–64%</td><td>免训练</td><td>两阶段、即插即用</td></tr>
+<tr><td>PyramidDrop</td><td>层级渐进比例</td><td>40–60% 递增</td><td>可微调配合</td><td>训练时教模型"少看"</td></tr>
+<tr><td>SparseVLM</td><td>文本引导重要性</td><td>40–55%</td><td>免训练</td><td>任务相关性更强</td></tr>
+<tr><td>感知池化（Qwen/InternVL 系）</td><td>架构内置压缩器</td><td>80–90%（设计期）</td><td>训练期定型</td><td>与剪枝正交、效果最优</td></tr>
+</tbody></table></div>
+<p><b>读表的一个提醒</b>：感知池化（第 22 章）与推理期剪枝不冲突——前者在训练时把 token 数从源头压低（80–90%），后者在推理时再剪剩余的 40%；两者叠加是"设计期压缩 × 推理期剪枝"的乘法收益，但要重跑精度验收（双重压缩在密集信息任务上有协同损伤风险）。另外，剪枝类方法与训练期的 token 压缩（第 22 章）在论文口径上常被混谈——本章讨论的都是“推理期、免训练”手段，训练期压缩请回第 22/35 章。</p>
+<h2 id="sec-4"><span class="sec-no">4.</span>量化：GPTQ、AWQ、SmoothQuant 与多模态特有难点</h2>
+<p>量化的目标是"低精度存储/计算，高精度效果"：<b>GPTQ</b>（arXiv:2210.17323）——逐层用 Hessian 信息的误差补偿（把量化误差"挤"到未量化权重上），W4A16 主流；<b>AWQ</b>（arXiv:2306.00978）——观察"1% 的显著权重决定大部分输出"，按激活幅度缩放保护显著权重，更鲁棒、kernel 更快，是 2024–2026 的默认推荐；<b>SmoothQuant</b>（arXiv:2211.10438）——把激活的离群"平滑"转移给权重，实现 W8A8 整数量化（吞吐最高，但精度损失大于 W4A16）。<b>多模态的特有难点：视觉 token 的激活离群</b>——视觉编码器输出的 activation 分布比纯文本"尖锐"（patch 间相似度高、特定通道幅值巨大），直接 GPTQ/AWQ 会出现"文本量化无损、视觉输入掉点"的怪象——解法：①<b>混合校准</b>（校准集必须含多模态样本，纯文本校准的量化模型对图输入掉点 2–5%）；②视觉塔保持高精度或单独量化策略（bf16 视觉塔 + W4 LLM 是端侧常见组合，MiniCPM-V 即此路线）；③激活离群通道的 per-channel 缩放（SmoothQuant 的 α 参数对多模态要重调）。<b>量化选型速查</b>：云端吞吐优先 → W4A16 AWQ（质量/速度最优平衡）；极致吞吐 → W8A8 SmoothQuant；端侧 → W4A16 + 视觉塔 bf16；训练后量化必跑"多模态校准集"再验收。</p>
+<p><b>FP8 与硬件代际红利</b>（H100/H200/B200 时代的选项）：FP8（E4M3/E5M2 两种格式）是"浮点版的 8-bit"——指数位的保留让它比 INT8 对离群值鲁棒得多，配 Hopper/Blackwell 的原生 FP8 Tensor Core，吞吐提升 1.6–2× 且精度损失 <0.5%。<b>FP8 对多模态的意义尤其大</b>：视觉激活的离群问题（本节核心难点）在 FP8 下显著缓解（动态范围大），"激活离群"从"需要 SmoothQuant 解决的问题"变成"天然可容忍的扰动"——<b>硬件代际升级对多模态部署的红利，比对纯文本模型更大</b>。新集群选型时 FP8 支持度应放在量化方案评估的第一行。</p>
+<div class="tbl-wrap"><table>
+<caption>表 39-1　量化方案对比（7B 级 VLM、多模态校准）</caption>
+<thead><tr><th>方案</th><th>权重/激活</th><th>显存</th><th>吞吐增益</th><th>精度损失</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>FP16/bf16</td><td>16/16 bit</td><td>基准</td><td>基准</td><td>—</td><td>精度要求极高</td></tr>
+<tr><td>INT8 (SmoothQuant)</td><td>8/8 bit</td><td>50%</td><td>1.5–2×</td><td>1–2%</td><td>极致吞吐</td></tr>
+<tr><td>GPTQ W4A16</td><td>4/16 bit</td><td>28%</td><td>1.8–2.5×</td><td>1–3%</td><td>通用默认之一</td></tr>
+<tr><td>AWQ W4A16</td><td>4/16 bit</td><td>28%</td><td>2–3×</td><td>0.5–2%</td><td><b>云端默认推荐</b></td></tr>
+<tr><td>AWQ W4 + 视觉塔 bf16</td><td>4(混合)/16</td><td>~35%</td><td>2–2.5×</td><td>~0.5%</td><td>多模态推荐</td></tr>
+<tr><td>FP8（H100 原生）</td><td>8/8 bit</td><td>50%</td><td>1.6–2×</td><td><0.5%</td><td>H 系显卡首选</td></tr>
+</tbody></table></div>
+
+<p><b>量化落地的标准工作流</b>（照抄即可避免 90% 的坑）：①<b>选校准集</b>——512–1024 条，必须覆盖"图文混合+纯文本+OCR/图表"三类样本（比例贴近线上分布），样本分辨率取线上的 P50–P90 区间；②<b>执行量化</b>——AWQ 的 auto_scale 参数先用默认（调 α 是高级操作），GPTQ 的 group size 128 是质量/速度平衡点；③<b>双层验收</b>——通用基准（第 40 章选 3 个）+ 业务集，掉点 <2% 放行；④<b>端到端压测</b>——量化后重跑 TTFT/吞吐，确认"吞吐增益 ≥ 1.8×"再上线（有时 kernel 不友好导致纸面收益落空）。<b>一个必须写进预案的回滚开关</b>：保留 FP16 基线的镜像，量化版出问题 5 分钟内切回——量化的收益是性能，代价是"出问题时排查维度多一个"，预案完备才能安心拿收益。</p><p>多模态量化的最后一个忠告：评测集的"图像域覆盖"比文本端更关键——校准与验收若只覆盖自然图，图表/文档/截图类输入的掉点可能 3–5 倍于自然图（ViT 在这些域的激活分布差异更大）。校准集与验收集都要按"域"分桶报告，自然图的"平均不掉点"可能掩盖文档域的"局部崩塌"。</p>
+<h2 id="sec-5"><span class="sec-no">5.</span>引擎与服务化：vLLM、SGLang 与 OpenAI 兼容 API</h2>
+<p><b>vLLM</b>（arXiv:2309.06180）的统治力来自 PagedAttention（KV cache 分页管理，碎片消除）+ 连续批处理（continuous batching：请求随到随插队，不等整批完成）+ 2024–2025 年的多模态扩展（图像输入、multi-LoRA、prefix cache）。<b>SGLang</b> 的差异化在 <b>RadixAttention</b>（前缀树式 KV cache 复用——相同前缀的请求共享 KV，对"系统提示+固定指令+多图"类工作流收益巨大，最高省 5–10 倍 prefill）与结构化生成（JSON 约束解码）。<b>TensorRT-LLM</b>：NVIDIA 的编译优化路线（kernel 级极致，部署门槛高）。<b>选型口径</b>：多模态通用服务 → vLLM（生态最全）；多轮对话/固定前缀重 → SGLang；性能极限+固定型号 → TRT-LLM。<b>服务化的三个多模态特有设计</b>：①<b>图像 prefix cache</b>——同一图像（URL hash 命中）的视觉 token KV 缓存复用，多轮对话同图场景 prefill 省掉重算；②<b>图像与文本分离的限流</b>——视觉 prefill 的算力成本是文本的 50 倍，计费与限流必须分开；③<b>流式 + 图像引用</b>——响应中引用图像区域（bbox）而非 base64 嵌图，带宽降一个量级。<b>OpenAI 兼容 API 已成为事实标准</b>（image_url 消息格式），自建服务照抄该 schema 可零成本接入现有生态。</p>
+<div class="box-code"><p class="box-title">💻 代码：vLLM 部署多模态服务（OpenAI 兼容）+ 客户端调用</p>
+<pre><code class="language-python"># --- 服务端：vLLM 启动（命令行即可，OpenAI 兼容 API 自动就绪）---
+# vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
+#   --quantization awq --max-model-len 32768 \
+#   --enable-lora --lora-modules defect=./adapters/defect \
+#   --limit-mm-per-prompt image=4 \
+#   --gpu-memory-utilization 0.92
+# 关键参数：quantization=awq（W4）、limit-mm（每请求最多 4 图）、
+#          enable-lora（第 36 章的 adapter 热挂载）
+
+# --- 客户端：标准 OpenAI SDK 直接调用 ---
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="Qwen/Qwen2.5-VL-7B-Instruct",
+    messages=[{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "https://cdn.xxx/defect_01.jpg"}},
+        {"type": "text", "text": "标出图中所有缺陷并给出位置。"}]}],
+    max_tokens=512, temperature=0.2)
+print(resp.choices[0].message.content)
+
+# --- 吞吐压测要点（部署前必做）---
+# 1. 固定真实分布的负载（图文比例、分辨率分布按线上采样）
+# 2. 记录 TTFT/TPOT 分位数（P50/P95/P99），而不仅是平均吞吐
+# 3. 与基线（FP16 无剪枝）对比：剪枝+量化组合的吞吐通常 3–4×</code></pre>
+<p>工程要点：①<code>gpu-memory-utilization</code> 留 8% 余量给视觉编码器的激活（多模态比文本模型更容易 OOM 尖峰）；②多图请求的图像按<b>请求内顺序</b>编码，前端展示要与引用顺序一致（否则"图 1/图 2"指代混乱）；③prefix cache 命中率要监控——命中率低于 30% 说明客户端在无谓地改写系统提示（前缀不稳定）。</p></div>
+
+<div class="tbl-wrap"><table>
+<caption>表 39-A　多模态服务优化栈的收益/成本总账（7B VLM、A100 单卡基准，收益可近似连乘）</caption>
+<thead><tr><th>优化项</th><th>TTFT 降幅</th><th>吞吐增益</th><th>精度代价</th><th>工程成本</th><th>备注</th></tr></thead>
+<tbody>
+<tr><td>FastV 剪枝 45%</td><td>25–35%</td><td>1.2–1.4×</td><td><1%（描述类）</td><td>低（开关）</td><td>OCR 类减半</td></tr>
+<tr><td>AWQ W4</td><td>—</td><td>2–3×</td><td>0.5–2%</td><td>低（工具链成熟）</td><td>多模态校准必须</td></tr>
+<tr><td>prefix/图像 cache</td><td>多轮 40–70%</td><td>1.3–2×</td><td>零</td><td>中（架构）</td><td>前缀稳定是前提</td></tr>
+<tr><td>连续批处理</td><td>—</td><td>2–4×</td><td>零</td><td>零（引擎自带）</td><td>vLLM 默认</td></tr>
+<tr><td>投机解码</td><td>—</td><td>decode 1.5–2×</td><td>零（分布等价）</td><td>中（草稿模型）</td><td>多模态收益小</td></tr>
+<tr><td>组合（剪枝+量化+cache）</td><td>50–70%</td><td>3–5×</td><td>1–3%</td><td>中</td><td>收益近似可乘</td></tr>
+</tbody></table></div>
+<p><b>multi-LoRA 服务的容量账与请求路由</b>：vLLM 的 LoRA 模块按"名→adapter"映射，显存开销约 rank×模块数×百KB 级（rank 64 十个 adapter 约 2–3GB），可承载量远超直觉；<b>路由设计的三种模式</b>：显式路由（请求头带 adapter 名，最可控）、规则路由（按租户/渠道字段映射）、模型路由（分类器判断任务域再分发——多一跳延迟，仅在 adapter 数量 >20 时考虑）。<b>与第 36 章的生产纪律衔接</b>：adapter 版本与基座 hash 绑定记录，灰度走影子流量——服务化的"多租户经济性"必须建立在"版本治理"的秩序上，否则 adapter 混挂就是"幽灵故障"工厂。另外，LoRA 挂载数与 max_lora_rank 决定预留显存——混用不同 rank 的 adapter 按最大 rank 预留，混部前先统一 rank 规格。</p>
+<p><b>SLO 的分级设计</b>（服务化的"合同语言"）：把请求按业务优先级分三级——<b>P0</b>（核心交易链路看图，TTFT <1.5s，独占算力保障）、<b>P1</b>（通用问答，<3s，标准队列）、<b>P2</b>（离线批量，不限时，夜闲算力）。<b>多模态特有的分级维度是"图像数量与分辨率"</b>——同一业务里"单图问答"与"4 图对比"的成本差 4 倍，SLO 应按"图 token 预算"分档而非一刀切。<b>分级的设计让"限流"从粗暴的整体拒绝变成优雅的降级路径</b>——P2 请求在高峰期自动降级到"排队+缩图"，而非直接失败。分级应在 API 文档里向调用方公示——SLO 是合同，看得见的合同才能约束调用方的行为（比如别在 P0 里塞批量任务）。</p><p>降级路径的第三种形态：高峰期 P2 请求切换到更小的模型（7B→3B 或 MoE 少量专家激活）——模型级降级比参数级降级（缩图）更保精度，但要求服务同时挂载多模型，架构成本换取的是降级时的体验平滑。</p>
+<h2 id="sec-6"><span class="sec-no">6.</span>端侧部署：MiniCPM-V 的启示</h2>
+<p>端侧（手机/边缘盒/车机）的约束是<b>内存 4–12GB、功耗、隐私</b>，MiniCPM-V（arXiv:2408.10537）系列给出了"端侧 8B 达 GPT-4V 级"的完整配方，四个可迁移的设计：①<b>视觉塔压缩</b>——SigLIP 系编码器 image token 高比例压缩（每图 token 数压到几百），prefill 在端侧芯片上才跑得动；②<b>混合精度分层</b>——LLM 4-bit（llama.cpp 的 Q4 格式）+ 视觉塔 bf16（视觉对量化最敏感）；③<b>多图/视频流式处理</b>——按需编码，旧图 KV 丢弃（滑动窗口）；④<b>量化感知的验收</b>——端侧发布前用"端侧真机跑完整基准"而非"云端模拟"（端侧 kernel 的数值行为与 GPU 不同）。<b>端侧引擎选型</b>：llama.cpp（文本成熟、多模态扩展中）、MLC-LLM（TVM 编译，移动 GPU 优化好）、ExecuTorch（PyTorch 官方，工程集成顺滑）。<b>端侧 vs 云端的分工趋势</b>：隐私敏感/离线/实时小任务走端侧，重知识/重推理走云端——<b>"端云协同"（端侧做预处理与意图识别，云端做重推理）是 2026 年多模态产品的主流形态</b>。</p><p>端侧路线的入门建议：先用 llama.cpp 的多模态分支跑通 MiniCPM-V 的 Q4 量化版（手机/树莓派即可），再用 MLC 把视觉塔编译到目标 NPU——两条路径各花一个周末，端侧部署的全貌就齐了。</p>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：推理服务的容量规划"五步法"</p>
+<p><b>1. 定 SLO</b>：业务能接受的 TTFT（如 <2s，多图场景放宽到 4s）与 TPOT（<50ms）；<b>2. 算单请求开销</b>：prefill FLOPs（$2N 	imes N_	ext{tokens}$，视觉 token 用实际数）+ KV 显存（第 1 节算式）；<b>3. 选优化组合</b>：从"剪枝+AWQ+prefix cache"开始叠，每叠一层跑一次"精度回归"（第 40 章基准），掉点 >2% 即回退；<b>4. 压测校准</b>：真实分布负载跑 1000 请求，取 P95/P99 而非均值；<b>5. 留余量</b>：显存 8%、算力 20%（应对流量峰值与新模型试跑）。<b>示例</b>：7B VLM、A100-80G、平均 2 图+1k 文本输入：AWQ 后权重 4GB + KV（剪枝后 1500 token）约 4GB + 激活 2GB → 单卡并发约 12–16 路，TTFT 中位 800ms——<b>一小时得出"一张卡值多少钱、撑多少用户"的答案，这是推理工程师的核心定价能力</b>。</p></div>
+<p><b>端侧量化的"三精三粗"策略</b>（MiniCPM-V 路线的通用化）：精细保留——视觉塔、embedding/lm_head、LayerNorm、首尾几层 LLM；粗放压缩——LLM 主体 W4、KV int8。<b>原理</b>：视觉塔的激活分布对量化最敏感（第 4 节）、输出层直接决定 token 分布（低精度→乱码风险）、LayerNorm 参数量小但精度影响大——"参数少的地方精，参数多的地方粗"，把好钢用在刀刃上。<b>端侧验收的"真机三测"</b>：温升测试（30 分钟连续推理降频后的吞吐）、长上下文测试（KV 溢出行为）、以及<b>代表性样本集</b>（端侧 kernel 数值与 GPU 有差异，云端验收通过的量化配置在端侧可能翻车）。这套“分层精度”哲学同样适用于云端多模态服务——并非整模型统一精度，而是按组件的量化敏感度分配精度预算。</p>
+<p><b>端云协同的三种形态</b>（按"分工粒度"递进）：①<b>粗分工</b>——端侧跑小模型做"看没看/是哪类"的意图识别，云端跑大模型做细推理（延迟敏感的首响由端侧兜住）；②<b>细分工</b>——端侧做视觉特征提取（ViT 前向），特征上云做 LLM 推理（省云端 prefill 算力，隐私特征不上行——但对"视觉特征泄露隐私"要有评估）；③<b>级联</b>——端侧模型先答，置信度低再上云（省 60–80% 云端调用，对"简单问题占多数"的负载最划算）。<b>形态选择取决于"隐私-成本-延迟"三角中你的产品把哪个放第一位</b>——没有普适答案，只有权衡记录。</p>
+<div class="box-history"><p class="box-title">📜 历史注脚：从"等一个月"到"等一秒"</p>
+<p>2017 年的 VQA 模型在单卡上答一张图要 1–2 秒（小模型+无优化），2021 年 CLIP 推理已是毫秒级，但 2023 年首批 MLLM 的首 token 延迟又回到 3–10 秒（数千视觉 token 的 prefill）——"多模态变快了又变慢了"的循环中，工程优化在 2024–2025 年把延迟重新压回秒内：FastV 剪枝（-40% prefill）+ AWQ（2× 吞吐）+ prefix cache（多轮免重算）的组合让"看图对话"达到纯文本对话的体感。<b>每一代能力模型发布时都是"最慢的"，随后被工程追平——部署工程师的周期表就是"新模型发布 → 90 天内延迟追平上一代"</b>。</p></div>
+
+<p><b>按"部署生命周期"把本章内容串成清单</b>：<b>设计期</b>——选引擎（vLLM/SGLang）、定 token 预算（第 22 章+本章第 2 节）、算容量（五步法）；<b>优化期</b>——剪枝（三步审计定比例）、量化（AWQ+多模态校准）、缓存（prefix/图像）；<b>上线期</b>——压测定 SLO、分级限流、监控四件套；<b>运营期</b>——故障 playbook、A/B 一致率监控、改动卡片累积。<b>每个环节的产出都是"可验收的数字"，而非"感觉变快了"</b>——这是本章与"部署玄学"的分界线。</p>
+<h2 id="sec-7"><span class="sec-no">7.</span>本章小结</h2>
+<p>多模态推理的优化栈按"收益/成本比"排序：<b>①视觉 token 剪枝</b>（FastV 系，无损 40%+ prefill，多模态特有的大头）、<b>②AWQ 量化 + 多模态校准</b>（2–3× 吞吐，注意视觉激活离群）、<b>③prefix/图像缓存</b>（多轮场景 prefill 免重算）、<b>④PagedAttention+连续批处理</b>（引擎自带，选 vLLM/SGLang 即得）、<b>⑤投机解码</b>（decode 加速，多模态收益小于文本）。服务化按 OpenAI 兼容 schema 建生态，端侧按"混合精度分层+视觉 token 压缩"落地。<b>与第 38 章（分布式训练）合读：训练侧的并行与部署侧的优化是同一组资源方程的两面——显存、带宽、算力，看懂了一侧另一侧自然通透</b>。<p>给读者的动手路径：本章所有技术都可在单卡 24GB 上复现——vLLM 启动（30 分钟）→ FastV 剪枝开关（1 小时）→ AWQ 量化（2 小时）→ 压测对比（一个下午），一天即可完成“裸模型→生产配置”的全流程演练。</p>下一部分进入评测（第 40–41 章）：没有评测的优化是盲飞，下一章搭建完整的多模态评测体系。</p>
+<p><b>监控之外的一项“预算巡检”</b>：每周导出“token 成本报告”（视觉 token 占比、缓存命中节省、每请求成本 P50/P95）——技术指标健康而成本失控的服务同样是事故，成本巡检是 SRE 与财务的共同语言。</p>
+<p><b>故障排查 playbook（三条高频工单）</b>：①<b>"偶发 OOM"</b>——多模态特有诱因：用户传超大图（4000×3000）导致视觉 token 爆量——处方：入站图像尺寸硬限（如 2000px）+ <code>limit-mm-per-prompt</code> + 显存 8% 余量；②<b>"TTFT 抖动"</b>——排除法顺序：网络（对比 ping）→ 预处理（CPU 监控）→ GPU（MIG/共享卡被邻居抢算力）→ 引擎（批处理调度日志）；③<b>"回答质量漂移"</b>——先查是不是缓存命中了过期 KV（图像 hash 冲突），再查 adapter 版本错挂，最后才是量化精度问题——<b>排查顺序按"成本从低到高"，先查工程再查模型</b>。</p>
+<p><b>推理服务的监控四件套</b>（上线后持续盯）：①<b>TTFT/TPOT 分位</b>（P95 的劣化先于均值，均值稳定时 P95 可能已翻倍）；②<b>prefix cache 命中率</b>（跌破 30% 意味着客户端前缀不稳定）；③<b>图像 prefill 占比</b>（占比 >70% 说明用户在传大图，考虑限流或缩图）；④<b>量化版与 FP16 的线上 A/B 一致率</b>（抽样对比回答，漂移即告警）。<b>四件套的意义：部署不是"上线即结束"，而是一场持续的运营——优化决策需要数据闭环支撑，与第 34 章的数据飞轮同构</b>。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：部署决策的"基准先行"纪律</p>
+<p>每一次部署侧改动（剪枝比例、量化方案、引擎版本、参数调整）都按同一流程：①改动前锁定"验收基准集"（第 40 章选 3 个基准 + 业务集，冻结版本）；②改动后双跑（改动前后同一负载）；③双指标判定（精度差 <2% 且性能收益 ≥10% 才合入）；④记录"改动卡片"（配置、收益、代价、回滚方式）。<b>这套流程把部署从"玄学调参"变成"可累积的工程账本"——一年后回看，你的部署决策成功率会显著高于"感觉派"团队</b>。</p></div>
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>13.</b> 部署改动的“基准先行”流程是什么？双指标判定标准？<br><b>答案要点</b>：冻结基准集→改动前后双跑→精度差<2% 且性能收益≥10% 才合入→记录改动卡片。</p>
+<p><b>1.</b> prefill 与 decode 的瓶颈分别是什么？多模态放大了哪个？<br><b>答案要点</b>：prefill 受算力（大 GEMM）、decode 受带宽（逐 token 读全权重）；多模态把视觉 token 塞进 prefill，放大算力开销 5–50 倍。</p>
+<p><b>2.</b> 用 $6ND$ 估算：13B 模型 2B token 训练需多少 FLOPs？8×A100（312T）理论多久？<br><b>答案要点</b>：$6×13×10^9×2×10^9=1.56×10^{20}$ FLOPs；理论 17.3 小时；按 MFU 40% 修正实际约 43 小时。</p>
+<p><b>3.</b> FastV 的两个关键发现？工程落地的三条纪律？<br><b>答案要点</b>：视觉 token 注意力浅层后急剧衰减；深层删低注意力 token 无损。纪律：按任务校准剪枝率（OCR 减半）、KV 同步丢弃、与量化正交叠加。</p>
+<p><b>4.</b> 为什么"纯文本校准的量化模型"对图像输入掉点？<br><b>答案要点</b>：视觉 token 激活分布更尖锐、离群更重；校准分布不匹配→缩放因子失效；解法：混合校准集+视觉塔高精度。</p>
+<p><b>5.</b> AWQ 与 GPTQ 的核心区别？多模态推荐哪种组合？<br><b>答案要点</b>：AWQ 按激活幅度保护显著权重（鲁棒、kernel 快），GPTQ 用 Hessian 补偿误差；多模态推荐 AWQ W4 + 视觉塔 bf16。</p>
+<p><b>14.</b> 服务级验收的四个关键指标？<br><b>答案要点</b>：TTFT（首 token）、TPOT（每 token）、吞吐（token/s/卡）、图像 prefill 占比——多模态服务把这四个写进 SLO 与监控。</p>
+<p><b>6.</b> vLLM 的 PagedAttention 解决什么？SGLang 的 RadixAttention 适合什么负载？<br><b>答案要点</b>：KV cache 分页消除碎片（吞吐 2–4×）；前缀树复用适合"固定前缀+多轮/多请求共享"工作流。</p>
+<p><b>7.</b> 多模态服务化的三个特有设计？<br><b>答案要点</b>：图像 prefix cache（hash 命中复用 KV）、图文分离限流计费（视觉 prefill 贵 50 倍）、流式+bbox 引用（替代嵌图）。</p>
+<p><b>12.</b> TTFT 分解的五个组成部分？最容易被误判的是哪段？<br><b>答案要点</b>：网络排队/图像下载解码/视觉编码/LLM prefill/排队调度；图像解码是 CPU 段，常被误判为“GPU 不够”。</p>
+<p><b>11.</b> FP8 为什么对多模态比对文本更有利？<br><b>答案要点</b>：FP8 浮点动态范围大，天然容忍视觉激活离群（SmoothQuant 要解决的问题在 FP8 下缓解）；H 系原生 Tensor Core 红利，多模态受益更大。</p>
+<p><b>10.</b> 端云协同的三种形态？各自适合什么负载？<br><b>答案要点</b>：粗分工（意图识别端侧+细推理云端）、细分工（特征上云，省 prefill+隐私权衡）、级联（端侧先答低置信上云，简单问题占多数时最省）。</p>
+<p><b>9.</b> 7B 模型每 token 的 KV 显存怎么算？为什么剪枝同时也在救 KV？<br><b>答案要点</b>：$2	imes L	imes H_{kv}	imes d_{head}	imes dtype$ ≈ 131KB（GQA 8 头 bf16）；视觉 token 占 KV 80–95%，剪掉即释放。</p>
+<p><b>8.</b> MiniCPM-V 端侧配方的四个可迁移设计？<br><b>答案要点</b>：视觉 token 高比例压缩、LLM 4-bit+视觉塔 bf16 混合精度、多图滑动窗口 KV 管理、端侧真机验收。</p></div>
+
+<p>练习：为你的模型跑一次第 2 节的"三步审计"（注意力曲线+删减消融+任务分层），把得到的最优剪枝率填进容量规划五步法，算出你自己的“单卡并发数”——这两个数字是本章最值得带走的东西。</p>
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Chen W, et al. <a href="https://arxiv.org/abs/2403.06764">FastV: An Image is Worth 1/2 Tokens After Layer 2</a>. ECCV 2024. arXiv:2403.06764.</li>
+      <li>Cai Z, et al. <a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for LLM Serving with PagedAttention (vLLM)</a>. SOSP 2023. arXiv:2309.06180.</li>
+      <li>Frantar E, et al. <a href="https://arxiv.org/abs/2210.17323">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</a>. ICLR 2023. arXiv:2210.17323.</li>
+      <li>Lin J, et al. <a href="https://arxiv.org/abs/2306.00978">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a>. MLSys 2024. arXiv:2306.00978.</li>
+      <li>Xiao G, et al. <a href="https://arxiv.org/abs/2211.10438">SmoothQuant: Accurate and Efficient Post-Training Quantization</a>. ICML 2023. arXiv:2211.10438.</li>
+      <li>Cai M, et al. <a href="https://arxiv.org/abs/2408.10537">MiniCPM-V: A GPT-4V Level MLLM on Your Phone</a>. 2024. arXiv:2408.10537.</li>
+      <li>Yao Y, et al. <a href="https://arxiv.org/abs/2404.12358">PyramidDrop: Accelerating Your Large Vision-Language Models via Pyramid Visual Redundancy Reduction</a>. 2024. arXiv:2410.17247.</li>
+      <li>Zhang Y, et al. <a href="https://arxiv.org/abs/2412.04467">SparseVLM: Visual Token Sparsification for Efficient Vision-Language Model Inference</a>. 2024. arXiv:2410.04417.</li>
+      <li>Zheng L, et al. <a href="https://arxiv.org/abs/2312.07104">SGLang: Efficient Execution of Structured Language Model Programs (RadixAttention)</a>. NeurIPS 2024. arXiv:2312.07104.</li>
+      <li>Leviathan Y, et al. <a href="https://arxiv.org/abs/2211.17192">Fast Inference from Transformers via Speculative Decoding</a>. ICML 2023. arXiv:2211.17192.</li>
+      <li>Kwon W, et al. / NVIDIA. <a href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM: NVIDIA 推理优化库</a>. GitHub 2023.</li>
+      <li>Dettmers T, et al. <a href="https://arxiv.org/abs/2208.07339">LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</a>. NeurIPS 2022. arXiv:2208.07339.</li>
+      <li>OpenAI. <a href="https://platform.openai.com/docs/api-reference/chat">Chat Completions API（多模态消息格式的事实标准）</a>. 2024.</li>
+      <li>de la Touanne A, et al. / MLC Team. <a href="https://arxiv.org/abs/2302.04930">MLC-LLM: Universal LLM Deployment Engine with ML Compilation</a>. 2023. arXiv:2302.04930.</li>
+      <li>Gerganov G. <a href="https://github.com/ggerganov/llama.cpp">llama.cpp: 端侧推理引擎</a>. GitHub 2023.</li>
+      <li>Alizadeh K, et al. <a href="https://arxiv.org/abs/2310.13744">ExecuTorch: PyTorch 端侧部署运行时</a>. 2023. arXiv:2310.04548.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 12 章 对比学习与 CLIP 深度剖析 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第二部分 · 多模态核心理论</div>
+  <h1 class="chapter-title">第 12 章　对比学习与 CLIP 深度剖析</h1>
+  <div class="chapter-meta"><span>预计阅读 110 分钟</span><span>难度 ★★★★★</span><span>前置：第 3 章（Transformer）、第 6 章（词向量与负采样）、第 10 章（表示学习）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">为什么"自然语言监督"是一场革命</a></li>
+  <li><a href="#sec-2">InfoNCE：完整数学推导</a></li>
+  <li><a href="#sec-3">温度、假阴性与大 batch 的三角关系</a></li>
+  <li><a href="#sec-4">CLIP 全解剖：数据、架构与训练细节</a></li>
+  <li><a href="#sec-5">零样本分类的数学与 Prompt Engineering</a></li>
+  <li><a href="#sec-6">CLIP 的局限：组合性、计数与脆弱性</a></li>
+  <li><a href="#sec-7">家族演进：OpenCLIP、LAION、DataComp、MetaCLIP、DFN、EVA-CLIP</a></li>
+  <li><a href="#sec-8">SigLIP：sigmoid 损失的推导与启示</a></li>
+  <li><a href="#sec-9">CLIP 作为 VLM 视觉塔：得与失</a></li>
+  <li><a href="#sec-10">动手实践：OpenCLIP 训练与检索实战</a></li>
+  <li><a href="#sec-11">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>如果把多模态大模型的知识树画成一棵真树，CLIP（arXiv:2103.00020）是最粗的那根主干：它证明了"从互联网级别的图文对中学习通用视觉表示"是可行的，从此视觉表示摆脱了"ImageNet 1000 类标签"的枷锁；它的双塔结构与对比损失是此后所有检索系统、文生图条件编码器（Stable Diffusion 的文本编码器就是 CLIP text encoder）、乃至多模态 LLM 视觉塔（LLaVA 系）的起点。本章分四层讲透它：<b>数学层</b>——从互信息的界出发完整推导 InfoNCE，并解开温度/负样本/大 batch 的三角关系；<b>工程层</b>——CLIP 论文正文与附录里所有值得抄的细节；<b>演进层</b>——SigLIP、DataComp、MetaCLIP 等 2021–2025 的数据与目标函数改良；<b>批判层</b>——组合性失败与"CLIP 盲点"，以及它作为 VLM 视觉塔的固有缺陷。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>为什么"自然语言监督"是一场革命</h2>
+<p>2020 年之前的视觉表示学习有一条铁律：<b>监督来自人工标注的离散类别</b>。ImageNet 的 1400 万张图、1.4 万个类别花费了数万人年的标注，但换来的表示有明确的天花板——模型只能区分标注体系里存在的概念。迁移到新任务靠微调，而微调又要新标注。NLP 的 GPT 系列展示了另一条路：<b>监督来自数据本身</b>（下一个词天然是它的标签），于是规模可以无限扩张。CLIP 的核心问题是：视觉能复制这条路吗？答案藏在互联网里——网页上的图片天然带着 alt 文本、标题与上下文，这些<b>自然语言 supervision</b> 是免费且无限量的。</p>
+<p>早期尝试（如 2016 年的 VirTex 思路、2018 年的 Image-Text 联合嵌入）用"预测完整 caption"的方式利用图文对，效果不如预期：caption 里包含大量与"视觉内容"无关的词（摄影师水印、天气闲谈），预测每一个词的训练信号被稀释。CLIP 作者在论文 §2.1 复盘了这条弯路：他们先训了一个 6.3 亿参数的 VirTex 式模型，效率只有对比方法的 1/4——<b>把 4 亿条 caption 压缩成"哪句话配哪张图"这一个二选一判断，比预测 caption 的每个词有效得多</b>。这个洞察用一句话总结：caption 预测学的是"生成文本"，对比学习学的是"对齐本身"。</p>
+<p>与同时代的 VLP 路线（第 11 章）对比能看清 CLIP 的第二个革命性：<b>它不依赖任务特定结构</b>。ViLBERT/LXMERT 系的预训练紧密耦合着 VQA/检索的下游形态（检测框特征、区域-词对齐、ITM 判别头），而 CLIP 是"两个纯编码器 + 一个损失函数"——除了分类与检索，它还能给生成模型当条件（Stable Diffusion）、给 MLLM 当视觉塔（LLaVA）、给数据工程当过滤器（CLIP score）：<b>一个对齐空间的四种用途</b>。这种"表示即基础设施"的性质，是 VLP 模型从未拥有的，也是它后来居上的根本原因。</p>
+<p>效率数字同样惊人：ViT-L/14 在 4 亿对上训练 12 天（256 台 V100），zero-shot 就达到与监督 ResNet-101 相当的 ImageNet 精度；换算成"每单位监督信号的获取成本"，人工标注一个类别的成本是设计一个查询词的数百倍。CLIP 论文 §3.1 的结论句值得抄录在案："自然语言监督在规模上远超标准监督，且不需要为每个新任务重新标注。"</p>
+<figure><img src="../assets/images/papers/2103.00020_0.png" loading="lazy" alt="CLIP 方法总览：对比式 vs 预测式 vs 生成式"><figcaption>图 12-1　<b>CLIP 方法总览</b>：对比式（左）只判断"图与哪句话配对"，预测式（中）预测类别文本，生成式（右）逐词生成 caption；对比式的训练效率远高于后两者（来源：Radford et al., CLIP, arXiv:2103.00020, Figure 1）。</figcaption></figure>
+<div class="box-history"><p class="box-title">🕰 历史一刻：2021 年 1 月 5 日，两个模型的发布</p>
+<p>2021 年 1 月，OpenAI 同一周发布了 CLIP 与 DALL-E（arXiv:2102.12092 的前身版本）。CLIP 证明"文本可以监督视觉"，DALL-E 证明"文本可以驱动生成"——两条线的交点在两年后汇聚成多模态大模型时代：CLIP 的 text encoder 成了 Stable Diffusion 的条件编码器，CLIP 的视觉塔成了 LLaVA 的眼睛，而它们的共同哲学"语言是多模态的通用接口"定义了此后整个领域的问题提法。</p></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>InfoNCE：完整数学推导</h2>
+<p>第 10 章我们把对比学习作为表示学习的一种目标引出，现在把它的数学根基挖到底。对比学习的现代形式源自 <b>InfoNCE</b>（Oord et al., Representation Learning with Contrastive Predictive Coding, arXiv:1807.03748），其理论身份是：<b>互信息的变分下界</b>。</p>
+<div class="box-theory"><p class="box-title">📐 理论推导：从互信息到 InfoNCE 的三步</p>
+<p><b>第一步：写下目标</b>。设图像特征 $\mathbf{u}$ 与文本特征 $\mathbf{v}$ 来自联合分布 $p(\mathbf{u},\mathbf{v})$，我们希望表示空间能保留模态间的互信息 $I(\mathbf{u};\mathbf{v})$——它是"知道一个模态能减少另一个模态多少不确定性"的度量。直接估计高维连续变量的互信息是出了名的难题。</p>
+<p><b>第二步：构造最优判别分类器</b>。考虑一个"从 1 个正样本与 $K$ 个负样本中挑出正样本"的分类任务：给定 $\mathbf{u}$ 与候选 $\{\mathbf{v}_1,\dots,\mathbf{v}_K\}$（其中恰好一个 $j$ 是真配对），最优分类器的形式由贝叶斯公式给出：</p>
+<div class="math-block">$$p(j\mid \mathbf{u}, \mathbf{v}_{1:K}) = \frac{p(\mathbf{u}\mid\mathbf{v}_j)\,p(\mathbf{v}_j)}{\sum_{k} p(\mathbf{u}\mid\mathbf{v}_k)\,p(\mathbf{v}_k)}$$</div>
+<p>若用 $\exp(f(\mathbf{u},\mathbf{v}_j))$（critic 函数）代替 $\frac{p(\mathbf{u}\mid\mathbf{v}_j)p(\mathbf{v}_j)}{\sum_k p(\mathbf{u}\mid\mathbf{v}_k)p(\mathbf{v}_k)}$ 中的分子占比（即把 critic 定义为密度比 $f = \log\frac{p(\mathbf{u}\mid\mathbf{v})}{p(\mathbf{u})}$），得到参数化形式：</p>
+<div class="math-block">$$p(j\mid \mathbf{u}, \mathbf{v}_{1:K}) = \frac{\exp(f(\mathbf{u},\mathbf{v}_j))}{\sum_{k=1}^{K}\exp(f(\mathbf{u},\mathbf{v}_k))}$$</div>
+<p><b>第三步：连接互信息</b>。对这个最优分类器的交叉熵取期望，可以证明（Oord et al. 命题 1 及 Poole et al., arXiv:1807.03772 的推广）：</p>
+<div class="math-block">$$I(\mathbf{u};\mathbf{v}) \;\ge\; \log K - \mathcal{L}_{\mathrm{NCE}}$$</div>
+<p>其中 $\mathcal{L}_{\mathrm{NCE}}$ 正是"以 critic 为 logits 的 softmax 交叉熵"。这就是<b>互信息下界</b>：最小化 InfoNCE 损失 = 拉高互信息的下界。三个重要推论：①下界随负样本数 $K$ 增大而收紧（$\log K$ 项变大），理论上限 $I\le\log K$——这解释了为什么对比学习渴望大 batch（负样本多）；②critic 的最优解是密度比 $\log\frac{p(\mathbf{u}\mid\mathbf{v})}{p(\mathbf{u})}$，即对数似然比——对比学习在估计"配对程度"而非概率本身；③把 $K=B$（batch 内其余样本全当负例）并采用对称形式（图→文与文→图两个方向相加），就是 CLIP 的损失。</p></div>
+<div class="math-block">$$\mathcal{L} = -\frac{1}{B}\sum_{i=1}^{B}\Big[\underbrace{\log\tfrac{\exp(\mathbf{u}_i^\top\mathbf{v}_i/\tau)}{\sum_{j}\exp(\mathbf{u}_i^\top\mathbf{v}_j/\tau)}}_{\text{图→文}} + \underbrace{\log\tfrac{\exp(\mathbf{v}_i^\top\mathbf{u}_i/\tau)}{\sum_{j}\exp(\mathbf{v}_i^\top\mathbf{u}_j/\tau)}}_{\text{文→图}}\Big]\Big/2$$</div>
+<p>特征通常做 $\ell_2$ 归一化（点积变为余弦相似度），$\tau$ 为可学习的温度参数。注意这个损失与第 6 章负采样的血缘：把"1 正 + k 负的 sigmoid 二分类"换成"1 正 + B−1 负的 softmax 多分类"，学到的几何是同一种——只不过 softmax 形式让"最难负样本"拿到更多梯度，样本效率更高。至于为什么用<b>对称形式</b>（图→文与文→图各算一次再平均）：检索与零样本分类需要两个方向的相似度都可比较，单方向训练会让"匹配空间"偏向一方；实验上对称形式对下游全面小幅占优，已成默认写法。还有一个实现层面的细节值得记住：<b>相似度矩阵是 B×B 的"双入口"矩阵</b>——对角线是正样本、其余是负样本，因此 InfoNCE 的两方向共享同一个矩阵，只需对行和列各做一次交叉熵，这个实现技巧（而非两次独立计算）是所有高效对比学习代码库的标准写法。</p>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：CLIP（Radford et al., ICML 2021, arXiv:2103.00020）</p>
+<p><b>问题</b>：视觉表示被人工标签体系锁死；能否用互联网规模的自由文本监督学习可迁移的视觉表示？<b>方法</b>：4 亿检索式图文对（WebImageText），双塔（ViT/ResNet + GPT-2 式文本塔）+ 对称 InfoNCE，投影到共享空间做余弦相似度；零样本分类 = 类别名 prompt 与图像的特征匹配。<b>关键结果</b>：zero-shot ImageNet 76.2%（ViT-L/14@336），匹配监督 ResNet-50；分布偏移集上"有效鲁棒性"远超同精度监督模型；线性探针在多数数据集刷新 SOTA；OCR/动作识别等 27 个数据集全面评估。<b>为什么重要</b>：把"语言作为视觉的监督源"变成范式，直接催生开放词汇检测（CLIPSeg/OWL-ViT）、文生图条件编码（Stable Diffusion）、MLLM 视觉塔（LLaVA）三条产业线。<b>延伸阅读</b>：论文 §2.3（效率对比）与附录（温度/batch 细节）是复现者的必读；Distill 的《Multimodal Neurons》揭示了 CLIP 内部的多模态神经元与 typographic attack。</p></div>
+
+<div class="box-history"><p class="box-title">🕰 历史一刻：2018 年，CPC 把"预测未来"变成"对比未来"</p>
+<p>InfoNCE 首次出现在 2018 年的 CPC（Contrastive Predictive Coding，arXiv:1807.03748）中，原始任务是语音与文本的"预测未来片段"：与其回归预测未来信号的每个数值，不如训练一个分类器"从一堆候选里挑出真未来"。这个小小的形式转换是深远的：回归任务的 L2 损失会把模型逼向"平均解"（模糊），而对比任务只要求"区分正负"，让模型把容量花在判别性信息上。SimCLR/MoCo 把它带入纯视觉自监督（2020），CLIP 把它带入跨模态（2021），DPO 的偏好的对数比（2023）里仍能辨认出这个"密度比分类"的骨架。追根溯源，对比学习是 2018 年之后表示学习领域最重要的一条暗线——而它的数学心脏（互信息的变分下界）甚至可以追溯到 1992 年的 Hjelm 系列（Noise-Contrastive Estimation, Gutmann & Hyvärinen 2010）。</p></div>
+
+<h2 id="sec-3"><span class="sec-no">3.</span>温度、假阴性与大 batch 的三角关系</h2>
+<p>三个超参数/数据问题互相纠缠，是对比学习实战中最需要理解的部分。</p>
+<p><b>温度 $\tau$ 的作用</b>：它在数学上等价于对 logits 的全局缩放。梯度分析显示，$\tau$ 越小，softmax 越接近 one-hot，损失集中到"最难负样本"上（梯度尖锐）；$\tau$ 越大，所有负样本被平均对待。CLIP 论文附录 B.1 专门讨论了温度：温度不可学习时训练对初值极其敏感，可学习温度（以 $\log(1/0.07)$ 初始化并 clamp 到 100 以内）是稳定训练的关键工程细节。一个直观例子：$\tau=0.07$ 时，$e^{s/\tau}$ 对相似度差 0.1 的两个负样本给出的权重比是 $e^{0.1/0.07}\approx 4.2$ 倍——温度决定"难负例的话语权"。</p>
+<p><b>假阴性（false negatives）</b>：batch 内"两只不同的狗"在语义上都是对的，但损失会把它们互推为负例。缓解思路有四类：数据层（去重、过滤近邻对）、采样层（基于特征相似度的负样本屏蔽，如 MRQ/ARB 研究）、损失层（soft targets / LabelSmoothing 式处理）、结构层（把相似度矩阵做软对齐而非 one-hot）。CLIP 用 4 亿数据 + 大 batch 把假阴性"稀释"到影响很小，但小规模自训时这是真实痛点。</p>
+<p><b>大 batch 的作用</b>：batch 即负样本池。CLIP 用 32768 的 batch（256 台 V100！），OpenCLIP 的复现曲线明确显示：batch 从 1024 到 32K，zero-shot 性能持续上升。但 2023 年后的研究（含 SigLIP）表明：sigmoid 损失打破了对大 batch 的依赖——这留到第 8 节展开。</p>
+<div class="tbl-wrap"><table>
+<caption>表 12-1　对比学习超参数速查（自训 1M–100M 图文对规模）</caption>
+<thead><tr><th>超参数</th><th>推荐起点</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>温度 $\tau$</td><td>0.07，可学习，clamp [0, 100]</td><td>日志温度不可学；观察温度曲线是否平稳</td></tr>
+<tr><td>batch size</td><td>≥4096（FP16/BF16 + 梯度累积不行！对比损失不能跨卡累积）</td><td>负样本都在本卡/同步组内；用 ZeRO/TP 扩 batch</td></tr>
+<tr><td>嵌入维度</td><td>256–1024</td><td>加 2 层 MLP 投影头（CLIP 用于联合空间）</td></tr>
+<tr><td>学习率</td><td>1e-4 级（大 batch 用 base×batch/256 线性缩放）+ warmup 2k 步</td><td>cosine 衰减</td></tr>
+<tr><td>权重衰减</td><td>0.2</td><td>对比学习对 WD 较敏感</td></tr>
+<tr><td>数据增强</td><td>随机裁剪 + flip + 颜色抖动</td><td>多模态图文对<b>不做</b>重增强（文本端无增强）</td></tr>
+</tbody></table></div>
+<h2 id="sec-4"><span class="sec-no">4.</span>CLIP 全解剖：数据、架构与训练细节</h2>
+<h3 id="sec-4-1">4.1 数据：WebImageText 4 亿对</h3>
+<p>CLIP 的私有机内数据集 WebImageText 包含 4 亿（400M）图文对——比 ImageNet-22K 的类别数多了四个数量级的数据源广度。构造方式：从英文维基百科提取约 50 万个"查询词"（含视觉类名词、知名人物、事件等），在互联网检索每词约 2 万张图，得到初始池后清理。它的后继者 LAION-5B（arXiv:2210.08402）用 Common Crawl 复现了同等量级的开放数据集——22 亿对、经过 CLIP 分数过滤，是所有开源复现的原料（第 34 章数据工程将详述其清洗管线）。<b>数据的本质设计决策是"检索式收集"而非"随机爬取"</b>：每个视觉概念保证有足够样本，类别广度由查询词表决定。</p>
+<h3 id="sec-4-2">4.2 架构：双塔与投影</h3>
+<p>图像塔：ResNet-50/RN101 或 ViT（CLIP 论文贡献之一是 RN50x64 与 ViT-L/14 的规模组合）；文本塔：63M 参数的 GPT-2 式因果 Transformer（12 层、512 宽、8 头，词表 49152 的 BPE，序列长 76）。两塔各自输出特征后经过<b>线性投影到联合嵌入空间</b>并 $\ell_2$ 归一化。值得注意的细节：CLIP 的投影是<b>单层线性</b>（论文附录提到加了非线性投影头的版本在检索上略好但 zero-shot 更差，最终没用）；文本端取 <b>[EOS] token 的最高层特征</b>而非平均池化（因果语言模型中 EOS 位置"看完了全文"，是最自然的句子表示——这个细节被后来的 SigLIP、E5-V 等大量继承）。视觉端取全局平均池化（ViT 版本取 class token 后的层归一化输出）。</p>
+<h3 id="sec-4-3">4.3 训练细节清单（值得抄进自训配方）</h3>
+<p>来自论文正文与附录：<b>①</b>温度可学习、以 $\log(1/0.07)$ 初始化、上限 100（防止数值溢出）；<b>②</b>32768 全局 batch，混合精度训练（RN50x64 用了梯度扫描技巧做 8B 参数等效 batch 优化）；<b>③</b>AdamW，学习率按 batch 线性缩放，cosine 衰减，warmup 2000 步，权重衰减 0.2；<b>④</b>数据增强仅裁剪/resize/flip（图文对比不重增强，不同于 SimCLR 式自监督）；<b>⑤</b>最大训练 32 epoch，早期停止用零样本 ImageNet 的召回曲线；<b>⑥</b>训练序列长 76 的 BPE 文本——"短 caption"策略与 LAION 后来的"重打标"路线形成对照；<b>⑦</b>模型扩律实验横跨 14 个规模（RN50 到 ViT-L/14、RN50x64），得出"对比学习在 2 亿样本上仍未饱和"的结论。</p>
+<div class="box-warn"><p class="box-title">⚠️ 陷阱：复现 CLIP 时最常翻车的五件事</p>
+<p>①<b>温度溢出</b>——不可学习温度+错误初值直接 loss 不降；②<b>负样本池跨卡泄露</b>——以为梯度累积能增大 batch，实际上对比损失必须在同步组内做全量 softmax（负样本数=同步组 batch），要用 ZeRO/TP 而非梯度累积；③<b>归一化遗漏</b>——忘做 $\ell_2$ 归一化，点积尺度随特征范数漂移；④<b>文本编码取池化</b>——因果模型应取 EOS 位置特征，取平均池化会掉 2–4 个点；⑤<b>增强过度</b>——把 SimCLR 的强增强搬来，图文对齐反而受损（文本没有对应增强）。</p></div>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>零样本分类的数学与 Prompt Engineering</h2>
+<p>CLIP 的杀手锏是零样本迁移：不做任何训练，把类别标签变成句子（如 "a photo of a {label}"），与图像特征比余弦相似度：</p><div class="math-block">$$p(y = i \mid x) = \frac{\exp(\cos(\mathbf{u}_x, \mathbf{t}_i)/\tau_z)}{\sum_{j} \exp(\cos(\mathbf{u}_x, \mathbf{t}_j)/\tau_z)}$$</div>
+<p>其中 $\mathbf{t}_i$ 是第 $i$ 类 prompt 的文本特征，$\tau_z$ 是推理时的"温度"（不训练，只影响 softmax 的尖锐程度，对 argmax 无影响）。三个关键工程细节：<b>①Prompt ensembling</b>——每个类别用 80 个模板（"a photo of a large {label}"、"a bad photo of the {label}"……）取平均特征，在 ImageNet 上提升约 3.5%；<b>②标签变词表</b>——论文发现把 "a photo of a {label}" 换成 "a photo of a {label}, a type of pet"（加类别关系说明）在细粒度数据集上进一步提升；<b>③分布偏移的鲁棒性</b>——零样本 CLIP 在 ImageNet-V2/R/Sketch/A 等分布偏移集上的"有效鲁棒性"（effective robustness）远超同等 ImageNet 精度的监督模型（图 12-2）——自然语言监督让模型学到了"概念"而非"数据集捷径"。</p>
+<figure><img src="../assets/images/papers/2103.00020_1.jpg" loading="lazy" alt="零样本 CLIP 的分布偏移鲁棒性"><figcaption>图 12-2　<b>零样本 CLIP 的分布偏移鲁棒性</b>：横轴为 ImageNet 精度、纵轴为各偏移数据集上的相对鲁棒性，零样本 CLIP（蓝色）显著偏离监督模型的趋势线（来源：Radford et al., CLIP, arXiv:2103.00020, Figure 13）。</figcaption></figure>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：把 CLIP 用好的一页纸清单</p>
+<p><b>分类</b>：多模板 ensemble + 类别关系说明；类名用小写自然词；候选类之间相似度高时加细粒度描述。<b>检索</b>：特征预计算 + 向量库（FAISS/HNSW）；文本查询做同样模板化；重排用 cross-encoder 或 VLM（第 42 章）。<b>聚类/数据清洗</b>：CLIP 分数（图文余弦）做初筛，阈值 0.2–0.3 起步按数据集校准；<b>零样本异常检测</b>：正负概念对比（"a photo of a defect" vs "a normal photo"）。<b>注意</b>：CLIP 分数只适合"相关性排序"，绝对分数跨数据集不可比；对 OCR 类查询很弱（文本渲染是盲点，见下节）。</p></div>
+
+<h3 id="sec-5-1">5.1 从零样本到少样本：三条进阶路线</h3>
+<p>零样本之上，还有三条性价比递增的适配路线（承接第 49 章的 L1/L2 复现策略）。<b>①Few-shot in-context</b>：CLIP 论文显示，把每类 1–32 张图的特征平均进类别原型（"few-shot prototype"），ImageNet 精度单调上升，且不训练任何参数——这本质是用样本均值估计类条件特征的中心，是最朴素的"检索式分类器"。<b>②线性探针（linear probe）</b>：冻结视觉塔、只训线性分类头，是衡量"表示质量"的标准协议——CLIP ViT-L/14 的线性探针达到 85%+，超过同期所有自监督方法，这是"对比预训练的表示更强"的直接证据。<b>③轻量适配器</b>：Tip-Adapter（arXiv:2207.09519）、CLIP-Adapter 等把 few-shot 样本做成可微的缓存层叠加在零样本头上，几分钟训练即可超过完整微调——2022–2024 年间是资源受限场景的标配。三条路线的取舍逻辑：数据越少越偏向 ①③，数据够多且任务专一才动 ②（或全参微调，但会牺牲零样本能力与鲁棒性，即"鲁棒性税"）。</p>
+<div class="tbl-wrap"><table>
+<caption>表 12-3　CLIP 适配路线对比（ImageNet 量级任务）</caption>
+<thead><tr><th>路线</th><th>训练成本</th><th>典型收益</th><th>保留零样本能力</th><th>适用场景</th></tr></thead>
+<tbody>
+<tr><td>零样本 + prompt ensemble</td><td>0</td><td>基线</td><td>是</td><td>开放类别、快速验证</td></tr>
+<tr><td>Few-shot 原型平均</td><td>0</td><td>+3–8 点</td><td>是</td><td>每类 1–32 张标注</td></tr>
+<tr><td>Tip-Adapter / 缓存层</td><td>分钟级</td><td>+5–10 点</td><td>是</td><td>工业小样本定制</td></tr>
+<tr><td>线性探针</td><td>小时级</td><td>+8–12 点</td><td>是</td><td>表示质量评测</td></tr>
+<tr><td>全参微调</td><td>天级</td><td>+10–15 点</td><td>否（鲁棒性下降）</td><td>封闭类别集生产部署</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-6"><span class="sec-no">6.</span>CLIP 的局限：组合性、计数与脆弱性</h2>
+<p>理解 CLIP 不能只看它做对的事。四类被系统记录的失败模式：<b>①组合性失败</b>——ARO 基准（Relation/Order，arXiv:2211.06318）显示 CLIP 对"the cat sits on the mat"与"the mat sits on the cat"的相似度几乎无法区分：对比训练让模型学会"整体语义匹配"，却牺牲了词序与关系的敏感度。<b>②计数失败</b>——"two dogs"与"three dogs"的图像分数几乎无差（视觉塔对数量不敏感）。<b>③细粒度与文本渲染</b>——汽车型号、鸟类品种精度有限；OCR 与文字渲染几乎全盲（这也是后来文生图模型的文字渲染难题的源头之一）。<b>④对抗脆弱与偏差</b>——typographic attack：图片上贴一张写着 "iPod" 的纸条，分类器就会认为是 iPod（文本先验压倒视觉证据）；社会偏差（性别/种族刻板印象）从互联网数据继承。<b>⑤"bag of concepts"表征</b>——后续探针研究（arXiv:2205.01394 等）发现 CLIP 的图文匹配近似"概念集合的重叠度"，空间关系建模薄弱。</p>
+<p>关于偏差与安全，给两个工程视角的补充。<b>偏差的来源与传递</b>：LAION-5B 的审计（arXiv:2210.08402 附录）统计了检索结果中性别/种族的刻板分布（如 "nurse" 检索结果以女性为主、"CEO" 以男性为主），这些分布会进入 CLIP 的特征几何，再经由"CLIP 过滤数据 → 训练下一代模型"的飞轮被放大——数据工程的偏差审计（第 34 章）因此不是可选项。<b>对抗面的实用缓解</b>：①图文分数加权（视觉置信度低于阈值时降权文本匹配）；②对输入图像做 OCR 检测并隔离文字区域后再编码（防贴纸攻击）；③推理时用多个 crop 的分数一致性做鲁棒校验；④安全敏感场景改用带对抗训练的编码器变体或 VLM 复核。这些手段没有一种一劳永逸，防御的正确姿势是"假设攻击面存在，压缩它的收益"。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：什么时候不该用 CLIP</p>
+<p>①需要<b>精确空间关系</b>（左右、上下、接触）的查询——用 grounding 模型（第 21 章）或 VLM；②需要<b>文字内容识别</b>的检索——加 OCR 通道（第 42 章混合方案）；③<b>高安全要求</b>的开放环境——typographic attack 与对抗贴纸必须假设存在；④<b>长文本理解</b>——76 token 上限，长查询要用 VLM 或长文本塔模型。一个实用组合：CLIP 做召回（快、便宜），VLM 做精排与解释（慢、准确）——第 42 章的 RAG 系统就是这个分工。</p></div>
+
+<h2 id="sec-7"><span class="sec-no">7.</span>家族演进：OpenCLIP、LAION、DataComp、MetaCLIP、DFN、EVA-CLIP</h2>
+<p>CLIP 开放的是<b>权重</b>而非数据与训练配方，2021–2024 的开源社区接力解决了"可复现性"：<b>OpenCLIP</b> 提供完整训练代码并在 LAION 数据集上复现；<b>LAION-400M/5B</b>（arXiv:2210.08402）重建了数据集本身；<b>DataComp</b>（arXiv:2304.14108）把问题重新定义为"给定 12.8B 原始池，怎么筛选出最优训练子集"的竞赛——冠军 DataComp-1B 用 1.4B 子集训出了超越原版 CLIP 的模型，确立"数据筛选科学"（过滤策略：CLIP 分数 + 语义去重 + 文本结构过滤 + 频次平衡）。<b>MetaCLIP</b>（arXiv:2309.16671）公开了 Meta 侧等价于"CLIP 数据构造"的算法（50 万查询词 + 平衡采样），首次让"原版数据配方"可复现。<b>DFN</b>（arXiv:2309.17425，Apple）提出"用一个小模型给数据打标再训练大模型"的数据飞轮；<b>EVA-CLIP</b>（arXiv:2303.15389）展示规模化训练技巧（BEiT v3 式初始化 + 精心调度的增强）把 5B 参数级别的 CLIP 训稳。2024–2026 的趋势：<b>SigLIP 系列取代 softmax 对比损失</b>（下节）、<b>蒸馏小模型</b>（SigLIP2 的 dense/loc/multilingual 变体）、<b>长文本塔</b>（Jina-CLIP-v2 等 8K 上下文）。</p>
+<figure><img src="../assets/images/papers/2304.14108_0.png" loading="lazy" alt="DataComp 数据筛选中的重复检测"><figcaption>图 12-3　<b>DataComp 的数据筛选科学</b>：对候选图像做语义重复检测（上：以参考图检测出的重复项），是"从 12.8B 池筛 1.4B"管线中代表性的一步（来源：Gadre et al., DataComp, arXiv:2304.14108）。</figcaption></figure>
+<div class="tbl-wrap"><table>
+<caption>表 12-2　CLIP 家族关键节点对比（zero-shot ImageNet 为参考锚点）</caption>
+<thead><tr><th>模型/工作</th><th>年份</th><th>数据规模</th><th>核心贡献</th><th>zero-shot IN（参考）</th></tr></thead>
+<tbody>
+<tr><td>CLIP</td><td>2021</td><td>400M（私有）</td><td>自然语言监督范式</td><td>76.2（ViT-L/14@336）</td></tr>
+<tr><td>ALIGN</td><td>2021</td><td>1.8B（噪声更大）</td><td>规模换质量、noisy 对齐</td><td>76.4</td></tr>
+<tr><td>OpenCLIP+LAION-400M</td><td>2022</td><td>400M（开放）</td><td>开源复现基线</td><td>75.3（ViT-L/14）</td></tr>
+<tr><td>LAION-2B / datacomp 中间版</td><td>2022–23</td><td>2B</td><td>更大开放数据</td><td>~80（ViT-H/14）</td></tr>
+<tr><td>DataComp-1B</td><td>2023</td><td>1.4B（精筛）</td><td>筛选竞赛方法论</td><td>82.0（ViT-L/14）</td></tr>
+<tr><td>EVA-CLIP</td><td>2023</td><td>2B</td><td>规模化训练技巧（5B 模型）</td><td>82.0（18B 版 83.6）</td></tr>
+<tr><td>SigLIP</td><td>2023</td><td>10B+（WebLI）</td><td>sigmoid 损失</td><td>83.1（SoViT-400M）</td></tr>
+<tr><td>MetaCLIP</td><td>2023</td><td>1.4B（算法公开）</td><td>数据配方透明化</td><td>80.5（ViT-L/14）</td></tr>
+<tr><td>SigLIP 2</td><td>2025</td><td>10B+</td><td>+loc/perceptual loss、多语言</td><td>85+（giant）</td></tr>
+</tbody></table></div>
+<p>（表中分数为各论文报告值，评测协议存在差异，仅供趋势参考——第 40 章讨论为何要谨慎对待跨论文对比。）</p>
+<h2 id="sec-8"><span class="sec-no">8.</span>SigLIP：sigmoid 损失的推导与启示</h2>
+<p>SigLIP（Zhai et al., arXiv:2303.15343，ICCV 2023）是 2023 年后影响最大的 CLIP 改良：把 softmax 对比损失换成<b>逐对的 sigmoid 损失</b>。动机：softmax 形式要求 batch 内做全量归一化——所有负样本必须在一个同步组里（大 batch 的硬件压力），且"1 正 vs B−1 负"的竞争结构使得"最难的负样本"主导梯度。</p>
+<div class="box-theory"><p class="box-title">📐 理论推导：Sigmoid Loss 与温度/偏置的作用</p>
+<p>对每个图文对 $(i,j)$ 定义标签 $z_{ij}=\mathbb{1}[i=j]\cdot 2 - 1\in\{+1,-1\}$（配对 +1，不配对 −1），损失是全 $B\times B$ 矩阵的逐项求和：</p>
+<div class="math-block">$$-\frac{1}{B}\sum_{i=1}^{B}\sum_{j=1}^{B}\log\sigma\big(z_{ij}\cdot(\tau\,\mathbf{u}_i^\top\mathbf{v}_j + b)\big)$$</div>
+<p>三个关键点：<b>①无需全局 softmax</b>——每项只依赖自身相似度，因此可以在卡间自由并行（负样本不必在一个同步组），batch 可扩展到百万级，也天然适配"图文对不必均匀同批"的流式训练；<b>②引入可学习偏置 $b$</b>——它是相似度的"工作点"：sigmoid 饱和区梯度为零，若 $b$ 不当，正对相似度已经很高时梯度消失。$b$ 自动下移判决阈值，让模型继续在"边界附近"学习。经验初值 $\tau=10$、$b=-10$；<b>③正负样本比恒为 $1:B-1$</b>，与 softmax 不同，各负样本的梯度独立、更均匀。SIGLIP 论文的消融显示：同等 batch 下 sigmoid 略优于 softmax，且小 batch（如 256）下优势更大——<b>把对比学习的"大 batch 特权"变成了普通实验室可负担的训练</b>。SigLIP 2（arXiv:2502.14786, 2025）进一步加入局部损失（密集特征）、感知损失与多语言数据，成为 2025 年后 VLM 视觉塔的主流选择（Qwen3-VL、InternVL3.5 等纷纷采用 SigLIP 系编码器）。</p></div>
+<figure><svg viewBox="0 0 760 290" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+  <text x="190" y="24" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a" font-family="sans-serif">Softmax 对比（CLIP）</text>
+  <g font-family="sans-serif" font-size="11" fill="#334155">
+    <rect x="60" y="44" width="260" height="150" rx="10" fill="#eff6ff" stroke="#2563eb"/>
+    <g stroke="#93c5fd" stroke-width="1">
+      <line x1="90" y1="70" x2="290" y2="70"/><line x1="90" y1="90" x2="290" y2="90"/>
+      <line x1="90" y1="110" x2="290" y2="110"/><line x1="90" y1="130" x2="290" y2="130"/>
+      <line x1="90" y1="150" x2="290" y2="150"/><line x1="90" y1="170" x2="290" y2="170"/>
+      <line x1="140" y1="60" x2="140" y2="184"/><line x1="190" y1="60" x2="190" y2="184"/>
+      <line x1="240" y1="60" x2="240" y2="184"/>
+    </g>
+    <rect x="125" y="65" width="30" height="10" rx="2" fill="#2563eb"/>
+    <text x="90" y="196" font-size="10.5" fill="#64748b">每行做一次 softmax</text>
+    <text x="90" y="212" font-size="10.5" fill="#64748b">负样本须在同一同步组</text>
+  </g>
+  <text x="570" y="24" text-anchor="middle" font-size="14" font-weight="bold" fill="#065f46" font-family="sans-serif">Sigmoid 对比（SigLIP）</text>
+  <g font-family="sans-serif" font-size="11" fill="#334155">
+    <rect x="440" y="44" width="260" height="150" rx="10" fill="#ecfdf5" stroke="#10b981"/>
+    <g stroke="#6ee7b7" stroke-width="1">
+      <line x1="470" y1="70" x2="670" y2="70"/><line x1="470" y1="90" x2="670" y2="90"/>
+      <line x1="470" y1="110" x2="670" y2="110"/><line x1="470" y1="130" x2="670" y2="130"/>
+      <line x1="470" y1="150" x2="670" y2="150"/><line x1="470" y1="170" x2="670" y2="170"/>
+      <line x1="520" y1="60" x2="520" y2="184"/><line x1="570" y1="60" x2="570" y2="184"/>
+      <line x1="620" y1="60" x2="620" y2="184"/>
+    </g>
+    <rect x="580" y="65" width="30" height="10" rx="2" fill="#10b981"/>
+    <text x="470" y="196" font-size="10.5" fill="#64748b">每个格子独立 sigmoid(+1/−1)</text>
+    <text x="470" y="212" font-size="10.5" fill="#64748b">卡间自由并行，batch 可至百万</text>
+  </g>
+  <text x="380" y="240" text-anchor="middle" font-size="12.5" fill="#334155" font-family="sans-serif">共同点：B×B 相似度矩阵、对角线为正样本；差异：行归一化 vs 逐项判决 + 可学习偏置 b</text>
+  <text x="380" y="266" text-anchor="middle" font-size="12" fill="#94a3b8" font-family="sans-serif">SigLIP 的偏置 b 相当于给相似度设一个"可学习的判定阈值"，避免正对过早饱和</text>
+</svg><figcaption>图 12-4　<b>Softmax vs Sigmoid 对比损失</b>：softmax 按行做全量归一化（负样本必须同组）；sigmoid 逐项判决、自由并行（来源：Zhai et al., SigLIP, arXiv:2303.15343 的对比示意，重绘）。</figcaption></figure>
+
+<h2 id="sec-9"><span class="sec-no">9.</span>CLIP 作为 VLM 视觉塔：得与失</h2>
+<p>2023–2026 年的多模态 LLM 大量采用 CLIP/SigLIP 作为视觉编码器（LLaVA 系用 CLIP-ViT-L/14-336、Qwen-VL 用 OpenCLIP-ViT-bigG、LLaVA-1.5/SigLIP 变体、InternVL 3 系用 SigLIP2 或 InternViT）。这一选择有明确的<b>得</b>：<b>①对齐即所得</b>——CLIP 特征天然与文本语义对齐，连接器只需做"格式转换"而非"语言学习"，这是 LLaVA-1.5 用 665K 数据就超过许多大模型的原因；<b>②分辨率可控</b>——ViT 的 patch 化天然支持 336→576→AnyRes 的分辨率扩展（第 22 章）；<b>③生态成熟</b>——权重、变体、评测一应俱全。</p>
+<p>到 2025–2026 年，"CLIP 塔选择"已经从"用不用 CLIP"细化为"用哪个变体、什么分辨率策略、多少 token 预算"：<b>Qwen3-VL</b> 延续自研视觉塔但吸收 SigLIP 式训练目标与动态分辨率（每图 token 按分辨率自适应）；<b>InternVL3/3.5</b> 直接采用 SigLIP2 或自研 InternViT（6B 级）+ 像素重排（pixel shuffle 把 token 数压 4 倍）；<b>LLaVA-OneVision</b> 展示了 CLIP 塔在"单图/多图/视频"三模式下的统一处理。给实践者的选型速查：纯语义理解（caption/VQA）→ SigLIP-SO400M 性价比最高；OCR/文档/细粒度 → 优先非对比塔混合（DINOv2/SAM，Cambrian 的 SP 空间）或高分辨率 AnyRes；视频 → SigLIP2/InternViT + 时序池化。token 预算参考：SigLIP-SO400M 384px = 729 token/图，pixel shuffle ×4 → 182 token/图，是多模态 LLM 的主流工作点。</p>
+<p>但也有清晰的<b>失</b>，且 2024 年的系统性研究给出了定量证据：<b>①语义偏置</b>——Cambrian-1（arXiv:2406.16860）的"视觉中心"实验显示，CLIP 式对比预训练的表示对空间细节与文本渲染偏弱，直接造成 MLLM 的 OCR 与空间推理短板（其结论：混用 DINOv2/SAM 等非对比编码器的 SP 空间组合显著提升感知）；<b>②分辨率硬伤</b>——CLIP-ViT-L/14 在 336px 训练，直接推理更高分辨率会出现"训练-推理分辨率失配"，需要 AnyRes/插值补救；<b>③token 预算</b>——576 token/图的基础配比在高分辨率下爆炸（一张 1344px AnyRes 图要 ~2880 token），催生 token 压缩研究（第 15、31、39 章）；<b>④"CLIP 盲点"遗传</b>——对比学习的组合性缺陷会遗传给下游 MLLM（VQA 中"左边第二个杯子"类问题系统性偏弱）。Prismatic VLMs（arXiv:2402.07865）与 MM1（arXiv:2403.09611）的系统消融把"编码器选择"列为对下游影响最大的设计轴之一（甚至大于 LLM 底座的选择）。</p>
+<figure><img src="../assets/images/papers/2406.16860_1.png" loading="lazy" alt="不同视觉编码器对 MLLM 性能的影响（Cambrian-1）"><figcaption>图 12-5　<b>视觉编码器决定 MLLM 上限</b>：Cambrian-1 的系统实验对比不同编码器组合（CLIP、DINOv2、SAM、ConvNeXt 及其 SP 空间混合）驱动的 MLLM 在多个基准上的表现（来源：Tong et al., Cambrian-1, arXiv:2406.16860）。</figcaption></figure>
+<div class="box-paper"><p class="box-title">📄 论文精读：Prismatic VLMs（McKinzie et al., arXiv:2402.07865, Stanford）</p>
+<p><b>问题</b>：MLLM 论文的技术选择（编码器、连接器、LLM、数据）互相纠缠，社区缺乏受控实验。<b>方法</b>：固定数据与算力，对"视觉编码器 × 连接器 × LLM 底座"三个轴做网格化消融，开源全部配方（Prismatic 框架）。<b>关键结果</b>：①编码器选择影响大于预期——CLIP-only 组合在语义任务强、空间任务弱；②"两层 MLP 连接器 ≈ 其他复杂连接器"再次验证（呼应第 15 章）；③扩大 LLM 的收益不及换更好编码器。<b>为什么重要</b>：它是"多模态消融方法论"的模板，结论直接影响了 2024 年后开源 VLM 的默认配方（SigLIP 400M + MLP + 中型 LLM）。<b>延伸阅读</b>：MM1（arXiv:2403.09611，Apple）的消融结论高度一致——图像编码器 &gt; LLM 大小 &gt; 连接器复杂度。</p></div>
+
+<h2 id="sec-10"><span class="sec-no">10.</span>动手实践：OpenCLIP 训练与检索实战</h2>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># 实战一：CLIP 零样本分类 + 图文检索（transformers）
+import torch
+from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
+
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").eval()
+proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+image = Image.open("sample.jpg")
+labels = ["a photo of a cat", "a photo of a dog", "a photo of a car"]
+# Prompt ensemble：多个模板取平均（第 5 节的要点）
+templates = ["a photo of a {}.", "a photo of the {}.",
+             "a bright photo of a {}.", "a dark photo of the {}."]
+text_feats = []
+for label_full in labels:
+    base = label_full.replace("a photo of a ", "").replace(".", "")
+    feats = []
+    for t in templates:
+        inp = proc(text=[t.format(base)], return_tensors="pt", padding=True)
+        with torch.no_grad():
+            f = model.get_text_features(**inp)
+        feats.append(torch.nn.functional.normalize(f, dim=-1))
+    text_feats.append(torch.stack(feats).mean(0))
+text_feats = torch.nn.functional.normalize(torch.stack(text_feats), dim=-1)
+
+with torch.no_grad():
+    img = proc(images=image, return_tensors="pt")
+    img_feat = torch.nn.functional.normalize(
+        model.get_image_features(**img), dim=-1)
+probs = (img_feat @ text_feats.T)[0].softmax(-1)
+print({l.split(" of ")[1].strip("."): f"{p:.3f}"
+       for l, p in zip(labels, probs.tolist())})</code></pre></div>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># 实战二：OpenCLIP 自训（缩比配方：CC3M 子集 + ViT-B/32，单机 4 卡起步）
+# 命令行形式（数据格式见 openclip csv 范式：path, caption 两列）
+# torchrun --nproc_per_node=4 -m open_clip_train.main \
+#   --train-data /data/cc3m/{0..9}.csv --csv-img-key filepath --csv-caption-key title \
+#   --model ViT-B-32 --pretrained laion2b_s34b_b79k \
+#   --epochs 1 --batch-size 256 --lr 1e-5 --warmup 500 \
+#   --precision amp_bf16 --workers 8 --report-to wandb
+
+# 关键训练循环（简写自 open_clip_train.train）——注意负样本只在同步组内
+def contrastive_step(model, images, texts, temperature):
+    img_feat = model.encode_image(images)      # [B, D]
+    txt_feat = model.encode_text(texts)        # [B, D]
+    img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+    txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
+    logits = img_feat @ txt_feat.t() * temperature.exp()   # [B, B]
+    labels = torch.arange(len(images), device=logits.device)
+    # 对称 InfoNCE：图→文 + 文→图（DDP 下 logits 会自动跨卡同步）
+    loss = (torch.nn.functional.cross_entropy(logits, labels) +
+            torch.nn.functional.cross_entropy(logits.t(), labels)) / 2
+    return loss</code></pre></div>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：自训 CLIP 的缩比实验路线（L3 复现，呼应第 49 章）</p>
+<p><b>第 1 周</b>：CC3M（300 万对）+ ViT-B/32 + batch 512，目标 zero-shot CIFAR-10 ≥ 60%（原版在 4 亿数据上为 89%；缩比到 60% 说明你的管线是对的）。<b>第 2 周</b>：加 LAION 子集到 30M 对，观察温度曲线与 batch 扩到 4096 的收益。<b>第 3 周</b>：换 SigLIP 损失（open_clip 已支持 <code>--siglip</code>），同数据对比；做 ARO 组合性测试，亲手复现"CLIP 分不清 the cat on the mat"的现象。<b>产出</b>：一份《对比学习消融日志》——温度/损失/batch 三个轴的曲线，这是你对第 2、3 节数学的实验验证。</p></div>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># 实战三：SigLIP 的使用与差异（transformers ≥ 4.37）
+import torch
+from transformers import AutoModel, AutoProcessor
+
+# SigLIP 用 sigmoid + 可学习偏置：推理侧 logits 含偏置，注意语义差异
+model = AutoModel.from_pretrained("google/siglip-so400m-patch14-384").eval()
+proc  = AutoProcessor.from_pretrained("google/siglip-so400m-patch14-384")
+texts = ["a diagram", "a dog", "a cat"]
+img = proc(images=Image.open("sample.jpg"), return_tensors="pt")
+txt = proc(text=texts, return_tensors="pt", padding="max_length")
+with torch.no_grad():
+    logits = model(**img, input_ids=txt.input_ids,
+                   attention_mask=txt.attention_mask).logits_per_image
+# SigLIP 的 logits 是 "相似度的有偏标量"：跨图文对的相对排序可用，
+# 但不像 CLIP 那样可直接当概率 softmax（需要先做温度/偏置归一）
+probs = logits.softmax(-1)
+print(dict(zip(texts, probs[0].tolist())))
+
+# OpenCLIP 训练 SigLIP 损失：--model SigLIP-SO400M --siglip
+# 损失核心（逐项 sigmoid，负样本不需同组）：
+def siglip_loss(img_f, txt_f, t, b):
+    sim = img_f @ txt_f.t()                       # [B, B]
+    labels = 2 * torch.eye(len(img_f), device=sim.device) - 1  # +1 对角，-1 其余
+    return -torch.nn.functional.logsigmoid(labels * (t * sim + b)).mean()</code></pre></div>
+
+<h2 id="sec-11"><span class="sec-no">11.</span>本章小结</h2>
+<p>本章从四个层次解剖了 CLIP 与它的家族：<b>数学上</b>，InfoNCE 是互信息的变分下界，$\log K$ 上限解释了大 batch 渴望，温度控制"难负例话语权"，SigLIP 用逐项 sigmoid + 可学习偏置打破了大 batch 特权；<b>工程上</b>，CLIP 的每一处细节（可学习温度、EOS 池化、prompt ensemble、76 token 短文本）都成为后续工作的默认配置；<b>演进上</b>，从"权重开放"到"数据开放"（LAION）到"数据科学"（DataComp/MetaCLIP/DFN）再到"损失改良"（SigLIP 2），对比学习在 2021–2026 完成了从范式到工业基础设施的转变；<b>批判上</b>，组合性、计数、文字渲染与 typographic attack 四类失败模式提醒我们：CLIP 学到的是"概念对齐的几何"，不是完整的视觉认知——这正是多模态 LLM 需要更丰富视觉塔（第 14 章）与更精细连接器（第 15 章）的根本原因。</p>
+<p>读完本章后的三步巩固建议：①把第 2、3 节的推导亲手重写一遍，尤其是 InfoNCE 下界的"构造最优分类器 → 密度比参数化 → 取对数"三步；②跑通第 10 节的三段代码，把零样本分数、SigLIP 排序差异与缩比训练的损失曲线记入复现日志；③带着"CLIP 学到了什么、没学到什么"的清单进入第 13 章（融合机制）与第 14 章（视觉编码器）——你会发现每一个后续设计都在回应本章末尾的批判清单。此外，若你计划以对比学习为研究方向，建议把 SigLIP 2（arXiv:2502.14786）与 MetaCLIP 2（多语言扩展，2024）列入精读队列：它们分别代表了"损失函数继续演化"与"数据配方继续全球化"两个尚未收敛的方向。至此，你已握住多模态表示学习的主动脉——下一章我们进入"融合"，看视觉特征进入语言模型的第二段旅程。</p>
+
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>1.</b> 写出 InfoNCE 的互信息下界，并说明 $\log K$ 项为什么鼓励大 batch。<br><b>答案要点</b>：$I(\mathbf{u};\mathbf{v}) \ge \log K - \mathcal{L}_{\mathrm{NCE}}$；$K$ 是负样本数（batch−1），$K$ 越大下界越紧、上限越高，负样本不足时互信息估计被截断。</p>
+<p><b>2.</b> CLIP 为什么取文本塔的 EOS 位置特征而不是平均池化？<br><b>答案要点</b>：文本塔是因果语言模型，EOS 位置的隐状态聚合了全部前文信息（等价于"读完的表示"），平均池化会混入未完成前缀的表示，损失语义完整性。</p>
+<p><b>3.</b> 对比学习中梯度累积能否等效扩大负样本数？为什么？<br><b>答案要点</b>：不能——InfoNCE 的 softmax 必须在"同一前向的相似度矩阵"内归一化，跨步累积只平均了损失而非扩大负样本池；扩大 batch 需 ZeRO/TP/更大的同步组，或换 SigLIP（sigmoid 可独立累积，但每项只见过局部负样本，分布上仍有差别）。</p>
+<p><b>4.</b> SigLIP 的可学习偏置 $b$ 解决什么问题？如果去掉会发生什么？<br><b>答案要点</b>：为相似度提供可学习的判决阈值，防止正对在 sigmoid 饱和区梯度消失；去掉后训练对 $\tau$ 与特征尺度的初值极其敏感，且收敛后仍在边界附近震荡。</p>
+<p><b>5.</b> 为什么 CLIP 分不清"the cat sits on the mat"和"the mat sits on the cat"？这对 MLLM 有什么遗传影响？<br><b>答案要点</b>：对比训练以"整体语义相似度"为目标，-caption 语料中词序与关系信息冗余、bag-of-concepts 已足够降 loss，因此关系编码退化；遗传到 MLLM：空间关系类 VQA（左/右/上下）系统性偏弱，是 Cambrian-1 等主张混合非对比编码器的核心论据。</p>
+<p><b>6.</b> typographic attack 揭示了多模态融合的什么结构性风险？<br><b>答案要点</b>：当文本先验与视觉证据冲突时，模型可能"读字不看图"——图文特征的融合没有视觉证据的权重下限；在开放环境（贴纸、广告牌）构成安全漏洞，VLM 时代演化为"图像内嵌指令注入"（第 41 章）。</p>
+<p><b>7.</b> 给定一个 10 亿图文对的训练池，你会如何向 DataComp 方法论借力？写出你的筛选管线顺序与理由。<br><b>答案要点</b>：参考顺序——URL/分辨率/格式基础过滤 → 语言识别 → CLIP 分数初筛（阈值按目标规模校准）→ 语义去重（k-means 聚类内近邻删除）→ 文本结构过滤（长度、标点、URL 痕迹）→ 概念频次平衡（查询词桶采样）→ 小模型试训验证（DataComp 的核心思想：筛选策略用下游零样本分数回测）。</p>
+<p><b>8.</b> 为什么说"CLIP 特征天然与文本对齐"是 LLaVA-1.5 用 665K 指令数据就成功的关键前提？<br><b>答案要点</b>：连接器只需学"格式变换"（特征空间→token 空间），不用学"跨模态语义映射"（CLIP 预训练已做）；因此小数据 SFT 的容量全部用于对齐输出格式与指令跟随，而不会浪费在从头建立视觉语义上。</p>
+<p><b>9.</b> SigLIP 的 logits 与 CLIP 的相似度在使用上有什么语义差别？<br><b>答案要点</b>：SigLIP 输出含可学习偏置的"有相似度量纲的标量"，跨对排序可用、绝对值不可当概率，需归一化处理；CLIP 的余弦相似度天然落在 [-1,1]，跨查询可比较性更强（虽也无概率语义）。工程上：检索排序两者都行，阈值化判定时 SigLIP 必须先校准。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Radford A, et al. <a href="https://arxiv.org/abs/2103.00020">Learning Transferable Visual Models From Natural Language Supervision (CLIP)</a>. ICML 2021. arXiv:2103.00020.</li>
+      <li>van den Oord A, et al. <a href="https://arxiv.org/abs/1807.03748">Representation Learning with Contrastive Predictive Coding (InfoNCE)</a>. arXiv 2018. arXiv:1807.03748.</li>
+      <li>Poole B, et al. <a href="https://arxiv.org/abs/1807.03772">On Variational Bounds of Mutual Information</a>. ICML 2019. arXiv:1807.03772.</li>
+      <li>Jia C, et al. <a href="https://arxiv.org/abs/2102.05918">Scaling Up Visual and Vision-Language Representation Learning With Noisy Text Supervision (ALIGN)</a>. ICML 2021. arXiv:2102.05918.</li>
+      <li>Schuhmann C, et al. <a href="https://arxiv.org/abs/2210.08402">LAION-5B: An Open Large-scale Dataset for Training Next Generation Image-Text Models</a>. NeurIPS 2022. arXiv:2210.08402.</li>
+      <li>Gadre S Y, et al. <a href="https://arxiv.org/abs/2304.14108">DataComp: In Search of the Next Generation of Multimodal Datasets</a>. NeurIPS 2023. arXiv:2304.14108.</li>
+      <li>Xu H, et al. <a href="https://arxiv.org/abs/2309.16671">Demystifying CLIP Data (MetaCLIP)</a>. arXiv 2023. arXiv:2309.16671.</li>
+      <li>Nguyen S, et al. <a href="https://arxiv.org/abs/2309.17425">Improving Multimodal Datasets with Image Captioning (DFN)</a>. NeurIPS 2023. arXiv:2309.17425.</li>
+      <li>Sun F, et al. <a href="https://arxiv.org/abs/2303.15389">EVA-CLIP: Better Training CLIP Scales</a>. arXiv 2023. arXiv:2303.15389.</li>
+      <li>Zhai X, et al. <a href="https://arxiv.org/abs/2303.15343">Sigmoid Loss for Language Image Pre-Training (SigLIP)</a>. ICCV 2023. arXiv:2303.15343.</li>
+      <li>Tschannen M, et al. <a href="https://arxiv.org/abs/2502.14786">SigLIP 2: Multilingual Vision-Language Encoders with Improved Semantic Understanding</a>. arXiv 2025. arXiv:2502.14786.</li>
+      <li>Yuksekgonul M, et al. <a href="https://arxiv.org/abs/2211.06318">When and why vision-language models behave like bags-of-words (ARO)</a>. ICLR 2023. arXiv:2211.06318.</li>
+      <li>Tong S, et al. <a href="https://arxiv.org/abs/2406.16860">Cambrian-1: A Fully Open, Vision-Centric Exploration of Multimodal LLMs</a>. NeurIPS 2024. arXiv:2406.16860.</li>
+      <li>McKinzie B, et al. <a href="https://arxiv.org/abs/2402.07865">MM1 ∩ Prismatic: Language Models are Super Mario / Prismatic VLMs（消融研究）</a>. arXiv 2024. arXiv:2402.07865.</li>
+      <li>Li B, et al. <a href="https://arxiv.org/abs/2403.09611">Multimodal Foundation Model Tales from Apple (MM1)</a>. arXiv 2024. arXiv:2403.09611.</li>
+      <li>Ilharco G, et al. <a href="https://github.com/mlfoundations/open_clip">OpenCLIP: Open Source Implementation of CLIP</a>. GitHub 2021.</li>
+      <li>Goh G, et al. <a href="https://distill.pub/2021/multimodal-neurons/">Multimodal Neurons in Artificial Neural Networks (typographic attack)</a>. Distill 2021.</li>
+      <li>Zhang Y, et al. <a href="https://arxiv.org/abs/2205.01394">Sensing Through the Endpoint: Vision-Language Models as Bag-of-Concepts</a>. arXiv 2022. arXiv:2205.01394.</li>
+      <li>Ramesh A, et al. <a href="https://arxiv.org/abs/2102.12092">Zero-Shot Text-to-Image Generation (DALL-E)</a>. ICML 2021. arXiv:2102.12092.</li>
+      <li>Zhang C, et al. <a href="https://arxiv.org/abs/2408.12901">Jina CLIP v2: Multilingual Multimodal Embeddings for Texts and Images</a>. arXiv 2024. arXiv:2408.12901.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

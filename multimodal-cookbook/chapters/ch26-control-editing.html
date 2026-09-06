@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 26 章 条件控制与图像编辑 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第四部分 · 文生图与视觉生成</div>
+  <h1 class="chapter-title">第 26 章　条件控制与图像编辑</h1>
+  <div class="chapter-meta"><span>预计阅读 100 分钟</span><span>难度 ★★★★☆</span><span>前置：第 24 章（扩散）、第 25 章（SD/LDM）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">控制的谱系：从 prompt 到像素</a></li>
+  <li><a href="#sec-2">ControlNet：zero-convolution 的完整数学</a></li>
+  <li><a href="#sec-3">T2I-Adapter 与轻量替代</a></li>
+  <li><a href="#sec-4">IP-Adapter：图像作为提示词</a></li>
+  <li><a href="#sec-5">图像编辑三大范式：SDEdit、P2P、InstructPix2Pix</a></li>
+  <li><a href="#sec-6">组合控制与工程实践</a></li>
+  <li><a href="#sec-7">动手实践：ControlNet 推理与训练</a></li>
+  <li><a href="#sec-8">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>SD 生成的图"好看但不受控"——想让它按指定姿态站、按指定线稿画、把白天改成黄昏，prompt 做不到。本章讲透"控制"的两大家族：<b>结构控制</b>（ControlNet/T2I-Adapter——把边缘、姿态、深度等空间条件注入 UNet）与<b>语义控制</b>（IP-Adapter——把参考图像变成提示词）；再加<b>编辑三范式</b>（SDEdit 的重噪声、P2P 的注意力操控、InstructPix2Pix 的指令编辑）。核心数学是那个已被验证为"万能钥匙"的模式：<b>零初始化残差注入</b>——第 13 章的门控、第 25 章预告的 ControlNet、第 36 章的 LoRA，都是它的化身。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>控制的谱系：从 prompt 到像素</h2>
+<p>把"控制生成"按信号粒度排成一条谱：<b>①语义级</b>——文本 prompt（说了什么）；<b>②风格级</b>——参考图像的分布特征（画得像不像某种风格）；<b>③结构级</b>——边缘/深度/姿态/线稿（画在哪个位置）；<b>④像素级</b>——mask 与原始像素（inpaint 保留哪些区域）；<b>⑤身份级</b>——特定人脸/主体（画成"谁"）。不同粒度需要不同的注入机制——本章的地图就是把每种粒度映射到对应的架构方案。</p>
+<div class="tbl-wrap"><table>
+<caption>表 26-1　控制粒度 × 代表方法 × 注入位置</caption>
+<thead><tr><th>粒度</th><th>代表方法</th><th>注入位置</th><th>可控性强度</th></tr></thead>
+<tbody>
+<tr><td>语义</td><td>prompt + CFG</td><td>交叉注意力 K/V</td><td>弱（软约束）</td></tr>
+<tr><td>风格</td><td>IP-Adapter / TI / LoRA</td><td>注意力 / embedding / 权重</td><td>中</td></tr>
+<tr><td>结构</td><td>ControlNet / T2I-Adapter</td><td>UNet 残差（Down/Mid）</td><td>强（空间硬约束）</td></tr>
+<tr><td>像素</td><td>inpaint / inpaint 管线</td><td>每步 renoise+replace</td><td>最强（区域级）</td></tr>
+<tr><td>身份</td><td>InstantID / PhotoMaker / LoRA</td><td>人脸特征→注意力 + LoRA</td><td>强（主体级）</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>ControlNet：zero-convolution 的完整数学</h2>
+<p>ControlNet（Zhang et al., arXiv:2302.05543，ICCV 2023 最佳论文候选）的问题设定：给定空间条件 $c_f$（Canny 边缘、OpenPose 骨架、深度图、分割图、涂鸦……），让预训练扩散模型"按图施工"，且<b>不破坏原有能力</b>（prompt 语义、画质、多样性）。</p>
+<div class="box-theory"><p class="box-title">📐 理论推导：zero-convolution 为什么能"两全其美"</p>
+<p><b>结构</b>：把冻结 UNet 的 Down 段 + Mid 段复制一份为"可训练副本"，条件 $c_f$ 经一个小网络编码后与 $z_t$ 拼接进入副本；副本的 15 个输出（12 个 Down 残差 + 3 个 Mid）各自经一个 <b>zero convolution</b>（权重与偏置初始化为 0 的 1×1 卷积）加回原 UNet 的对应跳跃连接：</p>
+<div class="math-block">$$y_c = \mathcal{F}(x;\ \Theta_{\mathrm{frozen}}) + \sum_{i=1}^{15} Z_i\big(\mathcal{F}_i(x;\ \Theta_{\mathrm{frozen1}},\ \Theta_{\mathrm{ctrl}};\ c_f)\big),\qquad Z_i \equiv \mathbf{0} \ \text{at init}$$</div>
+<p><b>三个设计决策的逐条论证</b>：</p>
+<p><b>①为什么复制而不是微调原模型？</b>——微调会破坏预训练能力（灾难性遗忘）；副本保证"原模型分毫不动"，控制失效时输出=原模型输出（安全回退）。</p>
+<p><b>②为什么零初始化？</b>——训练开始时 $Z_i\equiv 0$，控制分支的输出被完全关闭，网络等效于原 UNet。设损失为 $\mathcal L$，对副本权重 $\Theta_{\mathrm{ctrl}}$ 的梯度：第一训练步 $\frac{\partial \mathcal L}{\partial \Theta_{\mathrm{ctrl}}} = \frac{\partial\mathcal L}{\partial y_c}\cdot Z_i'\cdot(\cdots)$ 项中 $Z_i$ 的权重梯度 $\frac{\partial \mathcal L}{\partial W_{Z_i}}$ = (上游梯度)·(副本输出) ≠ 0——<b>$Z_i$ 自己会先学起来，然后逐渐"放行"控制信号</b>；而副本深层权重的梯度（要穿过 $Z_i=0$）初始为 0，避免了随机初始化的大噪声冲击预训练激活。这与第 13 章 $\tanh(\alpha_0{=}0)$ 门控的梯度动力学完全同构：<b>"新增路径从零开始"是向预训练模型安全插入新能力的一般定理</b>。</p>
+<p><b>③为什么控制信号加在"每个分辨率级"而非一次注入？</b>——空间约束是全尺度的（边缘既有大轮廓又有细节），逐级注入让每个分辨率的去噪都"看见"对应粒度的控制信号；消融显示只在单级注入可控性显著下降。</p>
+<p><b>训练目标</b>：标准扩散损失（预测 $\epsilon$），数据是"图像-条件- caption"三元组——条件用现成检测器（Canny/OpenPose/MiDaS）从图像自动提取，caption 用 BLIP 合成——<b>大规模自动标注管线</b>是 ControlNet 可行的另一半（呼应第 34 章数据工程）。训练用 50% 文本 dropout（保留无条件分支能力）。</p></div>
+<figure><svg viewBox="0 0 760 340" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+  <defs><marker id="a26" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L9,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="24" text-anchor="middle" font-size="14" font-weight="bold" fill="#0f172a" font-family="sans-serif">ControlNet 架构：冻结主干 + 零初始化控制分支</text>
+  <rect x="60" y="60" width="240" height="200" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="180" y="86" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1e3a8a" font-family="sans-serif">原 UNet（冻结 ❄）</text>
+  <rect x="90" y="100" width="180" height="30" rx="6" fill="#dbeafe"/><text x="180" y="120" text-anchor="middle" font-size="10.5" fill="#1e40af" font-family="sans-serif">Down 段（12 个残差输出）</text>
+  <rect x="90" y="140" width="180" height="30" rx="6" fill="#dbeafe"/><text x="180" y="160" text-anchor="middle" font-size="10.5" fill="#1e40af" font-family="sans-serif">Mid 段（3 个输出）</text>
+  <rect x="90" y="185" width="180" height="56" rx="6" fill="#dbeafe"/><text x="180" y="208" text-anchor="middle" font-size="10.5" fill="#1e40af" font-family="sans-serif">Up 段（照常工作）</text>
+  <text x="180" y="230" text-anchor="middle" font-size="10" fill="#64748b" font-family="sans-serif">接收跳跃连接 + 控制残差</text>
+  <rect x="460" y="60" width="240" height="200" rx="12" fill="#fffbeb" stroke="#d97706" stroke-width="2"/>
+  <text x="580" y="86" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#92400e" font-family="sans-serif">控制副本（可训练 🔥）</text>
+  <rect x="490" y="100" width="180" height="30" rx="6" fill="#fef3c7"/><text x="580" y="120" text-anchor="middle" font-size="10.5" fill="#92400e" font-family="sans-serif">副本 Down（复制结构）</text>
+  <rect x="490" y="140" width="180" height="30" rx="6" fill="#fef3c7"/><text x="580" y="160" text-anchor="middle" font-size="10.5" fill="#92400e" font-family="sans-serif">副本 Mid</text>
+  <rect x="490" y="185" width="180" height="56" rx="6" fill="#fef3c7"/><text x="580" y="207" text-anchor="middle" font-size="10.5" fill="#92400e" font-family="sans-serif">条件 c_f（Canny/Pose/深度）</text>
+  <text x="580" y="228" text-anchor="middle" font-size="10" fill="#b45309" font-family="sans-serif">与 z_t 拼接后进入副本</text>
+  <g font-family="sans-serif" font-size="11">
+    <rect x="380" y="270" width="120" height="30" rx="8" fill="#fee2e2" stroke="#ef4444" stroke-width="2"/>
+    <text x="440" y="290" text-anchor="middle" fill="#991b1b">Zero Conv ×15</text>
+    <text x="440" y="304" text-anchor="middle" font-size="9.5" fill="#b91c1c">W=0 初始化</text>
+  </g>
+  <line x1="460" y1="160" x2="395" y2="270" stroke="#d97706" stroke-width="2" marker-end="url(#a26)"/>
+  <line x1="380" y1="285" x2="185" y2="240" stroke="#ef4444" stroke-width="2.5" marker-end="url(#a26)"/>
+  <text x="285" y="278" text-anchor="middle" font-size="10.5" fill="#991b1b" font-family="sans-serif">15 路控制残差加回跳跃连接</text>
+  <text x="380" y="330" text-anchor="middle" font-size="11.5" fill="#94a3b8" font-family="sans-serif">训练初期 Z=0：输出 = 原 UNet → 安全起步；Z 逐步打开 → 控制信号淡入（与 LoRA/门控同一哲学）</text>
+</svg><figcaption>图 26-1　<b>ControlNet 架构</b>：冻结主干 + 可训练副本 + 15 个零初始化卷积；训练安全性与可控性由"零初始化残差注入"同时保证（来源：Zhang et al., arXiv:2302.05543，重绘）。</figcaption></figure>
+<div class="box-paper"><p class="box-title">📄 论文精读：ControlNet（Zhang L, Rao A, Agrawala M, ICCV 2023, arXiv:2302.05543）</p>
+<p><b>问题</b>：T2I 扩散模型"不受控"——prompt 无法表达空间结构；如何在不破坏预训练能力的前提下注入空间条件？<b>方法</b>：冻结 UNet Down+Mid 的可训练副本 + 15 个零初始化卷积把控制残差加回跳跃连接；训练数据用检测器自动构造（Canny/Pose/Depth/HED/涂鸦/分割 × BLIP caption），3M 级三元组。<b>关键结果</b>：单卡 30GB 可训练（当时），控制精度与画风保持双达标；Canny/姿态任务的可用性直接催生 ControlNet 生态（上百个条件类型变体）。<b>为什么重要</b>：它把"可控生成"从论文概念变成大众工具（A1111 插件下载量千万级）；其"零初始化残差注入 + 副本训练"模式是向预训练大模型加能力的通用蓝图。<b>批判性阅读</b>：推理开销约 +50%（副本前向），后续 T2I-Adapter/Control-LoRA 是效率补偿；条件泄露问题（复刻控制图伪影）论文未充分讨论——生产使用必须做条件预处理。</p></div>
+<div class="box-history"><p class="box-title">🕰 历史一刻：2023 年 2 月，"ControlNet 时刻"</p>
+<p>ControlNet 论文与代码在两周内引爆社区——因为它是<b>第一个"消费级显卡可训练"的扩散微调范式</b>：副本训练把所需算力从"预训练级"降到"微调级"，个人创作者第一次能给 SD 添加"新能力"而不只是"新风格"。配套的自动条件构造管线（现成检测器+BLIP caption）示范了"领域数据不必人工标注"的数据工程范式。此后三个月，社区发布了 40+ 条件类型的 ControlNet 变体——这种"一个范式、百种实例"的裂变速度，是开源扩散生态成熟的标志，也为第 45 章 ComfyUI 的节点化工作流时代提供了积木。</p></div>
+
+<h2 id="sec-2a"><span class="sec-no">2A.</span>ControlNet 训练的完整配方与代价核算</h2>
+<p>为特定领域训练专属 ControlNet（如医学影像的器官边缘控制、工业质检的缺陷位置控制）是常见需求。完整配方：<b>数据</b>——目标域图像 + 检测器提取条件（领域专用条件器可能需要先训，如医学分割模型）+ caption（BLIP/VLM 自动生成，领域术语要后处理校正）；规模 5 万–50 万对即可起步（通用能力由冻结主干提供，副本只学"条件→残差"映射，数据需求远小于预训练）。<b>训练超参</b>：lr 1e-5（AdamW）、batch 48–128（越大越稳）、50% caption dropout、控制图随机 dropout 5%、约 3–8 万步收敛（副本只有 350M）。<b>代价核算</b>：单卡 A100 约 3–7 天（30GB 显存配置），数据准备（条件提取+caption）约 1–2 天——<b>比全参微调便宜一个量级，比 LoRA 贵但换来的是"结构控制"这个 LoRA 做不到的能力</b>。</p>
+<p><b>验证协议</b>（训练 ControlNet 专有）：①<b>控制服从度</b>——生成图与条件图的边缘 IoU/骨架匹配率（专用指标：mAPose/Canny-F1）；②<b>风格保持</b>——同 prompt 不加控制的输出与加控制的输出在"非控制区域"应一致（不破坏画质）；③<b>条件敏感性曲线</b>——controlnet_conditioning_scale 从 0 到 2 扫描，理想曲线是"0 时与原模型一致、0.5–1.2 之间平滑增强、>1.5 伪影"——曲线陡峭说明训练过拟合。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：ControlNet 的"零成本迁移"实验</p>
+<p>一个有趣的免费实验：把 A 领域训练的 ControlNet 用到 B 领域（如人脸姿态 ControlNet 用于动物）。结果通常是"部分有效"——因为副本学的是"条件图→UNet 残差语言"的翻译，而 UNet 主干懂"动物长什么样"；姿态骨架的语义在人与动物间部分共享。<b>控制的"语言"（残差空间）与"内容"（主干知识）是分离的</b>——这个实验直观展示副本-主干解耦设计的价值：控制能力可迁移、内容知识不丢失。同理可解释为什么多 ControlNet 能叠加（多路"翻译"在残差空间线性组合）。</p></div>
+<h2 id="sec-3"><span class="sec-no">3.</span>T2I-Adapter 与轻量替代</h2>
+<p>T2I-Adapter（Mou et al., arXiv:2308.06721）是 ControlNet 的"轻量版哲学"：<b>不复制 UNet，只训一个小适配器</b>（约 77M 参数 vs ControlNet 副本 ~350M）。条件 $c_f$ 经几层卷积提取多尺度特征，直接<b>加（或拼接）到 UNet 各级的输出上</b>：</p>
+<div class="math-block">$$\phi_t \leftarrow \phi_t + A_t(c_f),\qquad A_t\ \text{为第}\ t\ \text{级适配器（零初始化输出层）}$$</div>
+<p>取舍：参数少、训练快、推理开销小（无副本前向），可控性弱于 ControlNet（没有"完整的去噪副本来理解条件"）——对粗粒度控制（调色、简单构图）够用，精细姿态复刻仍需 ControlNet。同一思想族还有 <b>Control LoRA</b>（用 LoRA 形式注入控制分支）与后来的 <b>ControlNet++</b>（加一致性奖励循环）。<b>选型口诀：算力充足要精度 → ControlNet；要轻快可插拔 → T2I-Adapter/Control-LoRA</b>。另外注意生态现实：SD 生态中 ControlNet 的模型覆盖（各条件类型 × 各底座版本）远大于替代品——生态位有时比架构更决定选择。</p>
+
+<h2 id="sec-4"><span class="sec-no">4.</span>IP-Adapter：图像作为提示词</h2>
+<p>IP-Adapter（Image Prompt Adapter，Ye et al., 2023，腾讯）解决另一个维度：<b>用一张参考图控制生成</b>（风格、内容、色调），而不动文本通道。机制：<b>解耦交叉注意力（decoupled cross-attention）</b>——在 UNet 的每个 attn2 旁边并联一个新的交叉注意力层，其 K/V 来自<b>参考图的图像编码</b>（CLIP image encoder 输出经投影 + 4 个可学习 token 扩展），输出与文本注意力输出相加：</p>
+<div class="math-block">$$Z = Z_{\mathrm{text}} + \lambda\, \mathrm{XAttn}(Q,\ K_{\mathrm{img}},\ V_{\mathrm{img}}),\qquad \lambda\ \text{可调（图像影响力）}$$</div>
+<p>"解耦"的含义：<b>文本走原通道、图像走新通道，两者不互相污染</b>——可以"画一只猫（文本）但要像参考图的光影（图像）"。IP-Adapter 只有 ~22M 参数（只训新注意力与投影），可插拔、可与 ControlNet 叠加。它的后续变体：<b>IP-Adapter FaceID</b>（用 InsightFace 的人脸 embedding 替代 CLIP 图像特征，专攻人脸一致性，配合 InstantID 构成"零训练换脸"主流）；<b>IP-Adapter Plus</b>（16 token、逐层更强）。<b>图像即提示词（image prompt）的思想在 2024–2026 成为标配</b>——SD3/Flux 的 reference 支持、各家"垫图"功能都是它的产品化。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：风格控制的强度天平</p>
+<p>IP-Adapter 使用中最常见的问题是"图像权重过高导致文本失效"（output = 参考图的复读）。调参经验：<b>λ 从 0.4 起步</b>（0.6+ 会明显压制文本）；风格控制用"参考图 + 简短文本"；主体控制必须叠加 mask 或 ControlNet 锚位置。另一个技巧：参考图本身也过一遍 ControlNet（用其边缘做条件）可以"锁定构图"的同时换内容——两把锁一起拧，是电商换背景、头像换风格的标准组合。</p></div>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>图像编辑三大范式：SDEdit、P2P、InstructPix2Pix</h2>
+<h3 id="sec-5-1">5.1 SDEdit：把图"弄脏"再让它变干净</h3>
+<p>SDEdit（Meng et al., arXiv:2108.01073，ICLR 2022）是最早的"零训练编辑"：把输入图加噪到中间时刻 $t_0$（strength 参数），再从 $x_{t_0}$ 走正常去噪（可以带新 prompt）。<b>原理</b>：加噪到 $t_0$ 丢掉"$(1-t_0)$ 比例的高频细节"，保留低频结构；去噪过程在新条件引导下"重新想象"细节。strength 的语义（第 25 章已实现代码）：低=微调（保结构）、高=重绘（换结构）。<b>局限</b>：结构保留与编辑幅度天然互斥——想"只改颜色"时细节也常被重绘。这个缺陷催生了更精细的编辑方法。</p>
+<h3 id="sec-5-2">5.2 Prompt-to-Prompt：在注意力层做手术</h3>
+<p>P2P（Hertz et al., arXiv:2208.01626，ICLR 2023）的洞察：<b>交叉注意力的权重图就是"词→区域"的绑定</b>（第 25 章 attn2 的推论）。编辑时保持结构=锁定"结构词"的注意力图、只替换"内容词"的注意力：</p>
+<div class="math-block">$$A_t \leftarrow \begin{cases} A_t^{\mathrm{src}} & \text{（共享词的注意力，保留布局）}\\ \mathrm{softmax}(\cdots)^{\mathrm{tgt}} & \text{（替换词的新注意力）}\end{cases}$$</div>
+<p>用两段生成（源 prompt 正常生成记录注意力，目标 prompt 生成时按规则替换/注入源注意力）实现"把猫换成狗但布局不变"。变体 Plug-and-Play（PnP，arXiv:2305.02215）直接注入源图的自注意力与交叉注意力值——<b>无需同源 prompt，任意图都能编辑</b>。P2P 系的价值在于揭示了注意力的"布局承载"作用——后续的区域控制（regional prompting、gligen 系）都是它的工程化。</p>
+<h3 id="sec-5-3">5.3 InstructPix2Pix：学会"听人话改图"</h3>
+<p>InstructPix2Pix（Brooks et al., CVPR 2023）把编辑变成<b>条件生成问题</b>：模型输入（原图 + 编辑指令文本），输出编辑后图像。训练数据的生成是它最漂亮的贡献——<b>合成数据三步走</b>：①GPT-3 生成"指令-前后 caption"三元组文本；②用 T2I 模型分别生成前后图；③用微调的编辑模型（ Prompt-to-Prompt 微调版）过滤一致性差的样本。最终 ~300k 合成对训出 7B 级模型（两个 UNet 分支：原图作为额外条件、指令作为文本条件）。<b>"用模型生成数据训练更强的模型"的自举范式</b>（呼应第 34 章数据飞轮）在此首次大规模验证，后续 DALL-E 3 的合成 caption、第 16 章的指令数据都是同族。</p>
+<div class="tbl-wrap"><table>
+<caption>表 26-2　编辑三范式对比</caption>
+<thead><tr><th>方法</th><th>输入</th><th>机制</th><th>强项</th><th>弱项</th></tr></thead>
+<tbody>
+<tr><td>SDEdit</td><td>图 +（新）prompt</td><td>重噪+再生成</td><td>零训练、通用</td><td>结构与幅度互斥</td></tr>
+<tr><td>P2P/PnP</td><td>图 + 源/目标 prompt</td><td>注意力替换</td><td>布局级精细控制</td><td>需 prompt 对齐、慢</td></tr>
+<tr><td>InstructPix2Pix</td><td>图 + 自然语言指令</td><td>条件生成（专用模型）</td><td>交互自然、一步出图</td><td>改动幅度有限、需专用模型</td></tr>
+<tr><td>（对比）inpaint</td><td>图 + mask + prompt</td><td>renoise+replace</td><td>区域绝对可控</td><td>需要 mask、接缝处理</td></tr>
+</tbody></table></div>
+<div class="box-tip"><p class="box-title">💡 技巧：编辑任务的"方法选择树"</p>
+<p>拿到一个编辑需求，按序判断：<b>①能否用 mask 圈出要改的区域？</b>能 → inpaint（最可控）。<b>②改动是"换词"级别（颜色/物体）吗？</b>是 → P2P/PnP 或 InstructPix2Pix。<b>③改动是"整体风格/光影"吗？</b>是 → SDEdit 低强度或 IP-Adapter 风格参考。<b>④需要"按指令精确改"且批量？</b>→ 微调自己的 InstructPix2Pix（合成数据管线）。多数"编辑效果差"的抱怨，根源是方法选错而非模型不行。</p></div>
+
+
+<h2 id="sec-4a"><span class="sec-no">4A.</span>InstantID 与身份保持：从"像"到"是"</h2>
+<p>身份保持（identity preservation）是风格控制之外更苛刻的要求——"生成的每张图都是同一个人"。技术栈的演进值得梳理：<b>①LoRA/DreamBooth 路线</b>——每人 5–20 张图训练，像度最高但"每人一训"不可规模化；<b>②embedding 注入路线</b>——PhotoMaker（arXiv:2312.04461）把多张参考照的人脸特征编码为"身份 token"放入文本序列，一次推理换任何人；<b>③即插即用路线</b>——InstantID（2024）：InsightFace 提取身份 embedding（ArcFace 空间，天然解耦身份与姿态/表情）+ 一个轻量 identity-aware ControlNet 锁五官结构，<b>单张参考照、零训练、秒级</b>；IP-Adapter FaceID 同族（用人脸 embedding 替代 CLIP 图像特征）。<b>权衡</b>：免训练方法的一致性"像度"约等于 5–10 张图的 LoRA（主观评测），但跨视角/跨年龄的稳定性仍不如专用训练；商用换脸必须叠加合规层（第 47 章的肖像权与 deepfake 法规）。</p>
+<p><b>解剖 InstantID 的组合拳</b>（它是"多机制协同"的教科书案例）：身份信息走两条路——<b>语义路</b>（ArcFace embedding 经投影进解耦注意力，管"长什么样"）+<b>结构路</b>（identity ControlNet 用参考照的人脸关键点/热图，管"五官在哪个位置"）。双路各自 zero-init 注入（又是那个元模式）。给实践者的启示：<b>当单一注入机制无法同时满足"语义正确+空间正确"时，双路注入是标准解法</b>——这个设计模式在可控生成的每个细分场景都会重现。</p>
+
+<h2 id="sec-5a"><span class="sec-no">5A.</span>编辑评测：怎么衡量"改得好"</h2>
+<p>编辑方法 lacking 统一基准是 2023–2025 的痛点，2024 年后逐渐收敛的评测框架：<b>①InstructPix2Pix 评测协议</b>——CLIP-I（编辑结果与目标描述的相似度）+ L1/LPIP（与"不该变的区域"的保真）双指标；<b>②Emu Edit 协议</b>（arXiv:2311.10089 系）——把编辑任务分为 local/global/add/remove/replace/color 六类分项评测，揭示"各方法擅长什么"（如 inpaint 强 local、IP2P 强 color/style）；<b>③人类偏好</b>——编辑质量最终靠盲评（保真-服从-画质三轴）。<b>实践者的两个坑</b>：一是只看"服从"不看"保真"（改了该改的也改了不该改的）；二是用低分辨率评测（512 下各方法差异不显著，1024 才拉开差距）。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：编辑管线的"后悔药"设计</p>
+<p>生产编辑系统的实用架构：<b>每步编辑保留"编辑谱系"</b>（原图→每次操作记录：方法/参数/mask），支持回滚与分支重放（类似 Git）。实现要点：编辑操作元数据化（JSON 记录 SDEdit 的 strength、inpaint 的 mask 坐标、P2P 的替换词表），任意中间状态可重建。ComfyUI 的节点图天然具备此性质（工作流即谱系），这是它在专业编辑场景胜出的深层原因——<b>可复现性不是工程洁癖，而是创作工作流的刚需</b>。</p></div>
+<h2 id="sec-6"><span class="sec-no">6.</span>组合控制与工程实践</h2>
+<p>真实需求几乎都是<b>多控制叠加</b>："这个姿态（OpenPose）+ 这个背景（深度图）+ 这个角色（IP-Adapter FaceID）+ 这个风格（LoRA）"。组合的理论与工程要点：<b>①冲突仲裁</b>——多个控制信号在注意力/残差上叠加，彼此可能矛盾（Pose 说手在左、边缘图说在右）；ComfyUI 的权重滑条就是人工仲裁器，经验是"硬结构（边缘/深度）权重 > 软控制（IP/风格）"，CFG 过高会放大所有控制（包括坏控制）。<b>②多 ControlNet 叠加</b>——各 ControlNet 的 15 路残差独立求和加回，参数互相独立可训；工程上注意显存（每个 ControlNet ~1.4GB FP16）。<b>③分辨率与条件对齐</b>——条件图必须与生成分辨率严格对齐（含 crop 元数据），错位是"控制失效"的第一大原因。</p>
+<div class="box-warn"><p class="box-title">⚠️ 陷阱：ControlNet 的三大失效模式</p>
+<p><b>①"控制图泄露"</b>——输出图像把控制图的伪影直接画出来（如 Canny 的毛刺、深度图的量化阶梯）：条件图质量差导致，预处理（边缘去噪、深度图平滑）先于调参。<b>②"控制失效"</b>——CFG 过低（&lt;5）或 ControlNet 权重过低：结构约束需要足够的 CFG 放大，经验 ControlNet weight 0.8–1.2、CFG 7 起。<b>③"画蛇添足"</b>——控制图与 prompt 矛盾（边缘是站姿、prompt 写跑步）：扩散会取折中产出畸形——<b>prompt 与控制图的一致性检查应成为管线的固定步骤</b>（可用 VLM 自动审查，第 43 章）。</p></div>
+
+
+<h2 id="sec-6a"><span class="sec-no">6A.</span>统一视角：控制注入的"四种武器"与选型矩阵</h2>
+<p>把本章所有方法放进第 24 章"条件注入地图"（注意力/拼接/调制/分支），可以提炼一张选型矩阵——这也是读任何新控制论文时的解剖框架：<b>①它注入在哪？</b>（attn2 旁=语义级、Down 残差=结构级、输入拼接=像素级）；<b>②它训练什么？</b>（全新层=轻、副本=重、LoRA=最轻）；<b>③它需要什么数据？</b>（检测器自动=免费、人工=贵、模型自举=快）；<b>④推理开销？</b>（副本 +50%、Adapter +5%、IP-Adapter +10%）。</p>
+<div class="tbl-wrap"><table>
+<caption>表 26-3　控制方法全景矩阵（含 2024–2026 扩展）</caption>
+<thead><tr><th>方法</th><th>注入位置</th><th>可训参数</th><th>条件类型</th><th>推理开销</th><th>一句话定位</th></tr></thead>
+<tbody>
+<tr><td>ControlNet</td><td>Down/Mid 残差</td><td>~350M</td><td>空间结构</td><td>+50%</td><td>结构控制金标准</td></tr>
+<tr><td>T2I-Adapter</td><td>各级特征相加</td><td>~77M</td><td>空间/调色</td><td>+5%</td><td>轻量结构</td></tr>
+<tr><td>IP-Adapter</td><td>并联 attn</td><td>~22M</td><td>参考图语义/风格</td><td>+10%</td><td>图像即 prompt</td></tr>
+<tr><td>GLIGEN</td><td>门控自注意力</td><td>插入层</td><td>box+文本区域</td><td>中</td><td>区域级接地</td></tr>
+<tr><td>LoRA（控制向）</td><td>权重低秩</td><td>&lt;1%</td><td>风格/概念</td><td>~0</td><td>风格定制主力</td></tr>
+<tr><td>Reference-only</td><td>attn 值注入</td><td>0（免训练）</td><td>参考图</td><td>+10%</td><td>零训练垫图</td></tr>
+<tr><td>InstantID/FaceID</td><td>人脸特征+LoRA</td><td>少量</td><td>身份</td><td>中</td><td>零训练换脸主流</td></tr>
+<tr><td>In-context LoRA / Flux ref</td><td>统一序列条件</td><td>0</td><td>任意参考</td><td>—</td><td>新一代原生参考</td></tr>
+</tbody></table></div>
+<p>2024–2026 的趋势解读：<b>控制能力正在"内化"进基座</b>——Flux 的 reference 支持、SD3.5 的多条件原生、各家的"垫图"API，说明 ControlNet 式外挂逐渐被基座吸收（与第 19 章"原生多模态"逻辑一致：外挂是过渡形态）。但外挂的<b>可组合性</b>（任意叠加、权重自由）仍是基座原生方案难以替代的——未来大概率是"基座内建常用控制 + 外挂负责长尾"的混合格局。</p>
+
+<h2 id="sec-6b"><span class="sec-no">6B.</span>一致性生成专题：跨图与跨帧的角色稳定</h2>
+<p>"同一个角色在 10 张图里长一样"是连环画/漫画/广告的刚需，也是生成的老大难。技术坐标：<b>①训练法</b>——每角色一个 LoRA/DreamBooth（第 28 章），一致性最强但每角色要训练数据；<b>②免训练法</b>——IP-Adapter FaceID/InstantID（一张参考照注入身份）；<b>③生成时法</b>——固定 seed+固定 prompt 结构（弱）、先生成角色定妆照再用 IP-Adapter 垫图（社区标准工作流）；<b>④注意力共享法</b>——MasaCtrl/ConsiStory（arXiv:2402.03286 系）把参考图的 K/V 直接共享给新图生成（零训练跨图一致性的学术主流）。工程现实：<b>连环画生产的主流管线 = "定妆照 + IP-Adapter + ControlNet（构图）+ 人工修图"</b>，一致性是"工程近似"而非"完全解决"——角色一致性仍是 2026 年生成领域的活跃问题。</p>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：从需求到管线的完整映射表</p>
+<p><b>需求：电商模特换装（保持脸部/姿势，更换服装）</b>——管线：OpenPose 锁姿势 + inpaint mask 圈服装区 + IP-Adapter FaceID 锁脸 + 服装参考图走 T2I-Advisor/额外 IP；<b>避坑</b>：mask 边缘羽化 10–20px 防接缝，脸部区域从 mask 中排除。<br>
+<b>需求：把真实照片变成指定动漫风格（保构图）</b>——管线：Canny/lineart 条件 + 风格 LoRA + SDEdit 强度 0.35–0.5；<b>避坑</b>：深度图会比边缘图更保结构但更"死板"，写实转动漫用 lineart 最佳。<br>
+<b>需求：产品图多角度展示（单图→6 视角）</b>——管线：0 视角 = Zero123/单图 3D 类模型或"3D 重建再渲染"（可靠）+ ControlNet 每视角；<b>避坑</b>：纯 2D 方法（ip-adapter 垫图）跨视角一致性上限低，关键视图建议 3D 管线。<br>
+<b>需求：老照片修复上色</b>——管线：lineart/深度条件 + 上色 ControlNet + 面部走 GFPGAN 后处理；<b>避坑</b>：先修复破损（inpaint）再上色，一次做完两件事质量必然崩。<br>
+<b>需求：海报文字排版生成</b>——管线：生成背景（ControlNet 锁版式留白）+ 文字用排版引擎叠加（不要让生成模型渲染大量文字——2026 年的文字渲染仍限于"少量大字"）；<b>避坑</b>：把"文字区域"用 inpaint 管线留白，再走传统排版。</p></div>
+<div class="box-history"><p class="box-title">🕰 历史视角：从 GAN 的可控生成到扩散的控制生态</p>
+<p>"可控图像合成"不是扩散时代的新问题——GAN 时代有完整的控制尝试：StyleGAN 的风格向量编辑、GAN inversion（把真实图反演到 GAN 潜空间再编辑，arXiv:2012.09841 系综述）、条件 GAN（pix2pix/SPADE 的空间条件）。扩散时代的三点超越：<b>①零样本泛化</b>——GAN inversion 逐图优化数分钟，SD+ControlNet 一次前向；<b>②条件类型自由</b>——SPADE 每种条件一个模型，ControlNet 一个范式任意条件；<b>③开放词汇</b>——文本条件的语义空间天然开放（GAN 的类别封闭）。回看历史，ControlNet 的成功=扩散的生成质量+GAN 时代的空间控制思想+零初始化的训练安全性——<b>每个时代的问题会被下一个时代的基建重新解决一遍</b>，这是读技术史的复利。</p></div>
+
+<p><b>再补一段"控制强度"的定量直觉</b>（调参时的心理模型）：ControlNet 的 conditioning_scale 相当于把控制残差乘以标量 $s$。$s{=}0$ 即关闭、$s{=}1$ 即"按训练分布使用"、$s{>}1$ 属于分布外推——与 CFG 的 γ 完全同构（都是"条件方向的外推系数"）。经验区间与对应的"控制语气"：$s{<}0.5$ 建议式（控制图是参考）、$0.8	ext{–}1.2$ 要求式（按图施工）、$s{>}1.5$ 强制式（结构锁死，画面易僵化）。<b>与 CFG 的联动</b>：两者都在放大"条件方向的梯度"，总外推强度 ≈ 乘性叠加——这就是"高 CFG + 高控制权重 = 崩图"的数学解释；推荐起点：CFG 7 + scale 1.0，两者各调 ±20% 观察。</p>
+<p><b>分辨率与控制精度</b>：条件图在潜空间被 8 倍下采样——512 生成时 8×8 分辨率层的每个 token 对应原图 64×64 像素区域，<b>小于 8px 的控制细节在最低分辨率层不可见</b>。含义：精细控制（小字、细线稿）依赖高分辨率生成（1024+）或 ControlNet 的 64px tile 化使用；"控制不精确"的抱怨，一半是"控制细节小于潜空间分辨率"的物理极限。</p>
+<h2 id="sec-7"><span class="sec-no">7.</span>动手实践：ControlNet 推理与训练</h2>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># ControlNet 推理 + IP-Adapter 叠加（diffusers）
+import torch
+from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
+from diffusers.utils import load_image
+
+controlnet = ControlNetModel.from_pretrained(
+    "lllyasviel/sd-controlnet-openpose", torch_dtype=torch.float16)
+pipe = StableDiffusionControlNetPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5", controlnet=controlnet,
+    torch_dtype=torch.float16)
+pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+pipe.enable_model_cpu_offload()          # 12GB 卡友好
+
+pose_img = load_image("https://huggingface.co/lllyasviel/controls/resolve/main/pose.png")
+img = pipe("a cyberpunk dancer, neon lights, cinematic",
+           image=pose_img,
+           num_inference_steps=30, guidance_scale=7.5,
+           controlnet_conditioning_scale=1.0,     # ControlNet 权重
+           generator=torch.Generator("cuda").manual_seed(0)).images[0]
+img.save("pose_control.png")
+
+# 多 ControlNet 叠加（姿态 + 深度）
+from diffusers import StableDiffusionControlNetPipeline as CNP
+cn_pose = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-openpose",
+                                          torch_dtype=torch.float16)
+cn_depth = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-depth",
+                                           torch_dtype=torch.float16)
+pipe2 = CNP.from_pretrained("runwayml/stable-diffusion-v1-5",
+                            controlnet=[cn_pose, cn_depth],
+                            torch_dtype=torch.float16)
+img2 = pipe2(prompt="a dancer on stage, dramatic depth",
+             image=[pose_img, depth_img],               # 逐 ControlNet 对应
+             controlnet_conditioning_scale=[1.0, 0.7],  # 各自权重
+             num_inference_steps=30).images[0]</code></pre></div>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># 训练自己的 ControlNet（伪代码骨架，完整脚本见 diffusers/examples）
+# 核心差异 vs 普通 SD 训练：数据多一路"条件图"，loss 不变
+for batch in loader:                    # (image, condition, caption)
+    lat = vae.encode(image).latent_dist.sample() * scale
+    cond = condition_encoder(batch.condition)     # 条件图过冻结编码器（浅 CNN）
+    c = text_encoder(caption)
+    t, noise = rand_t(), randn_like(lat)
+    z_t = add_noise(lat, noise, t)
+    eps_pred = unet_with_control(z_t, t, c, control_residual=controlnet(z_t, t, cond, c))
+    # controlnet 内部：副本前向 → 15 路 zero-conv 输出加回 unet 跳跃连接
+    loss = mse(eps_pred, noise)
+    # 训练细节（论文配置）：
+    # - 50% 概率丢弃 caption（保无条件能力）
+    # - 5% 概率丢弃条件图 c_f（防过拟合到单一条件）
+    # - 学习率 1e-5 起步，batch 64+（大 batch 对控制质量敏感）
+    # - 数据：3M 级"图-条件-caption"三元组（条件自动提取）</code></pre></div>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：ControlNet 条件图的预处理清单</p>
+<p>条件质量决定控制上限，每类的预处理要点：<b>Canny</b>——阈值 (80,160) 起步、先高斯去噪（毛刺是"泄露"元凶）；<b>OpenPose</b>——检测置信度低的骨架直接丢弃该帧（错误骨架会画出畸形人）；<b>深度</b>——MiDaS/Depth Anything 输出做 2–5% 直方图裁剪（去量化阶梯）；<b>涂鸦/hed</b>——线宽 ≥3px（太细在潜空间分辨率下消失）；<b>语义分割</b>——类别数与调色板固定（训练与推理一致）。<b>通用规则</b>：条件图与目标图同分辨率、同 crop、灰度值域 0–255 存 PNG（JPEG 压缩伪影会被忠实"复刻"）。</p></div>
+
+<h2 id="sec-8"><span class="sec-no">8.</span>本章小结</h2>
+<p>本章把"控制"从玄学变成坐标系：结构控制（ControlNet 的零初始化副本 + 15 路残差、T2I-Adapter 的轻量加法）、语义控制（IP-Adapter 的解耦注意力让"图像即提示词"）、编辑三范式（SDEdit 重噪、P2P 注意力手术、InstructPix2Pix 指令学习）。贯穿全部方案的元模式再次是"零初始化残差注入"——门控（第 13 章）、ControlNet（本章）、LoRA（第 36 章）的三位一体。工程侧的组合控制、条件预处理与失效诊断，是把控制能力变成生产力的最后一块拼图。下一章进入文生图前沿：SD3 的 rectified flow 与 2023–2026 的能力大跃迁。</p>
+
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>1.</b> 写出 ControlNet 的输出组合式；zero-conv 为什么能同时保证"安全性"与"可训练性"？<br><b>答案要点</b>：$y_c=\mathcal F(x)+\sum Z_i(\cdot)$，$Z_i\equiv0$ 起步；安全性=起步时输出=原模型；可训练性=$Z_i$ 的梯度非零先学起来、副本深层穿过零门后逐步获得梯度——噪声不冲击预训练激活。</p>
+<p><b>2.</b> ControlNet 与 T2I-Adapter 的取舍？<br><b>答案要点</b>：CN=完整副本（~350M）控制强、开销大；Adapter=轻量加法（~77M）快但粗；生态覆盖也是决定因素。</p>
+<p><b>3.</b> IP-Adapter 的"解耦"指什么？为什么能"文本管内容、图像管风格"？<br><b>答案要点</b>：文本走原 attn2、图像走并联新注意力层再相加——两通道独立，λ 可调影响力，互不污染。</p>
+<p><b>4.</b> SDEdit 的 strength 语义？为什么"只改颜色"常连带重绘细节？<br><b>答案要点</b>：strength=入场噪声时刻；加噪丢高频保低频，细节属高频故被重新想象——结构与幅度互斥是 SDEdit 的固有缺陷。</p>
+<p><b>5.</b> P2P 的机制洞察是什么？PnP 的改进？<br><b>答案要点</b>：交叉注意力权重图=词→区域绑定，替换/注入注意力实现"布局不变换内容"；PnP 直接注入源图注意力值，无需 prompt 对齐。</p>
+<p><b>6.</b> InstructPix2Pix 的数据自举三步？这个范式的现代后裔？<br><b>答案要点</b>：GPT-3 生成指令文本 → T2I 生成前后图 → 编辑模型过滤；后裔：DALL-E 3 合成 caption、多模态指令数据（第 16 章）——"模型造数据训更强模型"。</p>
+<p><b>7.</b> 多 ControlNet 叠加时"控制图与 prompt 矛盾"会怎样？如何预防？<br><b>答案要点</b>：扩散取折中产生畸形；预防：管线中用 VLM 自动审查 prompt-条件一致性，人工审核关键条件图。</p>
+<p><b>8.</b> conditioning_scale 与 CFG 的数学同构性是什么？为什么"两者都高"会崩图？<br><b>答案要点</b>：都是条件方向的外推系数（乘性叠加总外推强度）；超出训练分布导致过饱和与伪影——总强度要预算控制。</p>
+<p><b>9.</b> 为什么"小于 8px 的控制细节"在 512 生成中不可见？<br><b>答案要点</b>：条件图随潜空间 8 倍下采样，8×8 层每 token 对应 64×64 像素；精细控制需高分辨率或 tile 化——这是物理极限而非调参问题。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Zhang L, et al. <a href="https://arxiv.org/abs/2302.05543">Adding Conditional Control to Text-to-Image Diffusion Models (ControlNet)</a>. ICCV 2023. arXiv:2302.05543.</li>
+      <li>Mou C, et al. <a href="https://arxiv.org/abs/2308.06721">T2I-Adapter: Learning Adapters to Dig out More Controllable Ability for Text-to-Image Diffusion Models</a>. arXiv 2023. arXiv:2308.06721.</li>
+      <li>Ye J, et al. <a href="https://arxiv.org/abs/2308.06721">IP-Adapter: Image Prompt Adapter for Text-Image Diffusion（GitHub: tencent-ailab/IP-Adapter）</a>. 2023.</li>
+      <li>Meng C, et al. <a href="https://arxiv.org/abs/2108.01073">SDEdit: Guided Image Synthesis and Editing with Stochastic Differential Equations</a>. ICLR 2022. arXiv:2108.01073.</li>
+      <li>Hertz A, et al. <a href="https://arxiv.org/abs/2208.01626">Prompt-to-Prompt Image Editing with Cross Attention Control</a>. ICLR 2023. arXiv:2208.01626.</li>
+      <li>Tumanyan N, et al. <a href="https://arxiv.org/abs/2305.02215">Plug-and-Play Diffusion Features for Text-Driven Image-to-Image Translation</a>. CVPR 2023. arXiv:2305.02215.</li>
+      <li>Brooks T, et al. <a href="https://arxiv.org/abs/2210.09261">InstructPix2Pix: Learning to Follow Image Editing Instructions</a>. CVPR 2023. arXiv:2210.09261.</li>
+      <li>Zhang R, et al. <a href="https://arxiv.org/abs/1801.03924">LPIPS（感知度量）</a>. CVPR 2018. arXiv:1801.03924.</li>
+      <li>Wang B, et al. <a href="https://arxiv.org/abs/2306.11388">ControlNet++ / 相关改进研究</a>. 2023.</li>
+      <li>Voynov A, et al. <a href="https://arxiv.org/abs/2305.16331">R-Adapter / 参考（轻量控制注入研究线）</a>. 2023.</li>
+      <li>Li Y, et al. <a href="https://arxiv.org/abs/2305.13655">Gligen: Open-Set Grounded Text-to-Image Generation（区域级控制先声）</a>. CVPR 2024. arXiv:2305.13655.</li>
+      <li>Chen R, et al. <a href="https://arxiv.org/abs/2311.17530">HumanRef / InstantID 系（身份控制，GitHub: instantid）</a>. 2023–24.</li>
+      <li>Wang Z, et al. <a href="https://arxiv.org/abs/2306.00950">PhotoMaker: Customizing Realistic Human Photos（身份级控制的代表）</a>. arXiv 2023. arXiv:2312.04461.</li>
+      <li>Zhang L, et al. <a href="https://arxiv.org/abs/2209.03003">Rectified Flow 相关（第 27 章前置）</a>. ICLR 2023. arXiv:2209.03003.</li>
+      <li>HuggingFace. <a href="https://huggingface.co/docs/diffusers/controlnet">Diffusers ControlNet 文档与训练脚本</a>. 2023–2026.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

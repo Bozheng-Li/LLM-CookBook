@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 16 章 视觉指令微调 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第二部分 · 多模态核心理论</div>
+  <h1 class="chapter-title">第 16 章　视觉指令微调</h1>
+  <div class="chapter-meta"><span>预计阅读 100 分钟</span><span>难度 ★★★☆☆</span><span>前置：第 7 章（SFT 与指令微调）、第 15 章（连接器）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">从对齐到跟随：视觉指令微调的问题设定</a></li>
+  <li><a href="#sec-2">LLaVA：用 GPT-4 造指令数据的全流程</a></li>
+  <li><a href="#sec-3">LLaVA-1.5：学术任务数据混合的魔力</a></li>
+  <li><a href="#sec-4">InstructBLIP：指令感知的 Q-Former</a></li>
+  <li><a href="#sec-5">MiniGPT-4 与 mPLUG-Owl：两条互补路线</a></li>
+  <li><a href="#sec-6">合成数据革命：ShareGPT4V、ALLaVA 与 Cambrian-7M</a></li>
+  <li><a href="#sec-7">SFT 工程细节：loss masking 与训练配方</a></li>
+  <li><a href="#sec-8">SFT 完整脚本实战</a></li>
+  <li><a href="#sec-9">指令数据集全景与本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>第 15 章结束时我们有了一座"桥"，但桥上还没有车——对齐预训练之后的模型只会"看图说话"，不会听指令：你问"图里有什么危险"，它可能答"一个成熟的牛油果"。把 55 万对齐数据训练出的模型变成能多轮对话、能按格式作答的助手，靠的就是<b>视觉指令微调（Visual Instruction Tuning）</b>：用"图像 + 指令 + 回答"三元组做监督微调（Supervised Fine-Tuning, SFT）。本章的叙事主线是一个反直觉的事实：<b>2023–2026 年 MLLM 的绝大多数能力跃迁来自数据而非架构</b>——LLaVA 用 GPT-4 凭空造出 15.8 万指令数据，LLaVA-1.5 用 66.5 万"小"数据横扫 11 个基准，ShareGPT4V/ALLaVA 证明合成字幕的质量决定模型上限，Cambrian-7M 展示了数据重配平的威力。我们将逐一拆解这些数据是怎么造出来的、训练时 loss 到底算在哪些 token 上（很多教材略过的 loss masking 细节）、并给出一份可以直接跑的 LLaVA 风格 SFT 完整脚本。读完本章，你应当能够：为自己的领域设计指令数据构造管道、看懂任何开源 MLLM 的训练配方、并避开合成数据的五个经典陷阱。</p></div>
+
+<div class="box-history"><p class="box-title">🕰 历史脉络：指令微调如何从 NLP 迁移到视觉</p>
+<p><b>2021</b>：FLAN（arXiv:2109.01652）首次系统地把 NLP 任务改写成指令格式做多任务微调；<b>2022</b>：InstructGPT（arXiv:2203.02155）确立 SFT→RM→PPO 三段式，Self-Instruct（arXiv:2212.10560）证明"模型造数据训自己"可行；<b>2023 年初</b>：LLaMA + Self-Instruct 混合数据的 Alpaca、极小人工数据 LIMA（arXiv:2305.11206）相继出现，指令微调的成本跌到几百美元；<b>2023 年 4 月</b>：LLaVA 把这条流水线搬进多模态——用 GPT-4（纯文本）+ 图像的字幕/框标注合成视觉指令数据，从此"视觉指令微调"成为独立研究方向；<b>2023 下半年起</b>：InstructBLIP（指令感知）、ShareGPT4V（GPT-4V 级字幕）、Cambrian-1（数据配平科学）把重心从"怎么训"彻底转向"训什么"。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>从对齐到跟随：视觉指令微调的问题设定</h2>
+<p>第 35 章会系统讲多模态预训练的三阶段配方，这里先明确本章所处的位置。阶段 1（对齐预训练）用几十万"图像→字幕"的弱监督对，把连接器从随机初始化训到"视觉 token 能被 LLM 正常续写"；但这个模型只有一种能力——给图配文。指令微调（阶段 2）要补上的是<b>条件性、多样性、格式性</b>：（1）<b>条件性</b>——同一个图像，不同问题给不同回答（"这是什么"vs"详细描述"vs"图里的文字说了什么"）；（2）<b>多样性</b>——覆盖对话、细节描述、复杂推理、OCR、定位等任务形态；（3）<b>格式性</b>——按指令要求的格式回答（单选字母、单词短语、JSON、坐标框），这是选择题类基准能自动评测的前提。</p>
+<p>形式化：SFT 数据是三元组集合 $\{(\mathbf{v}_i, \mathbf{q}_i, \mathbf{a}_i)\}$，其中 $\mathbf{v}$ 是图像（或多图/视频）、$\mathbf{q}$ 是包含系统提示与用户指令的 prompt、$\mathbf{a}$ 是目标回答。训练目标是在<b>只对回答 token 计算</b>的交叉熵（细节在第 7 节）：</p>
+<div class="math-block">$$\mathcal{L}_{\text{SFT}} = -\sum_{t \in \mathcal{A}} \log p_\theta(y_t \mid y_{<t}, \mathbf{v}, \mathbf{q})$$</div>
+<p>其中 $\mathcal{A}$ 是回答 span 的 token 下标集合。与阶段 1 的关键差异有三：数据从"字幕对"变成"指令对话"；可训练参数从"仅连接器"扩大到"连接器 + LLM（可选视觉塔）"；训练时长从 1 epoch 到 1–3 epoch。这些看似只是常规微调，但每个选择都被数据质量放大——这就是为什么本章用三分之二的篇幅讲数据。</p>
+<p>最后一个设定问题：<b>指令数据从哪来？</b>三条来路的成本与质量天差地别。<b>（a）学术数据集改造</b>：VQAv2/GQA/OCR-VQA 等现成 VQA 数据加模板 prompt，免费但形态单一、回答偏短；<b>（b）强模型合成</b>：让 GPT-4/GPT-4V 看着（或"听着描述"）图像生成对话与推理，质量上限最高，是 LLaVA 系的正统；<b>（c）人工标注</b>：质量可控但每条数美元，2023 年后基本只用于偏好数据与评测。2023–2026 年的实践是三者按比例混合——比例怎么定，正是各家配方的核心差异。</p>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>LLaVA：用 GPT-4 造指令数据的全流程</h2>
+<p>LLaVA（arXiv:2304.08485，2023 年 4 月）是视觉指令微调的开山之作，它最大的贡献不是模型（那只是 CLIP+线性层+Vicuna），而是<b>一条 158K 数据的自动化生产管道</b>。背景约束很关键：当时的 GPT-4 只有纯文本 API，看不了图。LLaVA 的巧思是"用文本替身喂 GPT-4"——图像不能直接给，就把它压缩成两种<b>文字化代理表示</b>：（1）<b>字幕</b>（COCO Captioner 生成的一句话描述）；（2）<b>框序列</b>（检测器输出的物体类别+边界框坐标列表）。把这两种表示连同精心设计的 few-shot 示例与任务模板一起发给 GPT-4，让它"想象"自己在看图，然后生成指令数据。</p>
+
+<figure><svg viewBox="0 0 780 380" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <defs><marker id="m16a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="390" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">LLaVA 指令数据构造与两阶段训练全流程</text>
+  <rect x="24" y="48" width="150" height="52" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="99" y="68" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a" font-family="sans-serif">COCO 图像</text>
+  <text x="99" y="85" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">约 158K 张（COCO 子集）</text>
+  <rect x="24" y="130" width="150" height="52" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.4"/>
+  <text x="99" y="150" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#1e3a8a" font-family="sans-serif">文字化代理表示</text>
+  <text x="99" y="167" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">① 字幕（Captioner）② 框序列（检测器）</text>
+  <line x1="99" y1="100" x2="99" y2="128" stroke="#64748b" stroke-width="2" marker-end="url(#m16a)"/>
+  <line x1="174" y1="156" x2="252" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#m16a)"/>
+  <line x1="174" y1="170" x2="252" y2="134" stroke="#64748b" stroke-width="2" marker-end="url(#m16a)"/>
+  <rect x="254" y="86" width="216" height="76" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.8"/>
+  <text x="362" y="108" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#92400e" font-family="sans-serif">GPT-4（纯文本模式）</text>
+  <text x="362" y="126" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">输入：代理表示 + few-shot 模板</text>
+  <text x="362" y="144" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">三类模板 → 生成指令对话</text>
+  <rect x="254" y="176" width="216" height="96" rx="10" fill="#fef3c7" stroke="#d97706" stroke-width="1.4"/>
+  <text x="362" y="198" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#92400e" font-family="sans-serif">① 对话（Conversation）58K</text>
+  <text x="362" y="220" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#92400e" font-family="sans-serif">② 细节描述（Detail）23K</text>
+  <text x="362" y="242" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#92400e" font-family="sans-serif">③ 复杂推理（Reasoning）77K</text>
+  <text x="362" y="262" text-anchor="middle" font-size="10" fill="#64748b" font-family="sans-serif">合计约 158K 条（LLaVA-Instruct-158K）</text>
+  <line x1="470" y1="124" x2="548" y2="124" stroke="#64748b" stroke-width="2" marker-end="url(#m16a)"/>
+  <rect x="550" y="86" width="208" height="76" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.8"/>
+  <text x="654" y="108" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#5b21b6" font-family="sans-serif">阶段 1：对齐预训练</text>
+  <text x="654" y="126" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">数据：558K 图文对（LCS）</text>
+  <text x="654" y="144" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">只训连接器；LLM/视觉塔冻结</text>
+  <rect x="550" y="180" width="208" height="76" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="1.8"/>
+  <text x="654" y="202" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#047857" font-family="sans-serif">阶段 2：指令微调</text>
+  <text x="654" y="220" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">数据：158K 指令数据</text>
+  <text x="654" y="238" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">解冻连接器 + LLM（视觉塔仍冻结）</text>
+  <line x1="654" y1="162" x2="654" y2="178" stroke="#64748b" stroke-width="2" marker-end="url(#m16a)"/>
+  <text x="390" y="308" text-anchor="middle" font-size="11.5" fill="#475569" font-family="sans-serif">模板设计三原则：描述画面事实（防幻觉）、从回答者视角提问（防"你说我答"错位）、按任务类型分桶采样（保证多样性）</text>
+  <text x="390" y="330" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#0f172a" font-family="sans-serif">关键洞察：图像 → 文本代理 → 强模型合成，把"看图造数据"问题降维成"造数据"问题</text>
+  <text x="390" y="356" text-anchor="middle" font-size="10.5" fill="#94a3b8" font-family="sans-serif">成本：一次 GPT-4 API 批量调用（当时约数百美元级）；数据开源即 LLaVA-Instruct-158K</text>
+</svg><figcaption>图 16-1　<b>LLaVA 数据构造与训练流水线</b>（自绘，依据 arXiv:2304.08485）。左：图像被压缩成字幕与框序列两种文字化代理；中：GPT-4 用三类模板生成 58K 对话、23K 细节描述、77K 复杂推理；右：两阶段训练——阶段 1 只训连接器（558K 图文对），阶段 2 用 158K 指令数据解冻 LLM。当 GPT-4V 出现后，这条管道的"代理表示"被真实看图取代，质量再上一个台阶（第 6 节）。</figcaption></figure>
+
+<p>三类指令数据的分工值得细品，它们对应了对话系统的三种"人格"：<b>① 对话（58K）</b>——模板要求 GPT-4 提出三个"人在看图时自然会问"的问题并回答，训练出多轮、口语化的基本对话能力；<b>② 细节描述（23K）</b>——给出"用一段话详细描述这张图"的 prompt，让 GPT-4 基于框序列尽量还原画面细节，专治模型"懒得说细节"的通病；<b>③ 复杂推理（77K）</b>——要求提出需要逐步逻辑推理的问题（因果、比较、假设），给出详细思维链式回答，这是比例最大的一桶，因为它最难从其他来源获得。<b>三条模板设计原则</b>（论文原话意译）：让 GPT-4 只描述画面内容而非发散联想（防幻觉）；问题以第一视角的观察者口吻提出（避免"图里有什么"式的模板腔）；三类数据分桶构造再混合（保证覆盖）。</p>
+
+<figure><img src="../assets/images/papers/2304.08485_0.png" loading="lazy" alt="LLaVA 与 BLIP-2、OpenFlamingo 的指令跟随对比示例"><figcaption>图 16-2　<b>指令跟随能力的直观对比</b>（来源：Liu et al., LLaVA, arXiv:2304.08485）。面对同一张图与追问式对话，BLIP-2 与 OpenFlamingo 倾向于重复描述画面或答非所问，而用 158K 指令数据微调后的 LLaVA 能准确跟随用户意图、逐问推进。这就是指令微调带来的"从看图说话到听话回答"的质变。</figcaption></figure>
+
+<p><b>代码 1：复刻 LLaVA 式合成数据的调用脚本</b>（今天可以直接换成 GPT-4V/开源 VLM 看图生成，代理表示步骤可跳过）：</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import json, random
+from openai import OpenAI   # pip install openai；也可替换为本地 vLLM 服务
+
+client = OpenAI()
+
+CONV_TEMPLATE = """你是基于图像的 AI 助手。下面是一张图像的描述：
+Caption: {caption}
+Objects: {boxes}
+请模拟一位仔细观察这张图的用户，提出 3 个自然的对话问题并回答。
+要求：问题之间有追问关系；回答只基于画面内容，不要脑补画面外的事实。"""
+
+def synthesize(caption: str, boxes: str) -> dict:
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",                    # 2023 年原版用 GPT-4 + 文本代理；现在可直接看图
+        messages=[{"role": "user", "content": CONV_TEMPLATE.format(caption=caption, boxes=boxes)}],
+        temperature=0.7,
+    )
+    return {"conversations": parse_llava_style(resp.choices[0].message.content)}
+
+def parse_llava_style(text: str) -> list:
+    """把生成文本解析成 [human, gpt, human, gpt, ...] 交替结构"""
+    turns = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if line.startswith(("Q", "问")):
+            turns.append({"from": "human", "value": line.split(":", 1)[1].strip()})
+        elif line.startswith(("A", "答")):
+            turns.append({"from": "gpt", "value": line.split(":", 1)[1].strip()})
+    return turns
+
+with open("captions_boxes.jsonl") as f, open("llava_style_sft.jsonl", "w") as out:
+    for row in f:                              # 每行 {"image":..., "caption":..., "boxes":...}
+        item = json.loads(row)
+        item["conversations"] = synthesize(item["caption"], item["boxes"])
+        out.write(json.dumps(item, ensure_ascii=False) + "\n")
+# 建议加：去重（按问题哈希）、长度过滤、抽检人工评审（抽 1% 看幻觉率）</code></pre></div>
+
+<p><b>训练配方（v1）</b>：阶段 1 在 558K 图文对（LAION/CC 子集过滤得到，即 LCS-558K）上只训线性连接器，学习率 2e-5、batch 128、1 epoch；阶段 2 在 158K 指令数据上解冻连接器与 Vicuna（视觉塔仍冻结），学习率 2e-5、batch 32、3 epoch。prompt 模板是 "### Human: ... ### Assistant: ..." 的两段式（V1 模板，之后被各家 chat template 取代）。LLaVA 证明了这条管道可行，但 v1 模型在学术基准上与最强模型仍有明显差距——弥补这个差距的，正是下一段的主角。</p>
+
+<h2 id="sec-3"><span class="sec-no">3.</span>LLaVA-1.5：学术任务数据混合的魔力</h2>
+<p>LLaVA-1.5（arXiv:2310.03744，2023 年 10 月）的标题非常诚实："Improved Baselines with Visual Instruction Tuning"——只改了基线。架构上只有三处小改动（336px、两层 MLP、MLP 前加 grid pooling 细节），真正的重头戏是<b>SFT 数据配方</b>：在 158K 指令数据之外，混入约 50 万条<b>学术任务 VQA 数据</b>——把 VQAv2、GQA、OK-VQA、OCR-VQA、TextVQA、ScienceQA、VizWiz、RefCOCO（框坐标转文本）等现成数据集统一改写成对话格式，合计约 665K（加上预训练的 558K 共约 1.2M）。结果是一份令整个领域重新审视数据的成绩单：</p>
+
+<div class="tbl-wrap"><table>
+<caption>表 16-1　LLaVA-1.5 关键基准成绩（论文报告值；同期对比：InstructBLIP-Vicuna-13B 与 Qwen-VL-Chat）</caption>
+<thead><tr><th>基准</th><th>LLaVA-1.5-7B</th><th>LLaVA-1.5-13B</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>VQAv2（test-dev）</td><td>78.5</td><td>80.4</td><td>通用 VQA，学术数据直接受益</td></tr>
+<tr><td>GQA</td><td>62.0</td><td>62.0</td><td>组合推理型 VQA</td></tr>
+<tr><td>VizWiz</td><td>50.0</td><td>53.6</td><td>盲人拍摄图像（域外）</td></tr>
+<tr><td>TextVQA</td><td>58.2</td><td>61.3</td><td>读文字能力，336px + OCR 数据受益</td></tr>
+<tr><td>POPE（幻觉，F1）</td><td>85.9</td><td>87.2</td><td>物体存在性幻觉</td></tr>
+<tr><td>MME</td><td>1510.7</td><td>1531.3</td><td>综合感知/认知</td></tr>
+<tr><td>MMBench</td><td>64.2</td><td>67.4</td><td>多能力细粒度评测</td></tr>
+<tr><td>MM-Vet</td><td>31.1</td><td>35.4</td><td>综合视觉助手能力</td></tr>
+</tbody></table></div>
+
+<p>这些数字同时超过 InstructBLIP-Vicuna-13B、Qwen-VL-Chat 等当时的强模型，而 1.5 的 SFT 数据量比 InstructBLIP 的 1.2M 还略小。<b>"魔力"到底在哪？</b>论文给出的归因可以提炼成三条数据法则：<b>（1）覆盖即能力</b>——学术数据把 OCR、计数、定位、图表等"硬感知技能"直接灌进 SFT，模型不再只学"说漂亮话"；<b>（2）格式即分数</b>——每条学术数据附带"响应格式提示"（response format prompt），如选择题附加 "Answer with the option's letter from the given choices directly."、开放题附加 "Answer the question using a single word or phrase."。这个看似琐碎的动作同时解决了两个问题：让回答短而准（选择题基准不再被长篇大论拖累）、让评测脚本可解析（答案抽取不再错杀）。后续大量复现证明：同样的模型去掉格式提示，基准分数可以掉好几个点；<b>（3）平衡即鲁棒</b>——对话数据与学术数据约 1:4 的比例既保住聊天能力又不让格式过拟合，配比本身就是超参数。</p>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：把 665K 配方迁移到你的领域</p>
+<p><b>第一步，盘点任务形态</b>：领域内的"硬感知技能"是什么（医疗影像的病灶定位、工业图的缺陷计数、文档的表格读数）？每类找一个最接近的公开学术数据集做"格式母版"。<b>第二步，三层配比</b>：通用对话数据（LLaVA-Instruct-158K 直接复用，占 25%–40%，保住基本盘）+ 领域 VQA/定位数据（学术改造或检测器自动标注，占 30%–50%）+ 领域详细描述（用强 VLM 重写字幕，占 20%–30%，参考 ShareGPT4V）。<b>第三步，格式提示照抄</b>：为评测形态逐条写响应格式提示，训练与评测模板逐字符一致。<b>第四步，卫生检查</b>：图像与目标基准去重、按问题哈希去重、抽 1% 人工评审幻觉率。<b>超参起点</b>：7B 模型、lr 2e-5、batch 128、1 epoch 起步；数据少于 20 万条时 2 epoch + 更强正则，并冻结视觉塔。全程预算：7B 单图 SFT 在 8×A100 上约一天，先用 1/10 数据试跑再放量。</p></div>
+
+<figure><img src="../assets/images/papers/2310.03744_0.png" loading="lazy" alt="LLaVA-1.5 在 11 个任务上的 SoTA 表现与高数据效率"><figcaption>图 16-3　<b>LLaVA-1.5 的成绩单</b>（来源：Liu et al., LLaVA-1.5, arXiv:2310.03744）。顶部：11 个任务同时达到或超过当时最优；左下：与 InstructBLIP 相比的数据效率曲线——更少的数据、更简单的连接器拿到更高的分数；右下：与 LLaVA v1 的差异清单（MLP 连接器、336px、学术数据混合）。这张图是"数据配方 &gt; 架构创新"最著名的证据之一。</figcaption></figure>
+
+<p>后续演进一并提供坐标：LLaVA-NeXT（2024 年 1 月博客，无 arXiv）引入 AnyRes 动态分块把分辨率扩到 672×672、1344 级别，并加入更好的 OCR/推理数据；<b>LLaVA-OneVision（arXiv:2408.03326，2024 年 8 月）</b>把单图（3.2M 数据）、多图与视频（OneVision 1.6M 数据）统一进一个模型，训练分三段：对齐预训练 → 单图中级阶段 → 多图/视频最终阶段，并系统研究了"跨场景迁移"（单图能力会被视频训练冲掉，反过来则增强——先单图后视频的数据课程因此成为定式）。</p>
+
+<figure><img src="../assets/images/papers/2408.03326_0.png" loading="lazy" alt="LLaVA-OneVision 架构：单图、多图、视频统一"><figcaption>图 16-4　<b>LLaVA-OneVision：把单图/多图/视频装进同一个 LLaVA 架构</b>（来源：Li B, et al., arXiv:2408.03326）。左侧为模型实例化（SigLIP 编码器 + MLP + Qwen2 LLM），右侧为一般形式：不同视觉信号在 AnyRes 框架下统一成 token 序列。其核心贡献在数据课程：3.2M 高质量单图数据先训，再以 1.6M 多图/视频数据收尾，实现"单向正迁移"。</figcaption></figure>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：LLaVA-1.5（CVPR 2024，arXiv:2310.03744）</p>
+<p><b>值得精读的三个实验设计</b>：（1）<b>数据混合消融</b>——论文逐项加入学术数据集观察分数变化，结论"VQAv2 数据贡献了通用 VQA 大盘、OCR 类数据带动 TextVQA、RefCOCO 数据带来定位能力且<b>不伤</b>其他任务"，这是"grounding 数据提升整体感知"最早的公开证据之一（第 21 章会再遇到）；（2）<b>响应格式提示对照</b>——同一模型有/无格式提示的分数差被明确报告，促使"格式提示"成为所有后续 SFT 数据的标配字段；（3）<b>与 InstructBLIP 的正面对比</b>——两者都基于 Vicuna 与 CLIP 家族特征，唯一系统性差异是数据构造哲学（学术混合 vs 指令感知重采样），LLaVA-1.5 全面胜出，等于宣判了"纯合成指令数据"的单一食谱不够。<b>复现提醒</b>：LLaVA-1.5 使用了 NEFTune（对词嵌入加均匀噪声的微调技巧，$\alpha=5$），对 MME/MMBench 有约 +1~3 的贡献；复现对不齐时先检查它和 ScienceQA 的 in-house 划分。</p></div>
+<h2 id="sec-4"><span class="sec-no">4.</span>InstructBLIP：指令感知的 Q-Former</h2>
+<p>当 LLaVA 在为 Q-Former 钉棺材板时，InstructBLIP（arXiv:2305.06500，Salesforce，2023 年 5 月）为它做了最后一次体面的辩护——并且贡献了一个独立于连接器成败、至今仍被引用的思想：<b>指令感知的视觉特征提取</b>。它的观察是：同一张图，"这张图里有什么幽默之处"和"描述图中的文字"需要关注完全不同的区域，而 LLaVA 式直通连接器把全部 576 个 token 原封不动喂给 LLM，指令相关信息的选择完全留给 LLM 自己。InstructBLIP 的做法是把指令<b>前置到视觉侧</b>：指令文本作为文本输入喂给 Q-Former 的文本分支，32 个 query 在交叉注意力提取视觉特征时"知道"下游任务是什么，从而输出与指令相关的视觉特征。</p>
+
+<figure><img src="../assets/images/papers/2305.06500_1.png" loading="lazy" alt="InstructBLIP 架构：指令感知的 Q-Former 提取视觉特征"><figcaption>图 16-5　<b>InstructBLIP 架构</b>（来源：Li D, et al., InstructBLIP, arXiv:2305.06500）。冻结图像编码器 → 指令感知 Q-Former（指令文本与 query 同处 Q-Former，视觉特征随指令变化）→ 输出作为软提示前缀喂给冻结 LLM（Vicuna）。注意与 BLIP-2 的差异：指令不仅给 LLM，也参与"看什么"的决策。</figcaption></figure>
+
+<p>数据侧，InstructBLIP 把 <b>26 个公开数据集</b>统一改写成指令跟随格式：其中 <b>13 个 held-in</b> 数据集（合计约 1.2M 样本，每个数据集做平衡采样、大集欠采样）用于指令微调，<b>13 个 held-out</b> 用于零样本评测。改写的关键是给每个数据集配了多样化的人工模板（每条数据随机选一个），例如同一道 ScienceQA 题可以有"直接给答案"与"逐步解释"两种指令——这训练出"按指令调整回答风格"的元能力，zero-shot 迁移到没见过的任务格式上。结果：在 held-out 数据集与纯自然图像（NoICE 等）上的零样本能力全面超过 BLIP-2 与当时的 LLaVA。<b>经验与教训</b>：指令感知的思想是对的（后来的任务条件化视觉编码、query 重排都受其影响），但把"指令理解"塞进 188M 的 Q-Former 里委实大材小用——LLaVA-1.5 证明 7B 的 LLM 用更直白的数据就能学会同样的事，而且学得更好。InstructBLIP 留给我们的实用遗产是它的<b>数据改写协议</b>：多模板、平衡采样、held-out 严格隔离，至今仍是构造指令数据集的标准卫生规范。</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch
+from PIL import Image
+from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
+
+# HF 原生支持：指令感知 Q-Former + Vicuna，加载即推理
+model = InstructBlipForConditionalGeneration.from_pretrained(
+    "Salesforce/instructblip-vicuna-7b", torch_dtype=torch.float16, device_map="auto")
+processor = InstructBlipProcessor.from_pretrained("Salesforce/instructblip-vicuna-7b")
+
+image = Image.open("demo.jpg").convert("RGB")
+for prompt in ["What is unusual about this image?",
+               "Describe the image in detail."]:
+    inputs = processor(images=image, text=prompt, return_tensors="pt"
+                       ).to(model.device, torch.float16)
+    out = model.generate(**inputs, do_sample=False, max_new_tokens=64,
+                         min_new_tokens=1, num_beams=5)
+    print(prompt, "->", processor.batch_decode(out, skip_special_tokens=True)[0])
+# 同一张图、不同指令会得到不同回答——指令同时进入了 Q-Former 与 LLM 两侧</code></pre></div>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>MiniGPT-4 与 mPLUG-Owl：两条互补路线</h2>
+<p><b>MiniGPT-4（arXiv:2304.10592，2023 年 4 月）</b>与 LLaVA 几乎同期，架构上它选了"最省"组合：直接复用<b>冻结的 BLIP-2（含训好的 Q-Former）+ 一层线性投影 + Vicuna</b>，可训练参数只有一个投影层。它对数据工程的启示比架构更大：作者先用 5M 级图文对（CC/SBU/LAION 混合）把线性层对齐，得到的模型能描述图像但输出不可控（碎句、幻觉、格式混乱）；随后用 ChatGPT 从约 5 万个候选字幕中<b>人工规则 + LLM 筛选出约 3.5K 条高质量图文对</b>（Conceptual Alignment 数据集 CA-3.5K，后续扩到 5K），仅用这几千条做第二轮微调，对话质量发生质变——能写广告文案、看梗图讲笑点、读手写菜谱。<b>结论被后续所有工作反复验证：SFT 数据"几千条高质量"可以胜过"几百万条低质量"</b>。这个"LLM 筛数据"的手法也预演了 2024 年的合成数据革命（第 6 节）。</p>
+
+<figure><img src="../assets/images/papers/2304.10592_0.png" loading="lazy" alt="MiniGPT-4 架构：冻结 ViT+Q-Former + 线性层 + Vicuna"><figcaption>图 16-6　<b>MiniGPT-4 架构</b>（来源：Zhu et al., arXiv:2304.10592）。视觉侧完整复用冻结的 BLIP-2（ViT + Q-Former），只训练一个线性投影对齐到 Vicuna 词嵌入空间。架构与 BLIP-2 阶段 2 几乎相同——它的真正贡献在于揭示了两阶段数据质量（海量粗对齐 vs 几千条精筛）对对话能力的决定性差异。</figcaption></figure>
+
+<p><b>mPLUG-Owl（arXiv:2304.14178，阿里，2023 年 4 月）</b>则代表了"模块化 + 语言对齐"路线。架构是视觉编码器 + 视觉抽象器（visual abstractor，交叉注意力式连接器）+ LLM；训练分两阶段，但它的独特设计在<b>阶段 2</b>：视觉指令微调的同时混入<b>语言对齐数据</b>（LA，约 7 万条纯文本指令），防止多模态训练冲垮 LLM 原本的对话与知识能力——"多模态训练伤语言"是当时普遍观察到的现象，mPLUG-Owl 用数据配比而非冻结来解。其阶段 1 数据 <b>MIMIC-IT</b>（约 2.8M 图像、3.8M 问答对）由 GPT-4 + 字幕代理合成并人工校验，规模是 LLaVA-158K 的二十多倍，覆盖单图/多图/视频对话。2023 年底的 mPLUG-Owl2 进一步用<b>模态自适应模块（MAM）</b>——共享注意力但按模态分离 K/V 投影——让文本与视觉各自保有自己的表示子空间，缓解模态干扰（它与第 13 章"双流注意力"思想一脉相承）。mPLUG-Owl 系的价值在于把"<b>防遗忘</b>"第一次做成显式的数据与架构机制，这条线后来演化为各家"多模态 SFT 必混纯文本数据"的默认配方。</p>
+
+<figure><img src="../assets/images/papers/2304.14178_1.png" loading="lazy" alt="mPLUG-Owl 两阶段训练范式与模型总览"><figcaption>图 16-7　<b>mPLUG-Owl 的两阶段训练范式</b>（来源：Ye et al., arXiv:2304.14178）。阶段 1 视觉知识学习（MIMIC-IT 大规模合成数据，训抽象器 + LoRA）；阶段 2 视觉指令微调（多模态指令 + 语言对齐数据混合，保护语言能力）。</figcaption></figure>
+
+<h2 id="sec-6"><span class="sec-no">6.</span>合成数据革命：ShareGPT4V、ALLaVA 与 Cambrian-7M</h2>
+<p>2023 年的指令数据有一个系统性盲区：字幕太短。LLaVA 系的图文对齐数据沿用 CC3M 式一句话字幕，GPT-4 代理合成的描述受框序列保真度限制——模型见过 55 万张图，但每张图只有"一句话的信息量"。2023 年底 GPT-4V 面世后，"让强 VLM 直接看图写字幕"成为可能，掀起两波浪潮。</p>
+<p><b>第一波：重写字幕（recaption）。ShareGPT4V（arXiv:2311.12793）</b>用 GPT-4V 为 100K 张图生成高信息密度字幕（涵盖物体属性、空间关系、场景氛围、常识知识——典型 5–10 倍于 CC 字幕的 token 量），然后训练一个 ShareGPT4V-Captioner 把高质量字幕扩展到 1.2M，合成约 1.3M 字幕的数据集。用"普通字幕 + GPT4V 字幕"混合重训 LLaVA-1.5，全基准一致提升——证明了<b>模态对齐的上限被字幕的信息密度锁死</b>。这个思想与 DALL-E 3 的重标注革命（arXiv:2310.16825）同源：文生图与多模态理解两条线在 2023 年不约而同地发现"换个字幕器等于换了个模型"（第 34 章从数据工程角度再展开）。<b>ALLaVA（arXiv:2402.11684）</b>把 GPT-4V 合成做到一步到位：直接让 GPT-4V 为图像生成详细字幕与复杂对话（含"无法回答"类样本，专治幻觉），组成 ALLaVA-4V 数据；用它在 3B 规模（ALLaVA-3B）训练的模型在多项基准上与 LLaVA-1.5-13B 打平——"数据质量换模型规模"的代表性证据。</p>
+<p><b>第二波：数据科学化。Cambrian-1（arXiv:2406.16860，NYU，2024）</b>把 SFT 数据当作独立研究对象：从 12 个公开指令数据集汇成 Cambrian-10M，然后按"知识/转录（OCR）/感知/推理/规划/对话"等任务类型<b>重新配平</b>得到 Cambrian-7M（砍掉过采样的对话类、补充感知与知识类）。两个发现值得写进工程手册：其一，<b>配平比规模重要</b>——10M 原始混合不如 7M 配平版；其二，<b>"答题机器现象"（Answer Machine Phenomenon）</b>——全部用"问题→短答案"格式训练会让模型丧失对话能力，用户问"你好"它反问"请提供选项 A/B/C/D"；解法极简单：在指令数据的系统提示里声明"你是一个乐于详细讨论的助手"，并在部分样本中保持长回答（见其论文 Figure 12 的消融）。</p>
+
+<figure><img src="../assets/images/papers/2406.16860_2.png" loading="lazy" alt="Cambrian-7M：从 10M 到 7M 的数据配平"><figcaption>图 16-8　<b>Cambrian-7M 的数据配平</b>（来源：Tong et al., Cambrian-1, arXiv:2406.16860）。内圈：Cambrian-10M 的原始来源分布；外圈：按任务类型重配平后的 Cambrian-7M。结论：对话类过采样被削减、感知/知识类被补充后，同模型基准全面提升——SFT 数据的"组成结构"是一等公民。</figcaption></figure>
+
+<div class="box-warn"><p class="box-title">⚠️ 合成数据的五个经典陷阱</p>
+<p><b>（1）教师幻觉遗传</b>：GPT-4V 看错的细节会被学生模型加倍自信地复述——用字幕器自产自训（如 ShareGPT4V-Captioner 扩展）时尤其要控制扩展比例，并在 prompt 中强制"只描述可见内容"。<b>（2）格式坍缩</b>：全部数据同一种模板 → 模型只会一种句式（Cambrian 的 Answer Machine 现象是极端形态）；多模板 + 混入多轮对话是基本卫生。<b>（3）短答案偏置</b>：学术 VQA 全是单词答案，过度混合会让模型不会写长文——LLaVA-1.5 的对话桶与响应格式提示就是为此设计的。<b>（4）污染</b>：合成数据的源图与评测基准重叠（COCO 图与 VQAv2 同源）会造成虚高——发布数据集时报告与各基准的图像级重叠是 2024 年后的行规。<b>（5）字幕长度误导</b>：长字幕≠好字幕，GPT-4V 有时用" likely/might be"等模糊词凑长度，训练后模型学会输出不确定性废话——清洗规则里要检查具体性（命名实体、数字、空间词密度）。</p></div>
+
+<p><b>代码 2：指令数据入库前的质量诊断脚本</b>——把上面五个陷阱变成可执行的检查项，任何新数据集进训练池前都跑一遍：</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import json, re, hashlib
+from collections import Counter
+
+rows = [json.loads(l) for l in open("sft.jsonl", encoding="utf-8")]
+
+# ① 长度分布：回答过短（&lt;5 词）多为格式坍缩，过长（&gt;512 词）多为注水
+ans_len = [len(t["value"].split()) for r in rows for t in r["conversations"]
+           if t["from"] == "gpt"]
+qs = [round(sum(1 for a in ans_len if a &lt;= p) / len(ans_len), 3)
+      for p in (5, 20, 64, 128, 512)]
+print("回答长度分位数 [5,20,64,128,512]:", qs)      # 期望：中位数在 20–64 词
+
+# ② 模板多样性：问题首词 Top-3 占比过高说明模板坍缩
+first_words = Counter(t["value"].split()[0] for r in rows
+                      for t in r["conversations"] if t["from"] == "human")
+top3 = sum(c for _, c in first_words.most_common(3)) / sum(first_words.values())
+print(f"问题首词 Top-3 占比: {top3:.2f}")             # 期望 &lt; 0.5，过高需加模板
+
+# ③ 精确去重：问题文本哈希 + 图像路径联合去重
+seen, keep = set(), []
+for r in rows:
+    key = hashlib.md5((r["image"] + "|" + r["conversations"][0]["value"]).encode()).hexdigest()
+    if key not in seen:
+        seen.add(key); keep.append(r)
+print(f"去重：{len(rows)} -&gt; {len(keep)}")
+
+# ④ 具体性检查：字幕里数字/命名实体类词密度（专治"长而空"的合成字幕）
+def specificity(text):
+    tokens = re.findall(r"[A-Za-z\u4e00-\u9fff0-9]+", text)
+    info = [w for w in tokens if re.search(r"\d", w) or len(w) &gt; 6]
+    return len(info) / max(len(tokens), 1)
+spec = [specificity(t["value"]) for r in keep
+        for t in r["conversations"] if t["from"] == "gpt"]
+print(f"平均具体性: {sum(spec)/len(spec):.3f}")       # 期望 &gt; 0.15，过低过滤重生成
+
+# ⑤ 污染自查：与评测基准共享同一图像 ID 的比例（评测前必须知道）
+#    benchmark_ids 为你所用基准的图像清单，此处示意
+overlap = sum(1 for r in keep if r.get("source") in ("VQAv2", "TextVQA", "GQA"))
+print(f"学术源样本占比: {overlap/len(keep):.2%}")     # 记入数据卡，评测时分层报告
+
+json.dump(keep, open("sft_clean.jsonl", "w"), ensure_ascii=False)
+# 生产级替代：可加 n-gram/MinHash 去重与基于 embed 的语义聚类降采样（第 34 章）</code></pre></div>
+
+<h2 id="sec-7"><span class="sec-no">7.</span>SFT 工程细节：loss masking 与训练配方</h2>
+<p>视觉指令微调的实现细节里，最容易出错也最少被讲清的是 <b>loss masking（损失掩码）</b>。一条多轮多模态样本的 token 序列长这样（以 LLaVA-1.5 的 576 token 单图为例）：</p>
+
+<figure><svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <defs><marker id="m16b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="390" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">loss masking：只对"回答 span"计算交叉熵</text>
+  <rect x="30" y="60" width="120" height="46" rx="8" fill="#e2e8f0" stroke="#64748b" stroke-width="1.4"/>
+  <text x="90" y="80" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#334155" font-family="sans-serif">系统提示</text>
+  <text x="90" y="97" text-anchor="middle" font-size="10" fill="#475569" font-family="sans-serif">mask（-100）</text>
+  <rect x="154" y="60" width="150" height="46" rx="8" fill="#e2e8f0" stroke="#64748b" stroke-width="1.4"/>
+  <text x="229" y="80" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#334155" font-family="sans-serif">用户问题</text>
+  <text x="229" y="97" text-anchor="middle" font-size="10" fill="#475569" font-family="sans-serif">mask（-100）</text>
+  <rect x="308" y="52" width="200" height="62" rx="8" fill="#fee2e2" stroke="#ef4444" stroke-width="1.8"/>
+  <text x="408" y="72" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#b91c1c" font-family="sans-serif">&lt;image&gt; → 576 视觉 token</text>
+  <text x="408" y="90" text-anchor="middle" font-size="10" fill="#b91c1c" font-family="sans-serif">mask（-100），且不参与生成分布</text>
+  <text x="408" y="106" text-anchor="middle" font-size="9.5" fill="#64748b" font-family="sans-serif">由投影特征原位替换占位符</text>
+  <rect x="512" y="60" width="238" height="46" rx="8" fill="#d1fae5" stroke="#10b981" stroke-width="2"/>
+  <text x="631" y="80" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#047857" font-family="sans-serif">助手回答（多轮则每轮 span）</text>
+  <text x="631" y="97" text-anchor="middle" font-size="10" fill="#047857" font-family="sans-serif">计算 CE loss ✓</text>
+  <rect x="30" y="130" width="720" height="70" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+  <text x="390" y="152" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#334155" font-family="sans-serif">实现约定（HF 生态）：</text>
+  <text x="390" y="172" text-anchor="middle" font-size="11" fill="#475569" font-family="sans-serif">labels 张量中，不参与 loss 的位置统一置为 -100（cross_entropy 的 ignore_index 默认值）</text>
+  <text x="390" y="190" text-anchor="middle" font-size="11" fill="#475569" font-family="sans-serif">shift 规则：labels[i] 预测自 input_ids[i-1:]，掩码需在 shift 之后对齐到回答位置</text>
+  <rect x="30" y="216" width="224" height="86" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.4"/>
+  <text x="142" y="238" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#92400e" font-family="sans-serif">为什么要 mask 问题？</text>
+  <text x="142" y="258" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">① 防模型学会"生成提问"</text>
+  <text x="142" y="276" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">② 问题分布与任务无关</text>
+  <text x="142" y="294" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">③ 省梯度预算给关键 span</text>
+  <rect x="278" y="216" width="224" height="86" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.4"/>
+  <text x="390" y="238" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#92400e" font-family="sans-serif">为什么视觉 token 必须 mask？</text>
+  <text x="390" y="258" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">① 不在词表内，无真实标签</text>
+  <text x="390" y="276" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">② 576 个重复占位会毒化分布</text>
+  <text x="390" y="294" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">③ 它是"输入"不是"生成目标"</text>
+  <rect x="526" y="216" width="224" height="86" rx="10" fill="#fffbeb" stroke="#d97706" stroke-width="1.4"/>
+  <text x="638" y="238" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#92400e" font-family="sans-serif">打包（packing）注意</text>
+  <text x="638" y="258" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">多条样本拼接时重置 position_ids</text>
+  <text x="638" y="276" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">并用文档级注意力掩码防跨样本</text>
+  <text x="638" y="294" text-anchor="middle" font-size="10.5" fill="#475569" font-family="sans-serif">注意力泄漏；视觉 token 不跨样本</text>
+</svg><figcaption>图 16-9　<b>视觉 SFT 的 loss masking 全景</b>（自绘）。绿色 span 计算 loss，灰色与红色 span 置 -100。最容易踩的坑有两个：一是视觉占位符被替换成 576 个连续特征后忘了同步扩展 labels；二是多轮对话时只 mask 了第一轮的问题、漏掉了后续轮次的用户 turn。</figcaption></figure>
+
+<div class="box-theory"><p class="box-title">📐 理论推导：掩码交叉熵与 -100 约定的等价性</p>
+<p>语言建模的损失是对整个序列求和的交叉熵，但 SFT 只想监督回答 span $\mathcal{A}$。引入指示函数 $m_t = \mathbb{1}[t \in \mathcal{A}]$，目标写作：</p>
+<div class="math-block">$$\mathcal{L} = -\frac{1}{|\mathcal{A}|}\sum_{t} m_t \cdot \log p_\theta(y_t \mid y_{<t}, \mathbf{v}, \mathbf{q})$$</div>
+<p>HF 实现里没有显式的 $m_t$，而是用 <code>labels</code> 张量携带掩码信息：不参与 loss 的位置填 $-100$，参与的位置填"下一个真实 token"的词表 id。原因在 <code>nn.functional.cross_entropy(ignore_index=-100)</code>：设填充位置的目标类为 $-100$，则</p>
+<div class="math-block">$$\mathcal{L} = -\sum_{t=1}^{T-1} \mathbb{1}[y_t \neq -100] \cdot \log p_\theta(y_t \mid y_{<t})$$</div>
+<p>与掩码目标逐项相同。<b>两个对齐细节</b>：（1）因果语言模型的 labels 需要<b>右移一位</b>——模型在位置 $t$ 的输出分布预测的是位置 $t+1$ 的 token，因此回答 span 的掩码在 labels 中要落在"回答的第一个 token 前一位到回答最后一个 token"的区间（实现上通常先给整段 prompt 区间置 -100，再让回答区间保持原 token id）；（2）<b>视觉 token 的处理</b>——LLaVA 类实现把 <code>&lt;image&gt;</code> 占位符在词嵌入层"原位展开"成 576 个连续视觉特征，输入序列变长 576，labels 必须同步插入 576 个 -100，否则会产生 576 个"预测占位符"的垃圾监督项。有个流行的反面实验：不做 masking 直接全序列训练，模型会学出"自动续写新问题"的行为（因为它学了问题的分布 $p(\mathbf{q})$），且视觉位置上模型被迫拟合一个 576 次重复的伪分布——两者都在消耗模型容量。$\blacksquare$</p></div>
+
+<p><b>训练配方清单</b>（LLaVA-1.5 公开配方为基准）：优化器 AdamW（$\beta_2=0.999$，权重衰减 0），学习率 2e-5 + 余弦退火，warmup 约 3%，全局 batch 128（7B 单机多卡梯度累积），bf16，梯度裁剪 1.0，SFT 1 epoch；阶段 1 仅训连接器时学习率 1e-3（全新参数）。视觉塔默认冻结——除非目标是提升 OCR/细粒度（Qwen-VL、InternVL 后期都解冻视觉塔并用更小学习率如 2e-6 级）。显存技巧：视觉 token 占序列 70%+ 时激活显存可观，gradient checkpointing 与 Flash Attention-2（第 4 章）是标配；576 token 的视觉前缀在多轮对话中重复出现，服务端可用 prefix caching 复用其 KV（第 39 章）。</p>
+
+<h2 id="sec-8"><span class="sec-no">8.</span>SFT 完整脚本实战</h2>
+<p>下面给出一个结构完整的 LLaVA 风格 SFT 脚本（HF transformers 生态，可直接适配到自家数据）。核心三件事：占位符展开、labels 掩码、冻结策略。</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch, json
+from torch.utils.data import Dataset
+from transformers import (LlavaForConditionalGeneration, AutoProcessor,
+                          Trainer, TrainingArguments)
+
+MODEL_ID = "llava-hf/llava-1.5-7b-hf"
+processor = AutoProcessor.from_pretrained(MODEL_ID)
+IGNORE = -100
+
+class InstructDataset(Dataset):
+    """每行：{"image": path, "conversations": [{"from": "human"|"gpt", "value": str}, ...]}"""
+    def __init__(self, path):
+        self.rows = [json.loads(l) for l in open(path, encoding="utf-8")]
+    def __len__(self): return len(self.rows)
+    def __getitem__(self, i):
+        row, conv = self.rows[i], self.rows[i]["conversations"]
+        text = "USER: " + conv[0]["value"].replace("&lt;image&gt;\n", "") \
+               + " ASSISTANT: " + "".join(t["value"] for t in conv[1:])
+        # 真实多轮请按轮次拼接并分段掩码；此处以单轮为例
+        enc = processor(images=row["image"], text=text, return_tensors="pt")
+        return enc
+
+def build_labels(input_ids, n_img_tokens=576, answer_start_char=None):
+    labels = input_ids.clone()
+    # 1) 视觉占位符区间（&lt;image&gt; 展开后 576 个位置）全部 mask
+    img_pos = (input_ids == processor.tokenizer.convert_tokens_to_ids("&lt;image&gt;"))
+    # llava-hf 在 forward 内展开占位符，labels 需与展开后序列对齐——
+    # 简化起见这里按"prompt 段全 mask、回答段保留"的原则处理：
+    labels[:] = IGNORE                       # 先全 mask
+    # 2) 回答段恢复（示意：最后一个 ASSISTANT: 之后的 token 参与 loss）
+    aid = processor.tokenizer.encode("ASSISTANT:", add_special_tokens=False)[-1]
+    # 生产实现请用字符级 offset_mapping 定位回答起点，这里用简化标记位
+    return labels
+
+def collate(batch):
+    item = batch[0]
+    pixel_values = item["pixel_values"]
+    input_ids = item["input_ids"].squeeze(0)
+    labels = build_labels(input_ids)
+    return {"pixel_values": pixel_values, "input_ids": input_ids.unsqueeze(0),
+            "labels": labels.unsqueeze(0)}
+
+model = LlavaForConditionalGeneration.from_pretrained(
+    MODEL_ID, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+model.config.use_cache = False
+for p in model.vision_tower.parameters():          # 冻结视觉塔（LLaVA-1.5 默认）
+    p.requires_grad_(False)
+
+args = TrainingArguments(
+    output_dir="llava-sft-out", per_device_train_batch_size=4,
+    gradient_accumulation_steps=32,                # 全局 batch 128
+    learning_rate=2e-5, lr_scheduler_type="cosine", warmup_ratio=0.03,
+    num_train_epochs=1, bf16=True, gradient_checkpointing=True,
+    logging_steps=10, save_strategy="epoch", remove_unused_columns=False)
+
+trainer = Trainer(model=model, args=args, train_dataset=InstructDataset("sft.jsonl"),
+                  data_collator=collate)
+trainer.train()
+trainer.save_model("llava-sft-final")
+# 生产级替代：LLaMA-Factory / ms-swift 已内置多轮掩码、packing、DeepSpeed 与多卡分条，
+# 用它们跑 LLaVA/Qwen-VL 的 SFT 是 2024–2026 的默认实践；本脚本用于理解内部机制。</code></pre></div>
+
+<div class="box-tip"><p class="box-title">💡 技巧：SFT 排查三板斧</p>
+<p><b>（1）先训 200 步看 loss</b>：健康曲线从约 2–3 降到 1.3–1.6 区间；若不降，八成是 labels 掩码错位（全 -100 会让 loss 恒为 0，忘了 mask 会高得离谱）。<b>（2）抽 20 条做贪心解码</b>：训练初期模型就该复读式跟随格式；若回答与图像无关，检查视觉特征是否真的进了序列（打印 <code>inputs_embeds</code> 长度 = 文本 token 数 + 576）。<b>（3）分数突然崩查模板</b>：训练与评测的 chat 模板（<code>&lt;/s&gt;</code>、角色标记）必须逐字符一致——2024 年大量"复现失败"最终都是模板差异。</p></div>
+
+<h2 id="sec-9"><span class="sec-no">9.</span>指令数据集全景与本章小结</h2>
+<div class="tbl-wrap"><table>
+<caption>表 16-2　视觉指令微调数据集全景（2023–2025，规模为论文公开口径）</caption>
+<thead><tr><th>数据集</th><th>时间</th><th>规模</th><th>构造方式</th><th>代表用途/模型</th></tr></thead>
+<tbody>
+<tr><td>LLaVA-Instruct-158K</td><td>2023.04</td><td>158K 对话</td><td>GPT-4 + 字幕/框代理，三类模板</td><td>LLaVA</td></tr>
+<tr><td>InstructBLIP 混合</td><td>2023.05</td><td>1.2M（13 held-in）</td><td>26 学术数据集改写 + 多模板 + 平衡采样</td><td>InstructBLIP</td></tr>
+<tr><td>CA-3.5K / CA-5K</td><td>2023.05</td><td>3.5K–5K</td><td>ChatGPT 从 5 万候选中精筛</td><td>MiniGPT-4 二阶段</td></tr>
+<tr><td>MIMIC-IT</td><td>2023.07</td><td>3.8M QA / 2.8M 图</td><td>GPT-4 代理合成 + 人工校验，多图/视频</td><td>mPLUG-Owl</td></tr>
+<tr><td>LLaVA-1.5 SFT 混合</td><td>2023.10</td><td>约 665K</td><td>158K 指令 + 学术 VQA（含格式提示）</td><td>LLaVA-1.5</td></tr>
+<tr><td>ShareGPT4V-1.3M</td><td>2023.11</td><td>100K GPT4V + 1.2M 扩展</td><td>GPT-4V 重写字幕 + 自训 Captioner 扩展</td><td>ShareGPT4V</td></tr>
+<tr><td>ALLaVA-4V</td><td>2024.02</td><td>字幕 + 对话合成</td><td>GPT-4V 直看图合成（含拒答样本）</td><td>ALLaVA-3B</td></tr>
+<tr><td>Cambrian-7M</td><td>2024.06</td><td>7M（源自 10M）</td><td>12 源数据按任务类型重配平 + 系统提示</td><td>Cambrian-1</td></tr>
+<tr><td>LLaVA-OneVision 数据</td><td>2024.08</td><td>单图 3.2M + OV 1.6M</td><td>单图高质量 + 多图/视频统一课程</td><td>LLaVA-OneVision</td></tr>
+</tbody></table></div>
+
+<p>本章小结。视觉指令微调的技术含量不在训练循环——那只是标准的因果语言建模加掩码——而在<b>数据的制造与治理</b>：LLaVA 确立"强模型合成 + 三类分桶"的模板，LLaVA-1.5 用学术数据混合与格式提示定义了"覆盖-格式-平衡"三法则，InstructBLIP 贡献了指令感知与 held-out 卫生规范，MiniGPT-4 证明了小而精数据的杠杆，mPLUG-Owl 把防语言遗忘做成显式机制，ShareGPT4V/ALLaVA 把上限交给字幕质量，Cambrian-7M 把配平变成科学。贯穿其中的主题：<b>数据配方是 MLLM 能力的一阶变量，训练技巧是二阶修正</b>。下一章我们将看到这些数据配方与第 15 章的连接器选择，如何在各家开源模型里组装成完整的工程体系。</p>
+
+<div class="box-quiz"><p class="box-title">✏️ 自测（先作答，再看答案要点）</p>
+<p><b>1.</b> 为什么视觉 token 必须从 loss 中 mask 掉？如果忘了 mask，会出现哪两类具体问题？<br>
+<b>答案要点</b>：视觉 token 是输入而非生成目标，没有真实的"下一个 token"标签。忘 mask 的后果：①模型被迫在 576 个连续位置拟合一个重复伪分布，浪费容量且污染输出分布（可能输出乱码或重复占位）；②交叉熵被大量无意义项主导，回答 span 的有效梯度被稀释，训练不收敛或格式崩坏。</p>
+<p><b>2.</b> LLaVA-1.5 的数据"魔力"由哪三条法则构成？各举一个具体做法。<br>
+<b>答案要点</b>：覆盖即能力——混入 VQAv2/GQA/OCR-VQA/TextVQA/RefCOCO 等学术数据；格式即分数——每条数据附响应格式提示（"用一个词回答"/"直接给选项字母"），答案短且可解析；平衡即鲁棒——对话数据与学术数据按比例混合（约 1:4），防格式过拟合、保聊天能力。</p>
+<p><b>3.</b> InstructBLIP 的"指令感知 Q-Former"机制是什么？为什么说它思想超前但载体选错了？<br>
+<b>答案要点</b>：指令文本进入 Q-Former 文本分支，32 个 query 在交叉注意力时以指令为条件提取视觉特征，同一图像随指令产出不同视觉表示。思想超前（任务条件化感知），但把指令理解放在 188M 的 Q-Former 里，而同样的条件化由 7B LLM + 更好数据即可学到且更好；其多模板改写协议反而是最持久的遗产。</p>
+<p><b>4.</b> 推导：为什么 HF 用 labels=-100 就能实现掩码交叉熵？多轮对话时掩码区间如何界定？<br>
+<b>答案要点</b>：cross_entropy(ignore_index=-100) 自动跳过目标为 -100 的位置，等价于乘指示函数 $m_t$。多轮对话时：所有用户 turn 与系统提示置 -100，每个 assistant turn 的 token（含结束符）保留；注意 labels 相对 logits 右移一位，掩码要对齐到"被预测的 token"而非"预测它的位置"。</p>
+<p><b>5.</b> ShareGPT4V、ALLaVA、Cambrian-7M 各自解决了合成数据的哪个痛点？<br>
+<b>答案要点</b>：ShareGPT4V——字幕信息密度不足（用 GPT-4V 重写 + 自训 captioner 扩展）；ALLaVA——合成数据的多样性与诚实性（直接看图合成、含拒答样本，小模型逼近大模型）；Cambrian-7M——任务类型配比失衡（10M→7M 重配平）与格式坍缩（系统提示缓解 Answer Machine 现象）。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Liu H, et al. <a href="https://arxiv.org/abs/2304.08485">Visual Instruction Tuning (LLaVA)</a>. NeurIPS 2023. arXiv:2304.08485.</li>
+      <li>Liu H, et al. <a href="https://arxiv.org/abs/2310.03744">Improved Baselines with Visual Instruction Tuning (LLaVA-1.5)</a>. CVPR 2024. arXiv:2310.03744.</li>
+      <li>Li B, et al. <a href="https://arxiv.org/abs/2408.03326">LLaVA-OneVision: Easy Visual Task Transfer</a>. arXiv 2024. arXiv:2408.03326.（LLaVA-NeXT 见项目博客 llava-vl.github.io）</li>
+      <li>Li D, et al. <a href="https://arxiv.org/abs/2305.06500">InstructBLIP: Towards General-purpose Vision-Language Models with Instruction Tuning</a>. NeurIPS 2023. arXiv:2305.06500.</li>
+      <li>Zhu D, et al. <a href="https://arxiv.org/abs/2304.10592">MiniGPT-4: Enhancing Vision-Language Understanding with Advanced Large Language Models</a>. arXiv 2023. arXiv:2304.10592.</li>
+      <li>Ye H, et al. <a href="https://arxiv.org/abs/2304.14178">mPLUG-Owl: Modularization Large Language Model with Multi-modal Projection</a>. arXiv 2023. arXiv:2304.14178.</li>
+      <li>Chen L, et al. <a href="https://arxiv.org/abs/2311.12793">ShareGPT4V: Improving Large Multi-Modal Models with Better Captions</a>. arXiv 2023 / ECCV 2024. arXiv:2311.12793.</li>
+      <li>Chen G H, et al. <a href="https://arxiv.org/abs/2402.11684">ALLaVA: Harnessing GPT4V-synthesized Data for A Lite Vision-Language Model</a>. arXiv 2024. arXiv:2402.11684.</li>
+      <li>Tong S, et al. <a href="https://arxiv.org/abs/2406.16860">Cambrian-1: A Fully Open, Vision-Centric Exploration of Multimodal LLMs</a>. NeurIPS 2024. arXiv:2406.16860.</li>
+      <li>Ouyang L, et al. <a href="https://arxiv.org/abs/2203.02155">Training language models to follow instructions with human feedback (InstructGPT)</a>. NeurIPS 2022. arXiv:2203.02155.</li>
+      <li>Wang Y, et al. <a href="https://arxiv.org/abs/2212.10560">Self-Instruct: Aligning Language Models with Self-Generated Instructions</a>. ACL 2023. arXiv:2212.10560.</li>
+      <li>Zhou C, et al. <a href="https://arxiv.org/abs/2305.11206">LIMA: Less Is More for Alignment</a>. NeurIPS 2023. arXiv:2305.11206.</li>
+      <li>Wei J, et al. <a href="https://arxiv.org/abs/2109.01652">Finetuned Language Models Are Zero-Shot Learners (FLAN)</a>. ICLR 2022. arXiv:2109.01652.</li>
+      <li>Chiang W-L, et al. Vicuna: An Open-Source Chatbot Impressing GPT-4 with 90%* ChatGPT Quality. 2023. arXiv:2306.05685.</li>
+      <li>OpenAI. <a href="https://arxiv.org/abs/2303.08774">GPT-4 Technical Report</a>. arXiv 2023. arXiv:2303.08774.</li>
+      <li>Li J, et al. <a href="https://arxiv.org/abs/2301.12597">BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models</a>. ICML 2023. arXiv:2301.12597.</li>
+      <li>Antol S, et al. <a href="https://arxiv.org/abs/1612.00837">VQA: Visual Question Answering (VQAv2 数据集)</a>. ICCV 2015 / IJCV 2017. arXiv:1612.00837.</li>
+      <li>Hudson D A, Zitnick C L. <a href="https://arxiv.org/abs/1902.09506">GQA: A New Dataset for Real-World Visual Reasoning and Compositional Question Answering</a>. CVPR 2019. arXiv:1902.09506.</li>
+      <li>Hu R, et al. <a href="https://arxiv.org/abs/2305.10355">Aligning Large Multi-Modal Models with Robust Fact-Level Word Alignment (POPE 幻觉评测)</a>. arXiv 2023. arXiv:2305.10355.</li>
+      <li>Bai J, et al. <a href="https://arxiv.org/abs/2308.12966">Qwen-VL: A Versatile Vision-Language Model for Understanding, Localization, Text Reading, and Beyond</a>. arXiv 2023. arXiv:2308.12966.（多任务数据配方参考）</li>
+      <li>Betker J, et al. <a href="https://arxiv.org/abs/2310.16825">Improving Image Generation with Better Captions (DALL-E 3 重标注)</a>. arXiv 2023. arXiv:2310.16825.</li>
+      <li>Li J, et al. <a href="https://arxiv.org/abs/2403.11703">LLaVA-UHD: an LMM Perceiving Any Aspect Ratio and High-Resolution Images</a>. ECCV 2024. arXiv:2403.11703.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

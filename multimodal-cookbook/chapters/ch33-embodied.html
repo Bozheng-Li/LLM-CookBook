@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 33 章 具身智能与 VLA · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第五部分 · 感知模态扩展</div>
+  <h1 class="chapter-title">第 33 章　具身智能与 VLA</h1>
+  <div class="chapter-meta"><span>预计阅读 95 分钟</span><span>难度 ★★★★☆</span><span>前置：第 15–17 章（MLLM 训练）、第 31 章（视频理解）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">具身智能的定义与独特挑战</a></li>
+  <li><a href="#sec-2">RT-1：大规模真机数据的第一个答案</a></li>
+  <li><a href="#sec-3">RT-2 与 PaLM-E：把 VLM 接上机械臂</a></li>
+  <li><a href="#sec-4">OpenVLA 与 π0：开源 VLA 的两条路线</a></li>
+  <li><a href="#sec-5">数据飞轮：Open X-Embodiment、仿真与人形机器人</a></li>
+  <li><a href="#sec-6">评测：SIMPLER、CALVIN、LIBERO</a></li>
+  <li><a href="#sec-7">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>具身智能（Embodied AI）是多模态的"最终考场"：理解图像、看懂视频、听懂语言之外，还要<b>在物理世界里行动</b>——感知-决策-执行形成闭环，错了要付出"打翻杯子"的代价。VLA（Vision-Language-Action）模型是这个考场的答卷形式：VLM 的底座 + 动作输出头。本章沿 RT-1 → RT-2/PaLM-E → OpenVLA/π0 的主线解剖"动作如何被 token 化"，再讲数据飞轮（真机/仿真/人形）与评测体系。<b>全章的核心张力只有一个：机器人数据太贵，如何用互联网数据+仿真数据"喂"出真机能力</b>——这是多模态领域数据工程（第 34 章）的极限挑战版。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>具身智能的定义与独特挑战</h2>
+<p>具身智能的教科书定义来自 Brooks 与后来的 Moravec："智能需要身体——认知是为了行动服务的"。落到 AI 工程，具身系统有四个区别于"桌面多模态"的硬约束：<b>①闭环性</b>——输出改变环境，环境改变输入（观察），错误会级联（放歪了杯子→抓空→更歪）；<b>②数据昂贵</b>——真机遥操作数据约 $1–10/条（人类操作员+机器人工时），比图文对贵 5 个数量级，且<b>跨本体不可迁移</b>（Franka 臂的数据对 UR5 臂几乎无用）；<b>③实时性</b>——控制回路通常 10–50Hz，端到端模型必须每秒推理数十次；<b>④安全</b>——物理错误的代价不可逆（不能"重新生成一次"）。<b>Sim2Real 鸿沟</b>：仿真器（MuJoCo/Isaac）能产无限数据，但仿真与现实之间存在"物理保真度差"（摩擦/接触/柔性物体建模不准），直接把仿真策略搬到真机往往失效——domain randomization（大范围随机化仿真参数让策略学会"无视外观差异"）与 real2sim（扫描真实场景建仿真）是两大补丁。<b>这四个约束决定了 VLA 的技术形态：它必须是"多模态大模型的常识+控制系统的纪律"的杂交</b>。</p>
+<p><b>为什么是现在？</b>具身智能在 2023 年前的六十年里起落多次，2024–2026 的爆发由三个外部条件汇合触发：①<b>VLM 的成熟</b>——语义理解、视觉 grounding（第 21 章）、视频理解（第 31 章）恰好是机器人的三块认知拼图；②<b>硬件成本崩塌</b>——国产协作臂价格五年降 70%、人形本体从"实验室专用"降到 10 万级；③<b>数据工具链平民化</b>——3D 鼠标/VR 遥操作让数据采集从"机器人实验室专属"变成"研究生宿舍可及"。<b>三个条件对应"脑、身、数据"三要素——历史上第一次同时就位</b>。这解释了为什么不是 DeepMind 而是无数初创公司同时冲进来：门槛的降低改变了玩家结构。</p><p>对个人学习者的含义同样直接：2026 年"单人可负担"的具身实验栈（二手协作臂+开源 VLA+合成数据）总价已低于一辆电动车——<b>多模态工程能力的下一个溢价点，正从"会训 LLM"转向"会训 VLA"</b>。</p><p>入门路径：先跑通 OpenVLA 推理（本章代码）→ 用 200 条自采数据 LoRA 适配一个抓放任务 → 再学 π0 的动作块思想读其代码——三步约六周，即可获得"训过真机 VLA"的稀缺履历。</p>
+<p>把具身与 NLP 的"能力获得路径"并排看，能最清晰地看到差距与希望：GPT-3 用 3000 亿 token 的<b>免费</b>互联网文本达到通用；VLA 面对的任务数据<b>没有互联网级免费来源</b>（动作标签必须采集）——这 5 个数量级的差距是一切具身工程难题的总根源。三条突围路线对应本章三个主角：<b> borrowing</b>（借互联网数据的语义先验，RT-2）、<b>仿真</b>（免费造数据，Isaac 系）、<b>跨本体共享</b>（OXE——让 60 个实验室的数据互相借力）。第四条路线（2025 年出现）：**人类视频的动作重定向**（从 YouTube 手部视频提取动作先验供人形使用）——最接近"互联网规模"的具身数据形态，但"重定向保真度"仍是瓶颈。</p>
+<p>具身 AI 的技术谱系可分成三波：<b>第一波（2015–2020）</b>——深度强化学习端到端策略（Levine 系的 visuomotor policy），样本效率低、任务专用、无语言；<b>第二波（2020–2022）</b>——模仿学习复兴（ACT/ALOHA 的"低成本遥操作+Transformer 模仿"路线证明：好的数据采集硬件比好的算法更先解决数据问题）、语言条件任务出现；<b>第三波（2022 至今）</b>——VLA：把"多模态大模型的通用性"注入控制，RT-1 起步，本节之后的章节都是第三波的展开。<b>三波的接力关系值得注意：每一波解决了上一波的瓶颈（RL 解决了感知、模仿学习解决了数据采集、VLA 解决了泛化），但没有一波"取代"前一波——VLA 内部依然使用模仿学习的数据采集与 RL 的微调手段</b>。</p>
+<div class="box-theory"><p class="box-title">📐 理论：动作 token 化的数学——为什么"动作也是语言"</p>
+<p>设机器人末端控制量：位姿增量 $(\Delta x, \Delta y, \Delta z, \Delta\alpha, \Delta\beta, \Delta\gamma)$ + 夹爪开合 $g$，共 7 维连续动作。RT-2 的做法：<b>把每维离散成 256 桶</b>，7 维→7 个 token（每 token 词表 256，复用 LLM 稀有词），动作 $a_t$ 变成 7 token 的"句子"。为什么这样可行？①LLM 的 softmax 本来就是"分布输出"，token 化后动作预测=序列生成，训练/推理管线零改动；②离散化误差 $\delta \le \frac{a_{max}-a_{min}}{256}$，对 1cm 精度任务足够（256 桶把 [-1,1] 归一空间分成 8mm 级格子，配合平滑动作轨迹误差可接受）；③<b>Co-fine-tune 的魔法</b>：网络数据与机器人数据混训（RT-2 用 Google 内部真机数据+原始 VLM 网络数据 5:5 混合），语义知识"托底"泛化——看到"沙漠里的杯子"也能抓（真机数据里没有沙漠）。<b>动作 token 化是把控制问题翻译成序列建模问题的桥梁，VLA 的全部架构创新几乎都发生在这座桥上</b>。</p></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>RT-1：大规模真机数据的第一个答案</h2>
+<p>RT-1（Robotics Transformer 1，arXiv:2212.06817，Google，2022.12）证明了"规模化的真机数据+ Transformer 策略"可行：<b>13 台机器人×17 个月×13 万条演示</b>（700+ 任务，"机器人教室"里并行采集），架构是"FiLM-EfficientNet 图像编码 + SATE（场景与任务 token 化）+ Transformer 解码动作 token"——本质是把机器人控制变成了"视频帧→动作 token"的序列任务。RT-1 的三个教训比成绩更值钱：<b>①数据多样性 > 数据量</b>——700 任务 vs 100 任务的差距大于 13 万 vs 5 万的差距；②<b>语言指令必须多样</b>——模板生成的指令让模型学到"关键词匹配"而非语义理解，改用人类书写指令后泛化显著提升；③<b>执行鲁棒性可量化</b>——RT-1 在 unseen 任务上 76%（seen 97%），首次让"通用机器人策略"的叙事有了数据支撑。RT-1 是"数据飞轮"叙事的起点：更多数据→更强模型→更多部署→更多数据。</p>
+<p><b>RT-1 架构的"轻"是有意的</b>：它没有用任何预训练大模型（EfficientNet+小型 Transformer，总参数 35M），因为 2022 年的判断是"数据瓶颈优先于模型规模"——把推理压到 3Hz 以上的实时线，换取 13 万条数据的快速迭代。<b>这个"先数据后模型"的顺序与多数 AI 团队的直觉相反</b>：通用做法是拿大模型刷效果，RT-1 团队先建数据工厂再谈模型——18 个月后 RT-2 换上 55B 底座时，数据工厂已就位，co-fine-tune 立即生效。<b>"先修数据流水线，再放大模型"是具身领域验证过的正确施工顺序</b>。</p>
+<p><b>"机器人教室"的工业化细节</b>（被后来者全盘照抄的模板）：①<b>并行采集</b>——13 台机器人 24 小时轮班，人类操作员按"剧本"轮换任务，日产能约 1000 条；②<b>任务多样性管理</b>——700+ 任务按"技能树"组织（抓/放/开/插/推为原子技能，组合出复杂任务），保证原子技能覆盖密度；③<b>质量抽查</b>——10% 演示做双人复核，错误演示（操作员失误）单独归档做"恢复行为"数据；④<b>指令分层</b>——模板指令（保证覆盖）+ 人类自由改写（保证多样性）双轨混合。<b>这套流程的本质是把"数据质量"从模型训练的前置问题变成了工业流程问题——数据工厂的管理的归管理，模型的归模型</b>。</p>
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2212.06817_1.png" alt="RT-1 的机器人教室数据采集" loading="lazy">
+<figcaption>图 33-1　RT-1 的"机器人教室"（arXiv:2212.06817 图 2）：多台机器人并行采集 13 万条真机演示（约 700 任务），每条含相机流+本体状态+语言指令——这套"数据工厂"的组织方式定义了后来所有 VLA 数据采集的形态。</figcaption>
+</figure>
+<figure class="fig">
+<img src="../assets/images/papers/2212.06817_2.png" alt="RT-1 架构图" loading="lazy">
+<figcaption>图 33-2　RT-1 架构（arXiv:2212.06817 图 3）：语言指令经 Universal Sentence Encoder 编码，图像与状态经 FiLM-EfficientNet 提特征，TokenLearner 压缩后由 Transformer 直接输出离散动作 token——"感知压缩+序列决策"的雏形。</figcaption>
+</figure>
+</div>
+
+<h2 id="sec-3"><span class="sec-no">3.</span>RT-2 与 PaLM-E：把 VLM 接上机械臂</h2><p><b>RT-1 之后被忽视的对照组</b>：同期的 Gato（DeepMind，2022）走"通用多任务 token 化"路线（一个模型玩 Atari+控制+对话），单个任务表现平庸——与 RT-1 的"专注机器人数据"路线形成对照。<b>结果证明：在数据稀缺领域，"领域专注+数据纵深"优于"任务大杂烩"</b>——Gato 的教训后来被 VLA 社区反复引用，成为"不要为了通用性稀释数据密度"的论据。但 2025 年 π0.5 又把"通用性"请了回来（多环境多任务一体）——<b>通用与专注的钟摆摆动是所有 AI 子领域的宿命，摆锤位置由数据量决定</b>：数据够多时通用化收益为正，数据稀缺时专注化是唯一活路。</p><p>把这条"钟摆定律"用在职业选择上：当下（数据稀缺）深耕垂直场景的 VLA 团队（仓储、餐饮、理疗）比"通用机器人"创业公司存活率高——先在窄域跑通商业闭环，再谈通用，是数据经济学决定的路径。</p>
+
+<p><b>RT-2</b>（arXiv:2307.15818，2023.07）是 VLA 概念的命名之作：直接在 PaLI-X/PaLM-E 级 VLM 上做<b>co-fine-tune</b>——网络多模态数据（视觉问答、caption）与机器人动作数据混合微调，动作按第 1 节公式 token 化。三大发现：①<b>语义涌现</b>——"把恐龙玩具拿给 Elvis 照片"（需要语义推理）的成功率从 RT-1 的 0% 跃至 62%，网络数据"托底"了常识；②<b>规模法则成立</b>——5B→55B 参数，seen 任务 +2%，emergent 任务 +14%；③<b>代价是速度</b>——55B 模型 1–3Hz 推理，控制频率掉到实时线下（后以蒸馏补救）。<b>PaLM-E</b>（arXiv:2303.03378，2023.03）路线不同：562B 的"具身多模态 LLM"，把图像/状态/场景向量<b>连续注入</b>语言 token 流（不 token 化动作，输出交由下层策略执行），主打<b>多模态思维链规划</b>——"零样本多模态 CoT"演示（观察→分析→分步指令）是它的招牌。两者合起来定义了 VLA 的两大流派至今：<b>RT-2 派（动作 token 直出，端到端）vs PaLM-E 派（LLM 规划+下层控制，分层）</b>——2026 年的多数系统实际是两者的混合（上层 VLM 规划 + 下层高频策略）。</p>
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2307.15818_0.jpg" alt="RT-2 动作即语言的概览图" loading="lazy">
+<figcaption>图 33-3　RT-2 概览（arXiv:2307.15818 图 1）："机器人动作是另一种语言"——观测与指令进 VLM，动作以 token 形式直接生成再解码为控制量；网络数据与机器人数据共训，语义知识托举物理泛化。</figcaption>
+</figure>
+<figure class="fig">
+<img src="../assets/images/papers/2303.03378_2.jpg" alt="PaLM-E 引导真机长程任务" loading="lazy">
+<figcaption>图 33-4　PaLM-E 的分层范式（arXiv:2303.03378 图 7）：562B 多模态 LLM 做观察-推理-规划，输出自然语言子指令调度下层低级策略完成长程任务（"从抽屉拿薯片"被拆成多步可验证动作）。</figcaption>
+</figure>
+</div>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：RT-2 的 co-fine-tune 设计（arXiv:2307.15818）</p>
+<p><b>问题设定</b>：机器人数据（千级任务）远小于网络数据（亿级图文），如何让 VLM 的网络知识迁移到动作？<b>方法</b>：冻结基础架构，动作 token 化后与 VQA/caption 数据<b>混合微调</b>（5:5 配比），权重共享使"看图说话"与"看图出手"用同一套表征。<b>三个消融结论</b>：①纯机器人数据（无网络混合）训出的模型在"新物体+语义指令"上崩盘——<b>网络数据是泛化之源，不是锦上添花</b>；②混合比例 5:5 优于 9:1 与 1:9——两分布的"拔河"需要平衡点；③动作 token 的词表设计（复用 LLM 低频词 vs 新增特殊 token）几乎不影响性能——<b>机制不重要，混合本身才重要</b>。<b>深远影响</b>："co-fine-tune"成为 VLA 的标准训练法，π0 的"知识绝缘"（knowledge insulation：动作专家与 VLM 分参防干扰）是对它的精细化修正。<b>局限</b>：55B 推理 1–3Hz 埋下"实时性"债，直到 2025 年蒸馏+动作块才还清。</p></div>
+<p><b>RT-2 的规模曲线与"涌现"的再解读</b>：5B→55B 的 emergent 任务增益（+14%）常被引用为"具身智能的 scaling law"，但要注意其数据量<b>并未同比例增长</b>（机器人数据固定）——增益主要来自"语义底座变厚"，而非"动作能力变强"。这提示 VLA 的 scaling 是<b>异构的：语义能力随 VLM 规模涨，控制能力随机器人数据涨</b>，两条曲线的耦合点才是系统表现。π0 的"知识绝缘"（动作专家与 VLM 分参数）正是对这种异构性的工程响应：让语义侧自由 scaling 而不干扰动作侧的精细梯度。<b>"两条 scaling 曲线的解耦与对接"是 2025–2026 VLA 架构设计的中心问题</b>。</p>
+<p><b>PaLM-E 的"连续注入"细节</b>：图像/状态不经 token 化，直接以连续向量形式插入语言序列（每图约 512 向量），与文本 token 一起过 562B 主干——这样做的动机是<b>保留连续信息</b>（空间推理需要精确几何，离散 token 有损），代价是与语言 token 的"表示不匹配"需要大量数据对齐。PaLM-E 的实证贡献是"负迁移"研究：<b>多模态数据种类越多（图像+状态+场景图+语言），语言基准分数反而越高</b>（正迁移），这打破了"加入具身数据会伤语言能力"的担忧，为后来的"全模态一体"（第 30 章）铺了路。<b>PaLM-E 派的当代传人是"双系统"架构</b>：System 2（VLM，1–10Hz，做规划与异常判断）+ System 1（小型连续策略，50–200Hz，执行），Helix 与 Figure 的新一代皆如此——"快慢系统"的认知科学隐喻第一次在机器人架构上落地。</p>
+<h2 id="sec-4"><span class="sec-no">4.</span>OpenVLA 与 π0：开源 VLA 的两条路线</h2>
+<p><b>OpenVLA</b>（arXiv:2406.09246，2024.06）把 RT-2 思路开源化：7B（Llama2 底座+DINOv2/SigLIP 双视觉塔+动作 token 头），在 Open X-Embodiment（OXE）97 万条跨本体数据上训练——单机器人 RTX 4090 可微调，是"实验室级 VLA"的里程碑。关键设计：<b>双视觉塔</b>（语义 SigLIP+空间细节 DINOv2——与第 14 章"CLIP 盲点"结论呼应）、<b>本体感知注入</b>（机器人状态作为 token 进指令流）、LoRA 微调即可适配新本体。评测上超过同数据量的 RT-1-X/RT-2-X 15–20 个百分点。<b>π0（pi-zero）</b>（Physical Intelligence，arXiv:2410.24164，2024.10）代表了另一条路线：<b>flow matching 动作头</b>——放弃自回归 token，用 VLM 骨架+扩散/流匹配的"动作专家"（action expert）连续生成动作块（action chunk，一次生成未来 50 步），控制频率 50Hz、平滑性远超 token 逐个生成。π0 的"混合流预训练"（7 大数据源：多本体真机+互联网图文+……）与"动作块生成"已成为 2025 年工业 VLA 的模板（Figure Helix、1X、Galaxy 等皆同型）。<b>两条路线的对比是"离散 token（语义友好、慢、离散误差）vs 流匹配（高频平滑、快、连续精确）"——任务粒度决定选择：抓放任务两者皆可，精细操作（穿针、叠衣）流匹配明显占优</b>。</p>
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2406.09246_0.png" alt="OpenVLA 模型架构" loading="lazy">
+<figcaption>图 33-5　OpenVLA 架构（arXiv:2406.09246 图 1）：SigLIP（语义）与 DINOv2（空间）双视觉塔特征经 MLP 融合进 Llama2-7B，动作按离散 token 输出——开源 VLA 的"标准参考机"，LoRA 微调即可适配新机器人本体。</figcaption>
+</figure>
+<figure class="fig">
+<img src="../assets/images/papers/2410.24164_1.png" alt="π0 框架概览" loading="lazy">
+<figcaption>图 33-6　π0 框架（arXiv:2410.24164 图 3）：VLM 骨干+flow matching 动作专家，一次生成 50 步动作块（action chunk），高频平滑控制；预训练混合多本体真机与互联网数据，是 2025 年工业 VLA 的架构模板。</figcaption>
+</figure>
+</div>
+<div class="box-code"><p class="box-title">💻 代码：OpenVLA 的推理与 LoRA 适配</p>
+<pre><code class="language-python">from transformers import AutoModelForVision2Seq, AutoProcessor
+import torch
+from PIL import Image
+
+# --- 加载 OpenVLA 并适配新本体（LoRA）---
+model = AutoModelForVision2Seq.from_pretrained(
+    "openvla/openvla-7b",
+    torch_dtype=torch.bfloat16, trust_remote_code=True).to("cuda")
+processor = AutoProcessor.from_pretrained("openvla/openvla-7b",
+                                          trust_remote_code=True)
+
+# 控制循环（10Hz 级）：图像+指令+本体状态 → 离散动作 token
+image = Image.open("cam0.jpg").convert("RGB")
+prompt = "In: What action should the robot take to put the bowl in the sink?"
+inputs = processor(prompt, image).to("cuda", torch.bfloat16)
+action = model.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
+# action: 7 维 [Δx, Δy, Δz, Δr, Δp, Δy'aw, gripper] → 发给机器人控制器执行
+
+# --- 新本体 LoRA 微调要点（openvla 官方脚本）---
+# torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/finetune.py \
+#   --vla_path openvla/openvla-7b --data_root_dir ./oxe \
+#   --dataset_name my_robot_droid --run_root_dir ./runs \
+#   --lora_rank 32 --batch_size 16 --grad_accumulation_steps 1
+# 8×A100 数小时即可适配新机械臂（rank32 LoRA，动作头全参微调）</code></pre>
+<p>工程要点：①<code>unnorm_key</code> 是数据集的动作归一化统计——换数据集必换 key，这是开源 VLA 最常见的复现坑；②推理频率约 6–10Hz（7B 单卡），精细任务需要 π0 式动作块或高频小模型；③相机内外参一致性对成功率影响巨大——标定漂移会让"成功率高"的模型一夜归零。</p></div>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：实验室级 VLA 从零到抓放</p>
+<p><b>1. 硬件（预算 5–15 万）</b>：6 轴机械臂（UR5/xArm/睿尔曼）+ 平行夹爪 + 2 个 RGB 相机（眼在手+全局）+ 一台 4090 工作站。<b>2. 数据（首周 500–2000 条）</b>：3D 鼠标/SpaceMouse 遥操作采集，每任务 100–300 条演示，指令模板+人类改写双轨（RT-1 教训）。<b>3. 模型</b>：OpenVLA-7b LoRA（rank 32）微调，8 卡数小时或 2 卡过夜；或 ACT 小模型（50Hz、ALOHA 硬件路线）。<b>4. 评测</b>：20 个固定任务×5 次重复，记录成功率+失败模式分类（感知错/规划错/执行错）。<b>5. 迭代</b>：失败案例回流数据集（重点补"失败前置帧"——模型最缺的是"从错误中恢复"的演示）。<b>6. 上线检查</b>：急停按钮、工作区围栏、动作幅值限幅——物理系统的"容错三件套"永远优先于模型优化。</p></div>
+<p><b>OpenVLA 的三个"实验室友好"设计</b>值得展开：<p>与 OpenVLA 同期还有 <b>Octo</b>（Berkeley，2024.05）：更小（93M/27M）、动作头用扩散（goal-image 条件）、主打"轻量可复现"——它与 OpenVLA 形成"7B 语义优先 vs 100M 效率优先"的对照。<b>两者的实测分化</b>：语言指令任务 OpenVLA 强（语义底座），goal-image/示教任务 Octo 强（目标条件原生）。<b>这组对照给实践者的启示：先想清楚你的任务靠什么条件触发——语言触发选大 VLA，目标/示教触发选小模型+goal 条件</b>。</p>
+①<b>双塔特征融合</b>——SigLIP（语义对齐）与 DINOv2（空间细节）各自映射到 LLM 词空间后相加而非拼接（省一半 token），实测"空间细节"对抓取成功率贡献 +8%；②<b>本体状态注入</b>——机器人关节角作为特殊 token 前缀，让同一模型感知"当前姿势"（抓取与放置的策略依赖当前构型）；③<b>动作反归一化协议</b>——训练时动作归一到 [-1,1] 并保存每数据集的统计量，推理时用 <code>unnorm_key</code> 还原物理单位——<b>归一化协议的工程化（而非随意的 min-max）是跨数据集训练能工作的隐形功臣</b>。微调新本体的经验值：500–2000 条演示、LoRA rank 32、学习率 5e-4、3–5 epoch，成功率即可超过从零训练数万条的专用策略——<b>"预训练+少量适配"的范式在具身领域同样成立</b>。</p>
+<h2 id="sec-5"><span class="sec-no">5.</span>数据飞轮：Open X-Embodiment、仿真与人形机器人</h2>
+<p><b>Open X-Embodiment（OXE）</b>（arXiv:2310.08864，2023.10）是机器人界的 OpenImages：22 种机器人本体、60 个数据集、100 万条轨迹联合发布——它的真正贡献是<b>"跨本体训练"</b>的可行性证明（RT-X 实验显示混合数据让所有本体都变强：+50% 泛化），以及动作空间的<b>统一归一化协议</b>（各数据集动作映射到统一 7 维空间）。<b>仿真数据</b>：Isaac Lab/MuJoCo 的程序化任务可产千万级轨迹，但对"接触密集"任务（擦桌子、叠衣服）Sim2Real 仍难——当前共识是"<b>仿真管泛化、真机管精细</b>"的两级数据策略。<b>人形机器人浪潮</b>（2024–2026）：Figure/1X/宇树/智元的数据工厂模式（遥操作背心+动捕服日产万条）+ π0/Helix 类 VLA——人形的独特挑战是<b>全身协调</b>（VLA 从"臂+夹爪 7 维"扩展到"全身 30–50 维自由度"），动作块生成+分层控制（上半身 VLA/下半身行走控制器）是当前主流。<b>遥操作数据的"隐性税"</b>：人类演示含"停顿、纠错、犹豫"——数据清洗（去抖动、重切段）对最终策略质量的影响不亚于模型架构，第 34 章的数据工程思想在这里以最高代价兑现。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：实验室第一个机器人平台怎么选</p>
+<p>按研究目标分三条推荐路径：<b>①做 VLA 算法研究</b>——WidowX/ARX 臂（OXE 兼容、社区数据多，OpenVLA 微调即用，预算 3–8 万）；<b>②做精细操作/双臂</b>——ALOHA 套件（低成本双臂+ACT 配方完整复现，性价比之王，预算 2–5 万）；<b>③做人形/全身</b>——宇树 G1/睿尔曼复合臂（预算 10 万+，但全身控制工具链尚不成熟，慎入）。<b>三条共同的红线</b>：优先选有官方 ROS2/Python SDK 且社区活跃的型号——机器人平台的"软件生态权重"大于硬件参数，一个没人用的自由度再高的臂，不如一个演示代码齐全的"平庸"臂。</p></div>
+<div class="box-history"><p class="box-title">📜 历史注脚：Moravec 悖论的 40 年回响</p>
+<p>1980 年代 Moravec 悖论断言："对 AI 而言，高级推理易、感知运动难"——下棋/证明可以算法化，而"拿起一个鸡蛋"需要亿年演化的感觉运动能力。2023 年前的 AI 进展完美遵循悖论（LLM 会写论文但拿不住鸡蛋），RT-2 的"恐龙玩具到 Elvis 照片"是悖论第一次松动的信号；2025–2026 的人形机器人数据工厂与 VLA 规模化，正在把"感知运动"也纳入"数据+算力"的可规模化范畴。<b>但悖论的尾巴仍在：接触动力学（打结、切菜）的物理复杂度尚未被互联网式数据覆盖——Moravec 悖论的"最后一公里"可能还要十年</b>。</p></div>
+
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 640 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VLA 数据流与动作生成两路线">
+<rect x="0" y="0" width="640" height="300" fill="#f8fafc"/>
+<text x="320" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">VLA 的输入输出流：感知 →（语言/图像/状态）→ 动作</text>
+<!-- inputs -->
+<rect x="30" y="60" width="90" height="34" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+<text x="75" y="82" text-anchor="middle" font-size="12">相机帧</text>
+<rect x="30" y="110" width="90" height="34" rx="6" fill="#d1fae5" stroke="#10b981"/>
+<text x="75" y="132" text-anchor="middle" font-size="12">语言指令</text>
+<rect x="30" y="160" width="90" height="34" rx="6" fill="#fef3c7" stroke="#d97706"/>
+<text x="75" y="182" text-anchor="middle" font-size="12">本体状态</text>
+<!-- VLA core -->
+<rect x="180" y="80" width="150" height="100" rx="10" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="255" y="112" text-anchor="middle" font-size="13" font-weight="bold" fill="#4c1d95">VLA 骨干</text>
+<text x="255" y="132" text-anchor="middle" font-size="10.5" fill="#4c1d95">VLM 底座（语义）</text>
+<text x="255" y="148" text-anchor="middle" font-size="10.5" fill="#4c1d95">+ 视觉塔（空间细节）</text>
+<text x="255" y="164" text-anchor="middle" font-size="10.5" fill="#4c1d95">co-fine-tune 或混预训练</text>
+<!-- two routes -->
+<rect x="390" y="52" width="110" height="44" rx="6" fill="#fee2e2" stroke="#ef4444"/>
+<text x="445" y="70" text-anchor="middle" font-size="11" font-weight="bold" fill="#991b1b">路线 A：动作 token</text>
+<text x="445" y="86" text-anchor="middle" font-size="10" fill="#991b1b">自回归、离散化</text>
+<rect x="390" y="150" width="110" height="44" rx="6" fill="#d1fae5" stroke="#10b981"/>
+<text x="445" y="168" text-anchor="middle" font-size="11" font-weight="bold" fill="#065f46">路线 B：flow 动作块</text>
+<text x="445" y="184" text-anchor="middle" font-size="10" fill="#065f46">连续、一次 50 步</text>
+<!-- action out -->
+<rect x="540" y="100" width="76" height="46" rx="6" fill="#e2e8f0" stroke="#475569"/>
+<text x="578" y="120" text-anchor="middle" font-size="11">机械臂</text>
+<text x="578" y="136" text-anchor="middle" font-size="10">执行控制量</text>
+<!-- arrows -->
+<path d="M 120 77 C 150 77, 150 100, 180 105" stroke="#2563eb" stroke-width="2.5" fill="none" marker-end="url(#e1)"/>
+<path d="M 120 127 L 180 127" stroke="#10b981" stroke-width="2.5" marker-end="url(#e2)"/>
+<path d="M 120 177 C 150 177, 150 155, 180 150" stroke="#d97706" stroke-width="2.5" fill="none" marker-end="url(#e3)"/>
+<path d="M 330 110 L 390 74" stroke="#8b5cf6" stroke-width="2.5" marker-end="url(#e4)"/>
+<path d="M 330 150 L 390 172" stroke="#8b5cf6" stroke-width="2.5" marker-end="url(#e4)"/>
+<path d="M 500 74 C 525 85, 530 100, 540 115" stroke="#ef4444" stroke-width="2.5" fill="none" marker-end="url(#e5)"/>
+<path d="M 500 172 C 525 160, 530 145, 540 130" stroke="#10b981" stroke-width="2.5" fill="none" marker-end="url(#e6)"/>
+<text x="320" y="232" text-anchor="middle" font-size="11.5" fill="#475569">路线 A（RT-2/OpenVLA）：动作=语言，语义友好、可复用 LLM 管线；缺点：逐 token 慢（1–10Hz）、离散化误差</text>
+<text x="320" y="252" text-anchor="middle" font-size="11.5" fill="#475569">路线 B（π0/Helix）：动作=流向量场，50Hz 高频平滑、无量化误差；缺点：与语言空间解耦、需专门动作专家</text>
+<text x="320" y="274" text-anchor="middle" font-size="11.5" fill="#8b5cf6">抓放任务两者皆可；精细操作（叠衣/穿针）路线 B 明显占优 —— 任务粒度决定路线选择</text>
+<defs>
+<marker id="e1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2563eb"/></marker>
+<marker id="e2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#10b981"/></marker>
+<marker id="e3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#d97706"/></marker>
+<marker id="e4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8b5cf6"/></marker>
+<marker id="e5" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#ef4444"/></marker>
+<marker id="e6" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#10b981"/></marker>
+</defs>
+</svg>
+<figcaption>图 33-7　VLA 数据流全景：相机帧、语言指令、本体状态汇入 VLM 底座；动作生成有"离散 token"与"flow 动作块"两条路线——前者把控制翻译成语言问题，后者把控制留在连续向量场里，任务粒度决定选择。</figcaption>
+</figure>
+</div>
+<div class="tbl-wrap"><table>
+<caption>表 33-A　三类具身数据源对比</caption>
+<thead><tr><th>数据源</th><th>成本/条</th><th>规模潜力</th><th>保真度</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>真机遥操作</td><td>$1–10</td><td>万–百万</td><td>★★★★★</td><td>精细任务、最终微调</td></tr>
+<tr><td>仿真程序化</td><td>≈$0</td><td>千万+</td><td>★★（接触类差）</td><td>泛化预训练、任务多样性</td></tr>
+<tr><td>人类视频（无动作标签）</td><td>≈$0</td><td>亿级</td><td>★★★（缺动作）</td><td>视觉先验、常识托底</td></tr>
+<tr><td>YouTube 手部视频+重定向</td><td>低</td><td>千万</td><td>★★★</td><td>人形上半身先验</td></tr>
+</tbody></table></div><p><b>读表的方法</b>：成本列决定"用多少"，保真度列决定"用在哪级"——低保真数据放预训练（模型可容忍噪声），高保真数据放末端微调（决定最终精度）；四类数据的配比是各团队的"秘方"，公开信息显示 π0 的七源混合中真机与网络数据约为 1:10（token 口径）——<b>互联网数据提供"知道"，真机数据校准"做到"</b>。</p><p>一个实操提醒：混入网络数据时务必做"动作字段屏蔽"（图文样本的动作 token 置为空损失），否则分布噪声会污染动作头——这是混合训练最隐蔽的实现 bug。</p>
+<p><b>人形数据工厂的三种模式</b>（2025 年实测口径）：①<b>遥操作背心</b>（Figure/1X 模式）——操作员穿动捕背心同步控制全身，数据质量最高（每条 $10–30），适合精细全身任务；②<b>VR 遥操作</b>（国内多数团队）——成本减半，但精细度受手部追踪限制；③<b>动作重定向</b>——从人类视频/动捕库重定向到机器人（成本最低、规模最大），保真度依赖重定向算法（脚底打滑、穿模是常见伪影）。<b>三种模式是"质量-成本"曲线上的三个工作点</b>，成熟团队的配置通常是"重定向打底 + 遥操作精修"。</p>
+<p><b>数据飞轮的实际转速</b>（2025 年工业口径）：头部团队（π0 系、Figure）的真机数据量级在<b>百万条轨迹/年</b>（100+ 台机器人+数百遥操作员），是 RT-1 时代的 10 倍；但相对 LLM 的 token 消耗仍小 4 个数量级——<b>飞轮在转，转速仍不够</b>。由此产生的三个开放问题：①动作数据的"质量上限"由遥操作员决定，能否像 RLHF 那样让模型自举数据（self-improvement）？②跨本体的动作空间映射（7 维→人形 40 维）是否存在"维度诅咒"？③互联网视频的动作先验（第 29 章世界模型）能否直接替代部分真机数据？——这三个问题的答案将决定 2027 年的机器人行业格局。</p>
+<h2 id="sec-6"><span class="sec-no">6.</span>评测：SIMPLER、CALVIN、LIBERO</h2><p><b>仿真平台的选型速查</b>：算法原型/教学用 MuJoCo（轻、准、免费）与 Gymnasium-Robotics；大规模 GPU 并行训练用 Isaac Lab（数千环境并行、PhysX 5）；真实感视觉渲染用 Habitat/Isaac Sim（渲染保真度高，适合 VLA 视觉前端预训练）。<b>常见组合</b>："Isaac Lab 批量造数据 + MuJoCo 单机调试 + 真机验证"——三段式覆盖从算法到部署的验证链。</p>
+<p>VLA 评测的三层结构：<b>①仿真基准</b>——SIMPLER（2024，真机数据的仿真复刻，S2R 匹配度可量化，RT/OpenVLA 的快速回归测试场）、CALVIN（长程语言条件任务，考"连续执行四条指令"）、LIBERO（129 个任务的知识/泛化/长程三维度）；<b>②真机基准</b>——各家的内部协议（Google robot/WidowX 任务集），金标准但不可比、不可复现；<b>③真实世界部署指标</b>——MTBF（平均无故障时间）、任务成功率随时间衰减。仿真评测的坑要记住：<b>SIMPLER 分数与真机成功率的相关性约 0.7——仿真第一名可能真机第三</b>，选型决策必须"仿真初筛+真机验证"两步走。评测的趋势是把<b>"泛化"拆解成可归因维度</b>（新物体/新背景/新指令/新相机位姿——SIMPLER 与 LIBERO 都做了维度拆分），与第 40 章"能力归因式评测"完全同构。</p>
+<div class="tbl-wrap"><table>
+<caption>表 33-1　VLA 模型对比（2022–2026）</caption>
+<thead><tr><th>模型</th><th>底座</th><th>动作生成</th><th>控制频率</th><th>数据</th><th>关键贡献</th></tr></thead>
+<tbody>
+<tr><td>RT-1 (2022.12)</td><td>EfficientNet+Transformer</td><td>离散 token</td><td>3Hz</td><td>13 万真机演示</td><td>真机数据工厂范式</td></tr>
+<tr><td>PaLM-E (2023.03)</td><td>PaLM-562B</td><td>规划输出（分层）</td><td>-</td><td>多模态混合</td><td>具身多模态 CoT 规划</td></tr>
+<tr><td>RT-2 (2023.07)</td><td>PaLI-X 55B</td><td>离散 token</td><td>1–3Hz</td><td>真机+网络 5:5</td><td>co-fine-tune 语义涌现</td></tr>
+<tr><td>OpenVLA (2024.06)</td><td>Llama2-7B</td><td>离散 token</td><td>6–10Hz</td><td>OXE 97 万跨本体</td><td>开源、LoRA 适配本体</td></tr>
+<tr><td>π0 (2024.10)</td><td>PaliGemma+动作专家</td><td>flow matching 动作块</td><td>50Hz</td><td>7 大数据源混合</td><td>高频平滑控制、工业模板</td></tr>
+<tr><td>Helix/Figure (2025)</td><td>双系统 VLM+控制</td><td>分层（上肢 VLA）</td><td>200Hz 下层</td><td>人形遥操作</td><td>全身协调的分层 VLA</td></tr>
+</tbody></table></div>
+
+<p><b>三大仿真基准的分工</b>：SIMPLER 答"你的真机策略在仿真里复现得如何"（S2R 匹配）；CALVIN 答"连续语言指令下能坚持几步"（长程组合，ABC→D 四连指令的成功率衰减曲线）；LIBERO 答"知识迁移的三种形态"（任务内泛化/跨任务知识/长程）各自什么水平。<b>三者的阅读顺序</b>：先用 LIBERO 判断能力底座，再用 CALVIN 判断长程组合，最后用 SIMPLER 桥接真机——单看任何一个都会得出偏颇结论。</p><p><b>自建真机评测的最小协议</b>（可直接抄）：20 个任务×10 次重复×3 个扰动维度（物体位置±5cm、光照变化、指令改写），报告"成功率矩阵"而非单点分数；每次失败录屏并归因（感知/规划/执行），失败归因分布比成功率更能指导下一步——多数团队的升级路线图都写在失败录像里。</p>
+<p><b>评测之外的"隐性指标"</b>：论文成功率之外，部署视角更看四个数——<b>首任务延迟</b>（指令给出到动作开始）、<b>失败恢复率</b>（被打断/抓空后自愈比例）、<b>数据效率</b>（新任务需要多少条演示适配）、<b>MTBF</b>（无故障运行时间）。工业客户的采购评估里，这四个数的权重常高于 benchmark 成功率——<b>实验室指标与产线指标的错位，是机器人创业公司最常见的"技术好但卖不动"的原因</b>。</p>
+<h2 id="sec-7"><span class="sec-no">7.</span>本章小结</h2>
+<p>VLA 的三年演化把"机器人控制"从"任务专用策略网络"重写为"多模态序列建模的一个特例"：RT-1 建立数据工厂，RT-2/PaLM-E 证明 VLM 的语义知识可以托举物理动作（两条流派：端到端动作 token vs 分层规划），OpenVLA 把能力开源到实验室，π0 用 flow matching 动作块解决高频平滑控制的工程底线。数据侧的飞轮（OXE/人形数据工厂/仿真两级策略）与评测侧的归因化（SIMPLER/CALVIN/LIBERO）正在同步成熟。<b>与第 29–32 章对照：视频教会模型"世界怎么动"，3D 教会"世界什么结构"，VLA 教会"如何在其中行动"——具身智能是这三者的合流点，也是多模态大模型从"理解世界"走向"改变世界"的分界线</b>。下一部分（第 34–39 章）将回到"怎么造出这些模型"的工程纵深：数据、预训练、对齐、部署。</p>
+<p><b>安全层的工程现状</b>：VLA 的"幻觉动作"（对不可能任务强行输出动作）是真机部署的头号风险——现行的防御不是让模型"更聪明"而是加<b>独立安全层</b>：工作区几何围栏（动作幅值越界即截断）、力矩阈值监控（接触力异常即急停）、语义黑名单（"危险指令"正则+语义双过滤）、人工接管接口（置信度低时交还人类）。<b>"模型不保证安全，系统设计保证安全"——这是机器人与 NLP 产品在安全哲学上的根本分歧</b>：语言模型说错话可以撤回，机械臂打翻热油不能。</p><p><b>人机交互维度</b>也要纳入安全设计：VLA 对"人类突然伸手"的反应（急停？绕行？继续？）没有标准答案——现行做法是"预测人类意图 + 保守动作"（视觉检测人手→降低幅值与速度），但其可靠性依赖检测器召回率。<b>工业部署的现实约束是认证</b>：ISO 10218/TS 15066 对协作机器人的力/压限值是法定红线，端到端 VLA 目前<b>无法通过形式化认证</b>——所以商用系统都是"VLA 提建议 + 认证过的运动控制器执行"的两层结构，这个格局短期内不会变。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：VLA 论文的"五要素速读法"</p>
+<p>读一篇 VLA 论文按固定顺序抽五要素，10 分钟判断价值：①<b>动作空间</b>（几维？离散还是连续？频率？）——决定能做什么任务；②<b>数据配方</b>（真机/仿真/网络比例，跨几个本体）——决定泛化叙事的可信度；③<b>评测协议</b>（仿真 or 真机？多少次重复？成功判据谁定？）——真机×≥20 次重复×第三方判据才算硬；④<b>与基线的公平性</b>（同数据量对比吗？还是"我 10 倍数据打赢你"？）；⑤<b>消融</b>（语义混合、动作表示、视觉塔各自贡献多少）。<b>五要素里 ②③ 决定论文可信度，①④⑤ 决定技术含金量</b>——VLA 论文的水分大多藏在数据配方与评测协议里。</p></div><p>速读练手材料：OpenVLA（本文已精讲）、π0、Octo、RT-X 四篇对照读，五要素表格填一遍，即完成本章的实战作业。</p>
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>1.</b> 具身智能的四个硬约束是什么？各催生了什么技术？<br><b>答案要点</b>：闭环性（错误级联→安全层与验证）、数据昂贵（仿真+跨本体 OXE+互联网数据托底）、实时性（动作块/小模型/蒸馏）、安全不可逆（域内评估+人机协同）。</p>
+<p><b>2.</b> 推导动作 token 化的离散化误差；为什么 256 桶对多数抓放任务够用？<br><b>答案要点</b>：$\delta\le(a_{max}-a_{min})/256$；归一空间 8mm 级格子+轨迹平滑，1cm 精度任务可接受；精细操作需流匹配连续头。</p>
+<p><b>3.</b> RT-2 的"语义涌现"指什么？来自哪个训练设计？<br><b>答案要点</b>：需要语义推理的任务成功率 0%→62%；来自网络多模态数据与机器人数据 5:5 co-fine-tune（语义知识托底）。</p>
+<p><b>4.</b> RT-2 派与 PaLM-E 派的本质区别？各自优缺点？<br><b>答案要点</b>：端到端动作 token（延迟高但一体化）vs LLM 规划+下层控制（分层可解释、下层可高频）；2026 年多数系统为混合式。</p>
+<p><b>5.</b> OpenVLA 双视觉塔为什么是"语义+空间"而非两个相同编码器？<br><b>答案要点</b>：SigLIP 管语义对齐（指令理解），DINOv2 管空间细节（定位与抓取几何）——对应第 14 章 CLIP 系空间盲点的结论。</p>
+<p><b>6.</b> π0 的 flow matching 动作块解决了 token 路线的什么痛点？<br><b>答案要点</b>：逐 token 自回归慢且离散化误差累积；动作块一次生成 50 步、连续值无量化误差、50Hz 高频平滑。</p>
+<p><b>9.</b> VLA 的 scaling 为什么是"异构"的？知识绝缘解决什么？<br><b>答案要点</b>：语义能力随 VLM 规模涨、控制能力随机器人数据涨，两曲线耦合点决定系统表现；知识绝缘让动作专家与 VLM 分参，防止语义梯度干扰精细动作学习。</p>
+<p><b>10.</b> 人形数据工厂三种模式的取舍？<br><b>答案要点</b>：遥操作背心（质量最高、$10–30/条）、VR 遥操作（成本减半、精细度受限）、动作重定向（规模最大、保真度靠算法）；成熟配置为"重定向打底+遥操作精修"。</p>
+<p><b>8.</b> 为什么"失败案例回流数据集"要重点补"失败前置帧"？<br><b>答案要点</b>：模型最缺的是"从错误中恢复"的演示（干净成功演示不含恢复行为）；只补成功数据会加剧分布偏移。</p>
+<p><b>7.</b> Sim2Real 的两大补丁是什么？仿真评测的陷阱？<br><b>答案要点</b>：domain randomization（随机化参数学不变性）与 real2sim（扫描真实场景）；SIMPLER 与真机相关性仅约 0.7，必须真机验证。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Brohan A, et al. <a href="https://arxiv.org/abs/2212.06817">RT-1: Robotics Transformer for Real-World Control at Scale</a>. RSS 2023. arXiv:2212.06817.</li>
+      <li>Brohan A, et al. <a href="https://arxiv.org/abs/2307.15818">RT-2: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control</a>. CoRL 2023. arXiv:2307.15818.</li>
+      <li>Driess D, et al. <a href="https://arxiv.org/abs/2303.03378">PaLM-E: An Embodied Multimodal Language Model</a>. ICML 2023. arXiv:2303.03378.</li>
+      <li>Open X-Embodiment Collaboration. <a href="https://arxiv.org/abs/2310.08864">Open X-Embodiment: Robotic Learning Datasets and RT-X Models</a>. ICRA 2024. arXiv:2310.08864.</li>
+      <li>Kim M, et al. <a href="https://arxiv.org/abs/2406.09246">OpenVLA: An Open-Source Vision-Language-Action Model</a>. CoRL 2024. arXiv:2406.09246.</li>
+      <li>Black K, et al. <a href="https://arxiv.org/abs/2410.24164">π0: A Vision-Language-Action Flow Model for General Robot Control</a>. arXiv 2024. arXiv:2410.24164.</li>
+      <li>Physical Intelligence. <a href="https://arxiv.org/abs/2504.16054">π0.5: Knowledge Insulation for Open-World VLA</a>. 2025. arXiv:2504.16054.</li>
+      <li>Zitkovich B, et al. <a href="https://arxiv.org/abs/2306.17866">RT-X: 开源跨本体机器人数据与模型</a>. 2023. arXiv:2306.17866.</li>
+      <li>Li X, et al. <a href="https://arxiv.org/abs/2310.08875">Evaluating Real-World Robot Manipulation Policies in Simulation (SIMPLER)</a>. CoRL 2024. arXiv:2310.08875.</li>
+      <li>Mees O, et al. <a href="https://arxiv.org/abs/2112.02628">CALVIN: A Benchmark for Language-Conditioned Policy Learning for Long-Horizon Robot Manipulation Tasks</a>. RA-L 2022. arXiv:2112.02628.</li>
+      <li>Liu B, et al. <a href="https://arxiv.org/abs/2306.03310">LIBERO: Benchmarking Knowledge Transfer for Lifelong Robot Learning</a>. NeurIPS 2023. arXiv:2306.03310.</li>
+      <li>Ma Y, et al. <a href="https://arxiv.org/abs/2306.12424">Eureka: Human-Level Reward Design via Coding LLMs / Isaac 仿真生态</a>. 2023. arXiv:2310.12931.</li>
+      <li>Octo Team. <a href="https://arxiv.org/abs/2405.12213">Octo: An Open-Source Generalist Robot Policy</a>. RSS 2024. arXiv:2405.12213.</li>
+      <li>Intelligence F, et al. <a href="https://www.figure.ai/news/helix">Helix: A Vision-Language-Action Model for Generalist Humanoid Control</a>. Figure AI 2025.</li>
+      <li>Levine S, et al. <a href="https://arxiv.org/abs/1604.06786">End-to-End Training of Deep Visuomotor Policies（策略学习的经典起点）</a>. JMLR 2016. arXiv:1604.06786.</li>
+      <li>Zhao T, et al. <a href="https://arxiv.org/abs/2304.13705">Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware (ACT/ALOHA)</a>. RSS 2023. arXiv:2304.13705.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

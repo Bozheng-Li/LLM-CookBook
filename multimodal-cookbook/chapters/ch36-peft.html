@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 36 章 参数高效微调（LoRA/QLoRA） · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第六部分 · 训练工程纵深</div>
+  <h1 class="chapter-title">第 36 章　参数高效微调（LoRA/QLoRA）</h1>
+  <div class="chapter-meta"><span>预计阅读 90 分钟</span><span>难度 ★★★★☆</span><span>前置：第 35 章（预训练实战）、第 16 章（SFT）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">全参微调的显存数学：钱都花在哪了</a></li>
+  <li><a href="#sec-2">LoRA：低秩假设的完整推导</a></li>
+  <li><a href="#sec-3">超参数选型：rank、alpha 与目标模块</a></li>
+  <li><a href="#sec-4">QLoRA：4-bit 时代的微调民主化</a></li>
+  <li><a href="#sec-5">多模态特化：微调哪里？三层组合策略</a></li>
+  <li><a href="#sec-6">PEFT 库实战与多 adapter 服务</a></li>
+  <li><a href="#sec-7">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>预训练（第 35 章）是"少数人的游戏"，微调是"所有人的日常"——而微调的全部工程问题浓缩为一个词：<b>显存</b>。本章先算清全参微调的显存账（为什么 7B 模型全参微调要 100GB+），再解剖 LoRA 的低秩假设与数学推导，然后是 QLoRA 的 4-bit 民主化、多模态场景的"微调哪里"决策树，最后落到 PEFT 库的实战代码。<b>读完你应当能对任何 VLM 做出"给定显卡预算下的最优微调方案"</b>——这是多模态工程师最高频的日常任务，没有之一。本章的显存算术、低秩数学与组合策略，都围绕“给定约束下做出最优方案”展开。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>全参微调的显存数学：钱都花在哪了</h2>
+<p>以 7B 模型（bf16 权重）+ Adam 优化器全参微调为例，显存分四块：<b>①权重</b>：$7\times10^9 \times 2\,\text{byte} = 14$ GB；<b>②梯度</b>：与权重同形同精度 = 14 GB；<b>③优化器状态</b>——Adam 的 $m$ 与 $v$ 两个动量（fp32 各 4 byte）+ 主权重副本（fp32 混合精度训练）：$7\times10^9\times(4+4+4)=84$ GB；<b>④激活值</b>——随 batch/序列长度线性增长（无梯度检查点时 7B 模型 2k 上下文约 20–40 GB）。合计：<b>约 130–150 GB</b>——这就是"7B 全参微调至少要 4×A100-80G"的由来。优化器状态占 60% 是全参微调显存的真正大头，由此催生三条省钱路线：<b>省优化器</b>（LoRA：不训原权重，优化器只管新增的低秩参数）、<b>省权重</b>（QLoRA：权重 4-bit 存储）、<b>省激活</b>（梯度检查点：用 30% 重算换 60–70% 激活显存）——三者在实践中组合使用。<b>这个分解是所有 PEFT 决策的出发点：先问"显存瓶颈在哪一块"，再选对应的省法</b>。</p>
+<p>在进入算术前，先明确 PEFT 的商业坐标：<b>全参微调是"平台行为"（平台方训基座），PEFT 是"应用行为"（每个应用/租户/客户都要自己的适配）</b>——一个基座卖 SaaS 时，客户私有数据的适配只能靠 PEFT（全参副本既贵又泄漏风险高）。这决定了 PEFT 的三条工程约束：可多租户（存储小）、可热插拔（不改基座）、可审计（adapter 权重可隔离与撤销）——LoRA 的统治地位正是这三条约束下的唯一全面解。</p>
+<p><b>激活值那一块的详细算法</b>（面试与容量规划高频）：激活显存 ≈ batch × seq × hidden × layers × k，其中 k 是"每层保存的中间量数"（bf16 下约 20–34，取决于是否开梯度检查点与 FlashAttention）。代入 7B（hidden 4096、32 层、seq 2048、batch 8）：$8	imes2048	imes4096	imes32	imes34	imes2\,	ext{byte}pprox 138$ GB（不开检查点）——<b>激活反超权重成为第一大头</b>，这就是"长上下文微调必开梯度检查点"的定量理由。开检查点后 k 降到约 2–4，激活显存降为 1/8–1/16（代价：前向重算约 30% 额外计算）。<b>三件套的组合经验</b>：FlashAttention-2（省注意力激活）+ 梯度检查点（省层间激活）+ 8-bit 优化器（再省一半优化器）——三者叠加，7B 全参微调可压到 ~48GB 单卡（A6000 级），但 LoRA 通常仍更省更稳。</p>
+<p>工具侧的"显存实测"推荐两个手段：①<b>PyTorch 的 memory snapshot</b>（`torch.cuda.memory._record_memory_history()` + 火焰图导出）——逐算子看显存占用，定位"哪个张量吃掉了峰值"；②<b>ulysse/alpha 等社区的显存计算器</b>（输入模型/seq/batch 出估算）。<b>调显存的顺序纪律：先减 batch（最便宜）→ 开检查点（30% 速度代价）→ 量化/LoRA（结构性改动）</b>——顺序反了会把简单问题复杂化。</p>
+<div class="box-theory"><p class="box-title">📐 理论：LoRA 的完整数学——从低秩假设到梯度流</p>
+<p><b>核心假设（低秩本征性）</b>：微调引起的权重变化 $\Delta W$ 的本征秩（intrinsic rank）远小于 $W$ 的满秩——Aghajanyan 等（arXiv:2012.13255）证明预训练模型的"下游适配"在低维参数子空间即可完成。LoRA 据此把 $\Delta W$ 参数化为两个低秩矩阵之积：</p>
+<div class="math-block">$$W' = W_0 + \Delta W = W_0 + \frac{\alpha}{r} B A, \quad A\in\mathbb{R}^{r\times d},\; B\in\mathbb{R}^{d_\text{out}\times r},\; r \ll \min(d, d_\text{out})$$</div>
+<p><b>初始化的不对称设计</b>：$A$ 用高斯随机初始化，$B$ 置零——保证训练起点 $W'=W_0$（不破坏预训练分布）；若两者都随机，起点即"随机扰动"，训练初期会灾难性遗忘。<b>梯度流</b>：前向 $h = W_0 x + \frac{\alpha}{r}BAx$，反向只对 $A,B$ 求导：$\frac{\partial L}{\partial A} = \frac{\alpha}{r}B^T\frac{\partial L}{\partial h}x^T$，$\frac{\partial L}{\partial B} = \frac{\alpha}{r}\frac{\partial L}{\partial h}(Ax)^T$——原权重 $W_0$ 冻结（无梯度、无优化器状态）。<b>显存账</b>：rank 16 时 $A+B$ 参数约 $16\times(d+d_\text{out})$——对 7B 模型约 20M 可训参数（vs 全参 7B），优化器状态从 84GB 降到 0.24GB。<b>推理零延迟</b>：部署时 $W_0+\frac{\alpha}{r}BA$ 可合并为单一权重，无额外前向——这是 LoRA 对 adapter（串联结构）的决定性优势，第 39 章部署会再次用到。</p></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>LoRA：低秩假设的完整推导</h2>
+<p>低秩假设为什么在微调场景成立？三个互补的解释：<b>①过参数化视角</b>——预训练已把"任务通用解"压缩进权重，微调只需要在"解空间"里小幅导航（少量方向即可表达）；<b>②谱视角</b>——实测 $\Delta W$ 的奇异值谱高度集中（前几十个奇异值承载 95%+ 能量），第 37 章的 LoRA+ 变体甚至利用"$A$ 与 $B$ 学习率不对称"进一步加速（$B$ 的初始为零使其梯度更小，需要更大学习率）；<b>③信息论视角</b>——下游适配的信息量（任务与预训练分布的 KL 散度）本来就小，低秩参数足以编码。<b>LoRA 的实证地位</b>：LLM 与 VLM 上 rank 8–64 的 LoRA 在多数指令任务上达到全参微调 95–100% 的效果；但在"知识注入"类任务（学新领域知识而非新任务格式）上，LoRA 有系统性差距——<b>"学格式用 LoRA，学知识要全参或大 rank"，这是选型的第一分界线</b>。</p>
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2106.09685_0.png" alt="LoRA 论文中 A 矩阵子空间相似度分析" loading="lazy">
+<figcaption>图 36-1　LoRA 的子空间分析（arXiv:2106.09685 图 3）：不同 rank 下学到的 $A$ 矩阵列向量间相似度极高——低秩子空间在训练中高度一致，这为"低秩本征性"假设提供了直接的实证支撑，也暗示 rank 无需太大。</figcaption>
+</figure>
+<figure class="fig">
+<img src="../assets/images/papers/2106.09685_2.png" alt="LoRA 推理延迟分析" loading="lazy">
+<figcaption>图 36-2　LoRA 的推理延迟（arXiv:2106.09685 图 5）：合并前（不合并）的额外延迟随 rank 增大而增大，但整体 <1%（可忽略）——这也是 LoRA 相对串联 Adapter 的关键工程优势之一。</figcaption>
+</figure>
+</div>
+
+<p><b>LoRA 之前的 PEFT 谱系</b>（理解设计演化才能选对工具）：①<b>Adapter 串联层</b>（2019）——层间插瓶颈 MLP，第一个"插件化"方案，但串联结构增加推理延迟且无法合并；②<b>Prefix-tuning/P-tuning</b>（2021）——不动权重只学"虚拟前缀 token"，参数最省但有效秩受限于注意力"带宽"（效果上限低、对超参敏感）；③<b>BitFit</b>——只训 bias 项，极简但能力上限最低；④<b>LoRA（2021）</b>——"权重内低秩旁路"同时拿到"可合并+高上限+易并行"三张牌，终结了谱系竞争。<b>2023 年后的"LoRA 变体潮"（AdaLoRA 动态 rank 分配、rsLoRA 缩放修正、DoRA 方向分解）都是对原始设计在小细节上的打磨——原始 LoRA 的"低秩+旁路+置零初始化"三件套至今未被实质超越</b>。</p>
+<p><b>LoRA 在多模态上的实证图谱</b>（社区复现共识）：LLaVA 式模型上，"投影全参+LLM LoRA r=32"可达全参 SFT 的 98–100%（指令任务）；Qwen-VL 式（含视觉 token 压缩）上，r=64 的 all-linear LoRA 在 OCR/计数类任务比 r=16 高 3–6 个点（这些任务"看起来"像知识注入——需要视觉细节编码）；Grounding 任务上，视觉塔 LoRA 的贡献约为 LLM LoRA 的两倍（空间能力主要存在 ViT 里）。<b>把这三条实证记住，第 5 节的组合策略就不是"背诵"而是"推导"</b>。</p>
+<p><b>"LoRA 是否够用"的判据</b>可以形式化为一句：任务所需的新增信息量 < 低秩子空间的编码容量。容量估算：r=32 的 LoRA 在 7B 模型上约 20M 参数 × log2(有效精度) bit ≈ 数十 MB 的"可写空间"——足够编码一个"任务格式+风格+领域术语表"，不足以编码"一整本医学教材+诊断逻辑"。这也解释了 RAG（第 42 章）与 LoRA 的分工：<b>易变的知识交给检索（不改权重），稳定的能力交给权重（LoRA 或全参）</b>——两者的边界就是"知识更新频率"。</p>
+<h2 id="sec-3"><span class="sec-no">3.</span>超参数选型：rank、alpha 与目标模块</h2>
+<p><b>rank</b>：经验配方——风格/格式类任务 rank 8–16；领域适配 32–64；知识注入/复杂多模态 64–256。<b>rank 过大的害处不只是浪费</b>：rank 256+ 时过拟合风险上升（可训参数接近 1%），需要更强正则。<b>alpha</b>：缩放因子 $\alpha/r$ 是"学习率的有效倍增器"——常用 $\alpha = 2r$（缩放 2）；<b>固定 alpha 调 rank 是常见错误</b>（rank 翻倍时有效缩放减半，等效学习率骤变），正确做法是"rank 变、alpha=2r 跟着变"。<b>dropout</b>：LoRA dropout 0.05–0.1 是默认正则，数据少（<5k）时加到 0.1–0.15。<b>目标模块</b>：attention-only（q/k/v/o）是最早期配置；<b>all-linear</b>（含 MLP 的 gate/up/down）是 2024 年后的默认——实测 MLP 层的 LoRA 对"知识类"任务贡献超过一半。多模态的模块选择见第 5 节。（另注：embedding/lm_head 不要挂 LoRA——输出层的低秩约束会直接限制词表分布的表达，收益为负。）<b>学习率</b>：LoRA 的 lr 是全参的 5–10 倍（可训参数少、梯度信噪比高，且旁路输出未经过预训练分布“校准”）——全参 1e-5 对应 LoRA 5e-5~1e-4，这是新手最常犯的"配了 LoRA 忘了调 lr"错误。</p>
+<div class="fig-row">
+<figure class="fig">
+<svg viewBox="0 0 640 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="LoRA 注入与合并示意">
+<rect x="0" y="0" width="640" height="320" fill="#f8fafc"/>
+<text x="320" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">LoRA：训练时的旁路，部署时的合并</text>
+<!-- left: training -->
+<rect x="24" y="44" width="280" height="230" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="164" y="66" text-anchor="middle" font-size="13" font-weight="bold" fill="#2563eb">训练时（旁路）</text>
+<rect x="48" y="150" width="90" height="40" rx="6" fill="#dbeafe" stroke="#2563eb"/>
+<text x="93" y="175" text-anchor="middle" font-size="12">W₀ 冻结</text>
+<rect x="52" y="86" width="80" height="30" rx="6" fill="#fef3c7" stroke="#d97706"/>
+<text x="92" y="106" text-anchor="middle" font-size="11">A (r×d)</text>
+<rect x="148" y="86" width="80" height="30" rx="6" fill="#fef3c7" stroke="#d97706"/>
+<text x="188" y="106" text-anchor="middle" font-size="11">B (d×r)</text>
+<text x="145" y="82" text-anchor="middle" font-size="10" fill="#d97706">×(α/r)</text>
+<circle cx="230" cy="170" r="7" fill="#1e293b"/>
+<text x="230" y="196" text-anchor="middle" font-size="10" fill="#475569">相加</text>
+<rect x="48" y="230" width="220" height="26" rx="6" fill="#f1f5f9" stroke="#94a3b8"/>
+<text x="158" y="248" text-anchor="middle" font-size="10.5" fill="#475569">h = W₀x + (α/r)BAx　（B 初始为 0）</text>
+<path d="M 120 116 L 150 150" stroke="#d97706" stroke-width="2" fill="none" marker-end="url(#l1)"/>
+<path d="M 210 116 L 190 150" stroke="#d97706" stroke-width="2" fill="none" marker-end="url(#l1)"/>
+<text x="164" y="128" font-size="10" fill="#d97706">仅 A/B 有梯度</text>
+<!-- right: deployment -->
+<rect x="336" y="44" width="280" height="230" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="476" y="66" text-anchor="middle" font-size="13" font-weight="bold" fill="#10b981">部署时（合并）</text>
+<rect x="372" y="120" width="120" height="52" rx="8" fill="#d1fae5" stroke="#10b981"/>
+<text x="432" y="142" text-anchor="middle" font-size="12">W = W₀ + (α/r)BA</text>
+<text x="432" y="160" text-anchor="middle" font-size="10" fill="#065f46">单一权重，零额外延迟</text>
+<rect x="520" y="120" width="80" height="52" rx="8" fill="#ede9fe" stroke="#8b5cf6"/>
+<text x="560" y="150" text-anchor="middle" font-size="11">多租户：</text>
+<text x="560" y="164" text-anchor="middle" font-size="10">换 adapter 即换技能</text>
+<text x="476" y="230" text-anchor="middle" font-size="10.5" fill="#475569">合并=离线一次；多租户场景可保留旁路按请求热切换</text>
+<text x="476" y="248" text-anchor="middle" font-size="10.5" fill="#475569">（vLLM 的 multi-LoRA 服务，第 39 章）</text>
+<path d="M 432 90 L 432 120" stroke="#10b981" stroke-width="2.5" marker-end="url(#l2)"/>
+<text x="476" y="290" text-anchor="middle" font-size="11" fill="#475569">训练省 90%+ 显存，推理可零成本合并 —— 两侧的"经济性"共同造就了 LoRA 生态</text>
+<defs>
+<marker id="l1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#d97706"/></marker>
+<marker id="l2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#10b981"/></marker>
+</defs>
+</svg>
+<figcaption>图 36-3　LoRA 的两副面孔：训练时以低秩旁路（A 高斯、B 零初始化）注入，只训 0.1–1% 参数；部署时可合并回基座权重实现零延迟推理，或多 adapter 热切换服务多租户。</figcaption>
+</figure>
+</div>
+
+<p><b>rank 选型的"三步实验法"</b>（比查配方表更可靠）：①跑 r=8 与 r=64 两个端点（各 500 步小规模），看任务分差；②分差 <2% → 任务是"低本征秩"（格式/风格类），r=16 收工；③分差 >5% → 任务吃容量（知识/感知类），在 r=32/64/128 细扫，取"分数开始平台化"的点。<b>总成本约 1.5 个训练日（两档各半天+半天分析）</b>，换来的是"不为冗余参数买单、也不让容量不足背锅"的最优点——与第 34 章"配比用小模型扫"同一思想：超参是实验出来的，不是抄出来的。</p><p>实验记录模板（三步法专用）：任务名 / 数据量 / r=8 结果 / r=64 结果 / 分差 / 结论 rank——一行一张，一个月后你的团队就有了自己的 rank 查找表。</p>
+<p><b>学习率与调度的完整配方</b>（LoRA 微调的"出厂设置"）：LLM 部分 LoRA lr 1e-4（风格类）/5e-5（知识类），视觉塔 LoRA 5e-6~1e-5（ViT 对学习率最敏感，超一点就遗忘），投影层全参 1e-5~2e-5（模态翻译器的"中间地带"学习率）；warmup 3–5%，cosine 衰减到峰值的 10%；epoch 1–3（多模态 SFT 过 3 epoch 必过拟合，宁欠勿过）；batch 等效 64–128（梯度累积凑）。<b>一个反直觉的调度细节</b>：LoRA 的收敛比全参"快且陡"（参数少、梯度大），loss 曲线常在 30% 步数处就平台化——看到平台就停（早停），把余下算力拿去扩数据，比多训几个 epoch 的边际收益高得多。</p>
+<h2 id="sec-4"><span class="sec-no">4.</span>QLoRA：4-bit 时代的微调民主化</h2>
+<p><b>QLoRA</b>（arXiv:2305.14314，2023）把"消费级显卡微调 65B"变成现实，三个组件：<b>①NF4 数据类型</b>——4-bit 量化但分位数对齐正态分布（权重天然近高斯，NF4 的量化误差显著低于 int4）；<b>②双重量化</b>——对量化的"缩放常数"再量化一次（进一步省 0.37 bit/参数）；<b>③分页优化器</b>——优化器状态在显存峰值时换页到 CPU 内存（防 OOM 尖峰）。效果：65B 模型在单张 48GB 卡上可微调（vs 全参约 780GB），且最终质量与 16-bit 全参持平（Guanaco 证明）。<b>QLoRA 的训练前向用反量化的 bf16 权重计算</b>（计算精度不降，只降存储），所以速度损失仅 20–30%。<b>DoRA</b>（arXiv:2402.09353，2024）的增量改进：把权重分解为"幅值+方向"（weight decomposed），LoRA 只学方向修正——低 rank 下的表现更接近全参（尤其小数据），代价是推理合并略复杂。<b>选型口径</b>：显存够（≥2×模型 bf16）用标准 LoRA；显存紧（消费级 12–24GB 跑 7B+）用 QLoRA/NF4；追求低 rank 极限效果用 DoRA；多租户 serving 场景再叠加 vLLM 的 multi-LoRA。<b>QLoRA 的隐藏成本</b>：4-bit 基座的"量化误差底噪"在极端精细任务（细粒度定位、高精度 OCR）上偶有可测影响——重要产品线上线前应做"QLoRA vs LoRA 的 A/B"。</p>
+<div class="fig-row">
+<figure class="fig">
+<img src="../assets/images/papers/2305.14314_0.png" alt="QLoRA 与其他微调方法的显存需求对比" loading="lazy">
+<figcaption>图 36-4　QLoRA 的显存革命（arXiv:2305.14314 图 1）：全参/adapter/LoRA/QLoRA 四种方法的显存需求对比——QLoRA 把 65B 的微调门槛从数十张 A100 压到一张 48GB 卡，"微调民主化"的具象化一图。</figcaption>
+</figure>
+</div>
+
+<p><b>NF4 为什么优于 int4——量化格点的信息论</b>：均匀量化（int4：16 个等距格点）对均匀分布最优，但预训练权重的分布是零均值、近似正态（σ≈0.02 量级）——绝大多数权重挤在中心小区间，等距格点在中心区的"分辨率"不足。NF4 的格点取自正态分布的分位数（每个格点间恰好"装下"等概率质量的权重），等效于"对权重实际分布的熵编码最优量化"。<b>一个可复现的直觉</b>：把 σ=0.02 的高斯装进 [-1,1] 的 int4 格点，中心区两个格点间要"跳" 0.13——几乎是权重标准差的 6 倍；NF4 的中心格点间距缩小到 σ 量级。<b>这个"格点形状匹配分布形状"的思想，是量化领域（第 39 章 GPTQ/AWQ）通用的第一性原理</b>。</p><p>顺带厘清一个易混概念：QLoRA 是"训练技术"（4-bit 基座上训 LoRA），GPTQ/AWQ 是"推理压缩技术"（训练完的模型压成 4-bit 部署）——两者可叠加（QLoRA 训出的 adapter 部署到 GPTQ 基座），但叠加后务必重跑评测，两次近似的误差会叠加而非抵消。</p>
+<p><b>QLoRA 实战的三条避坑线</b>：①<b>视觉塔慎用 4-bit</b>——ViT 对量化误差更敏感（LayerNorm 后激活分布更"尖"），经验做法：LLM 侧 4-bit、视觉塔保持 bf16（多花 1–2GB 换稳定性）；②<b>合并的正确姿势</b>——训练结束先 `merge_and_unload()` 得到 bf16 完整权重再评估，避免"4-bit 推理评估"低估 QLoRA 真实能力；③<b>分页优化器的代价</b>——换页到 CPU 是"防 OOM 保险"而非性能特性，常态性换页说明 batch 该减了（换页开销可达 20% 步时）。<b>8-bit Adam（bitsandbytes）是介于全 fp32 Adam 与分页之间的中间档</b>——全参微调省一半优化器显存、精度损失可忽略，QLoRA 之外的第二省钱杠杆。</p>
+<h2 id="sec-5"><span class="sec-no">5.</span>多模态特化：微调哪里？三层组合策略</h2>
+<p>VLM 的微调对象有四个候选：视觉塔（ViT）、投影层（adapter/MLP）、LLM、（可选）tokenizer 侧。组合策略按任务分四档：<b>①纯指令适配</b>（教模型新任务格式）——只训 LoRA on LLM（all-linear），视觉塔与投影冻结，rank 8–16，5k 数据即可；<b>②领域知识注入</b>（医学影像/遥感/文档新领域）——投影层全参 + LLM LoRA rank 64+，视觉塔可选部分解冻（顶层 4–8 层 LoRA）；<b>③感知能力升级</b>（细粒度识别、新分辨率）——视觉塔必须动（LoRA rank 16–32 或顶层全参），投影全参，LLM LoRA；<b>④全能力重训</b>——接近继续预训练（第 35 章），全参为佳。<b>两个多模态特有经验</b>：其一，<b>投影层永远值得全参</b>——它是"模态翻译器"且参数量小（百万级），冻结投影的 LoRA 微调是常见翻车配置；其二，<b>视觉塔的微调需要 10 倍小的学习率</b>（1e-6~1e-5，ViT 对 lr 极敏感），且需要更强的图像增强正则，否则"灾难性视觉遗忘"（新领域行、通用场景瞎）。<b>视觉 token 压缩的配合</b>：高分辨率输入时先用感知池化/压缩（第 22 章技术）压 token 再进 LoRA 微调的 LLM——训练成本可降 3–5 倍而任务损失 <2%。</p>
+<p><b>PEFT 微调的四大翻车模式与处方</b>：①<b>"什么都学不到"</b>（loss 平、评测平）——多半是 lr 忘了乘 10 或目标模块漏了关键层（只挂了 q_proj）；②<b>"灾难性遗忘"</b>（新任务好、通用任务崩）——rank 过大+数据过少，处方：降 rank/加数据/混 20% 通用数据；③<b>"视觉能力丢失"</b>（通用图还行、细粒度变瞎）——视觉塔 lr 过大或投影被动过且数据格式不匹配，处方：视觉塔冻结重训 LLM 部分；④<b>"QLoRA 精度异常"</b>（loss 尖峰/NaN）——4-bit 反量化溢出，处方：开 double quant、检查 compute dtype=bf16、梯度裁剪 1.0。<b>四大模式的排查顺序：先查配置（90% 是配置错），再查数据，最后才怀疑方法本身</b>。</p>
+<div class="tbl-wrap"><table>
+<caption>表 36-1　PEFT 方法对比（7B 模型、单任务适配场景）</caption>
+<thead><tr><th>方法</th><th>可训参数</th><th>训练显存</th><th>推理开销</th><th>典型效果（指令类）</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>全参微调</td><td>100%</td><td>~130GB+</td><td>零</td><td>100%（基准）</td><td>预算充足/知识注入</td></tr>
+<tr><td>Adapter（串联）</td><td>~3%</td><td>~40GB</td><td>有（额外前向）</td><td>90–95%</td><td>已少用（被 LoRA 替代）</td></tr>
+<tr><td>Prefix/P-tuning</td><td><0.1%</td><td>~30GB</td><td>极小</td><td>80–90%</td><td>极小数据/分类任务</td></tr>
+<tr><td>LoRA r=16</td><td>~0.3%</td><td>~35GB</td><td>零（可合并）</td><td>95–100%</td><td>指令/风格适配默认</td></tr>
+<tr><td>QLoRA r=16</td><td>~0.3%</td><td>~12–16GB</td><td>零</td><td>94–99%</td><td>消费级显卡</td></tr>
+<tr><td>DoRA r=8</td><td>~0.15%</td><td>~12–16GB</td><td>近零</td><td>95–99%</td><td>低 rank 极限场景</td></tr>
+</tbody></table></div><p><b>读表注意</b>：训练显存为 7B 模型、4k 上下文、batch 4 的量级参考；"典型效果"指指令类任务相对全参的达成度，知识注入类任务各方法普遍要打 5–10 个点的折扣。表中“典型效果”一列请结合第 2 节的本征秩讨论理解：格式类任务普遍贴上限，知识类任务贴下限。</p>
+
+<p><b>视觉塔微调的"何时值得"三问</b>：①任务是否需要"新的视觉原子"（新模态如深度图、新域如 SAR 雷达图）？——需要则视觉塔必动；②失败案例是"语言层面说错"还是"视觉层面看错"？——抽样 50 个失败人工归因，看错比例 >40% 则视觉塔值得动；③数据是否够"撑得起"视觉塔微调？——ViT 微调的数据需求约为 LLM LoRA 的 5–10 倍（防止视觉遗忘），<1 万条时建议只动顶层。<b>三问的答案组合成决策，比"所有教程都说微调视觉塔"或"所有教程都说冻结"都可靠</b>——多模态微调没有普适答案，只有任务归因后的推导。</p>
+<div class="tbl-wrap"><table>
+<caption>表 36-A　VLM 四层结构的微调组合决策（"微调哪里"速查）</caption>
+<thead><tr><th>任务类型</th><th>视觉塔</th><th>投影层</th><th>LLM</th><th>数据量参考</th></tr></thead>
+<tbody>
+<tr><td>新任务格式（输出 JSON/新指令风格）</td><td>冻结</td><td>冻结</td><td>LoRA r=8–16</td><td>1k–5k</td></tr>
+<tr><td>领域知识注入（医学/法律影像）</td><td>可选顶层 LoRA</td><td><b>全参</b></td><td>LoRA r=64–128</td><td>5k–50k</td></tr>
+<tr><td>感知升级（细粒度/新分辨率/OCR 强化）</td><td>LoRA r=16–32</td><td><b>全参</b></td><td>LoRA r=32–64</td><td>10k–100k</td></tr>
+<tr><td>行为对齐（防幻觉/拒答风格）</td><td>冻结</td><td>冻结</td><td>LoRA + DPO（第 37 章）</td><td>偏好 1k–1 万</td></tr>
+<tr><td>全新领域重训（遥感卫星/显微图像）</td><td>全参</td><td>全参</td><td>全参或 r≥256</td><td>≈继续预训练</td></tr>
+</tbody></table></div>
+<h2 id="sec-6"><span class="sec-no">6.</span>PEFT 库实战与多 adapter 服务</h2>
+<div class="box-code"><p class="box-title">💻 代码：VLM + QLoRA 的完整微调与多 adapter 推理</p>
+<pre><code class="language-python">import torch
+from transformers import AutoProcessor, AutoModelForVision2Seq, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, PeftModel
+
+# --- 1. 4-bit 基座加载（QLoRA）---
+bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                         bnb_4bit_compute_dtype=torch.bfloat16,
+                         bnb_4bit_use_double_quant=True)
+model = AutoModelForVision2Seq.from_pretrained(
+    "Qwen/Qwen2.5-VL-7B-Instruct", quantization_config=bnb,
+    torch_dtype=torch.bfloat16)
+processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+
+# --- 2. LoRA 配置：LLM all-linear + 投影层全参 ---
+lcfg = LoraConfig(
+    r=32, lora_alpha=64, lora_dropout=0.05,
+    target_modules=["q_proj","k_proj","v_proj","o_proj",
+                    "gate_proj","up_proj","down_proj"],
+    modules_to_save=["visual.merger.mlp"],   # 投影/merger 全参保存
+)
+model = get_peft_model(model, lcfg)
+model.print_trainable_parameters()   # 约 0.6% 可训参数
+# 训练循环（TRL SFTTrainer 可替代）：标准 forward + loss.backward()
+
+# --- 3. 多 adapter 热切换服务（vLLM 场景示意）---
+# vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
+#   --enable-lora --lora-modules medical=./adapters/medical \
+#   legal=./adapters/legal ocr=./adapters/ocr --max-lora-rank 64
+# 请求侧指定模型：{"model": "medical", ...} → 同一基座按请求挂载不同 LoRA
+# 典型显存：7B 基座 ~16GB + 每适配器 ~200MB（rank64）→ 单卡服务多领域</code></pre>
+<p>工程要点：①<code>modules_to_save</code> 里放投影/merger（全参微调的"多模态税"，必交）；②QLoRA 训练后合并前先在 fp16/bf16 上"反量化重载+合并"再部署（直接部署 4-bit+LoRA 会叠加量化误差）；③多 adapter 服务的 rank 上限由 <code>max_lora_rank</code> 决定，混用不同 rank 的适配器按最大值预留显存。</p></div>
+<div class="box-code"><p class="box-title">💻 代码：用 TRL + PEFT 跑一个完整的 VLM SFT（训练器路线）</p>
+<pre><code class="language-python">from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig
+import torch
+
+# 数据：{"messages": [{"role":"user","content":[{"type":"image","image":"x.jpg"},
+#         {"type":"text","text":"图中有什么缺陷？"}]},
+#        {"role":"assistant","content":[{"type":"text","text":"左上角有划痕"}]}]}
+from datasets import load_dataset
+ds = load_dataset("json", data_files="defect_sft.jsonl", split="train")
+
+lcfg = LoraConfig(r=32, lora_alpha=64, lora_dropout=0.05,
+                  target_modules=["q_proj","k_proj","v_proj","o_proj",
+                                  "gate_proj","up_proj","down_proj"],
+                  modules_to_save=["visual.merger.mlp"])
+
+cfg = SFTConfig(
+    output_dir="./qwen25vl-defect",
+    per_device_train_batch_size=4, gradient_accumulation_steps=8,
+    learning_rate=1e-4, num_train_epochs=2,
+    bf16=True, gradient_checkpointing=True,
+    lr_scheduler_type="cosine", warmup_ratio=0.04,
+    max_length=4096, dataset_text_field="",   # VLM 数据走 collator
+    remove_unused_columns=False, dataloader_num_workers=4,
+    save_strategy="steps", save_steps=200, logging_steps=10)
+
+trainer = SFTTrainer(
+    model="Qwen/Qwen2.5-VL-7B-Instruct",
+    args=cfg, train_dataset=ds, peft_config=lcfg)
+trainer.train()
+trainer.save_model()       # adapter 保存（约 300MB）
+# 合并导出：model = trainer.model.merge_and_unload(); model.save_pretrained(...)  </code></pre>
+<p>TRL 路线 vs 手写循环：TRL 处理了"图文样本的 collator、assistant-only loss 掩码、检查点恢复"三件最容易写错的事——<b>生产微调建议 trainer 路线起步，需要特殊 loss（如 grounding 的框损失）时再下沉到手写</b>。</p></div>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：显存预算的"十分钟规划法"</p>
+<p>给定任务与显卡，十分钟定微调方案：<b>第 1 步：查参数量</b>——模型总参数 P（7B/13B/72B…），记 N=P×10⁹。<b>第 2 步：算方案显存</b>——全参 ≈ N×16 byte（bf16 权重+梯度+Adam）+激活；LoRA ≈ N×2 byte（冻结权重）+LoRA 参数×16 byte+激活；QLoRA ≈ N×0.55 byte（4-bit+超参）+激活。<b>第 3 步：估激活</b>——seq S、batch B、hidden H、层数 L：检查点关闭 ≈ B×S×H×L×34×2 byte，开启 ≈ B×S×H×L×3×2 byte。<b>第 4 步：选档</b>——预算=显存×0.9（留碎片余量），从"全参→LoRA→QLoRA→QLoRA+检查点"逐级降档直到装下。<b>示例</b>：24GB 卡微调 7B VLM、4k 上下文：QLoRA 权重 4GB + 激活（开检查点，B=4）≈ 8GB + LoRA/优化器 1GB ≈ 13GB ✓（batch 还能上 8）。<b>这套算式的价值：立项时就能回答"几张卡、几天、多少钱"——工程信誉从这里开始</b>。</p></div>
+<div class="box-paper"><p class="box-title">📄 论文精读：QLoRA 的"反常识"发现（arXiv:2305.14314）</p>
+<p><b>三个改写行业认知的实验结论</b>：①<b>"4-bit 存储+bf16 计算"不掉点</b>——权重存储精度与计算精度解耦后，NF4 反量化引入的误差在训练动力学中"被平均掉"，MMLU 类基准与 16-bit 全参差距 <0.5%；②<b>NF4 的信息论依据</b>——预训练权重分布近零均值正态，NF4 的分位数量化格点对该分布最优（vs int4 的均匀格点），量化误差（MSE）降约 30%；③<b>checkpoint 大小的边际收益递减</b>——双重量化再省的 0.37 bit/参数在 65B 上只省 3GB，但对"量化缩放常数离群"导致的精度损失有显著防护（省的是"稳定性"而非"空间"）。<b>方法论遗产</b>：QLoRA 确立了"存储精度与计算精度分离"的设计范式——此后的一切低精度训练（fp8、fp4 训练，第 38 章）都站在这个范式上。<b>Guanaco 附录的"人类评测协议"也值得一读</b>：与单点 benchmark 相比，他们对齐了评测的"维度设计"（帮不上忙/没/fine 三档），是偏好评测的早期范本。</p></div>
+<p><b>LoRA 生态的商业形态</b>（2025 年观察）：Civitai/HuggingFace 上的 T2I LoRA 市场（风格/角色/服装，下载量过亿的头部 adapter）、企业私有化部署的"一客一 adapter"模式、以及"adapter 商店"的基座厂商自营生态（各云厂商的微调服务本质都是托管 LoRA）。<b>多模态领域的特殊机会</b>：领域视觉 adapter（医疗影像科、遥感、工业质检）的数据壁垒比文本 adapter 高得多——<b>视觉数据的采集设备与合规门槛构成了天然护城河，这是领域专家比提示工程师更值钱的赛道信号</b>。</p><p>对个人的行动含义：选一个"数据在你手里"的垂直视觉领域（你所在行业的质检/影像/监控），做出第一个"业务可用"的 adapter 并开源——这是 2026 年建立多模态技术声誉的最短路径。</p>
+<p><b>adapter 工程化的三个生产纪律</b>：①<b>版本管理</b>——adapter 与基座版本必须绑定记录（base hash + adapter hash），基座升级后旧 adapter 一律重测（低秩旁路对基座分布敏感，"能跑"不等于"还对"）；②<b>评测门禁</b>——每个 adapter 除任务评测外必须过"通用能力回归"（5% 通用数据上的不掉点检查），防止领域 adapter 拖垮基座公共能力；③<b>合并 vs 旁路的部署分界</b>——单 adapter 独占服务→合并（零延迟）；多租户混部→旁路+热切换（vLLM multi-LoRA）。<b>三条纪律的缺失分别是"幽灵故障""平台劣化""成本失控"三大生产事故的直接来源</b>。</p><p>补充一个运维细节：adapter 的灰度发布走"1% 流量影子评测"——新 adapter 挂影子通道跑真实流量但不回给用户，对比新旧 adapter 的"回答质量分+延迟分位"，48 小时无回归再放量——与 LLM 服务的灰度纪律（第 39 章）一致，只是多了"基座兼容性"这一检查维度。</p>
+<div class="box-history"><p class="box-title">📜 历史注脚：从"全家桶微调"到"按需热插拔"</p>
+<p>2019 年 GPT-2 时代，"微调一个模型"意味着复制整份权重（多任务=多份完整副本，存储与部署双爆炸）；2020 年 adapter 层（Houlsby）第一次让"小插件"成为可能，但串联结构带来了 10–30% 的推理延迟（当时无人能接受）；2021 年 LoRA 的"旁路+可合并"设计同时解决显存与延迟；2023 年 QLoRA 把门槛打到消费级；2024 年 vLLM 的 multi-LoRA 让"一个基座挂 N 个技能"成为服务标准。<b>五年时间，"模型即产品"演进为"基座即平台、adapter 即应用"——多模态领域的 LoRA 生态（角色/风格/领域各成市场）正是这一演进的应用层回声</b>。</p></div>
+
+<div class="box-tip"><p class="box-title">💡 技巧：PEFT 选型的"五问决策树"</p>
+<p>接到微调需求先问五问，答案串起来就是方案：①<b>任务要新知识还是新格式？</b>新格式→LoRA r=8–16 收工；新知识→进②。②<b>数据量级？</b><1 万条→LoRA 大 rank+通用数据混合；>10 万条→考虑全参。③<b>显卡预算？</b>算显存账（本章配方），装不下全参→QLoRA。④<b>视觉侧要不要动？</b>三问法（新视觉原子？看错还是说错？数据够吗？）。⑤<b>部署形态？</b>单租户→合并；多租户→旁路+热切换。<b>五问的每一问都对应本章一节——PEFT 方案没有玄学，只有约束条件的推导</b>。配一次方案不需要五问全答，但答不出任何一问，就说明需求还没定义清楚。</p></div><p>决策树之外的一条"元建议"：把每次微调的"方案-配置-结果"写成实验卡片（本章表格的格式），积累 20 张后你会发现自己的任务域有稳定的"常胜配置"——<b>个人与团队的 PEFT 能力，本质是实验卡片的复利——所以从今天的第一张卡片开始，比选哪个工具更重要。</b>。</p>
+<h2 id="sec-7"><span class="sec-no">7.</span>本章小结</h2>
+<p>PEFT 的本质是"识别微调所需的最低自由度"：LoRA 用低秩假设把自由度从 100% 压到 0.3%，QLoRA 再用 4-bit 存储把显存压到消费级，DoRA 用方向分解进一步榨低 rank 潜力；多租户服务与 adapter 经济则把它们转化为产品能力。多模态场景的核心增量是"四层结构（视觉塔/投影/LLM/tokenizer）的分别决策"——投影全参、LLM 按任务配 rank、视觉塔慎动且低学习率，是 2026 年的默认开工配置。<b>与第 35 章（预训练）合读：预训练决定"模型会什么"，PEFT 决定"一个基座能服务多少场景"——后者的商业价值正在以前者无法想象的速度被 LoRA 生态兑现</b>。下一章转向"让模型说真话"：多模态对齐与幻觉缓解。</p>
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>1.</b> 7B 全参微调的显存四块账？优化器状态为什么占大头？<br><b>答案要点</b>：权重 14G+梯度 14G+优化器 84G（Adam 双动量 fp32+主权重副本）+激活 20–40G；优化器状态的 12 byte/参数是全参的大头。</p>
+<p><b>2.</b> 写出 LoRA 的参数化与梯度公式；为什么 B 置零初始化？<br><b>答案要点</b>：$W'=W_0+\frac{\alpha}{r}BA$；$\partial L/\partial A=\frac{\alpha}{r}B^T g x^T$、$\partial L/\partial B=\frac{\alpha}{r}g(Ax)^T$；B 置零保证起点 $W'=W_0$ 不破坏预训练。</p>
+<p><b>3.</b> "rank 加倍、alpha 不变"错在哪？<br><b>答案要点</b>：有效缩放 $\alpha/r$ 减半、等效学习率骤变；应保持 $\alpha=2r$ 同步放大。</p>
+<p><b>4.</b> QLoRA 的三个组件分别省什么？训练时权重是什么精度？<br><b>答案要点</b>：NF4 省权重存储、双重量化省缩放常数、分页优化器防 OOM 尖峰；前向计算仍是反量化后的 bf16（存储 4-bit、计算 bf16）。</p>
+<p><b>5.</b> VLM 微调中"投影层永远值得全参"的原因？<br><b>答案要点</b>：投影是模态翻译器、参数量小（百万级）、对模态对齐最敏感；冻结投影是常见翻车配置。</p>
+<p><b>6.</b> 视觉塔微调的两个纪律？<br><b>答案要点</b>：学习率比 LLM 低 10 倍（1e-6~1e-5）；强图像增强正则防"灾难性视觉遗忘"。</p>
+<p><b>11.</b> NF4 与 int4 的本质区别？<br><b>答案要点</b>：NF4 格点取正态分布分位数（对权重分布熵编码最优），int4 均匀格点在中心区分辨率不足；NF4 量化 MSE 低约 30%。</p>
+<p><b>7.</b> LoRA 相比串联 Adapter 的两个决定性优势？<br><b>答案要点</b>：可离线合并为零延迟推理；旁路结构与基座同形便于多 adapter 热切换服务。</p>
+<p><b>12.</b> PEFT 的三条商业约束是什么？LoRA 为何是唯一全面解？<br><b>答案要点</b>：可多租户（存储小）、可热插拔（不改基座）、可审计（权重可隔离撤销）；串联 adapter 不可合并、Prefix 上限低、BitFit 容量不足，唯 LoRA 三条全占。</p>
+<p><b>10.</b> 多 adapter 服务的显存怎么算？热切换的请求粒度？<br><b>答案要点</b>：基座显存+Σ(每 adapter≈rank×模块数×几百 KB–MB)；vLLM 按请求指定 adapter 名，切换粒度为单请求（毫秒级挂载）。</p>
+<p><b>9.</b> 激活显存的粗算公式？长上下文微调为什么必须开梯度检查点？<br><b>答案要点</b>：激活 ≈ B×S×H×L×k×2byte（k≈34 不开/≈3 开检查点）；S=4k 时激活超权重 2 倍，检查点把 k 从 34 压到 3、显存降约 8–10 倍（代价 30% 重算）。</p>
+<p><b>8.</b> 什么任务 LoRA 会输给全参？为什么？<br><b>答案要点</b>：知识注入类（学新领域知识）——低秩子空间容量不足以编码新知识；学格式/风格类任务 LoRA 即可（本征秩低）。</p></div>
+
+<p>练习：对你手头的一个 7B VLM，按“十分钟规划法”写出三档方案（24GB/48GB/80GB 显卡各一档），再与本章表 36-1 对照校验——能独立给出三档配置，本章即已掌握。</p>
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Hu E, et al. <a href="https://arxiv.org/abs/2106.09685">LoRA: Low-Rank Adaptation of Large Language Models</a>. ICLR 2022. arXiv:2106.09685.</li>
+      <li>Dettmers T, et al. <a href="https://arxiv.org/abs/2305.14314">QLoRA: Efficient Finetuning of Quantized LLMs</a>. NeurIPS 2023. arXiv:2305.14314.</li>
+      <li>Liu S, et al. <a href="https://arxiv.org/abs/2402.09353">DoRA: Weight-Decomposed Low-Rank Adaptation</a>. ICML 2024. arXiv:2402.09353.</li>
+      <li>Aghajanyan A, et al. <a href="https://arxiv.org/abs/2012.13255">Intrinsic Dimensionality Explains the Effectiveness of Language Model Finetuning</a>. ACL 2021. arXiv:2012.13255.</li>
+      <li>Houlsby N, et al. <a href="https://arxiv.org/abs/1902.00751">Parameter-Efficient Transfer Learning for NLP (Adapter)</a>. ICML 2019. arXiv:1902.00751.</li>
+      <li>Lester B, et al. <a href="https://arxiv.org/abs/2104.08691">The Power of Scale for Parameter-Efficient Prompt Tuning</a>. EMNLP 2021. arXiv:2104.08691.</li>
+      <li>Zhang Q, et al. <a href="https://arxiv.org/abs/2402.12354">LoRA+/ Efficient LoRA with Asymmetric Learning Rates</a>. ICML 2024. arXiv:2402.12354.</li>
+      <li>Liu H, et al. <a href="https://arxiv.org/abs/2304.08485">Visual Instruction Tuning (LLaVA)</a>. NeurIPS 2023. arXiv:2304.08485.</li>
+      <li>Bai J, et al. <a href="https://arxiv.org/abs/2308.12966">Qwen-VL: A Versatile Vision-Language Model</a>. arXiv 2023. arXiv:2308.12966.</li>
+      <li>Chen Z, et al. <a href="https://arxiv.org/abs/2403.05525">InternVL: Scaling up Vision Foundation Models</a>. CVPR 2024. arXiv:2403.05525.</li>
+      <li>Yao Y, et al. <a href="https://arxiv.org/abs/2408.10537">MiniCPM-V: A GPT-4V Level MLLM on Your Phone</a>. 2024. arXiv:2408.10537.</li>
+      <li>Penedo G, et al. <a href="https://arxiv.org/abs/2401.02385">TinyLlama: An Open-Source Small Language Model</a>. 2024. arXiv:2401.02385.</li>
+      <li>Mangrulkar S, et al. <a href="https://github.com/huggingface/peft">PEFT: Hugging Face 参数高效微调库</a>. GitHub 2023.</li>
+      <li>Kwon W, et al. <a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for LLM Serving with PagedAttention (vLLM 与 multi-LoRA)</a>. SOSP 2023. arXiv:2309.06180.</li>
+      <li>Gao Z, et al. <a href="https://arxiv.org/abs/2306.01222">LLM-Adapters / PEFT 综合评测</a>. EMNLP 2023. arXiv:2304.01933.</li>
+      <li>Dettmers T, et al. <a href="https://arxiv.org/abs/2208.07339">8-bit Optimizers via Block-wise Quantization</a>. ICLR 2022. arXiv:2208.07339.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

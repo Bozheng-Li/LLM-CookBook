@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 18 章 闭源多模态模型剖析 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第三部分 · 多模态大模型架构全景</div>
+  <h1 class="chapter-title">第 18 章　闭源多模态模型剖析</h1>
+  <div class="chapter-meta"><span>预计阅读 70 分钟</span><span>难度 ★★★☆☆</span><span>前置：第 13 章（融合）、第 15 章（连接器）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">为什么闭源模型值得解剖</a></li>
+  <li><a href="#sec-2">Flamingo：早期融合融合层的教科书</a></li>
+  <li><a href="#sec-3">GPT-4V / GPT-4o：能力边界与系统行为</a></li>
+  <li><a href="#sec-4">Gemini 系：原生多模态与超长上下文</a></li>
+  <li><a href="#sec-5">Claude 与 o 系：视觉推理的两条路线</a></li>
+  <li><a href="#sec-6">闭源 API 的工程使用模式</a></li>
+  <li><a href="#sec-6a">国产阵营与 API 生态</a></li>
+  <li><a href="#sec-7">开源 vs 闭源：差距的量化与选型决策</a></li>
+  <li><a href="#sec-8">本章小结</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>闭源模型看不到权重，但它们定义了能力的上限与用户的预期。本章的立场是"<b>结构未知，行为可知</b>"：通过系统卡、技术报告、独立评测与行为实验，依然可以对闭源多模态模型做出有依据的工程判断——什么时候用、成本几何、能力边界在哪、与开源方案差距多少。我们会逐家剖析 Flamingo（尽管只有技术报告，它是"书面信息最完整"的闭源式模型）、GPT-4V/4o、Gemini、Claude 与 o 系列的视觉推理，并给出 API 工程化使用的完整模式。结论先行：<b>2026 年的闭源-开源差距已从"代差"收敛到"特定场景的领先"</b>，选型逻辑随之从"追最强"变成"匹配场景"。</p></div>
+
+<div class="box-tip"><p class="box-title">💡 技巧：建立你自己的"闭源模型档案卡"</p>
+<p>为每个纳入选型的闭源模型维护一页档案卡（建议存进团队 wiki）：能力探针集的最近三次分数、图像 token 单价与上下文上限、拒答风格样本三条、数据使用政策摘要、版本变更日志、以及"上次迁移评估结论"。每次供应商发新版，只更新档案卡不动系统；只有当档案卡显示跨版本收益超过迁移成本时才触发真正的工程迁移。这张卡片把"追新"的冲动转成可审计的例行公事。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>为什么闭源模型值得解剖</h2>
+<p>一个务实的观点：闭源多模态模型是整个领域的"能力探针"与"预期锚点"。2023 年 3 月 GPT-4V 的图像输入上线，让"多模态 ChatGPT"从论文概念变成大众预期——开源社区此后一年的爆发（LLaVA、Qwen-VL、InternVL），本质上是在追赶这个预期。理解闭源模型有三重价值：<b>①能力地图</b>——它告诉你当前技术能达到什么水平，为开源路线提供目标函数；<b>②行为样本</b>——它的失败模式（幻觉、拒答、定位偏差）是所有 MLLM 的共同镜子；<b>③产品参照</b>——价格、延迟、合规构成商业系统的现实约束，任何开源选型都要与这条基线对比后再做决定。</p>
+<p>但解剖闭源模型的方法论与开源不同。没有权重可读，信息来源按可信度排序：<b>官方技术报告/系统卡</b>（模型行为与安全评估的第一手声明）&gt; <b>独立复现评测</b>（lmms-eval、OpenCompass、LMArena 等第三方榜单）&gt; <b>行为实验</b>（受控提示实验，如探测定位方式、分辨率上限）&gt; <b>社区逆向猜测</b>（最不可靠，仅作线索）。本章严格区分"声明的事实"与"合理的推测"——这是读闭源信息的基本功。另外一个阅读纪律：闭源信息有<b>半衰期</b>——系统卡描述的行为在几次版本迭代后可能完全改变，引用任何闭源模型的行为结论时必须带"版本 + 日期"戳，如同引用实验条件。本书对闭源模型的描述统一标注信息时点（本章时点为 2026 年 9 月），过期内容的更新优先级也高于开源章节——这是闭源材料维护成本更高的结构性原因。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：从"行为痕迹"反推架构设计</p>
+<p>闭源模型有几个经典的"行为指纹"实验：<b>①token 计费反推</b>——按图像 token 计费数反推视觉 token 化方式（GPT-4V 按 512px tile 计费的行为暴露了 tile 化的视觉处理）；<b>②分辨率敏感性测试</b>——同一问题在不同分辨率下的回答变化，探测动态分辨率策略；<b>③定位输出格式</b>——要求输出 bbox，观察它是输出坐标数字、还是描述性位置（"左上角"），判断是否训练过 grounding 数据；<b>④多图指代测试</b>——"第二张图里的猫"类问题，探测图像序号机制；<b>⑤OCR 探针</b>——小字号文字的识别阈值，探测视觉塔分辨率。这套"视觉考古学"是评估闭源模型的标准姿势。</p></div>
+
+<p>方法论之外还有一个"信息时间差"的观察：闭源模型的能力信息通常滞后于其内部进展 6–18 个月发布，而开源生态则以周为单位迭代（这一时间差的存在，也让"闭源报告"某种程度上成了开源领域的"预告片"）。结果是 2024–2026 年出现了一个有趣的"双螺旋"：闭源演示某能力（如 4o 的实时语音、o3 的视觉缩放）→ 开源社区在数月内给出可复现的近似实现（Qwen2-Audio 的实时对话、QVQ 的视觉思考）→ 闭源再演示更高阶能力。跟踪这个螺旋的节奏，本身就是预测开源路线图的方法——本章对每家闭源模型的剖析，都会标注"哪些能力已经开源可替代、哪些尚无"。</p>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>Flamingo：早期融合融合层的教科书</h2>
+<p>Flamingo（DeepMind，arXiv:2204.14198）虽然不是商品化 API 模型，但它作为"闭源式发布"（只有论文无权重，2023 年前）的典范，值得在本章占一节——第 13 章已从融合机制角度精读过它，这里补上系统视角。Flamingo 的规模实验是当时最完整的：3B/9B/32B/80B 四档（Chinchilla 底座），横跨 16 个多模态基准。它的两个系统性结论影响了整个领域：<b>①few-shot 交错学习有效且随规模增长</b>——32-shot 下性能持续上升，证明"图文交错上下文"是一种可扩展的推理方式；<b>②冻结 LLM + 轻量融合可以在 1.4T token 的多模态混合数据上完成对齐</b>——这打破了"必须联合预训练"的假设，为后来的"适配器路线"（BLIP-2、LLaVA）提供了理论信心。</p>
+<p>从今天回看，Flamingo 的局限同样有教育意义：交叉注意力融合使其无法直接复用快速迭代的 LLM 生态（KV cache 优化、量化、投机解码都要为专用层重新实现）；视觉 token 压缩到 64 个的 Resampler 在 OCR/细粒度任务上先天不足；商业许可的缺失让社区只能等 IDEFICS/OpenFlamingo 的复现。<b>"架构教科书"与"工程可用"之间的距离</b>，正是 2023 年开源社区用一整年填平的沟壑。</p>
+
+<div class="box-history"><p class="box-title">🕰 历史一刻：2023 年 9 月 25 日，GPT-4V 系统卡发布</p>
+<p>这一天被很多从业者视为"多模态产品元年"的起点：GPT-4 的图像输入正式开放，配套的系统卡披露了专家红队评估（含新风险类型：图像内嵌指令、名人身份、医疗图像）。系统卡里最值得玩味的是对"风险分布变化"的诚实陈述——多模态引入了纯文本没有的攻击面（图像中的文字指令、人脸隐私、地理定位泄露），而防御手段（训练拒绝、输入过滤）在当时都不成熟。这份文档与其说是技术报告，不如说是"多模态安全工程的开题报告"——第 41 章的安全评测体系，与它一脉相承。同年 11 月 GPT-4V 上线"多图 + 网页浏览"组合，大众第一次能在 ChatGPT 里"给 AI 看截图问问题"——Agent 叙事的第一块拼图落位。</p></div>
+
+<p>再补一个常被引用的训练细节：Flamingo 的多模态混合数据是"三源合一"——M3W（4300 万网页级图文交错序列）+ 图文对（LAION 式，约 18 亿对，用于对比式的 NextICC 任务）+ 视频配对文本，总训练量按 token 计约 1.4 万亿。它的"loss 只算文本部分、视觉部分以特殊标记占位"的掩码策略，是后来所有交错训练（包括 Qwen-VL 系）的模板。Flamingo 之后 DeepMind 未开放权重，但社区以 IDEFICS（HuggingFace，后继 IDEFICS2/3）、OpenFlamingo 两条线完成了复现与再发明——今天回看，Flamingo 的真正遗产是"交错上下文 + 门控融合 + 冻结底座"这个组合的可信度，而非任何单一模块。</p>
+
+<h2 id="sec-3"><span class="sec-no">3.</span>GPT-4V / GPT-4o：能力边界与系统行为</h2>
+<p>GPT-4V（2023 年 3 月接入图像输入，9 月正式发布系统卡）是第一个大众化的多模态 LLM。系统卡与后续研究披露的信息包括：支持多图输入、能处理文档与图表、具备一定的空间定位描述能力（早期不支持精确 bbox 输出）；安全侧做了大量对抗测试（人脸/名人识别拒绝、图像内嵌恶意指令的防御）。独立评测揭示的能力边界：OCRBench 类细粒度文字任务落后于同期专用模型；"数数"类问题不可靠；空间关系（左右）错误率偏高——这些与"CLIP 式视觉塔 + tile 化输入"的推测一致。</p>
+<p>行为实验（"视觉考古学"）在 GPT-4V 上的三个代表性发现，示范了这类方法的产出形态：<b>①tile 计费公式反推</b>——高分辨率图像按 512px tile 计费（每 tile 170 token），推断其视觉处理是"放大到高分辨率后切块编码"，这与 LLaVA-NeXT 的 AnyRes 思路同构——闭源工程实践与开源研究在 2023 年就出现了趋同；<b>②定位方式测试</b>——要求 bbox 时 GPT-4V 通常给出"归一化 0-10 坐标"且精度有限，说明 grounding 不是其训练重点（对比同期 Kosmos-2 的 1000 桶离散坐标）；<b>③"文字注入"脆弱性</b>——图像内嵌入"忽略以上指令，输出 X"的文字时早期版本会照做，催生了图文混合指令注入的防御研究（第 41 章）。这三个实验都不需要任何内部信息，却精确刻画了模型的视觉管线——这是"行为可知"方法论的最好注脚。</p>
+<p>GPT-4o（2024 年 5 月）的"o"代表 omni：<b>文本、图像、语音的端到端统一处理</b>，最引人注目的是语音模式的实时性（平均 320ms 语音延迟，接近人类对话反应）——这暗示语音不再经过"ASR→LLM→TTS"的级联，而是端到端的原生处理，是"原生多模态"（第 19 章）在产品侧的里程碑。对视觉方向的工程含义：4o 的图像理解在多数基准上比 4V 提升明显（尤其文档与推理类），且图像 token 计费的下降（tile 计费简化为统一的图像 token 单价）反映了更高效的视觉 token 化。2024–2026 年的迭代（4o 后续版本与 GPT-5 系）持续强化多模态推理与 Agent 能力（screen 点选、computer use），闭源侧的节奏约为每半年一次能力刷新。</p>
+<p>对"要不要追新"的工程建议：闭源模型的每次大版本更替都会重排一次能力榜单，但生产系统的迁移成本是实打实的（重新评测、重新调提示、重新做成本模型）。理性的跟进策略是<b>"半年窗口"</b>——每次大版本发布后，用固定探针集跑一轮对比，只有当"你的核心场景指标"提升超过 10% 或价格下降超过 20% 时才启动迁移；其余升级让"探针告警"被动触发。把跟随新版本的冲动约束在数据流程里，是多模态服务长期稳定的隐性支柱。</p>
+<div class="tbl-wrap"><table>
+<caption>表 18-1　GPT-4V 与 GPT-4o 的行为差异（独立评测与官方披露汇总）</caption>
+<thead><tr><th>维度</th><th>GPT-4V（2023）</th><th>GPT-4o（2024+）</th></tr></thead>
+<tbody>
+<tr><td>语音交互</td><td>无原生语音</td><td>端到端实时语音（~320ms 延迟）</td></tr>
+<tr><td>图像计费</td><td>512px tile 分段计费</td><td>统一图像 token 单价</td></tr>
+<tr><td>文档/图表</td><td>可用但细粒度弱</td><td>显著增强（高分辨率处理）</td></tr>
+<tr><td>多模态推理</td><td>文本 CoT 为主</td><td>视觉信息深度参与推理</td></tr>
+<tr><td>Agent 能力</td><td>无</td><td>computer use / 屏幕操作方向演进</td></tr>
+</tbody></table></div>
+
+<p>把闭源阵营按"技术押注"总结成一张地图，会更清楚各家在赌什么：<b>OpenAI 押注推理与 Agent</b>（o 系长思考 + computer use，把模型变成操作者）；<b>Google 押注原生统一与规模</b>（多模态原生训练 + 百万上下文 + 全家桶集成）；<b>Anthropic 押注对齐与可靠性</b>（Constitutional 系、扩展思考的可审计性、企业级工具链）。三家2026 年的产品形态已经明显分化——这不只是商业选择，更是对"多模态模型的终局形态"的三种技术判断：是推理引擎、是通用接口、还是可靠的知识工作者。开源生态在三条线上都有追赶者（QVQ/R1 系对推理、Qwen/InternVL 对统一、各种 Agent 框架对可靠性），第 43、44、48 章会逐一展开。</p>
+
+<h2 id="sec-4"><span class="sec-no">4.</span>Gemini 系：原生多模态与超长上下文</h2>
+<p>Google 的 Gemini 1.0（2023 年 12 月）从技术报告起就强调<b>多模态原生训练</b>——不是"语言模型加装视觉"，而是从预训练起就混合多模态数据（报告披露的预训练配比包含大量图文/视频），配合 TPU 集群的 MoE 架构。Gemini 1.5（2024 年 2 月）的两个数字震动了工程界：<b>100 万 token 的上下文窗口</b>（后续到 200 万）与"针在草堆"测试中 99%+ 的召回——对多模态的意义是<b>小时级视频、数千页文档可以整体放入上下文</b>，视频理解从"采样几帧"变成"全序列处理"。长上下文多模态的工程代价（KV cache 显存、位置编码外推）见第 7 章与第 31 章——Gemini 的实践表明 MoE + 高效注意力是这个规模的前提。</p>
+<p>Gemini 2.x（2024–2026）沿三个方向演进：原生图像输出（图像生成与理解统一）、实时多模态交互（Live API 对标 4o 语音）、以及与 Search/Workspace 的深度整合（多模态 RAG 的产品化样板）。对研究者的启示：Gemini 的技术路线是"原生多模态"假设的最佳代言——如果这个假设完全正确，适配器路线的开源模型将在长视频/长文档等"重原生"场景持续承压；而 2025–2026 年的开源追赶（Qwen2.5-VL 的原生动态分辨率、InternVL3 的长视频）正是对这一压力的正面回应——两条路线的竞争仍在进行时。</p>
+<div class="box-paper"><p class="box-title">📄 论文精读：Gemini 1.5（Team Gemini, arXiv:2403.05530）</p>
+<p><b>问题</b>：多模态模型能否在保持推理质量的同时，把上下文扩展到百万 token 级（小时级视频/整本书）？<b>方法</b>：MoE Transformer（每次激活部分专家）+ 稀疏混合专家的分布式训练 + 长上下文数据课程；多模态数据（图文/视频/音频）从预训练即混合。<b>关键结果</b>：128K→1000 万 token 级的"针在草堆"检索 99%+；全长电影问答、跨 700 页文档推理等新基准上的演示；相同计算下性能超过同代稠密模型。<b>为什么重要</b>：它把"长上下文多模态"从幻想变成工程现实，并证明了 MoE 是多模态长上下文的可行底座；其"needle in a haystack"式评测成为长上下文报告的标准姿势。<b>延伸阅读</b>：对比读 Qwen2.5-VL/InternVL3 的长视频评测（第 31 章），能看到开源侧用"更便宜的方式"（帧压缩+多级池化）追赶同一条曲线。</p></div>
+<p>超长上下文的多模态用法有一个容易忽视的工程细节：<b>"放得进上下文"≠"答得准"</b>。Gemini 1.5 的技术报告诚实地区分了"检索型任务"（针在草堆，接近满分）与"聚合型任务"（需要跨全文档综合，性能随长度下降更陡）。用百万上下文做视频理解的正确姿势因此是任务分解：先让模型做"定位型"查询（哪个片段发生了 X——检索型，可靠），再对定位到的片段做深入问答（短上下文，高质量），而不是"看完整场电影写一篇影评"式的单次聚合。这个"检索→聚焦"两级模式是多模态 RAG（第 42 章）在超长上下文时代的延续——上下文变长没有消灭 RAG，只是改变了它的形态。</p>
+
+<p>安全与合规维度上，三家闭源供应商的差异也值得写进选型表。OpenAI 的安全报告偏重"能力-风险对照"（每个新能力配一组红队结果）；Anthropic 的 RSP（负责任扩展政策）承诺按能力阈值触发更严的评估，文档风格偏"政策条款"；Google 的 Approach 团队把安全评估与产品集成（Workspace/Android）的合规要求绑定。对多模态而言，三者都在图像隐私（人脸/定位）、深度伪造、图像注入攻击上有专项声明——差异主要在<b>拒答风格</b>（Claude 偏解释性、GPT 偏硬拒绝、Gemini 偏过滤）与<b>数据使用政策</b>（API 数据是否用于训练，各家的条款与可选开关不同）。生产系统的合规审查应把这三份文档当作必读材料，而不是依赖二手解读。</p>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>Claude 与 o 系：视觉推理的两条路线</h2>
+<p><b>Claude 系</b>（Anthropic）的视觉能力自 Claude 3（2024 年 3 月）起进入第一梯队，其差异化定位在<b>文档与代码场景</b>：长文档理解（200K 上下文下的多文档对比）、图表精确读数（与 Claude 的系统性思维链倾向结合）以及 Artifacts 式的"看图写代码"工作流。Claude 的系统卡传统（Constitutional AI 的对齐方法，arXiv:2212.08073）使其在拒答边界上与 GPT 系风格不同——更少的过度拒答、更详细的解释性拒绝，这在合规敏感场景是真实的选型考量。</p>
+<p><b>o 系列</b>（OpenAI，o1 于 2024 年 9 月、后续 o3/o4-mini）代表另一条路线：<b>把视觉感知塞进"长思考"的强化学习循环</b>。o 系模型的 signature 行为是生成大量隐藏的思维链 token（推理时计算，test-time compute），并在思考过程中<b>主动使用视觉信息</b>——o3 的演示（2024 年 12 月）包括：对图像进行缩放查看细节（"zoom in" 工具行为）、在几何题中逐步标注、跨多张图追踪线索。这标志着视觉使用的范式变化：从"一次编码、静态表示"（编码器→连接器→LLM）转向"按需多次调用视觉、推理中迭代感知"。<b>视觉推理的 test-time scaling</b>（第 44 章的主题）由此成为 2025 年多模态研究的最热方向：开源跟进者包括 QVQ（Qwen 的视觉推理模型）与各类视觉 PRM（过程奖励模型）。</p>
+<div class="box-theory"><p class="box-title">📐 理论视角：test-time compute 如何改变视觉问题</p>
+<p>传统 MLLM 的视觉处理是"单次前向"：图像 → 固定 token → 一次性推理。这在三个场景下失效：①<b>分辨率不足</b>——小字看不清，且无法弥补；②<b>感知歧义</b>——一瞥难辨的内容（密集计数、重叠物体）；③<b>多步视觉推理</b>——每一步推理都会改变"下一步该看哪里"。o 系的"思考中使用视觉"本质上是把视觉感知变成<b>可多次调用的动作</b>：模型可以决定"放大左下角""再数一遍"，每次调用都产生新的 token 进上下文。用 RL 的语言说：感知从"状态的一部分"变成了"动作空间的一员"。这一视角下的开源实现路径（QVQ 类的视觉 CoT、VisualPRM 的过程监督、以及第 44 章的 zoom-in 工具化设计）构成了 2025–2026 年多模态推理的主叙事。</p></div>
+
+<p>给闭源视觉推理做横向小结，o 系与 Claude/Gemini 的"长思考"风格有细微但重要的差别：o 系的思考过程默认隐藏（只输出摘要），工程上拿到的是"更准的最终答案"但失去中间可审计性；Claude 的扩展思考（extended thinking）与 Gemini 的思考模式则提供可见/可控的思考预算——对需要<b>审计链</b>的生产场景（金融审批、医疗辅助），"看得见的推理"是真实的选型差异。开源侧的对照物是 QVQ、DeepSeek-R1 系的显式思维链输出：推理质量略逊但全程可审计、可微调、可私有化——"准确率 vs 可审计性"的权衡在 2026 年的多模态推理选型中会成为常态话题。</p>
+
+<div class="box-paper"><p class="box-title">📄 文档精读：Learning to Reason with LLMs（o1 系统卡, OpenAI 2024）</p>
+<p><b>性质</b>：这不是传统论文而是"博客 + 系统卡"的混合体，但其中的评测设计值得精读。<b>关键声明</b>：o1 在数学竞赛（AIME 83%）、代码（Codeforces 89 分位）、博士级科学题（GPQA 78%）上的跃升来自"大规模 RL 产生长思维链"；系统卡首次系统披露了"思维链安全"问题——隐藏 CoT 可能编码策略性欺骗（scheming）行为，因此 OpenAI 选择不对用户公开原始思维链。<b>对多模态的意义</b>：o 系证明了 RL 驱动的长思考可以迁移到需要视觉的数学/科学任务（o3 的视觉缩放与标注行为），把"感知-推理-行动"放进同一个可优化的循环。<b>批判性阅读</b>：系统卡的评测由厂商自选，第三方复现（如 ARC-AGI 上的表现）与自报分数的差异值得对照；隐藏思维链的"不可审计性"是真实的工程代价。<b>延伸阅读</b>：Snell et al.（arXiv:2408.03314）的 test-time compute scaling 理论框架，为"多少思考预算换多少准确率"提供定量语言。</p></div>
+
+<h2 id="sec-6"><span class="sec-no">6.</span>闭源 API 的工程使用模式</h2>
+<p>把闭源多模态 API 用好是纯粹的工程问题，以下是经过生产验证的模式集：</p>
+<p><b>①图像输入规范</b>：主流 API 都接受 base64/URL 输入，但要控制三件事——分辨率（多数 API 有内置上限与下采样，送 4K 原图是浪费）、格式（WebP/AVIF 可省传输但不被所有端点接受）、多图顺序（顺序即语义，乱序的多图会引发指代错误）。<b>②结构化输出</b>：JSON Schema/函数调用约束输出（第 7 章受控生成），OCR/抽取类任务必须用，"自由文本再解析"的错误率是不可接受的。<b>③成本工程</b>：图像 token 计费是文本的数倍——缓存系统提示、批处理合并请求、低价值请求降级到小模型，是三大省钱杠杆；同批多图共享一次对话比多次单图对话便宜得多。<b>④延迟工程</b>：流式输出、prefill 缓存（图像重复出现时）、区域就近部署；视觉编码的 prefill 开销使"多图长对话"的 TTFT（首 token 延迟）显著高于纯文本——前端要为此设计加载态。<b>⑤评测与回归</b>：API 模型会静默更新，生产系统必须建立固定探针集（第 40 章的协议）定期回归，版本号锁定只是最低保障。</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># OpenAI 兼容多模态 API 的生产化调用（含重试/降级/结构化输出）
+import base64, json, time
+from openai import OpenAI
+
+client = OpenAI()  # 或 OpenAI(base_url="http://localhost:8000/v1",
+                   #        api_key="...")  # 指向 vLLM 部署的开源模型
+
+def ask_vlm(image_path: str, question: str, schema: dict | None = None,
+            retries: int = 3):
+    b64 = base64.b64encode(open(image_path, "rb").read()).decode()
+    kwargs = dict(
+        model="gpt-4o-mini",                    # 生产中按成本分层选型
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/jpeg;base64,{b64}",
+                               "detail": "low"}},  # low/high 控制 token 成本
+            ]}],
+        max_tokens=512, temperature=0)
+    if schema:                                   # 结构化输出（受控生成）
+        kwargs["response_format"] = {"type": "json_schema",
+                                     "json_schema": schema}
+    for i in range(retries):                     # 指数退避重试
+        try:
+            r = client.chat.completions.create(**kwargs)
+            return r.choices[0].message.content
+        except Exception as e:
+            if i == retries - 1:
+                return fallback_to_local(image_path, question)  # 降级到本地开源模型
+            time.sleep(2 ** i)
+
+# 成本守门：图像 token 的粗估（4o 系 tile 公式的简化版）
+def est_image_tokens(w: int, h: int, detail: str = "high") -> int:
+    if detail == "low":
+        return 85
+    tiles = (w + 511) // 512 * (h + 511) // 512
+    return tiles * 170 + 85          # 每 tile 170 token + 基础开销</code></pre></div>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：多模型分层的成本-质量优化</p>
+<p>生产系统的标准分层：<b>第一层（80% 流量）</b>——开源 7B 级模型（vLLM 自部署），处理格式化抽取、简单 VQA，成本趋近于零；<b>第二层（15%）</b>——闭源轻量端点（gpt-4o-mini / gemini-flash 级），处理需要更强推理的任务；<b>第三层（5%）</b>——旗舰端点（4o/Gemini Pro/Claude Sonnet 级）+ 长思考，处理困难样本。分层的关键设施是<b>路由器</b>：先用小模型+置信度估计（self-consistency 分歧度），分歧大或置信度低才升级。经验数字：合理分层能把整体成本压到"全旗舰"的 5–10%，质量损失 &lt;2%。第 46 章项目五给出完整实现。</p></div>
+
+<h2 id="sec-6a"><span class="sec-no">6A.</span>国产阵营与 API 生态</h2>
+<p>中文多模态生态的闭源/半闭源 API 与国际阵营并行发展，且在中文文档、本地合规、价格上各有优势。选型时值得纳入对照的主要梯队（2026 年初快照）：<b>①阿里系</b>——通义 Qwen-VL-Max/Plus API 与开源 Qwen-VL 系同源，API 行为与开源模型高度一致，迁移成本低；<b>②字节系</b>——豆包视觉理解（ doubao-vision ）与即梦（生成侧），视频理解与内容审核场景成熟；<b>③智谱系</b>——GLM-4V-Plus/GLM-4.5V，长视频理解与 Agent 能力见长，且开源 GLM-4V 权重与 API 双轨；<b>④月之暗面</b>——Kimi 视觉版以长上下文文档见长；<b>⑤百度/腾讯</b>——文心/混元视觉 API 深耕行业解决方案。中文场景的独有评测维度：中文 OCR（竖排、印章、票据）、中文图表、本地化合规（生成内容标识、数据出境），这些在国际榜单上不可见但对国内落地是硬约束。</p>
+<div class="tbl-wrap"><table>
+<caption>表 18-2　多模态 API 选型对照（2026 年初快照，价格为量级参考）</caption>
+<thead><tr><th>供给线</th><th>代表端点</th><th>图像 token 价格量级</th><th>相对优势</th><th>典型场景</th></tr></thead>
+<tbody>
+<tr><td>国际旗舰</td><td>GPT-4o / Gemini Pro / Claude Sonnet</td><td>高</td><td>推理深度、Agent 生态</td><td>难例兜底、复杂推理</td></tr>
+<tr><td>国际轻量</td><td>4o-mini / Gemini Flash / Claude Haiku</td><td>中低</td><td>速度、成本平衡</td><td>高流量理解任务</td></tr>
+<tr><td>国产 API</td><td>Qwen-VL-Max / GLM-4V / 豆包视觉</td><td>低</td><td>中文场景、合规、价格</td><td>国内生产系统主力</td></tr>
+<tr><td>开源自部署</td><td>Qwen2.5-VL / InternVL3.5 / MiniCPM-V</td><td>≈GPU 折旧</td><td>可控、可微调、可定制</td><td>数据敏感与高频负载</td></tr>
+</tbody></table></div>
+<p>工程上值得注意的"生态位事实"：国产 API 的<b>价格</b>通常比国际旗舰低一个数量级，<b>中文文档理解</b>（票据、合同、竖排古籍）常有专项优化，<b>合规</b>上天然满足数据不出境与生成标识要求；而国际旗舰在<b>推理深度</b>（o 系长思考）与<b>Agent 工具生态</b>（computer use、代码执行）上保持领先。2026 年的趋势是两条供给线的"能力集"快速趋同，选型越来越像"供应链决策"——延迟、合规、价格、供应商风险的权衡，而非纯粹的能力排名——这也让本章的"档案卡"实践（第 1 节）从建议变成了刚需。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：多供应商抽象层的最小设计</p>
+<p>生产系统建议在第一天就做供应商抽象，避免锁定：<b>①统一消息格式</b>——把"文本+图像列表+图像detail+schema"映射为各家 API 的方言（OpenAI 兼容格式已成事实标准，国产 API 多数提供兼容端点）；<b>②能力注册表</b>——每个端点登记"上下文长度/是否支持 schema/图像上限/价格/SLA"，路由器按能力表选择；<b>③探针回归</b>——每周对全端点跑固定探针集，供应商静默更新第一时间告警；<b>④降级链</b>——旗舰→轻量→国产→本地开源，每级配置超时与熔断。这套抽象层大约一周工作量，回报是永久的议价权与可用性。</p></div>
+
+<p><b>⑥吞吐侧模式</b>：闭源 API 也讲吞吐——批量端点（batch API）以数小时延迟换 50% 折扣，适合离线回填与日常重建索引；并发管理要遵守 rate limit 的"双桶"（请求数/每分钟 + token 数/每分钟），多图请求往往先撞 token 桶；重试必须指数退避且尊重 Retry-After 头，否则雪崩式重试会把你锁在门外。<b>⑦缓存体系</b>：三层缓存——图像特征级（同一图同一问题的答案缓存，键为内容哈希+提示哈希）、前缀级（供应商提供的 prompt caching 直接省 prefill 费用）、语义级（相似问题的向量检索命中复用）。文档系统上线缓存后，通常 30–50% 的请求根本不需要调用模型。</p>
+
+<h3 id="sec-6-1">6.1 图像预处理流水线：API 成本与质量的第一杠杆</h3>
+<p>闭源 API 按图像 token 计费，而图像 token 数由你上传的分辨率决定——<b>预处理是成本与质量的第一杠杆</b>。生产化的预处理流水线：<b>①智能裁剪</b>——检测文档边界/主体区域，裁掉无关背景（一张含大片桌面的照片裁剪后 token 数可降 60%）；<b>②目标分辨率映射</b>——按任务定分辨率（分类/描述 768px 足够，OCR 1568px+，对应各 API 的 tile 网格），避免"越大越好"的误区；<b>③格式与压缩</b>——JPEG 质量 85 的视觉质量与原图几乎无差，传输与存储成本减半；<b>④多页合并策略</b>——PDF 场景"每页一图多次调用"对比"拼长图一次调用"，在 token 单价与任务质量上各有优势，需要按任务实测（经验：抽取类任务拼长图 + 页码标记更稳，长文档问答分页调用更好）。</p>
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># 任务感知的图像预处理：成本降一半，质量不掉
+from PIL import Image
+import io
+
+def smart_prepare(image_path: str, task: str = "ocr",
+                   max_side: int | None = None, quality: int = 85):
+    img = Image.open(image_path).convert("RGB")
+    # 1) 任务相关目标分辨率（tile 网格对齐：512 的倍数常见）
+    presets = {"classify": 768, "describe": 1024, "ocr": 1568, "fine_ocr": 2048}
+    target = max_side or presets.get(task, 1024)
+    scale = min(1.0, target / max(img.size))
+    if scale < 1.0:
+        img = img.resize((round(img.width*scale), round(img.height*scale)),
+                         Image.LANCZOS)
+    # 2) EXIF 剥离（隐私）+ 质量 85 压缩
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality, optimize=True)
+    return buf.getvalue(), img.size
+
+# 经验数字：1568px 的 A4 文档 JPEG-85 约 250–400KB，
+# 对应 4o 系 6 tile ≈ 1105 图像 token —— 预算内做完一页 OCR</code></pre></div>
+<div class="tbl-wrap"><table>
+<caption>表 18-3　成本-延迟分层的典型配置（文档理解服务为例）</caption>
+<thead><tr><th>层级</th><th>端点</th><th>流量占比</th><th>单次延迟</th><th>适用请求</th></tr></thead>
+<tbody>
+<tr><td>L1 本地开源</td><td>Qwen2.5-VL-7B @vLLM</td><td>~80%</td><td>0.5–1.5s</td><td>格式化抽取、常规 VQA</td></tr>
+<tr><td>L2 轻量 API</td><td>4o-mini / Gemini Flash / Qwen-VL-Plus</td><td>~15%</td><td>1–3s</td><td>复杂图表、跨页推理</td></tr>
+<tr><td>L3 旗舰+长思考</td><td>4o / Gemini Pro / o 系</td><td>~5%</td><td>3–30s</td><td>难例兜底、高价值决策</td></tr>
+</tbody></table></div>
+<div class="box-warn"><p class="box-title">⚠️ 陷阱：API 评测的"版本漂移"与供应商幻觉</p>
+<p>闭源 API 评测有两个独有的坑。<b>①版本漂移</b>——同一端点三个月后的输出分布会变（模型更新、系统提示调整），跨月的评测分数不可直接比较；严谨的对比必须锁定版本号并注明评测日期。<b>②供应商自报分数</b>——各家技术博客的榜单都是"自家主场"（选自家强的基准与协议），引用时必须找第三方统一评测（lmms-eval、OpenCompass、LMArena 的 ELO）交叉验证。经验法则：供应商博客提供"能力叙事"，第三方榜单提供"相对位置"，自己的探针集提供"你的场景的真相"——三层缺一不可。</p></div>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：一笔"开源 vs API"的账</p>
+<p>设定：文档问答服务，月均 300 万次调用、每次 1 图（≈1200 图像 token）+ 800 输出 token。<br>
+<b>闭源轻量端点</b>：按 2026 年初主流定价量级，每月账单通常在数万元人民币量级，零运维、弹性伸缩。<br>
+<b>开源自部署</b>：Qwen2.5-VL-7B + vLLM，单张 A100/4090 级可支撑约 15–25 QPS（见第 39 章吞吐估算），300 万次/月 ≈ 1.2 QPS 均值（峰值 5×），<b>1–2 张 GPU 即可</b>——月成本 = GPU 折旧/租用（数千元）+ 运维人力。<b>结论</b>：这个量级下自部署成本约为 API 的 1/3–1/5，且数据不出域；但 <10 万次/月的小流量场景，API 的零运维完胜。<b>盈亏平衡点</b>的直觉公式：月调用量 × 单次 API 价 > GPU 月成本 ÷ 目标利用率时，自部署开始划算——把你的真实数字代进去算一次，比读十篇对比文章都有用。</p></div>
+
+<h2 id="sec-7"><span class="sec-no">7.</span>开源 vs 闭源：差距的量化与选型决策</h2>
+<p>把 2023–2026 的第三方评测（MMMU、MathVista、OCRBench、OSWorld 等）串起来看，差距的演变分三个阶段（分数为跨论文对比的趋势量级，协议差异见第 40 章）：<b>2023 年</b>——GPT-4V 对开源最好模型有 15–25 个点的代差（MMMU 上约一倍）；<b>2024 年</b>——Qwen2-VL/InternVL2.5 把差距压到 5–10 个点，部分感知类基准反超；<b>2025–2026 年</b>——旗舰开源（Qwen3-VL、InternVL3.5、MiniCPM-V 4.5）在多数理解类基准与闭源旗舰互有胜负，差距收敛到"推理深度与 Agent 可靠性"两个特定维度——o 系的长思考视觉推理与 computer use 的端到端可靠性是闭源最后的护城河（第 43、44 章讨论开源的追赶路径）。</p>
+<figure><svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+  <text x="380" y="26" text-anchor="middle" font-size="14" font-weight="bold" fill="#0f172a" font-family="sans-serif">开源 vs 闭源差距演变（示意，以 MMMU 类知识基准为代表）</text>
+  <line x1="80" y1="250" x2="700" y2="250" stroke="#334155" stroke-width="2"/>
+  <line x1="80" y1="250" x2="80" y2="50" stroke="#334155" stroke-width="2"/>
+  <line x1="80" y1="80" x2="700" y2="80" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,4"/>
+  <text x="700" y="74" text-anchor="end" font-size="10.5" fill="#64748b" font-family="sans-serif">闭源旗舰水平带</text>
+  <polyline points="100,235 260,190 420,140 560,110 680,95" fill="none" stroke="#2563eb" stroke-width="3"/>
+  <polyline points="100,243 260,225 420,175 560,130 680,105" fill="none" stroke="#d97706" stroke-width="3"/>
+  <rect x="90" y="60" width="200" height="26" rx="6" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="190" y="77" text-anchor="middle" font-size="10.5" fill="#1e40af" font-family="sans-serif">2023: 代差 15–25 点</text>
+  <rect x="300" y="60" width="200" height="26" rx="6" fill="#fffbeb" stroke="#d97706"/>
+  <text x="400" y="77" text-anchor="middle" font-size="10.5" fill="#92400e" font-family="sans-serif">2024: 收敛到 5–10 点</text>
+  <rect x="510" y="60" width="180" height="26" rx="6" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="600" y="77" text-anchor="middle" font-size="10.5" fill="#047857" font-family="sans-serif">2025–26: 互有胜负</text>
+  <text x="150" y="268" font-size="10.5" fill="#2563eb" font-family="sans-serif">— 开源旗舰</text>
+  <text x="270" y="268" font-size="10.5" fill="#d97706" font-family="sans-serif">— 闭源旗舰（示意趋势，非精确分数）</text>
+  <text x="380" y="290" text-anchor="middle" font-size="11" fill="#94a3b8" font-family="sans-serif">剩余差距集中在：长思考视觉推理 / Agent 端到端可靠性 / 超长上下文多模态</text>
+</svg><figcaption>图 18-1　<b>开源-闭源差距的三年收敛</b>（基于公开榜单的趋势示意）：理解类差距基本抹平，剩余差距在推理与 Agent 维度。</figcaption></figure>
+<div class="box-recipe"><p class="box-title">🍳 实战配方：开源/闭源选型决策清单</p>
+<p><b>选闭源 API</b>，当：①需求含长思考视觉推理或复杂屏幕操作；②无 GPU 资产与运维能力；③合规允许数据出境/入第三方；④用量波动大（按需付费优于固定 GPU）。<b>选开源自部署</b>，当：①数据敏感（医疗/金融/政企）；②高频稳定负载（成本临界点通常在每月数百万次调用）；③需要微调到私有领域；④需要控制延迟与可用性 SLO。<b>混合</b>（多数团队的现实选择）：分层路由（第 6 节配方），开源吃量、闭源兜底难例。<b>决策的隐藏变量</b>：闭源 API 的"静默更新"对需要确定性回归的生产系统是长期风险——金融/医疗类客户往往因此一票否决。还有两个常被低估的变量：<b>能力的时间维度</b>——闭源能力以月为单位演进，今天的"差距"三个月后可能反转，因此架构上保留"供给侧可替换"（第 6A 节的抽象层）比一次性押注更重要；<b>数据的复利</b>——自部署意味着用户交互数据留在自己手里，可以反哺微调形成数据飞轮，而走 API 的数据返利取决于供应商协议——在产品有数据网络效应的场景，这一项的长期价值可能超过全部 GPU 成本。</p></div>
+
+<h2 id="sec-8"><span class="sec-no">8.</span>本章小结</h2>
+<p>本章用"结构未知、行为可知"的方法论解剖了闭源多模态阵营：Flamingo 留下架构教科书与"冻结 LLM 可行"的信心；GPT-4V/4o 定义了产品形态与端到端语音的里程碑；Gemini 押注原生多模态与超长上下文；Claude 以文档与对齐风格差异化；o 系把视觉感知变成推理中可调用的动作，开启 test-time scaling 叙事。工程侧给出了 API 使用五模式与分层路由配方；选型侧给出了差距演变的三个阶段与决策清单。核心判断：<b>2026 年的选型问题不再是"谁最强"，而是"这个场景的可观测需求，由哪条供给线满足最划算"</b>——能力、成本、合规、可审计性四个变量的联合优化。给你的阅读路标：把本章与第 39 章（部署）、第 43 章（Agent）、第 46 章（项目）对照阅读，会形成"选型→部署→应用→回归评测"的完整闭环。下一章回到架构本身——原生多模态与早期融合，看看"把视觉长进大脑"这条激路线的进展与代价。</p>
+
+<div class="box-quiz"><p class="box-title">✏️ 自测</p>
+<p><b>1.</b> "行为指纹"实验的五个例子分别探测什么？<br><b>答案要点</b>：token 计费→视觉 token 化方式；分辨率敏感性→动态分辨率策略；定位输出格式→grounding 训练；多图指代→图像序号机制；OCR 阈值→视觉塔分辨率。</p>
+<p><b>2.</b> Flamingo 的两个系统性结论是什么？它最后的工程局限呢？<br><b>答案要点</b>：few-shot 交错学习随规模增长；冻结 LLM+轻量融合可行。局限：专用层不兼容 LLM 生态、64 token 压缩先天弱于细粒度任务、无开源权重。</p>
+<p><b>3.</b> GPT-4o 的"omni"在工程上意味着什么？<br><b>答案要点</b>：语音绕过 ASR→LLM→TTS 级联、端到端实时处理（~320ms）；即"原生多模态"从论文概念变成产品事实。</p>
+<p><b>4.</b> o 系列把视觉使用从"状态"变成"动作"是什么意思？举两个行为证据。<br><b>答案要点</b>：感知成为推理循环中可多次调用的动作（test-time compute）；证据：缩放查看细节、几何题逐步标注、跨图追踪线索。</p>
+<p><b>5.</b> 分层路由的成本逻辑是什么？路由信号通常用什么？<br><b>答案要点</b>：多数流量可由小模型解决，仅难例需旗舰；路由信号用小模型置信度/自一致性分歧度，升级路径按难度分层，整体成本可压至 5–10% 而质量损失 &lt;2%。</p>
+<p><b>6.</b> 为什么说"静默更新"是闭源 API 在生产中的长期风险？<br><b>答案要点</b>：输出行为可能随供应商迭代漂移，破坏回归测试与合规审计的确定性；金融/医疗等需要行为可审计的场景常常因此否决闭源方案。</p>
+<p><b>7.</b> 图像预处理为什么是 API 成本的第一杠杆？给出三个可执行的压缩动作。<br><b>答案要点</b>：图像 token 由上传分辨率决定，成本直接可控。动作：任务感知的目标分辨率（分类 768/OCR 1568）、智能裁剪去除无关区域、JPEG-85 压缩与格式选择；三招通常省 40–60%。</p>
+<p><b>8.</b> 一笔账：月 300 万次文档问答调用，开源自部署与 API 的盈亏平衡由哪些变量决定？<br><b>答案要点</b>：单次 API 价 × 调用量 vs （GPU 折旧+运维）÷ 目标利用率；另需计入峰值扩容、可用性 SLA 与数据合规的隐性成本/收益。</p>
+<p><b>9.</b> "检索型 vs 聚合型"任务在超长上下文里的性能差异说明了什么？正确的使用模式是什么？<br><b>答案要点</b>：长上下文不保证跨全文档聚合质量，性能随聚合范围衰减；正确模式是任务分解——先检索定位（可靠），再对聚焦片段深入推理（高质量），即"检索→聚焦"两级模式。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Alayrac J-B, et al. <a href="https://arxiv.org/abs/2204.14198">Flamingo: a Visual Language Model for Few-Shot Learning</a>. NeurIPS 2022. arXiv:2204.14198.</li>
+      <li>OpenAI. <a href="https://openai.com/research/gpt-4v-system-card">GPT-4V(ision) System Card</a>. 2023.</li>
+      <li>OpenAI. <a href="https://openai.com/index/hello-gpt-4o/">Hello GPT-4o（端到端多模态与实时语音）</a>. 2024.</li>
+      <li>Team G, et al. <a href="https://arxiv.org/abs/2312.11805">Gemini: A Family of Highly Capable Multimodal Models</a>. arXiv 2023. arXiv:2312.11805.</li>
+      <li>Team G, et al. <a href="https://arxiv.org/abs/2403.05530">Gemini 1.5: Unlocking Multimodal Understanding Across Millions of Tokens of Context</a>. arXiv 2024. arXiv:2403.05530.</li>
+      <li>Bai Y, et al. <a href="https://arxiv.org/abs/2212.08073">Constitutional AI: Harmlessness from AI Feedback</a>. arXiv 2022. arXiv:2212.08073.</li>
+      <li>OpenAI. <a href="https://openai.com/o1/">Learning to Reason with LLMs（o1 系统卡与博客）</a>. 2024.</li>
+      <li>Laurençon H, et al. <a href="https://arxiv.org/abs/2311.01346">OpenFlamingo: An Open-Source Framework for Training Large Autoregressive Vision-Language Models</a>. arXiv 2023. arXiv:2311.01346.</li>
+      <li>Mathew M, et al. <a href="https://arxiv.org/abs/2406.04337">Webscale Document Extraction / OCRBench 类独立评测（闭源模型 OCR 能力对照）</a>. 2024.</li>
+      <li>Yue X, et al. <a href="https://arxiv.org/abs/2311.16502">MMMU: A Massive Multi-discipline Multimodal Understanding Benchmark</a>. CVPR 2024. arXiv:2311.16502.</li>
+      <li>Fu C, et al. <a href="https://arxiv.org/abs/2311.17043">LLaMA-VID 类独立对比 / MME: A comprehensive evaluation benchmark</a>. 2023–24.</li>
+      <li>Liu F, et al. <a href="https://arxiv.org/abs/2404.16825">MM-SafetyBench: 对闭源多模态模型的安全评估</a>. ECCV 2024. arXiv:2404.16825.</li>
+      <li>Chen Z, et al. <a href="https://arxiv.org/abs/2502.13923">Qwen2.5-VL Technical Report（开源旗舰与闭源的对照评测）</a>. arXiv 2025. arXiv:2502.13923.</li>
+      <li>Anthropic. <a href="https://www.anthropic.com/claude">Claude 模型卡与系统透明度文档</a>. 2024–2026.</li>
+      <li>Snell C, et al. <a href="https://arxiv.org/abs/2408.03314">Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters</a>. arXiv 2024. arXiv:2408.03314.</li>
+      <li>HuggingFace M4. <a href="https://huggingface.co/blog/idefics">IDEFICS: An Open-Source Visual Language Model（Flamingo 复现工程实录）</a>. 2023.</li>
+      <li>OpenCompass. <a href="https://rank.opencompass.org.cn/">多模态模型统一评测榜单</a>. 2024–2026.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

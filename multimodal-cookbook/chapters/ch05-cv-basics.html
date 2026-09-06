@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 5 章 计算机视觉基础 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第一部分 · 基础篇：单模态基石</div>
+  <h1 class="chapter-title">第 5 章　计算机视觉基础</h1>
+  <div class="chapter-meta"><span>预计阅读 90 分钟</span><span>难度 ★★★☆☆</span><span>前置：第 1 章（优化基础）；可与第 2 章并行阅读</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">卷积网络简史：2012 年的那个秋天</a></li>
+  <li><a href="#sec-2">卷积的数学与归纳偏置</a></li>
+  <li><a href="#sec-3">ResNet 与残差学习：完整推导</a></li>
+  <li><a href="#sec-4">BatchNorm、数据增强与训练技巧</a></li>
+  <li><a href="#sec-5">检测与分割一页通</a></li>
+  <li><a href="#sec-6">ViT 前史与归纳偏置之争</a></li>
+  <li><a href="#sec-7">视觉表示学习：从监督到自监督</a></li>
+  <li><a href="#sec-8">多模态视角：你的视觉塔从哪来</a></li>
+  <li><a href="#sec-9">实战配方与本章自测</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>多模态大模型的"眼睛"几乎全部出身 CNN 时代的技术积累：LLaVA/Qwen-VL 的视觉塔是 ViT（Transformer），但它的 patch 切分继承自卷积的滑动窗口思想；SAM 的提示分割把检测/分割时代的 box/mask 表示直接变成了 VLM 的输出格式；MAE 的掩码预训练是 BN 时代训练技巧的 Transformer 翻版。本章用一条主线——<b>视觉表示是怎么变得越来越好用的</b>——把卷积网络的黄金十年（2012–2021）压缩成一页可用的知识：卷积的数学与归纳偏置、ResNet 残差连接的不跳步推导、BatchNorm 的训练/推理双模式、检测与分割任务谱系、ViT 如何以及为什么取代 CNN。读完本章再看第 14 章（视觉编码器家族），你会对"为什么视觉塔长这样"有完整的判断力。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>卷积网络简史：2012 年的那个秋天</h2>
+<p>卷积神经网络（Convolutional Neural Network, CNN）不是 2012 年的发明——LeCun 等人在 1989–1998 年就用 LeNet-5 完成了银行支票数字识别（1998 年《Proceedings of the IEEE》论文，约 6 万参数，卷积+下采样+全连接的骨架与现代 CNN 一致）。真正改变历史的是 2012 年 9 月 30 日：Krizhevsky、Sutskever 与 Hinton 的 AlexNet 在 ImageNet ILSVRC-2012 竞赛中把 top-5 错误率从上一年的 25.8% 一举压到 <b>15.3%</b>（第二名 26.2%），领先幅度史无前例。图像分类从此进入了"深度学习十年"。</p>
+<p>AlexNet 的胜利要素今天看都是"常识"：ReLU 激活（比 tanh 快数倍）、Dropout 正则、两块 GTX 580 GPU 上 6 天训练（模型 6000 万参数——当年需要在两卡间手工切分网络）、大规模数据（ILSVRC 120 万张、1000 类）。此后是三步快跑：VGG（2014，arXiv:1409.1556）证明"更小卷积核堆更深"的简单美学（全部 3×3 卷积，16–19 层，1.38 亿参数）；GoogLeNet/Inception（2014，arXiv:1404.5997）用 1×1 卷积做瓶颈、多尺度并行卷积，把参数量压到 680 万的同时拿到 6.7% top-5；<b>ResNet（2015，arXiv:1512.03385）</b>用残差连接把深度推到 152 层、ensemble top-5 错误率 <b>3.57%</b>——首次超越人类水平（约 5.1%），并包揽当年 ImageNet 检测、定位、COCO 检测/分割冠军。</p>
+
+<figure><img src="../assets/images/papers/1409.0575_0.png" loading="lazy" alt="ImageNet 数据集的多样性示例"><figcaption>图 5-1　<b>ImageNet 的数据多样性</b>（来源：Krizhevsky et al., ImageNet Classification with Deep Convolutional Neural Networks, arXiv:1409.0575，图中展示 ILSVRC 分类的类别多样性）。深度学习革命的燃料不只是新架构——120 万张、涵盖 1000 个细粒度类别（120 种狗）的有标注数据，让"深而表达力强"的模型第一次可以被训练而不至于过拟合。数据规模驱动的范式转变，在十年后的 CLIP（4 亿图文对）与今天的视频数据上被一再重演。</figcaption></figure>
+
+<div class="box-history"><p class="box-title">🕰 历史一刻：2012–2015，三年换了三次天</p>
+<p>2012 年 AlexNet（15.3%）证明了"深度+数据+GPU"的路线；2013 年 ZFNet（11.7%）靠反卷积可视化解释了卷积在"看什么"；2014 年 VGG（7.3%）与 GoogLeNet（6.7%）把深度推到 19 层与 22 层；2015 年 ResNet（3.57%）解决了"深度堆不动"的根本问题。如果算上检测线的节奏——R-CNN（2014）→ Fast R-CNN（2015）→ Faster R-CNN（2015）→ YOLO（2016）→ Mask R-CNN（2017）——你会发现 2012–2017 这五年奠定了今天所有视觉系统（包括 VLM 的视觉塔与 grounding 头）的地基。2017 年 Transformer 问世，2019 年 ViT 的前身们开始出现，2020 年 ViT 发布——CNN 的黄金十年结束，但它留下的工程遗产（残差、归一化、增强、预训练→微调范式）全部被继承。</p></div>
+
+<div class="tbl-wrap"><table>
+<caption>表 5-1　经典 CNN 关键指标对照（ImageNet ILSVRC 单模型/竞赛成绩）</caption>
+<thead><tr><th>模型</th><th>年份</th><th>深度</th><th>参数量</th><th>top-5 错误率</th><th>关键创新</th></tr></thead>
+<tbody>
+<tr><td>LeNet-5</td><td>1998</td><td>5 层</td><td>≈6 万</td><td>—（MNIST）</td><td>卷积+下采样骨架、参数共享</td></tr>
+<tr><td>AlexNet</td><td>2012</td><td>8 层</td><td>6000 万</td><td>15.3%</td><td>ReLU、Dropout、双 GPU 训练</td></tr>
+<tr><td>VGG-16</td><td>2014</td><td>16 层</td><td>1.38 亿</td><td>7.3%</td><td>纯 3×3 堆叠、通道数倍增</td></tr>
+<tr><td>GoogLeNet</td><td>2014</td><td>22 层</td><td>≈680 万</td><td>6.7%</td><td>Inception 多尺度、1×1 瓶颈</td></tr>
+<tr><td>ResNet-152</td><td>2015</td><td>152 层</td><td>6020 万</td><td>3.57%（ensemble）</td><td>残差连接、批量归一化深网</td></tr>
+<tr><td>Swin-L（对照）</td><td>2021</td><td>层级 Transformer</td><td>≈2 亿</td><td>top-1 ≈87.3%（IN-22k 预训练）</td><td>滑窗注意力、层级特征图</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>卷积的数学与归纳偏置</h2>
+<p>卷积层做的事情：一个可学习的核（kernel）在输入特征图上<b>滑动</b>，每个位置做一次加权求和。对输入 $\mathbf{X}\in\mathbb{R}^{C_{in}\times H\times W}$ 与核 $\mathbf{W}\in\mathbb{R}^{C_{out}\times C_{in}\times k\times k}$，输出通道 $o$ 在位置 $(i,j)$ 处：</p>
+<div class="math-block">$$\mathbf{Y}_{o,i,j} = \sum_{c=1}^{C_{in}}\sum_{u=1}^{k}\sum_{v=1}^{k} \mathbf{W}_{o,c,u,v}\cdot \mathbf{X}_{c,\; i\cdot s+u-1,\; j\cdot s+v-1} + b_o$$</div>
+<p>其中 $s$ 是步幅（stride）。与全连接层对比，卷积有三条"先天约束"，统称<b>归纳偏置</b>（Inductive Bias）：<b>（1）局部性</b>——每个输出只看 $k\times k$ 的邻域（像素的语义是局部的）；<b>（2）参数共享</b>——同一个核扫过全图（2024×2024 参数即可覆盖任意尺寸输入，而全连接需要输入尺寸 × 输出尺寸）；<b>（3）平移等变性</b>——把输入平移一格，输出特征图相应平移一格（数学上：$T_\delta \mathrm{Conv}(\mathbf{X}) = \mathrm{Conv}(T_\delta \mathbf{X})$，因为核与位置无关）。加上池化带来的近似平移<b>不变性</b>与逐层堆叠产生的层级结构（边缘→纹理→部件→物体），CNN 把"视觉世界的先验"直接焊进了架构。</p>
+<p><b>感受野</b>（Receptive Field）是量化"每层看多远"的核心概念：第 $l$ 层一个输出神经元的感受野为</p>
+<div class="math-block">$$RF_l = RF_{l-1} + (k_l - 1)\times\prod_{i=1}^{l-1} s_i$$</div>
+<p>推导直觉：第 $l$ 层的每个输出位置读 $k_l$ 个上一层位置，而每个上一层位置已经"看过" $RF_{l-1}$ 宽的输入；两层之间的距离被中间各层的步幅 $s_i$ 放大。举例：VGG-16 的三个 3×3 卷积（stride 1）串联，$RF = 1+2+2+2 = 7$——恰好等于一个 7×7 卷积，但用了 3 次 ReLU（3 个非线性）与三分之一的参数（$3\times(3^2)=27$ vs $49$），这就是"小核堆叠"优于大核的原因。</p>
+
+<figure><svg viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <defs><marker id="m5a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">卷积的层级特征与感受野增长（示意）</text>
+  <!-- input image -->
+  <rect x="40" y="60" width="120" height="120" rx="4" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+  <circle cx="100" cy="120" r="34" fill="#fde68a" stroke="#d97706" stroke-width="2"/>
+  <circle cx="88" cy="112" r="3.5" fill="#0f172a"/><circle cx="112" cy="112" r="3.5" fill="#0f172a"/>
+  <path d="M86 132 Q 100 142 114 132" fill="none" stroke="#0f172a" stroke-width="2"/>
+  <text x="100" y="200" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">输入 224×224</text>
+  <text x="100" y="218" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">RF = 3×3（像素级）</text>
+  <line x1="165" y1="120" x2="212" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#m5a)"/>
+  <!-- conv1 -->
+  <rect x="216" y="70" width="110" height="110" rx="4" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <g stroke="#93c5fd" stroke-width="1"><line x1="244" y1="70" x2="244" y2="180"/><line x1="272" y1="70" x2="272" y2="180"/><line x1="300" y1="70" x2="300" y2="180"/><line x1="216" y1="98" x2="326" y2="98"/><line x1="216" y1="126" x2="326" y2="126"/><line x1="216" y1="154" x2="326" y2="154"/></g>
+  <path d="M258 98 L 286 126 L 300 112" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+  <text x="271" y="200" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">Conv1：边缘/角点</text>
+  <text x="271" y="218" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">RF = 3×3</text>
+  <line x1="331" y1="120" x2="378" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#m5a)"/>
+  <!-- conv3 -->
+  <rect x="382" y="76" width="110" height="98" rx="4" fill="#fffbeb" stroke="#d97706" stroke-width="1.6"/>
+  <g stroke="#fcd34d" stroke-width="1"><line x1="419" y1="76" x2="419" y2="174"/><line x1="456" y1="76" x2="456" y2="174"/><line x1="382" y1="109" x2="492" y2="109"/><line x1="382" y1="142" x2="492" y2="142"/></g>
+  <path d="M400 100 C 430 90, 450 130, 478 118" fill="none" stroke="#d97706" stroke-width="2.4"/>
+  <text x="437" y="200" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">Conv3-4：纹理/部件</text>
+  <text x="437" y="218" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">RF = 13×13 量级</text>
+  <line x1="497" y1="120" x2="544" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#m5a)"/>
+  <!-- conv5 -->
+  <rect x="548" y="84" width="110" height="82" rx="4" fill="#ecfdf5" stroke="#10b981" stroke-width="1.6"/>
+  <rect x="578" y="106" width="52" height="40" rx="8" fill="#a7f3d0" stroke="#10b981" stroke-width="1.4"/>
+  <circle cx="604" cy="126" r="12" fill="none" stroke="#047857" stroke-width="2"/>
+  <text x="603" y="200" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">Conv5+：物体级语义</text>
+  <text x="603" y="218" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">RF 覆盖大半图</text>
+  <text x="380" y="266" text-anchor="middle" font-size="12.5" fill="#334155" font-family="sans-serif">感受野公式：RF_l = RF_{l-1} + (k_l − 1) × 前面所有层步幅之积</text>
+  <text x="380" y="290" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">3 个 3×3（stride 1）= 1 个 7×7 的感受野，但参数 27 vs 49、非线性 ×3 —— VGG 的核心洞察</text>
+</svg><figcaption>图 5-2　<b>卷积层级与感受野</b>（示意）。浅层学边缘与颜色、中层学纹理与部件、深层学物体级语义——层级表示是 CNN 与 ViT 共享的"分层次"世界观；区别在于 CNN 靠局部核逐步扩大感受野，ViT 第一层就有全局注意力。</figcaption></figure>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# —— 手写 2D 卷积前向（教学用；生产用 nn.Conv2d，其内部走 cuDNN/tensor core）——
+def conv2d_naive(x, weight, bias=None, stride=1):
+    """x: [B, Cin, H, W]，weight: [Cout, Cin, k, k]"""
+    B, Cin, H, W = x.shape
+    Cout, _, k, _ = weight.shape
+    Ho, Wo = (H - k) // stride + 1, (W - k) // stride + 1
+    # im2col 思想：把每个滑动窗口展开成列，卷积变成一次矩阵乘 —— GPU 上卷积的真实形态
+    cols = F.unfold(x, kernel_size=k, stride=stride)          # [B, Cin*k*k, Ho*Wo]
+    w = weight.view(Cout, -1)                                  # [Cout, Cin*k*k]
+    out = w @ cols                                             # [B?] 等价批量矩阵乘
+    out = out.view(1, Cout, Ho, Wo) if B == 1 else out         # 简化演示（仅 batch=1）
+    return out + (bias.view(1, -1, 1, 1) if bias is not None else 0)
+
+x = torch.randn(1, 3, 32, 32)
+w = torch.randn(8, 3, 3, 3)
+mine = conv2d_naive(x, w)
+ref = F.conv2d(x, w)
+print("与 F.conv2d 的最大误差:", (mine - ref).abs().max().item())   # ≈1e-6
+
+# —— 感受野计算器：输入 (kernel, stride, dilation) 的逐层列表 ——
+def receptive_field(layers):
+    rf, jump = 1, 1                      # jump：相邻两个输出位置对应的输入距离
+    for k, s, dil in layers:
+        k_eff = dil * (k - 1) + 1        # 膨胀卷积的有效核
+        rf = rf + (k_eff - 1) * jump
+        jump = jump * s
+    return rf
+
+vgg_style = [(3,1,1)] * 3               # 三个 3×3、stride 1
+print("三个 3×3 的感受野:", receptive_field(vgg_style))              # 7
+resnet_stem = [(7,2,1), (3,2,1)] + [(3,1,1)] * 3
+print("ResNet 前 5 层的感受野:", receptive_field(resnet_stem))        # 27</code></pre></div>
+
+<h2 id="sec-3"><span class="sec-no">3.</span>ResNet 与残差学习：完整推导</h2>
+<p>2015 年之前，"加深网络"遇到一个反直觉的墙：在 CIFAR-10 上，56 层普通卷积网络的<b>训练误差</b>反而高于 20 层版本——这不是过拟合（过拟合是训练误差低、测试误差高），而是<b>优化问题</b>：更深的普通网络连"恒等映射"这个理论上最简单的解都学不到（多层非线性把 $\mathbf{x}\mapsto\mathbf{x}$ 变成了难以拟合的目标）。He 等人（ResNet，CVPR 2016 最佳论文，arXiv:1512.03385）的解法只有一行公式——把要学的映射从目标 $\mathcal{H}(\mathbf{x})$ 改写为相对恒等的<b>残差</b> $\mathcal{F}(\mathbf{x}) = \mathcal{H}(\mathbf{x}) - \mathbf{x}$：</p>
+<div class="math-block">$$\mathbf{y} = \mathcal{F}(\mathbf{x}, \{W_i\}) + \mathbf{x} \qquad \text{（维度不匹配时以线性投影 } \mathbf{W}_s\mathbf{x} \text{ 替换 } \mathbf{x})$$</div>
+<p>直觉：如果某个层"最好什么都不做"，只要把 $\mathcal{F}$ 推向 0 即可（权重衰减天然干这事），而"恒等"对非线性层堆来说是难的、对"加法直通"来说是免费的。</p>
+
+<div class="box-theory"><p class="box-title">📐 理论推导：残差连接为什么让百层网络可训练</p>
+<p><b>第一步：多块嵌套展开</b>。记第 $l$ 个残差块的输入为 $\mathbf{x}_l$，块函数 $\mathcal{F}_l$，则 $\mathbf{x}_{l+1} = \mathbf{x}_l + \mathcal{F}(\mathbf{x}_l, W_l)$。对任意深的块链（从 $l$ 到 $L$）反复代入：</p>
+<div class="math-block">$$\mathbf{x}_{L} = \mathbf{x}_{l} + \sum_{i=l}^{L-1}\mathcal{F}(\mathbf{x}_i, W_i)$$</div>
+<p>深层的特征 $\mathbf{x}_L$ 永远以<b>加法</b>包含着浅层特征 $\mathbf{x}_l$——信息有一条不经过任何权重矩阵的直通路径。</p>
+<p><b>第二步：梯度公式</b>。对损失 $\mathcal{E}$ 求梯度，用链式法则（$\partial \mathbf{x}_L / \partial \mathbf{x}_l$ 经上式对 $\mathbf{x}_l$ 求导）：</p>
+<div class="math-block">$$\frac{\partial \mathcal{E}}{\partial \mathbf{x}_l} = \frac{\partial \mathcal{E}}{\partial \mathbf{x}_{L}}\cdot\left(1 + \frac{\partial}{\partial \mathbf{x}_l}\sum_{i=l}^{L-1}\mathcal{F}(\mathbf{x}_i, W_i)\right)$$</div>
+<p>关键在括号里的 "<b>1 +</b>"：梯度中永远有一项直接以系数 1 从 $\mathbf{x}_L$ 传回 $\mathbf{x}_l$——不管网络多深、不管中间的 $\mathcal{F}$ 导数多小，<b>乘法链条上多了一个加法的"逃生通道"</b>，梯度消失的指数衰减被彻底打断。对照普通网络：$\frac{\partial \mathcal{E}}{\partial \mathbf{x}_l} = \frac{\partial \mathcal{E}}{\partial \mathbf{x}_L}\cdot\prod_i \frac{\partial \mathbf{x}_{i+1}}{\partial \mathbf{x}_i}$，连乘中每项 $&lt;1$ 就是指数消失、$&gt;1$ 就是爆炸——残差把"乘法链"变成了"乘法 + 加法"的混合结构。</p>
+<p><b>第三步：为什么训练初期尤其友好</b>。随机初始化时 $\mathcal{F}$ 输出很小，每个块近似恒等映射——网络从"一条干净的信息直通线"出发，逐步学"改写量"。这与第 3 章 Pre-LN Transformer 的"残差流"是同一个数学骨架：LLaMA 式块 $\mathbf{x}_{l+1} = \mathbf{x}_l + \mathrm{Attn}(\cdot) + \mathrm{FFN}(\cdot)$ 就是 ResNet 公式的两连击。</p>
+<p><b>第四步：两个补充视角</b>。（1）<b>隐式集成</b>（Veit et al., arXiv:1605.06431）：展开递推后 ResNet 等价于 $2^{L}$ 条"不同深度子网"路径的集合，删除单个块不致命（实验：随机跳块测试误差几乎不变），解释了它对深度扰动的鲁棒性。（2）<b>Pre-Activation 版本</b>（He et al., arXiv:1603.05027）：把 BN/ReLU 移到卷积之前（$\mathbf{y} = \mathbf{x} + F(\mathrm{BN}(\mathrm{ReLU}(\mathbf{x})))$），让"恒等路径"上完全没有任何变换，千亿级深度的训练更平滑；它也是后来 Transformer Pre-LN 设计的直接灵感来源。$\blacksquare$</p></div>
+
+<figure><svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <defs><marker id="m5b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">残差块：普通路径与恒等捷径</text>
+  <circle cx="70" cy="150" r="7" fill="#2563eb"/>
+  <text x="70" y="178" text-anchor="middle" font-size="12" fill="#2563eb" font-family="sans-serif">x 输入</text>
+  <line x1="77" y1="150" x2="150" y2="150" stroke="#64748b" stroke-width="2" marker-end="url(#m5b)"/>
+  <rect x="154" y="118" width="96" height="64" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="202" y="144" text-anchor="middle" font-size="12.5" fill="#1e3a8a" font-family="sans-serif">3×3 Conv</text>
+  <text x="202" y="164" text-anchor="middle" font-size="12.5" fill="#1e3a8a" font-family="sans-serif">BN + ReLU</text>
+  <line x1="250" y1="150" x2="322" y2="150" stroke="#64748b" stroke-width="2" marker-end="url(#m5b)"/>
+  <rect x="326" y="118" width="96" height="64" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <text x="374" y="144" text-anchor="middle" font-size="12.5" fill="#1e3a8a" font-family="sans-serif">3×3 Conv</text>
+  <text x="374" y="164" text-anchor="middle" font-size="12.5" fill="#1e3a8a" font-family="sans-serif">BN</text>
+  <path d="M 100 150 C 130 90, 380 60, 468 138" fill="none" stroke="#10b981" stroke-width="3" marker-end="url(#m5b)"/>
+  <text x="284" y="76" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#047857" font-family="sans-serif">恒等捷径 identity（可含 1×1 投影 W_s）</text>
+  <circle cx="480" cy="150" r="12" fill="#fff" stroke="#0f172a" stroke-width="2"/>
+  <text x="480" y="155" text-anchor="middle" font-size="13" fill="#0f172a" font-family="sans-serif">+</text>
+  <line x1="422" y1="150" x2="466" y2="150" stroke="#64748b" stroke-width="2"/>
+  <line x1="492" y1="150" x2="546" y2="150" stroke="#64748b" stroke-width="2" marker-end="url(#m5b)"/>
+  <rect x="550" y="118" width="76" height="64" rx="8" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.6"/>
+  <text x="588" y="150" text-anchor="middle" font-size="12.5" fill="#5b21b6" font-family="sans-serif">ReLU</text>
+  <line x1="626" y1="150" x2="676" y2="150" stroke="#64748b" stroke-width="2" marker-end="url(#m5b)"/>
+  <circle cx="690" cy="150" r="7" fill="#d97706"/>
+  <text x="690" y="178" text-anchor="middle" font-size="12" fill="#d97706" font-family="sans-serif">y 输出</text>
+  <text x="380" y="226" text-anchor="middle" font-size="12.5" fill="#334155" font-family="sans-serif">y = ReLU( F(x) + x )，F = 两层 3×3 卷积；梯度 ∂E/∂x = ∂E/∂y · (1 + ∂F/∂x)</text>
+  <text x="380" y="250" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">恒等项 "1" 保证梯度直达 —— 与第 3 章 Transformer 残差流同一骨架；Pre-activation 变体把 BN/ReLU 移到 F 内部</text>
+  <text x="380" y="276" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">下采样时捷径用 1×1 Conv（stride 2）匹配维度：y = F(x) + W_s·x</text>
+</svg><figcaption>图 5-3　<b>残差块结构</b>（示意）。原论文（Post-activation）的 BasicBlock 如上；Pre-activation 版本把 BN/ReLU 放进分支，恒等路径完全无阻。ResNet 的"短路加法"与 Transformer 的残差流在数学上同构——第 3 章的 Pre-LN 与这里的 Pre-activation 也是同一个思想。</figcaption></figure>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch
+import torch.nn as nn
+
+class BasicBlock(nn.Module):
+    """ResNet-18/34 的基本残差块（Post-activation 原始形态）"""
+    expansion = 1
+    def __init__(self, cin, cout, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(cin, cout, 3, stride, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(cout)
+        self.conv2 = nn.Conv2d(cout, cout, 3, 1, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(cout)
+        # 下采样或通道变化时，捷径用 1×1 卷积 + BN 匹配维度（即公式中的 W_s）
+        self.shortcut = nn.Sequential()
+        if stride != 1 or cin != cout:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(cin, cout, 1, stride, bias=False), nn.BatchNorm2d(cout))
+
+    def forward(self, x):
+        out = torch.relu(self.bn1(self.conv1(x)))     # F 的前半
+        out = self.bn2(self.conv2(out))                # F 的后半（ReLU 留到相加后）
+        return torch.relu(out + self.shortcut(x))      # y = ReLU( F(x) + W_s·x )
+
+block = BasicBlock(64, 128, stride=2)
+x = torch.randn(2, 64, 56, 56)
+print(block(x).shape)              # [2, 128, 28, 28]：分辨率减半、通道翻倍（VGG 式惯例）
+
+# 验证残差梯度公式的"1 + ∂F/∂x"：数值检查恒等路径确实传梯度
+x = torch.randn(1, 4, 8, 8, requires_grad=True)
+y = x + torch.nn.Sequential(nn.Conv2d(4, 4, 3, padding=1))(x)     # 最小残差块
+y.sum().backward()
+print("输入梯度范数:", x.grad.norm().item())   # 与纯恒等(≈y.sum 的 1.0)同量级：直通成立</code></pre></div>
+<h2 id="sec-4"><span class="sec-no">4.</span>BatchNorm、数据增强与训练技巧</h2>
+<p>BatchNorm（批量归一化，Ioffe &amp; Szegedy, ICML 2015，arXiv:1502.03167）是让"深 CNN + 大学习率"成为现实的第二根支柱。对每个通道 $c$，在<b>一个 batch 的所有样本与所有空间位置</b>上统计均值与方差，再做仿射归一化：</p>
+<div class="math-block">$$\hat{x}_{c} = \frac{x_c - \mu_{\mathcal{B},c}}{\sqrt{\sigma^2_{\mathcal{B},c}+\epsilon}}, \qquad y_c = \gamma_c\,\hat{x}_c + \beta_c, \qquad \mu_{\mathcal{B},c} = \frac{1}{m}\sum_{\mathcal{B}} x_c$$</div>
+<p>$\gamma,\beta$ 是可学习的缩放/平移（归一化不破坏表达力）。训练与推理<b>行为不同</b>：训练用当前 batch 的统计量（且同步维护指数滑动平均的 running mean/var，动量常取 0.1）；推理切换为固定的 running 统计量（<code>model.eval()</code>）。原论文把收益归因于缓解"内部协变量偏移"（Internal Covariate Shift），Santurkar 等（arXiv:1805.11604）后来的分析指出更本质的作用是<b>让损失面更平滑</b>（Lipschitz 常数变小），从而容忍更大学习率。与第 3 章的 LayerNorm 相比：BN 依赖 batch 且有训练/推理差异，在序列/Transformer 语境下被 LN/RMSNorm 全面取代；但在 CNN 里 BN 至今仍是默认（ConvNeXt 等现代 CNN 也在用 LN，属于少数派）。分布式训练时大 batch 被切到多卡，单卡统计失真，需要 SyncBN 跨卡同步。</p>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch
+import torch.nn as nn
+
+bn = nn.BatchNorm2d(4, momentum=0.1)      # 4 个通道
+x_train = torch.randn(8, 4, 16, 16)
+
+bn.train()                                 # 训练模式：用 batch 统计量
+out = bn(x_train)
+print("训练输出均值≈0:", out.mean(dim=(0, 2, 3)).tolist())   # 各通道 ≈0
+print("running_mean 仍在累积:", bn.running_mean.abs().sum().item() &gt; 0)
+
+bn.eval()                                  # 推理模式：切到 running 统计量（固定）
+out2 = bn(x_train)
+print("eval 模式下同批输入输出不变:", torch.allclose(bn(x_train), out2))
+
+# 经典 bug：训练/评估模式没切换 —— dropout 与 BN 的行为不同，
+# 表现为"训练 loss 正常，验证指标莫名变差"或"BN 统计被验证集污染"
+model = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), nn.BatchNorm2d(8))
+model.train()   # 忘记调用 model.eval() 是练习生最常见的翻车点</code></pre></div>
+
+<p><b>数据增强与经典训练配方</b>。CNN 时代沉淀的增强组合至今仍在视觉预训练里服役：随机裁剪+水平翻转（基本盘）、颜色抖动、Random Erasing；<b>Mixup</b>（arXiv:1710.09412，把两张图按 $\tilde{x}=\lambda x_i + (1-\lambda)x_j$、标签同理线性混合，$\lambda\sim\mathrm{Beta}(\alpha,\alpha)$）与 <b>CutMix</b>（arXiv:1905.04899，把一块矩形区域贴到另一张图、标签按面积加权）显著改善校准与泛化；标签平滑（label smoothing 0.1）在 Transformer 原论文里也已被采用。多模态时代的传承：VLM 训练里视觉塔若参与训练，增强必须谨慎（文本标签与视觉内容强对齐时，过强的增强反而破坏对齐，第 16、35 章展开）；而 SAM/DINOv2 的训练配方仍大量使用这些技术。</p>
+
+<div class="box-tip"><p class="box-title">💡 技巧：CNN 微调的三条旧船票</p>
+<p>（1）<b>判别式学习率</b>：预训练层用 1/10 的学习率、新分类头用全量学习率——这正是第 1 章配方表"视觉塔 0.1η"的出处。（2）<b>冻结 BN</b>：小 batch 微调时冻结 BN 的 running 统计量（<code>module.eval()</code> 只作用于 BN 层），否则统计漂移会毁掉预训练特征。（3）<b>先看 baseline</b>：换任何 fancy 增强前，先跑一遍"裁剪+翻转"的朴素配方——ImageNet 级任务上朴素配方的收敛曲线往往已经接近上限。</p></div>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>检测与分割一页通</h2>
+<p>分类只回答"图里有什么"，检测与分割回答"在哪里、什么形状"——这两个能力对多模态模型至关重要：VLM 输出 bounding box（Kosmos-2/Shikra 一系，第 21 章）、自动构造 grounding 数据（第 34 章）、SAM 驱动的像素级编辑（第 26 章），全部建立在检测/分割的概念与词汇之上。一页速览三大谱系：</p>
+<p><b>两阶段检测（Region-based）</b>：R-CNN（2014，选择性搜索提候选框 + CNN 逐框分类）→ Fast R-CNN（整图一次提特征，RoI Pooling 取特征）→ <b>Faster R-CNN</b>（Ren et al., NeurIPS 2015，arXiv:1506.01497）：用<b>区域建议网络</b>（Region Proposal Network, RPN）替代外部候选算法——在共享卷积特征上滑动小网络，对每个位置输出 $k$ 个 anchor（默认 3 尺度 × 3 长宽比）的"是否含物体"分数与框回归。端到端可训练，VGG 版约 5 FPS、PASCAL VOC07 mAP 73.2，成为此后五年的检测基座。<b>单阶段检测</b>：<b>YOLO</b>（Redmon et al., CVPR 2016，arXiv:1506.02640）把检测变成"网格回归"——$7\times7$ 网格每个格子直接预测框与类别，45 FPS（Fast YOLO 155 FPS）开启实时检测，精度略逊（VOC07 mAP 63.4）；SSD（arXiv:1512.02325）多尺度特征图并行预测；RetinaNet（arXiv:1708.02002）用 focal loss 解决正负样本极端不平衡，让单阶段追平两阶段。<b>分割</b>：语义分割（FCN，arXiv:1411.4038，全卷积逐像素分类）→ 实例分割 <b>Mask R-CNN</b>（He et al., ICCV 2017 最佳论文，arXiv:1703.06870）：在 Faster R-CNN 上加一个逐 RoI 的小型分割分支，并把 RoI Pooling 换成 <b>RoIAlign</b>——用双线性插值消除取整量化误差（对像素级任务致命），COCO 上实例分割提升明显。全景分割（panoptic）把"stuff"（天空、路面）与"things"（可数物体）统一到一张标签图。</p>
+
+<figure><svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <text x="380" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">三种视觉输出格式：分类 / 检测 / 分割（VLM grounding 的词汇源头）</text>
+  <!-- classification -->
+  <rect x="30" y="46" width="210" height="210" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4"/>
+  <rect x="60" y="76" width="150" height="110" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+  <circle cx="135" cy="131" r="30" fill="#fde68a" stroke="#d97706" stroke-width="2"/>
+  <circle cx="124" cy="124" r="3" fill="#0f172a"/><circle cx="146" cy="124" r="3" fill="#0f172a"/>
+  <path d="M123 143 Q 135 151 147 143" fill="none" stroke="#0f172a" stroke-width="2"/>
+  <text x="135" y="212" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e3a8a" font-family="sans-serif">分类</text>
+  <text x="135" y="234" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">整图 → 类别概率</text>
+  <!-- detection -->
+  <rect x="275" y="46" width="210" height="210" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4"/>
+  <rect x="305" y="76" width="150" height="110" rx="6" fill="#fff" stroke="#94a3b8" stroke-width="1.4"/>
+  <rect x="322" y="92" width="70" height="80" fill="none" stroke="#ef4444" stroke-width="2.4"/>
+  <text x="322" y="86" font-size="10.5" fill="#ef4444" font-family="sans-serif">cat 0.97</text>
+  <rect x="400" y="100" width="46" height="60" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+  <text x="400" y="94" font-size="10.5" fill="#2563eb" font-family="sans-serif">dog 0.88</text>
+  <text x="380" y="212" text-anchor="middle" font-size="13" font-weight="bold" fill="#991b1b" font-family="sans-serif">检测</text>
+  <text x="380" y="234" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">框 [x,y,w,h] + 类别 + 置信度</text>
+  <!-- segmentation -->
+  <rect x="520" y="46" width="210" height="210" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4"/>
+  <rect x="550" y="76" width="150" height="110" rx="6" fill="#fff" stroke="#94a3b8" stroke-width="1.4"/>
+  <path d="M 570 170 C 560 120, 600 90, 640 100 C 690 92, 700 130, 676 170 Z" fill="#10b981" opacity="0.35"/>
+  <path d="M 570 170 C 560 120, 600 90, 640 100 C 690 92, 700 130, 676 170" fill="none" stroke="#10b981" stroke-width="2.4"/>
+  <rect x="616" y="104" width="40" height="46" fill="#8b5cf6" opacity="0.35"/>
+  <rect x="616" y="104" width="40" height="46" fill="none" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="625" y="212" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46" font-family="sans-serif">实例分割</text>
+  <text x="625" y="234" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">逐像素 mask（实例级）/ 语义级 / 全景级</text>
+  <text x="380" y="284" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">VLM 的 grounding 输出（第 21 章）= 这些格子的文本化：坐标数字化（Shikra）或特殊 box token（Kosmos-2）</text>
+</svg><figcaption>图 5-4　<b>视觉任务的输出格式谱系</b>（示意）。检测给"框"、分割给"掩码"；多模态模型把它们翻译成 token 序列输出——理解这两个任务的定义与指标（mAP、IoU），是读懂 grounding 章节（第 21 章）与 SAM（本章第 8 节）的前提。</figcaption></figure>
+
+<div class="tbl-wrap"><table>
+<caption>表 5-2　检测/分割代表模型速查</caption>
+<thead><tr><th>模型</th><th>年份</th><th>范式</th><th>核心组件</th><th>典型速度/精度（发表时）</th></tr></thead>
+<tbody>
+<tr><td>R-CNN</td><td>2014</td><td>两阶段（外部候选）</td><td>选择性搜索 + 逐框 CNN</td><td>约 47 秒/图</td></tr>
+<tr><td>Faster R-CNN</td><td>2015</td><td>两阶段（学习候选）</td><td>RPN + anchor + RoI Pooling</td><td>约 5 FPS，VOC07 mAP 73.2</td></tr>
+<tr><td>YOLO v1</td><td>2016</td><td>单阶段</td><td>网格回归 + 置信度</td><td>45 FPS，VOC07 mAP 63.4</td></tr>
+<tr><td>RetinaNet</td><td>2017</td><td>单阶段</td><td>focal loss 抗类不平衡</td><td>精度追平两阶段</td></tr>
+<tr><td>Mask R-CNN</td><td>2017</td><td>两阶段 + 像素分支</td><td>RoIAlign + mask head</td><td>COCO AP 37.1（实例分割）</td></tr>
+<tr><td>SAM（对照）</td><td>2023</td><td>可提示分割</td><td>ViT-H 编码器 + 提示编码器</td><td>零样本迁移 23 类分割任务</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-6"><span class="sec-no">6.</span>ViT 前史与归纳偏置之争</h2>
+<p>Transformer 在 NLP 统一之后，视觉侧的"叛变"分三步走。<b>第一步：验证 Transformer 能不能直接看图</b>。iGPT（Chen et al., ICML 2020，arXiv:1906.00462）把 32×32 低分辨率图像的像素按光栅顺序展开成序列、用 GPT 式自回归预训练——证明了纯 Transformer 无需卷积也能学出高质量视觉表示，但代价巨大（13 亿参数的 iGPT-L 在小数据下的线性探测精度不及同规模 CNN），结论是"方向对、性价比不对"。<b>第二步：ViT 用数据规模翻案</b>。Dosovitskiy 等人（ICLR 2021，arXiv:2010.11929）把图像切成 16×16 patch、线性投影成 token 序列（加上 [CLS] token 与位置编码，第 2 章 patch embedding 的出处），用标准 Transformer 编码器做图像分类：在 ImageNet-1k 上 ViT 不如同级 CNN，但预训练数据扩到 JFT-300M（3 亿图）后反超——ViT-H/14 达 88.55% top-1，且<b>同等质量下所需计算量远小于 CNN</b>。</p>
+
+<figure><img src="../assets/images/papers/2010.11929_0.png" loading="lazy" alt="ViT 模型结构图"><figcaption>图 5-5　<b>ViT：图像 = patch 序列</b>（来源：Dosovitskiy et al., arXiv:2010.11929）。224×224 输入按 16×16 切成 196 个 patch，线性嵌入后加位置编码、前置 [CLS] token，进标准 Transformer 编码器，用 [CLS] 输出做分类。"图像是 16×16 的词"——这句话背后是第 2 章 patch embedding 与第 3 章 Transformer 编码块的直接拼接，没有任何视觉特化结构。</figcaption></figure>
+
+<figure><img src="../assets/images/papers/2010.11929_1.png" loading="lazy" alt="ViT 与 ResNet 在不同预训练数据量下的精度曲线"><figcaption>图 5-6　<b>归纳偏置之争的实证</b>（来源：arXiv:2010.11929，Figure 4）。横轴是预训练数据量（ImageNet-1k → ImageNet-21k → JFT-300M），纵轴是迁移精度：小数据下 ResNet 更强（CNN 的局部性/平移先验省了学习成本），数据跨过某个量级后 ViT 全面反超且斜率更陡。这张图是全书反复出现的主题"先验 vs 规模"的最经典证据，也预告了 CLIP 选择 ViT 视觉塔的理由（4 亿图文对正是"够大的数据"）。</figcaption></figure>
+
+<p><b>第三步：弥合样本效率差距</b>。ViT 在中等数据下也能打，靠两条路。<b>蒸馏</b>：DEiT（Touvron et al., ICML 2021，arXiv:2012.12877）证明仅用 ImageNet-1k 训练 ViT 是可行的，配方是强增强 + 稳定训练，以及一个关键的<b>蒸馏 token</b>——序列里额外放一个可学习 token，其注意力目标指向一个训练好的 CNN teacher（如 RegNetY）的 logits，DEiT-B 蒸馏后达 83.4% top-1（约 +2 点），且蒸馏 token 的注意力图呈现出与 [CLS] 不同的全局关注模式。<b>层级化</b>：Swin Transformer（Liu et al., ICCV 2021 最佳论文，arXiv:2103.14030）把 Transformer 拉回"特征图金字塔"的世界——patch 合并逐级下采样（4×→8×→16×），注意力限制在滑动窗口内、隔层移位（shifted window）实现跨窗通信：既有 CNN 的多尺度特征图（对检测/分割友好），又保留注意力建模。Swin-L 在 ImageNet-22k 预训练后达约 87.3% top-1，一度是检测/分割的默认骨干。</p>
+
+<figure><img src="../assets/images/papers/2103.14030_0.png" loading="lazy" alt="Swin Transformer 的层级特征图与窗口注意力"><figcaption>图 5-7　<b>Swin 的层级特征图</b>（来源：Liu et al., arXiv:2103.14030）。左：patch 合并逐级构建 4×/8×/16× 下采样的层级特征图——与 CNN 特征金字塔对齐，检测/分割头可以直接套用；右：滑窗注意力（W-MSA/SW-MSA）把自注意力的开销从全图 $O((HW)^2)$ 降到 $O((HW)\cdot M^2)$（$M$ 为窗口边长）。Swin 与第 4 章的 FlashAttention 是两条互补的降本路线：一个改"算多少"，一个改"怎么算"。</figcaption></figure>
+
+<p><b>归纳偏置之争的最终裁决</b>（2021–2024 的共识）：偏置的价值与数据规模成反比——小数据下 CNN 的先验是免费午餐，大数据下先验变成"天花板"（全局注意力能学到卷积学不到的长程关系与组合性）；而当 ConvNeXt（arXiv:2201.03545）把 CNN 全面现代化（大核 7×7、LN、倒瓶颈等）后与 Swin 几乎打平，说明<b>具体的算子（卷积 vs 注意力）不是本质，"全局信息交换 + 良好的训练配方"才是</b>。对多模态的实际影响：ViT 胜出的直接原因是"同一个 Transformer 处理两种模态"，连接器与融合的设计因此简单得多——这就是第 9 章"模态共享骨架"的架构起点。</p>
+<h2 id="sec-7"><span class="sec-no">7.</span>视觉表示学习：从监督到自监督</h2>
+<p>"ImageNet 预训练 → 下游微调"是深度视觉的黄金范式，但它有两个隐忧：标注昂贵（ImageNet 1400 万标注是几年人力），且监督信号（1000 个类别）只是图像信息的一小部分。2018–2022 年的自监督革命给出三条不依赖人工标签的路线：</p>
+<p><b>对比学习</b>：SimCLR（arXiv:2002.05709）与 MoCo（arXiv:1911.05722）让同一图像的两个增广视图在特征空间靠近、不同图像远离（InfoNCE，完整推导在第 12 章）；MoCo 用动量编码器维护负样本队列，SimCLR 靠超大 batch。线性探测精度一路逼近监督预训练。<b>掩码建模</b>：BEiT（arXiv:2106.08254）先做了离散 token 版；<b>MAE</b>（He et al., CVPR 2022，arXiv:2111.06377）给出最简洁的形态——随机遮住 75% 的 patch，编码器只处理剩下的 25%，一个轻量解码器从可见 token + 掩码占位重建像素。非对称设计（重编码器/轻解码器）+ 高掩码率让预训练快 3 倍以上，MAE ViT-H 微调后 87.8% ImageNet top-1。<b>图文对比</b>：CLIP（arXiv:2103.00020）用 4 亿自然图文对做对比学习，直接把"监督信号"换成了网络上的 alt-text——这条路线因为天然衔接语言而成为多模态时代的主干，第 12 章整章精读。</p>
+
+<figure><img src="../assets/images/papers/2111.06377_0.png" loading="lazy" alt="MAE 非对称编码器-解码器架构"><figcaption>图 5-8　<b>MAE：掩码自编码器</b>（来源：He et al., arXiv:2111.06377）。编码器只编码 25% 的可见 patch（省 4 倍计算），掩码 token 只进轻量解码器，目标是重建被遮像素。75% 的极端掩码率是关键超参：任务太难才能迫使模型学习全局语义而非局部插值——这为第 14 章"自监督视觉塔（MAE/DINOv2）为什么适合密集预测"埋下伏笔。</figcaption></figure>
+
+<div class="tbl-wrap"><table>
+<caption>表 5-3　视觉预训练范式对比（对多模态的适用性为全书视角）</caption>
+<thead><tr><th>范式</th><th>监督信号</th><th>代表模型</th><th>擅长下游</th><th>多模态适用性</th></tr></thead>
+<tbody>
+<tr><td>监督分类</td><td>人工类别标签</td><td>ResNet / ViT (IN-21k)</td><td>分类、检索粗排</td><td>特征偏"类别语义"，细粒度/OCR 弱</td></tr>
+<tr><td>实例对比</td><td>图像自身增广</td><td>SimCLR / MoCo v3</td><td>线性探测、迁移</td><td>与语言无对齐，少直接用作 VLM 塔</td></tr>
+<tr><td>掩码建模</td><td>重建被遮内容</td><td>MAE / BEiT / DINOv2(混合)</td><td>密集预测、分割、深度</td><td>空间细节好，需要额外对齐语言</td></tr>
+<tr><td><b>图文对比</b></td><td><b>自然语言描述</b></td><td><b>CLIP / SigLIP / EVA-CLIP</b></td><td>零样本分类、图文检索</td><td><b>VLM 视觉塔的事实标准（第 12/14 章）</b></td></tr>
+<tr><td>可提示分割</td><td>11 亿掩码（半自动）</td><td>SAM / SAM 2</td><td>分割一切、数据引擎</td><td>grounding/编辑的先验与数据引擎</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-8"><span class="sec-no">8.</span>多模态视角：你的视觉塔从哪来</h2>
+<p>把本章与第 2、3 章拼起来，2026 年一个典型 VLM 视觉侧的"家谱"就清楚了：输入图像 → <b>patch 切分</b>（ViT 式，第 2 章）→ <b>ViT 变体编码器</b>（第 3 章的块 + 本章的层级/窗口/预训练选择）→ 连接器压缩（第 15 章）→ LLM。选哪个编码器，取决于三个本章铺垫过的问题：<b>预训练信号</b>（CLIP 式图文对比天然对齐语言，是 LLaVA/Qwen-VL 系的默认；MAE/DINOv2 式自监督空间细节强，常作第二编码器）、<b>分辨率策略</b>（固定 336 vs 动态 tile，第 22 章）、<b>归纳偏置</b>（纯 ViT 全局注意力 vs Swin 层级窗口）。CNN 并未绝迹：ConvNeXt 在部分数据混合实验中仍是有力基线，OCR/文档方向的检测头、SAM 的 mask 解码器周边也常用卷积组件。</p>
+
+<figure><img src="../assets/images/papers/2304.02643_1.png" loading="lazy" alt="SAM 的可提示分割架构"><figcaption>图 5-9　<b>SAM：可提示分割模型</b>（来源：Kirillov et al., Segment Anything, arXiv:2304.02643）。重型 ViT-H 图像编码器（MAE 式预训练）输出图像嵌入，轻量提示编码器接收点/框/掩码提示，掩码解码器秒级输出多个有效分割。左下角的"歧义"处理（一个点输出多个粒度的掩码）与 11 亿掩码的 SA-1B 数据引擎，使 SAM 成为 grounding 数据自动标注（第 21、34 章）与视觉编辑（第 26 章）的标准工具——检测/分割时代的技术以"先验 + 数据引擎"的形式活在多模态生态里。</figcaption></figure>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：Deep Residual Learning（He et al., CVPR 2016 最佳论文，arXiv:1512.03385）</p>
+<p><b>问题</b>：网络加深出现"退化"——更深模型的训练误差反而更高，说明不是过拟合而是优化困难；理论上 56 层网络至少应该能学到 20 层网络的解（多出的层学恒等即可），但普通结构学不动。<b>方法</b>：残差学习 $\mathbf{y} = \mathcal{F}(\mathbf{x}) + \mathbf{x}$，配合 BN 与恒等捷径；在 ImageNet 上训出 152 层模型，CIFAR-10 上甚至训过 1202 层（训练误差仍低，测试端过拟合）。<b>关键结果</b>：ILSVRC-2015 分类 3.57%（ensemble）、检测/定位冠军；COCO 检测相对提升约 28%（Faster R-CNN 换用 ResNet-101 主干）。<b>为什么重要</b>：残差连接是"让百层网络可训"的钥匙，今天从 LLM 到扩散 UNet 的每一个大型架构都是它的直接后代；第 3 章 Transformer 的残差流、第 24 章 UNet 的 skip connection（结构上是残差的表亲）都应放在这个谱系里理解。<b>重读建议</b>：第 3 节的"退化实验图"（20 vs 56 层）与第 4 节 "Deeper Bottleneck" 的 1×1 瓶颈设计（GoogLeNet 的 1×1 思想 + 残差）最值得精读。</p></div>
+
+<h2 id="sec-9"><span class="sec-no">9.</span>实战配方与本章自测</h2>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import models, transforms
+
+# —— torchvision 微调 ResNet-50（CNN 时代的标准姿势，VLM 时代依旧常用）——
+transform_train = transforms.Compose([
+    transforms.RandomResizedCrop(224),      # 基本盘增强
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet 统计
+])
+model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+for p in model.parameters():
+    p.requires_grad = False                  # 冻结主干（或只解冻 layer3/4）
+model.fc = nn.Linear(model.fc.in_features, 10)   # 换分类头（新参数默认 requires_grad=True）
+# 微调 BN：小 batch 时冻结 BN 统计量更稳
+for m in model.modules():
+    if isinstance(m, nn.BatchNorm2d):
+        m.eval()                             # 只让 BN 用 running 统计
+
+# —— timm 加载 ViT 对照（一行换骨干，多模态预研常用）——
+# import timm
+# vit = timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=10)
+# 说明：timm 的 ViT 默认输出 [B, 197, 768]（含 CLS），取 x[:, 0] 做分类、x[:, 1:] 做密集特征
+
+params = [p for p in model.parameters() if p.requires_grad]
+optimizer = torch.optim.AdamW([
+    {"params": params, "lr": 1e-4},          # 新头
+    {"params": [p for m in [model.layer4] for p in m.parameters() if p.requires_grad],
+     "lr": 1e-5},                             # 解冻的深层主干：判别式学习率
+])
+loader = DataLoader(placeholder_dataset, batch_size=32, shuffle=True)  # 伪代码：换成你的数据集
+
+def mixup(x, y, alpha=0.2):
+    """Mixup：混合图像与标签（λ ~ Beta(α, α)），改善校准与泛化"""
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    idx = torch.randperm(x.size(0))
+    return lam * x + (1 - lam) * x[idx], y, y[idx], lam
+
+for x, y in loader:
+    x, ya, yb, lam = mixup(x, y)
+    loss = lam * nn.functional.cross_entropy(model(x), ya) + \
+           (1 - lam) * nn.functional.cross_entropy(model(x), yb)
+    loss.backward()
+    optimizer.step(); optimizer.zero_grad()</code></pre></div>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：视觉侧选型速查</p>
+<p><b>分类/检索原型</b>：torchvision ResNet-50 或 timm ViT-B/16（IN-21k 预训练），224 分辨率起步。<b>VLM 视觉塔</b>：优先 CLIP/SigLIP 预训练的 ViT（openai/clip-vit-large-patch14-336、google/siglip-so400m-patch14-384 等），分辨率与 LLM 预算匹配；密集任务（OCR/文档）再叠 MAE/DINOv2 或动态 tile（第 14、22 章）。<b>分割/grounding 数据</b>：SAM 自动标注 + 人工抽检。<b>训练</b>：AdamW + cosine + warmup 3%（第 1 章）；视觉塔学习率设为 LLM 的 1/10；增强从简（Resize+CenterCrop 做评测，RandomResizedCrop+Flip 做训练）。<b>评测</b>：分类看 top-1/校准（ECE）；检测/分割看 mAP/IoU；密集预测对比线性探测——这些数字在 VLM 语境下分别对应第 40 章的各类基准。</p></div>
+
+<div class="box-warn"><p class="box-title">⚠️ 陷阱清单：从 CNN 迁移到 VLM 语境的五个坑</p>
+<p><b>（1）分辨率失配</b>：视觉塔训练在 224/336，你喂 1024——ViT 会插值位置编码（第 3 章），patch 数暴涨且特征质量下降；高分辨率必须走 tile/AnyRes 方案（第 22 章）。<b>（2）BN 与微调 batch</b>：batch&lt;16 时 BN 统计噪声大，冻结 BN 或换 GN/LN。<b>（3）归一化统计错位</b>：用 ImageNet mean/std 处理非自然图像（医学/遥感）往往不如 0.5/0.5/0.5，CLIP 系有自己的统计，要用对应 processor。<b>（4）patch 数 = 分辨率²/14²</b>：别用"图像大小"估显存，用 token 数（672×672 = 2304 token 而不是"一张图"），对接第 4 章的平方账。<b>（5）增强破坏文本对齐</b>：VLM 微调中视觉塔若参与训练，CutMix/Mixup 会把"图文配对"拆散，SFT 阶段慎用。</p></div>
+
+<div class="box-quiz"><p class="box-title">✏️ 自测（先独立作答，再看答案要点）</p>
+<p><b>1.</b> 推导：写出残差块的梯度公式，并说明"1 +"这一项为什么打断梯度消失。<br>
+<b>答案要点</b>：$\mathbf{x}_L = \mathbf{x}_l + \sum_{i=l}^{L-1}\mathcal{F}_i$，故 $\frac{\partial\mathcal{E}}{\partial\mathbf{x}_l} = \frac{\partial\mathcal{E}}{\partial\mathbf{x}_L}\big(1 + \frac{\partial}{\partial\mathbf{x}_l}\sum\mathcal{F}_i\big)$。普通网是纯连乘（每项&lt;1 即指数消失）；残差加法里恒有系数为 1 的直通项，深层梯度可无损传回浅层。</p>
+<p><b>2.</b> 三个 3×3 卷积（stride 1）与一个 7×7 卷积感受野相同，为什么 VGG 选前者？<br>
+<b>答案要点</b>：参数 $3\times3^2C^2=27C^2$ vs $49C^2$；且非线性激活多 2 次，同感受野下表达力更强、更省参数。感受野公式 $RF_l = RF_{l-1}+(k_l-1)\prod s_i$ 验证 $1+2+2+2=7$。</p>
+<p><b>3.</b> BatchNorm 训练与推理行为有何不同？为什么 Transformer 换成 LayerNorm？<br>
+<b>答案要点</b>：训练用 batch 统计量并维护 running mean/var，推理用固定 running 统计（model.eval() 切换）。Transformer 用 LN 因为：序列长度可变、batch 内统计不稳定、有训练/推理差异、且 LN 对每个 token 的特征维归一化与 batch 无关，天然适配自注意力的逐位置计算。</p>
+<p><b>4.</b> 用"数据规模"解释 CNN→ViT 的范式转移，并给出论文证据。<br>
+<b>答案要点</b>：归纳偏置的价值随数据规模递减：ViT 论文 Figure 4 显示小数据下 ResNet 更好，预训练达 JFT-300M 级后 ViT 反超且所需计算更少（ViT-H/14 88.55%）。先验在小数据下是"免费午餐"，在大数据下限制上限；CLIP 的 4 亿图文对进一步证明规模解锁 Transformer 视觉。</p>
+<p><b>5.</b> Faster R-CNN 与 YOLO 的本质区别？RoIAlign 修复了什么？<br>
+<b>答案要点</b>：Faster R-CNN 两阶段（RPN 学习候选框 + RoI 精修，精度高、约 5 FPS）；YOLO 单阶段（网格直接回归框+类别，45–155 FPS、精度略低）。RoIAlign 用双线性插值取代 RoIPool 的取整量化，消除框与特征错位，对像素级掩码任务（Mask R-CNN）尤为关键。</p>
+<p><b>6.</b> MAE 的非对称设计与 75% 掩码率各解决什么问题？<br>
+<b>答案要点</b>：编码器只处理 25% 可见 patch → 预训练计算省约 3–4 倍；掩码 token 只进轻量解码器。75% 高掩码让"局部插值"式偷懒失效，迫使模型学习全局语义，才得到可迁移的表示（MAE ViT-H 87.8% top-1）。</p>
+<p><b>7.</b> 为什么 2023 年后的 VLM 视觉塔几乎都是"CLIP 式预训练的 ViT"，而不是 ImageNet 监督 ViT 或 ResNet？<br>
+<b>答案要点</b>：图文对比预训练的特征天然与语言对齐（零样本分类、检索、指令描述的起点好），数据规模（4 亿级图文对）让 ViT 充分发挥；ImageNet 1000 类监督的特征语义过窄，ResNet 缺全局注意力且与 LLM 的 token 化接口不匹配。分辨率与动态 tile（Qwen2-VL/InternVL）进一步建立在 ViT 的任意 patch 数灵活性上。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>LeCun Y, et al. Gradient-Based Learning Applied to Document Recognition (LeNet-5). Proceedings of the IEEE 1998.（无 arXiv 版）</li>
+      <li>Krizhevsky A, Sutskever I, Hinton G. <a href="https://arxiv.org/abs/1409.0575">ImageNet Classification with Deep Convolutional Neural Networks (AlexNet)</a>. NeurIPS 2012. arXiv:1409.0575.</li>
+      <li>Simonyan K, Zisserman A. <a href="https://arxiv.org/abs/1409.1556">Very Deep Convolutional Networks for Large-Scale Image Recognition (VGG)</a>. ICLR 2015. arXiv:1409.1556.</li>
+      <li>Szegedy C, et al. <a href="https://arxiv.org/abs/1404.5997">Going Deeper with Convolutions (GoogLeNet)</a>. CVPR 2015. arXiv:1404.5997.</li>
+      <li>He K, et al. <a href="https://arxiv.org/abs/1512.03385">Deep Residual Learning for Image Recognition (ResNet)</a>. CVPR 2016. arXiv:1512.03385.</li>
+      <li>He K, et al. <a href="https://arxiv.org/abs/1603.05027">Identity Mappings in Deep Residual Networks (Pre-activation)</a>. ECCV 2016. arXiv:1603.05027.</li>
+      <li>Veit A, Wilber M, Belongie S. <a href="https://arxiv.org/abs/1605.06431">Residual Networks Behave Like Ensembles of Relatively Shallow Networks</a>. NeurIPS 2016. arXiv:1605.06431.</li>
+      <li>Ioffe S, Szegedy C. <a href="https://arxiv.org/abs/1502.03167">Batch Normalization: Accelerating Deep Network Training</a>. ICML 2015. arXiv:1502.03167.</li>
+      <li>Santurkar S, et al. <a href="https://arxiv.org/abs/1805.11604">How Does Batch Normalization Help Optimization?</a>. NeurIPS 2018. arXiv:1805.11604.</li>
+      <li>Zhang H, et al. <a href="https://arxiv.org/abs/1710.09412">mixup: Beyond Empirical Risk Minimization</a>. ICLR 2018. arXiv:1710.09412.</li>
+      <li>Yun S, et al. <a href="https://arxiv.org/abs/1905.04899">CutMix: Regularization Strategy to Train Strong Classifiers</a>. ICCV 2019. arXiv:1905.04899.</li>
+      <li>Ren S, et al. <a href="https://arxiv.org/abs/1506.01497">Faster R-CNN: Towards Real-Time Object Detection with Region Proposal Networks</a>. NeurIPS 2015. arXiv:1506.01497.</li>
+      <li>Redmon J, et al. <a href="https://arxiv.org/abs/1506.02640">You Only Look Once: Unified, Real-Time Object Detection (YOLO)</a>. CVPR 2016. arXiv:1506.02640.</li>
+      <li>Liu W, et al. <a href="https://arxiv.org/abs/1512.02325">SSD: Single Shot MultiBox Detector</a>. ECCV 2016. arXiv:1512.02325.</li>
+      <li>Lin T, et al. <a href="https://arxiv.org/abs/1708.02002">Focal Loss for Dense Object Detection (RetinaNet)</a>. ICCV 2017. arXiv:1708.02002.</li>
+      <li>He K, et al. <a href="https://arxiv.org/abs/1703.06870">Mask R-CNN</a>. ICCV 2017. arXiv:1703.06870.</li>
+      <li>Long J, Shelhamer E, Darrell T. <a href="https://arxiv.org/abs/1411.4038">Fully Convolutional Networks for Semantic Segmentation</a>. CVPR 2015. arXiv:1411.4038.</li>
+      <li>Chen M, et al. <a href="https://arxiv.org/abs/1906.00462">Generative Pretraining from Pixels (iGPT)</a>. ICML 2020. arXiv:1906.00462.</li>
+      <li>Dosovitskiy A, et al. <a href="https://arxiv.org/abs/2010.11929">An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale (ViT)</a>. ICLR 2021. arXiv:2010.11929.</li>
+      <li>Touvron H, et al. <a href="https://arxiv.org/abs/2012.12877">Training data-efficient image transformers &amp; distillation through attention (DEiT)</a>. ICML 2021. arXiv:2012.12877.</li>
+      <li>Liu Z, et al. <a href="https://arxiv.org/abs/2103.14030">Swin Transformer: Hierarchical Vision Transformer using Shifted Windows</a>. ICCV 2021. arXiv:2103.14030.</li>
+      <li>Liu Z, et al. <a href="https://arxiv.org/abs/2201.03545">A ConvNet for the 2020s (ConvNeXt)</a>. CVPR 2022. arXiv:2201.03545.</li>
+      <li>He K, et al. <a href="https://arxiv.org/abs/2111.06377">Masked Autoencoders Are Scalable Vision Learners (MAE)</a>. CVPR 2022. arXiv:2111.06377.</li>
+      <li>He K, et al. <a href="https://arxiv.org/abs/1911.05722">Momentum Contrast for Unsupervised Visual Representation Learning (MoCo)</a>. CVPR 2020. arXiv:1911.05722.</li>
+      <li>Chen T, et al. <a href="https://arxiv.org/abs/2002.05709">A Simple Framework for Contrastive Learning of Visual Representations (SimCLR)</a>. ICML 2020. arXiv:2002.05709.</li>
+      <li>Kirillov A, et al. <a href="https://arxiv.org/abs/2304.02643">Segment Anything (SAM)</a>. ICCV 2023. arXiv:2304.02643.</li>
+      <li>Radford A, et al. <a href="https://arxiv.org/abs/2103.00020">Learning Transferable Visual Models From Natural Language Supervision (CLIP)</a>. ICML 2021. arXiv:2103.00020.</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>

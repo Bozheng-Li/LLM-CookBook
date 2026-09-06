@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 4 章 Flash Attention 与高效注意力 · 多模态大模型 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script>window.MathJax={tex:{inlineMath:[["$","$"],["\\(","\\)"]],displayMath:[["$$","$$"],["\\[","\\]"]]},svg:{fontCache:"global"}};</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+</head>
+<body>
+<div id="progress-bar"></div>
+<nav id="sidebar"></nav>
+<header id="topbar">
+  <button id="menu-btn">☰</button>
+  <div id="search-box"><input id="search-input" placeholder="搜索全书…"><div id="search-results"></div></div>
+  <div class="topbar-actions"><button class="tb-btn" id="theme-btn">🌓 主题</button></div>
+</header>
+<main class="content"><div class="article">
+
+<header class="book-header">
+  <div class="part-badge">第一部分 · 基础篇：单模态基石</div>
+  <h1 class="chapter-title">第 4 章　Flash Attention 与高效注意力</h1>
+  <div class="chapter-meta"><span>预计阅读 75 分钟</span><span>难度 ★★★★☆</span><span>前置：第 3 章（注意力数学）、第 1 章（混合精度）</span></div>
+</header>
+
+<div class="toc-mini"><b>本章目录</b><ol>
+  <li><a href="#sec-1">注意力的两本账：计算量与访存量</a></li>
+  <li><a href="#sec-2">标准实现的真相：为什么慢</a></li>
+  <li><a href="#sec-3">Tiling 与 Online Softmax 完整推导</a></li>
+  <li><a href="#sec-4">FlashAttention 前向：SRAM 里的分块流水</a></li>
+  <li><a href="#sec-5">反向传播：用重计算换显存</a></li>
+  <li><a href="#sec-6">FA2 与 FA3：并行度、Hopper 与 FP8</a></li>
+  <li><a href="#sec-7">MQA 与 GQA：给 KV Cache 瘦身</a></li>
+  <li><a href="#sec-8">Varlen 注意力与多模态序列打包</a></li>
+  <li><a href="#sec-9">对多模态的意义：高分辨率的平方税</a></li>
+  <li><a href="#sec-10">实战选型与本章自测</a></li>
+</ol></div>
+
+<div class="box-tip"><p class="box-title">💡 本章导读</p>
+<p>第 3 章末尾我们留了一个引子：视觉 token 数量动辄数千到数万，注意力的平方复杂度会把多模态模型压垮。本章的主角 FlashAttention（Dao et al., arXiv:2205.14135，NeurIPS 2022）给出了 2022–2026 年最重要的工程答案：它<b>不改变注意力的数学</b>（精确注意力，不是近似），而是改变注意力的<b>读写方式</b>——把中间的 $T\times T$ 矩阵彻底"藏进片上内存"，用 tiling（分块）与 online softmax（在线归一化）让显存从 $O(T^2)$ 降到 $O(T)$、速度提升 2–4 倍。没有 FlashAttention，就没有 16k 上下文 BERT、没有 Qwen2-VL 的原生任意分辨率、也没有 vLLM 的高吞吐服务。本章按"瓶颈分析 → 数学推导 → 前向/反向 → 硬件演进（FA2/FA3）→ KV 瘦身（MQA/GQA）→ varlen 与多模态打包"的顺序展开，online softmax 的推导与数值算例一步不跳。</p></div>
+
+<h2 id="sec-1"><span class="sec-no">1.</span>注意力的两本账：计算量与访存量</h2>
+<p>分析任何 GPU 算子要同时记两本账。<b>计算账</b>：注意力每层的前向 FLOPs 约为 $4T^2 d$（$\mathbf{Q}\mathbf{K}^{\top}$ 与 $\tilde{\mathbf{P}}\mathbf{V}$ 两次 $T\times T\times d$ 矩阵乘，每次 $2T^2d$ FLOPs，忽略 softmax 的指数开销）。<b>访存账</b>：朴素实现需要把 $\mathbf{Q}\mathbf{K}^{\top}$（未归一化分数 $\tilde{\mathbf{S}}$，$T\times T$）与 softmax 结果 $\mathbf{P}$（又是 $T\times T$）写进显存（HBM）再读回来，每份 $T^2\times p$ 字节（$p$=2 为 FP16）。</p>
+<p>两本账的比值叫<b>算术强度</b>（Arithmetic Intensity，FLOPs/字节），它决定算子处于 Roofline 模型的哪一段：以 A100 SXM 为例，BF16 Tensor Core 峰值约 312 TFLOPs/s、HBM 带宽约 2 TB/s——要让计算单元吃满，算子的算术强度必须超过约 $312\times10^{12} / 2\times10^{12} \approx 156$ FLOP/字节。大矩阵乘（batch × 大尺寸）轻松超过这个门槛，是<b>计算受限</b>（compute-bound）；而标准注意力实现每完成 275 GFLOPs 的计算（$T=4096, d=4096$ 例），却要为 $T\times T$ 中间矩阵支付约 4–8 GB 的 HBM 往返流量，算术强度不足 50 FLOP/字节——<b>访存受限</b>（memory-bound）：GPU 的 SM 大量时间在等数据，而不是在算。</p>
+
+<figure><svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <defs><marker id="m4a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="26" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">标准注意力 vs FlashAttention：HBM 往返流量对比</text>
+  <!-- 左：标准 -->
+  <rect x="20" y="46" width="330" height="220" rx="12" fill="#fef2f2" stroke="#ef4444" stroke-width="1.8"/>
+  <text x="185" y="70" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#991b1b" font-family="sans-serif">标准实现：3 次大矩阵往返 HBM</text>
+  <rect x="40" y="86" width="120" height="30" rx="6" fill="#fff" stroke="#ef4444" stroke-width="1.4"/>
+  <text x="100" y="106" text-anchor="middle" font-size="12" fill="#991b1b" font-family="sans-serif">GPU（片上算）</text>
+  <rect x="40" y="196" width="120" height="30" rx="6" fill="#fff" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="100" y="216" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">HBM（显存）</text>
+  <line x1="100" y1="116" x2="100" y2="192" stroke="#ef4444" stroke-width="2" marker-end="url(#m4a)"/>
+  <text x="112" y="140" font-size="11.5" fill="#ef4444" font-family="sans-serif">写 S=P̃ [T×T] ①</text>
+  <line x1="146" y1="196" x2="146" y2="120" stroke="#ef4444" stroke-width="2" marker-end="url(#m4a)"/>
+  <text x="158" y="170" font-size="11.5" fill="#ef4444" font-family="sans-serif">读回做 softmax ②</text>
+  <line x1="190" y1="116" x2="190" y2="192" stroke="#ef4444" stroke-width="2" marker-end="url(#m4a)"/>
+  <text x="202" y="140" font-size="11.5" fill="#ef4444" font-family="sans-serif">写 P [T×T] ③</text>
+  <line x1="236" y1="196" x2="236" y2="120" stroke="#ef4444" stroke-width="2" marker-end="url(#m4a)"/>
+  <text x="248" y="170" font-size="11.5" fill="#ef4444" font-family="sans-serif">读 P 做 P·V ④</text>
+  <text x="185" y="252" text-anchor="middle" font-size="11.5" fill="#991b1b" font-family="sans-serif">T=4096, 32 头：S+P 每份 1 GiB/层，流量 4+ GiB → 访存受限</text>
+  <!-- 右：FA -->
+  <rect x="410" y="46" width="330" height="220" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="1.8"/>
+  <text x="575" y="70" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#065f46" font-family="sans-serif">FlashAttention：分块后不落盘</text>
+  <rect x="430" y="86" width="120" height="110" rx="6" fill="#fff" stroke="#10b981" stroke-width="1.4"/>
+  <text x="490" y="110" text-anchor="middle" font-size="12" fill="#065f46" font-family="sans-serif">SRAM（片上）</text>
+  <text x="490" y="130" text-anchor="middle" font-size="11.5" fill="#475569" font-family="sans-serif">Q_i, K_j, V_j 小块</text>
+  <text x="490" y="148" text-anchor="middle" font-size="11.5" fill="#475569" font-family="sans-serif">+ softmax 统计量</text>
+  <text x="490" y="166" text-anchor="middle" font-size="11.5" fill="#475569" font-family="sans-serif">算完即弃，只回写 O_i</text>
+  <rect x="430" y="216" width="120" height="30" rx="6" fill="#fff" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="490" y="236" text-anchor="middle" font-size="12" fill="#475569" font-family="sans-serif">HBM</text>
+  <line x1="510" y1="200" x2="510" y2="212" stroke="#10b981" stroke-width="2" marker-end="url(#m4a)"/>
+  <text x="524" y="212" font-size="11.5" fill="#047857" font-family="sans-serif">只读入 Q/K/V，只写 O（O(T·d)）</text>
+  <text x="575" y="252" text-anchor="middle" font-size="11.5" fill="#065f46" font-family="sans-serif">中间 T×T 矩阵从未存在于显存 → 显存 O(T)、速度 2–4×</text>
+  <text x="380" y="288" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">核心思想：让 T×T 矩阵从头到尾不出现在显存中，softmax 分块增量重标定后得到精确结果</text>
+</svg><figcaption>图 4-1　<b>标准实现与 FlashAttention 的访存对比（示意）</b>。注意 FlashAttention 是<b>精确</b>注意力：数学输出与标准实现一致（误差仅浮点舍入级），不是稀疏化或低秩近似——这是它与 Longformer/Performer 等"近似注意力"路线的本质区别。</figcaption></figure>
+
+<div class="tbl-wrap"><table>
+<caption>表 4-1　注意力中间矩阵与计算量的规模账（FP16，batch=1；单层单头按 $T^2\times2$ B 计中间矩阵）</caption>
+<thead><tr><th>序列长度 $T$</th><th>单头 S 矩阵</th><th>32 头单层 S+P 总量</th><th>单层注意力 FLOPs（$d{=}4096$）</th><th>128k 上下文 32 头</th></tr></thead>
+<tbody>
+<tr><td>1,024</td><td>2 MiB</td><td>128 MiB</td><td>8.6 GFLOPs</td><td>—</td></tr>
+<tr><td>4,096</td><td>32 MiB</td><td>2 GiB</td><td>137 GFLOPs</td><td>—</td></tr>
+<tr><td>16,384</td><td>512 MiB</td><td>32 GiB</td><td>2.2 TFLOPs</td><td>—</td></tr>
+<tr><td>36,864（视频/多图典型）</td><td>2.6 GiB</td><td>166 GiB</td><td>11.1 TFLOPs</td><td>—</td></tr>
+<tr><td>131,072</td><td>32 GiB</td><td>2 TB</td><td>140 TFLOPs</td><td>不可物化</td></tr>
+</tbody></table></div>
+<p>表格读法：$T=16$k 时，仅一层的一个 batch 就需要 32 GiB 来"放"中间矩阵——标准实现在数学上可行、在工程上不可行；$T\ge36$k 时连"能放下"都谈不上。<b>FlashAttention 把这些数字全部抹掉</b>：任何长度下额外显存都只有输出 $O(T\cdot d)$ 与每行两个标量统计量。</p>
+
+<h2 id="sec-2"><span class="sec-no">2.</span>标准实现的真相：为什么慢</h2>
+<p>先用最朴素的 PyTorch 代码复现标准实现（不是生产代码，但每一行都对应一次真实的显存读写）：</p>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch, time
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+B, h, T, d_head = 1, 32, 8192, 128          # 8k 序列、32 头
+Q = torch.randn(B, h, T, d_head, device=device)
+K = torch.randn(B, h, T, d_head, device=device)
+V = torch.randn(B, h, T, d_head, device=device)
+
+def naive_attention(Q, K, V):
+    scores = Q @ K.transpose(-2, -1) / Q.size(-1) ** 0.5   # 写出 T×T（8k²×2B×32头=4 GiB）
+    P = F.softmax(scores, dim=-1)                          # 读 S、写 P（再 8 GiB 流量）
+    del scores                                              # 即使 del，峰值也已经发生
+    return P @ V                                            # 读 P、写输出
+
+if device == "cuda":
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    out = naive_attention(Q, K, V)
+    torch.cuda.synchronize()
+    print(f"朴素: {time.perf_counter()-t0:.3f}s, "
+          f"峰值显存 {torch.cuda.max_memory_allocated()/2**30:.2f} GiB")
+
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    out2 = F.scaled_dot_product_attention(Q, K, V, is_causal=False)  # 自动分派 Flash/高效后端
+    torch.cuda.synchronize()
+    print(f"SDPA: {time.perf_counter()-t0:.3f}s, "
+          f"峰值显存 {torch.cuda.max_memory_allocated()/2**30:.2f} GiB")
+    print("数值一致:", (out - out2).abs().max().item())     # ≈1e-6：Flash 是精确注意力</code></pre></div>
+
+<p>在 A100 上运行（8k 序列）：朴素版峰值显存约为 SDPA 版的 6–8 倍，耗时长 3–5 倍——差距全部来自中间矩阵的 HBM 流量，而不是"算得不够快"。还有一个更深的问题让"优化 softmax 本身"看似不可能：<b>softmax 的归一化分母要整行求和，似乎必须先看到整行</b>。Tile 级计算与"必须全行"的矛盾，正是 online softmax 要解决的。</p>
+
+<h2 id="sec-3"><span class="sec-no">3.</span>Tiling 与 Online Softmax 完整推导</h2>
+<div class="box-theory"><p class="box-title">📐 理论推导：从 Safe Softmax 到 Online Softmax，再到分块重标定</p>
+<p><b>第一步：Safe Softmax（数值稳定版）</b>。直接按定义算 softmax 会因指数溢出出错（第 1 章的陷阱），标准做法先减去行最大值 $m$：</p>
+<div class="math-block">$$\mathrm{softmax}(\mathbf{x})_i = \frac{e^{x_i - m}}{\sum_{j} e^{x_j - m}}, \qquad m = \max_j x_j$$</div>
+<p>分子分母同乘 $e^{m}$ 不改变结果，且所有指数的输入 $\le 0$，绝不上溢。问题依旧：$m$ 需要看完一整行才知道。</p>
+<p><b>第二步：Online 重标定（流式更新 max 与分母）</b>。关键洞察：分母 $l = \sum_j e^{x_j - m}$ 可以在 $m$ 变化时<b>廉价修正</b>。设已处理前 $k$ 个元素，记录 $m^{(k)}$（当前最大）与 $l^{(k)} = \sum_{j\le k} e^{x_j - m^{(k)}}$。来了新元素 $x_{k+1}$：</p>
+<div class="math-block">$$m^{(k+1)} = \max\big(m^{(k)}, x_{k+1}\big), \qquad l^{(k+1)} = e^{\,m^{(k)} - m^{(k+1)}}\, l^{(k)} + e^{\,x_{k+1} - m^{(k+1)}}$$</div>
+<p>证明只需一行：旧项 $e^{x_j - m^{(k)}} = e^{x_j - m^{(k+1)}}\cdot e^{m^{(k)} - m^{(k+1)}}$——每个旧贡献乘上同一个"降权因子" $e^{m^{(k)}-m^{(k+1)}}$ 即对齐到新基准。这就是 online softmax（Milakov &amp; Gimelshein, arXiv:1805.02867）：一遍流式扫描，同时维护 $\max$ 与分母，不需要回头。</p>
+<p><b>第三步：带值的分块（attention 版 online softmax）</b>。注意力输出 $\mathbf{o}_i = \frac{1}{l}\sum_j e^{s_{ij}-m}\mathbf{v}_j$，把"分子"也做成流式状态。对第 $i$ 个 query 行，已见分块 $[1..j]$ 的状态是三元组 $(m^{(j)},\, l^{(j)},\, \mathbf{o}^{(j)})$（$\mathbf{o}^{(j)}$ 为<b>未归一化</b>的加权和）。新到分块 $\mathbf{K}_j, \mathbf{V}_j$，算出局部分数 $\tilde{\mathbf{s}} = \mathbf{q}_i\mathbf{K}_j^{\top}/\sqrt{d_k}$ 与局部统计 $m_j = \max \tilde{\mathbf{s}}$、$l_j = \sum e^{\tilde s - m_j}$、$\mathbf{p}_j = e^{\tilde{\mathbf{s}} - m_j}$：</p>
+<div class="math-block">$$m^{\text{new}} = \max\big(m^{(j)},\, m_j\big), \qquad l^{\text{new}} = e^{\,m^{(j)}-m^{\text{new}}}\,l^{(j)} + l_j$$</div>
+<div class="math-block">$$\mathbf{o}^{\text{new}} = \underbrace{e^{\,m^{(j)}-m^{\text{new}}}\,\mathbf{o}^{(j)}}_{\text{旧块整体降权}} + \underbrace{\mathbf{p}_j\,\mathbf{V}_j}_{\text{新块未归一化累加}}$$</div>
+<p>扫描完所有块后，归一化一次：$\mathbf{o}_i = \mathbf{o}^{\text{final}} / l^{\text{final}}$。用归纳法可证最终结果与整行 softmax 完全一致：每一步只是把"以旧 max 为基准的未归一化和"换算成"以新 max 为基准"，与第二步的单元素情形逐项相同。$\blacksquare$</p>
+<p><b>为什么这解决了 tiling 矛盾</b>：每个分块内部只需要<b>块内</b>的 max 与求和（片上完成），跨块只传递两个标量 $m, l$ 和一个 $T\times d$ 向量 $\mathbf{o}$——$T\times T$ 矩阵从未成形。</p></div>
+
+<p><b>数值算例（手算一遍，彻底安心）</b>：取一行分数 $\mathbf{s} = [1, 2, 3, 4]$，对应标量值 $\mathbf{v}=[v_1,v_2,v_3,v_4]$，分两块计算。第一块 $[1,2]$：块内 $m^{(1)}=2$，$l^{(1)}=e^{-1}+e^{0}\approx 1.3679$，$\mathbf{o}^{(1)} = 0.3679\,v_1 + 1\cdot v_2$。第二块 $[3,4]$：$m_2=4$，$l_2 \approx 1.3679$，$\mathbf{p}_2 = [e^{-1}, 1] = [0.3679, 1]$。合并：$m^{\text{new}}=4$；旧块降权 $e^{2-4}\approx0.1353$；于是 $l^{\text{new}} = 0.1353\times1.3679 + 1.3679 \approx 1.5530$；$\mathbf{o}^{\text{new}} = 0.1353\times(0.3679 v_1 + v_2) + (0.3679 v_3 + v_4) = 0.0498 v_1 + 0.1353 v_2 + 0.3679 v_3 + v_4$。归一化后权重 $\approx [0.0321, 0.0871, 0.2369, 0.6439]$——与直接整行 softmax（$e^{-3},e^{-2},e^{-1},1$ 除以 1.5530）逐项一致。下面用代码复现这个算例：</p>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+T, d = 8, 4
+X = torch.randn(1, T, d)                       # 一条"序列"同时充当 K 和 V 的来源
+S = X @ X.T / d ** 0.5                          # 8×8 分数矩阵（演示用）
+V = X
+
+def online_softmax_blockwise(S, V, block=2):
+    """按 K 维分块的 online softmax 注意力：只维护每行 (m, l, o) 三个状态"""
+    rows = []
+    for i in range(S.size(0)):                  # 逐 query 行（真实 kernel 是逐块、并行的）
+        m, l, o = torch.tensor(float("-inf")), torch.zeros(1), torch.zeros(d)
+        for j0 in range(0, S.size(1), block):   # 外层：K/V 分块，一次一块进 SRAM
+            s_blk = S[i, j0:j0+block]                       # 块内分数
+            m_j = s_blk.max()
+            p_blk = torch.exp(s_blk - m_j)                  # 块内未归一化权重
+            l_j = p_blk.sum()
+            m_new = torch.maximum(m, m_j)                   # 合并 max
+            scale = torch.exp(m - m_new) if m != float("-inf") else torch.tensor(0.0)
+            l = scale * l + l_j                             # 分母重标定
+            o = scale * o + p_blk @ V[j0:j0+block]          # 输出重标定累加
+            m = m_new
+        rows.append(o / l)                       # 最后统一归一化
+    return torch.stack(rows)
+
+out_block = online_softmax_blockwise(S, V, block=2)
+out_full = F.softmax(S, dim=-1) @ V
+print("分块 vs 全行的最大误差:", (out_block - out_full).abs().max().item())  # ~1e-6
+print("精确一致 ⇒ FlashAttention 不是近似，是换了一种读写顺序的精确注意力")</code></pre></div>
+
+<figure><svg viewBox="0 0 760 340" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <defs><marker id="m4b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">Tiling 分块计算示意：外层扫 K/V 块，内层更新 Q 行块的状态</text>
+  <!-- 分数矩阵 -->
+  <g>
+    <rect x="40" y="70" width="270" height="210" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.2"/>
+    <rect x="40" y="70" width="90" height="52.5" fill="#dbeafe"/>
+    <rect x="130" y="70" width="90" height="52.5" fill="#bfdbfe"/>
+    <rect x="220" y="70" width="90" height="52.5" fill="#93c5fd"/>
+    <rect x="40" y="122.5" width="90" height="52.5" fill="#bfdbfe"/>
+    <rect x="130" y="122.5" width="90" height="52.5" fill="#93c5fd"/>
+    <rect x="220" y="122.5" width="90" height="52.5" fill="#dbeafe"/>
+    <rect x="40" y="175" width="90" height="52.5" fill="#93c5fd"/>
+    <rect x="130" y="175" width="90" height="52.5" fill="#dbeafe"/>
+    <rect x="220" y="175" width="90" height="52.5" fill="#bfdbfe"/>
+    <rect x="40" y="227.5" width="90" height="52.5" fill="#dbeafe"/>
+    <rect x="130" y="227.5" width="90" height="52.5" fill="#bfdbfe"/>
+    <rect x="220" y="227.5" width="90" height="52.5" fill="#93c5fd"/>
+    <text x="85" y="40" text-anchor="middle" font-size="12" fill="#334155" font-family="sans-serif">K/V 分块（外层循环 j）</text>
+    <text x="24" y="100" font-size="12" fill="#334155" font-family="sans-serif">Q 行</text>
+    <text x="24" y="130" font-size="12" fill="#334155" font-family="sans-serif">块 i</text>
+    <text x="24" y="160" font-size="12" fill="#334155" font-family="sans-serif">（内层</text>
+    <text x="24" y="178" font-size="12" fill="#334155" font-family="sans-serif">循环）</text>
+    <text x="85" y="100" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₁₁</text>
+    <text x="175" y="100" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₁₂</text>
+    <text x="265" y="100" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₁₃</text>
+    <text x="85" y="152" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₂₁</text>
+    <text x="175" y="152" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₂₂</text>
+    <text x="265" y="152" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₂₃</text>
+    <text x="85" y="205" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₃₁</text>
+    <text x="175" y="205" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₃₂</text>
+    <text x="265" y="205" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₃₃</text>
+    <text x="85" y="258" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₄₁</text>
+    <text x="175" y="258" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₄₂</text>
+    <text x="265" y="258" text-anchor="middle" font-size="11" fill="#1e3a8a" font-family="sans-serif">S₄₃</text>
+  </g>
+  <path d="M 320 96 L 368 96" stroke="#10b981" stroke-width="2.4" marker-end="url(#m4b)"/>
+  <text x="344" y="86" text-anchor="middle" font-size="11.5" fill="#047857" font-family="sans-serif">K_j,V_j</text>
+  <path d="M 320 200 L 368 200" stroke="#2563eb" stroke-width="2.4" marker-end="url(#m4b)"/>
+  <text x="344" y="190" text-anchor="middle" font-size="11.5" fill="#1e3a8a" font-family="sans-serif">Q_i</text>
+  <!-- SRAM -->
+  <rect x="370" y="60" width="180" height="200" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+  <text x="460" y="84" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46" font-family="sans-serif">SRAM（片上）</text>
+  <text x="460" y="110" text-anchor="middle" font-size="12" fill="#047857" font-family="sans-serif">① S_ij = Q_i·K_jᵀ/√d</text>
+  <text x="460" y="132" text-anchor="middle" font-size="12" fill="#047857" font-family="sans-serif">② m̃=max, p̃=exp(S−m̃)</text>
+  <text x="460" y="154" text-anchor="middle" font-size="12" fill="#047857" font-family="sans-serif">③ Õ = α·Õ + p̃·V_j</text>
+  <text x="460" y="176" text-anchor="middle" font-size="12" fill="#047857" font-family="sans-serif">④ l = α·l + Σp̃, m=…</text>
+  <text x="460" y="206" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">α = exp(m_old − m_new)</text>
+  <text x="460" y="226" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">T×T 从不落盘</text>
+  <text x="460" y="246" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">块算完即弃（除状态）</text>
+  <path d="M 550 160 L 608 160" stroke="#8b5cf6" stroke-width="2.4" marker-end="url(#m4b)"/>
+  <text x="578" y="150" text-anchor="middle" font-size="11.5" fill="#5b21b6" font-family="sans-serif">回写</text>
+  <rect x="610" y="120" width="130" height="80" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.8"/>
+  <text x="675" y="148" text-anchor="middle" font-size="12" fill="#5b21b6" font-family="sans-serif">HBM：O_i 行块</text>
+  <text x="675" y="170" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">+ (m, l) 统计量</text>
+  <text x="675" y="190" text-anchor="middle" font-size="11.5" fill="#64748b" font-family="sans-serif">O(T·d) 显存</text>
+  <text x="380" y="308" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">蓝/浅蓝 = 因果掩码下被计算的块（下三角）；一次仅一小块进入 SRAM，合并公式见第 3 节推导</text>
+</svg><figcaption>图 4-2　<b>FlashAttention 的 tiling 与 online softmax 数据流</b>。每个 Q 行块沿 K/V 块方向推进，在 SRAM 内完成"算分数 → 局部 softmax → 重标定累加"，跨块只传递标量 $m,l$ 与行块输出 $O_i$。因果掩码只需跳过上三角块（FA2 的"非对角块"并行正是利用这一点）。</figcaption></figure>
+<h2 id="sec-4"><span class="sec-no">4.</span>FlashAttention 前向：SRAM 里的分块流水</h2>
+<p>有了 online softmax，算法层面"分块计算精确注意力"已经成立；但要把性能吃满，还差最后一环：<b>让分块大小与硬件内存层级匹配</b>。GPU 的内存层级（第 8 章详解）：每个 SM 有约 192 KB 的 SRAM（A100，Hopper 约 228 KB），读写速度接近寄存器；HBM 容量大（40–80 GB）但带宽慢一个量级。FlashAttention 的 kernel 设计原则是：每个线程块（thread block）领取一个 Q 行块，把对应 K/V 块分批搬进 SRAM，重复"算分数 → softmax 重标定 → 累加"，SRAM 里没有任何东西回流 HBM。</p>
+<p><b>分块大小怎么定</b>：设行块大小 $B_r$、列块大小 $B_c$，SRAM 需要容纳 $\mathbf{Q}_i$（$B_r\times d$）、$\mathbf{K}_j,\mathbf{V}_j$（各 $B_c\times d$）与中间分数块（$B_r\times B_c$），即 $(B_r + 2B_c)\,d + B_r B_c \le \mathrm{SRAM}$。以 $d=128$、A100 约 100 KB 可用为例，$B_r=B_c\approx 100$–128 是典型取值——每个块都是几百到几千 KB 的"工作集"，恰好 tensor core 也喜欢这种方形 tile。<b>循环顺序</b>：FA1 是外层扫 K/V 块、内层扫 Q 行块（每个 Q 行块自己维护 $(m, l, \mathbf{o})$ 状态，互不干扰，天然并行）；FA2 会交换内外循环（第 6 节讲为什么）。</p>
+<p><b>正确性与精度</b>：整个计算只有两类数值偏离"教科书"：分块 exp 的顺序不同（浮点加法不结合，误差在 $10^{-6}$ 量级），以及统计量 $m,l$ 的重标定乘法。在 BF16 下与朴素实现的端到端差异通常小于 $10^{-3}$，所有主流模型（LLaMA/Qwen 系列）都是直接用 FlashAttention 训练的，不存在"精度切换"问题。</p>
+<div class="box-tip"><p class="box-title">💡 技巧：为什么 softmax 每行还要存 m 和 l</p>
+<p>前向把输出 $O$ 归一化后写回，但反向传播还需要未归一化的信息重算 $\mathbf{P}$。与其存下 $T\times T$ 的 $\mathbf{P}$，不如只存每行的 $m_i, l_i$（$2T$ 个标量）——反向时用 $\mathbf{S} - m_i$ 重算指数、除以 $l_i$ 即可精确恢复 $\mathbf{P}$。这是"显存 O(T)"的另一半：前向丢弃 $T^2$ 中间量、只留统计量，反向重新算一遍。下一节展开。</p></div>
+
+<h2 id="sec-5"><span class="sec-no">5.</span>反向传播：用重计算换显存</h2>
+<p>标准实现的反向传播需要保存 $\mathbf{P}$（$T\times T$）来计算 $\partial \mathbf{S} = \mathbf{P}\odot(\partial\mathbf{P} - \mathrm{rowsum}(\partial\mathbf{P}\odot\mathbf{P}))$。FlashAttention 的做法：前向只保存 $O_i$ 与 $(m_i, l_i)$；反向重新执行一遍分块前向（同样的 tiling）重建 $\mathbf{P}$ 的每个小块，边重建边算梯度。代价是<b>额外约 1.5–2 倍的注意力 FLOPs</b>；收益是<b>反向显存也从 $O(T^2)$ 降到 $O(T)$</b>，而且由于算子本来就访存受限，多算的那部分 FLOPs 大部分被带宽等待"吸收"了——端到端训练时间仍比标准实现快 2–4 倍。</p>
+<p>把反向公式的推导写完整（这是很多博客"直接引用"的部分）。设 $\mathbf{O} = \mathrm{softmax}(\mathbf{S})\mathbf{V} = \mathbf{P}\mathbf{V}$，$\mathbf{S} = \mathbf{Q}\mathbf{K}^{\top}/\sqrt{d_k}$，上游梯度为 $\partial\mathbf{O}$：</p>
+<div class="math-block">$$\partial\mathbf{V} = \mathbf{P}^{\top}\partial\mathbf{O}, \qquad \partial\mathbf{P} = \partial\mathbf{O}\,\mathbf{V}^{\top}$$</div>
+<p>softmax 的反向：对行向量 $\mathbf{p} = \mathrm{softmax}(\mathbf{s})$，雅可比 $\partial\mathbf{s} = \mathbf{p}\odot(\partial\mathbf{p} - \langle \mathbf{p}, \partial\mathbf{p}\rangle)$（利用 $\sum_j p_j = 1$ 与 $\frac{\partial p_i}{\partial s_j} = p_i(\delta_{ij} - p_j)$，逐分量展开即可验证）。逐行写成矩阵形式时，$\langle \mathbf{p}, \partial\mathbf{p}\rangle$ 是<b>逐行点积</b>，故：</p>
+<div class="math-block">$$\mathbf{D} = \mathrm{rowsum}\big(\partial\mathbf{P}\odot\mathbf{P}\big)\in\mathbb{R}^{T}, \qquad \partial\mathbf{S} = \mathbf{P}\odot\big(\partial\mathbf{P} - \mathbf{D}\big)$$</div>
+<p>FlashAttention 反向里 $\mathbf{D}$ 的计算有个巧妙事实：<b>不需要单独跑一遍</b>。由链式法则 $\langle \mathbf{p}_i, \partial\mathbf{p}_i\rangle = \langle \mathbf{o}_i, \partial\mathbf{o}_i\rangle$（因为 $\partial\mathbf{o}_i = \partial\mathbf{p}_i\mathbf{V}$、$\mathbf{o}_i = \mathbf{p}_i\mathbf{V}$，代入即得 $\partial\mathbf{o}_i\cdot\mathbf{o}_i = \partial\mathbf{p}_i\mathbf{V}\mathbf{V}^{\top}\mathbf{p}_i^{\top}$，而 $\partial\mathbf{p}_i\cdot\mathbf{p}_i$ 经同样展开与 $\mathbf{V}\mathbf{V}^{\top}$ 的二次型相等——精确等式 $\mathrm{rowsum}(\partial\mathbf{P}\odot\mathbf{P}) = \mathrm{rowsum}(\partial\mathbf{O}\odot\mathbf{O})$），于是 $\mathbf{D}$ 可以<b>在 kernel 启动前用一次便宜的逐元素乘求和得到</b>。最后：</p>
+<div class="math-block">$$\partial\mathbf{Q} = \partial\mathbf{S}\,\mathbf{K}/\sqrt{d_k}, \qquad \partial\mathbf{K} = \partial\mathbf{S}^{\top}\mathbf{Q}/\sqrt{d_k}$$</div>
+<p>所有这些计算都在与前向相同的 tiling 结构里分块完成——$\partial\mathbf{V}$ 用重算的 $\mathbf{P}$ 块，$\partial\mathbf{S}$ 在 SRAM 里逐块算完即用。</p>
+
+<figure><img src="../assets/images/papers/2307.08691_0.png" loading="lazy" alt="FlashAttention-2 前向计算流程图"><figcaption>图 4-3　<b>FlashAttention-2 的前向分块流程</b>（来源：Dao, FlashAttention-2, arXiv:2307.08691）。K/V 沿列方向切分成块，Q 沿行方向切分；每个工作块在 SRAM 内计算局部 softmax 并做跨块重标定，最终输出精确的注意力。与 FA1 相比，FA2 调整了循环顺序与线程内分工，减少了非矩阵乘（non-matmul）的 FLOPs 占比。</figcaption></figure>
+
+<h2 id="sec-6"><span class="sec-no">6.</span>FA2 与 FA3：并行度、Hopper 特性与 FP8</h2>
+<h3 id="sec-6-1">6.1 FlashAttention-2（arXiv:2307.08691）：把 SM 喂饱</h3>
+<p>FA1 证明了"tiling + online softmax"的可行性，但只利用了 A100 理论 FLOPs 峰值的 25–40%。诊断出的问题有三个，FA2 逐一修复：<b>（1）并行度不足</b>：FA1 沿 K/V 块做外层循环，不同线程块处理的 Q 行块数量受限于 batch×头数——4k 序列、单 batch 单头时只有极少数 SM 有活干（A100 有 108 个 SM）。FA2 把外层循环换成 <b>Q 行块</b>，并行度变成"Q 块数 × batch × 头数"，长序列下 SM 几乎满载。<b>（2）非 matmul 操作太多</b>：softmax 的 max/exp/乘加无法用 tensor core，FA1 的内核里这类操作占比可观；FA2 重新组织了线程间的数据划分（每个 warp 处理 d 维的不同切片），把非 matmul FLOPs 与寄存器往返砍掉约一半。<b>（3）块尺寸</b>：调整 $B_r/B_c$ 更贴近 128×128 的 tensor core 甜点。结果：前向达到 A100 BF16 理论峰值（312 TFLOPs/s）的<b>约 73%</b>（反向约 63%），GPT-2 级端到端训练约 225 TFLOPs/s，整体比 FA1 快约 2 倍。</p>
+
+<figure><img src="../assets/images/papers/2307.08691_1.png" loading="lazy" alt="FlashAttention-2 前向并行与工作块划分"><figcaption>图 4-4　<b>FlashAttention-2 的并行划分</b>（来源：arXiv:2307.08691）。左：前向按"batch × 头 × Q 行块"划分线程块，长序列下并行度随 Q 块数线性增长（绿色块为因果掩码下实际计算的下三角部分）；右：单个线程块内 4 个 warp 协同处理一个 Q 块与 K/V 块的矩阵乘与 softmax。这两张图合起来解释了"为什么 FA2 快"：并行度与非 matmul 开销同时被优化。</figcaption></figure>
+
+<h3 id="sec-6-2">6.2 FlashAttention-3（arXiv:2407.08608）：拥抱 Hopper 的异步</h3>
+<p>H100 引入了两组新硬件能力，FA3 的设计围绕它们展开：<b>WGMMA</b>（warpgroup matrix multiply-accumulate，矩阵乘可跨 warp 组异步执行）与 <b>TMA</b>（Tensor Memory Accelerator，异步搬运数据、支持 barriers）。Ampere 时代"边搬边算"的同步开销在 Hopper 上成了新瓶颈。FA3 的三板斧：<b>（1）生产者-消费者异步流水</b>——专门的 warp 组用 TMA 预取下一块 K/V（生产者），另一组 warp 并行做矩阵乘与 softmax（消费者），数据一到位立即计算；<b>（2）pingpong 调度</b>——两组消费者错峰执行 GEMM 与 softmax，让 tensor core 与 SFU（算 exp 的单元）交替满载；<b>（3）FP8 支持</b>——用 8 位精度做矩阵乘（吞吐翻倍），配 in-kernel 的逐块缩放与（可选）非一致性量化（incoherent processing，用随机正交变换消除激活离群值），把 FP8 的精度损失压到可控。结果：BF16 下达 540–740 TFLOPs/s（约为 H100 理论峰值 989 的 55–75%），比 FA2 快 1.5–2 倍；FP8 下接近 1.2 PFLOPs/s。FP8 注意力对多模态还有一层特殊价值：视觉 token 的激活分布差异大，FA3 的逐块缩放是"kernel 内治理离群值"的示范，与第 39 章的多模态量化难点相呼应。</p>
+
+<figure><img src="../assets/images/papers/2407.08608_0.png" loading="lazy" alt="FA3 的 pingpong 异步调度示意"><figcaption>图 4-5　<b>FA3 的 pingpong 调度</b>（来源：Shah et al., FlashAttention-3, arXiv:2407.08608）。两组 warpgroup 交替执行 softmax 与 GEMM：当一组在算 softmax（用不到 tensor core）时，另一组恰好进入 GEMM 阶段，tensor core 与 SFU 的空闲被互补填满——这是 Hopper 异步能力把注意力算子推向理论峰值的最后一块拼图。</figcaption></figure>
+
+<figure><img src="../assets/images/papers/2205.14135_0.jpg" loading="lazy" alt="FlashAttention 在不同序列长度下相对标准 PyTorch 的加速比"><figcaption>图 4-6　<b>FlashAttention 相对标准 PyTorch 实现的加速比</b>（来源：Dao et al., arXiv:2205.14135，A100 实测）。序列越长、头维度越大，标准实现 wasted 在 HBM 往返上的时间越多，FA 的加速比越高（长序列下可达 3–4 倍以上）。反过来读这张图：如果你的序列只有 128（纯文本短序列），SDPA 的数学后端与 Flash 后端差距很小——不必迷信"必须 Flash"。</figcaption></figure>
+
+<div class="tbl-wrap"><table>
+<caption>表 4-2　标准实现与 FlashAttention 1/2/3 的关键指标对比（A100/H100 厂商标称峰值）</caption>
+<thead><tr><th>实现</th><th>硬件</th><th>前向峰值利用率</th><th>额外显存</th><th>核心机制</th></tr></thead>
+<tbody>
+<tr><td>标准（物化 T×T）</td><td>A100</td><td>&lt;20%（访存受限）</td><td>$O(T^2)$</td><td>三遍大矩阵 HBM 往返</td></tr>
+<tr><td>FlashAttention-1</td><td>A100</td><td>25–40%</td><td>$O(T)$</td><td>tiling + online softmax + 重计算反向</td></tr>
+<tr><td>FlashAttention-2</td><td>A100</td><td>≈73%（反向 ≈63%）</td><td>$O(T)$</td><td>Q 外层并行、非 matmul FLOPs 减半</td></tr>
+<tr><td>FlashAttention-3</td><td>H100</td><td>55–75%（740 TFLOPs/s）</td><td>$O(T)$</td><td>TMA/WGMMA 异步流水 + pingpong + FP8</td></tr>
+</tbody></table></div>
+
+<div class="box-paper"><p class="box-title">📄 论文精读：FlashAttention（Dao et al., NeurIPS 2022，arXiv:2205.14135）</p>
+<p><b>问题</b>：注意力是访存受限算子，$T\times T$ 中间矩阵造成显存与带宽的双重浪费；已有"稀疏/低秩近似"路线牺牲精度且加速不稳定。<b>方法</b>：IO-aware 的精确注意力——分析 GPU 内存层级后设计 tiling（前向）与重计算（反向），用 online softmax 让分块结果可精确合并。<b>关键结果</b>：BERT-large（512）端到端快 15%、GPT-2（1k）快 3 倍、Long-Range Arena（4k）快 2.4 倍；注意力显存从 $O(T^2)$ 降到 $O(T)$，首次使 16k 上下文 BERT 的训练成为可能。<b>为什么重要</b>：它确立了"系统瓶颈决定算法设计"的思路（IO-aware algorithm design），此后 FA2/FA3、PagedAttention、第 39 章的整个推理优化栈都沿用"先算算术强度、再设计 kernel"的方法论。<b>重读建议</b>：第 2 节的 IO 复杂度分析（为什么分块次数 $\Theta(T^2 d^2 / M)$）与 Algorithm 1/2 值得逐行对照本章第 3–5 节。</p></div>
+<h2 id="sec-7"><span class="sec-no">7.</span>MQA 与 GQA：给 KV Cache 瘦身</h2>
+<p>FlashAttention 解决"计算与中间显存"，而推理服务的另一半瓶颈是第 3 章的 KV Cache。多查询注意力（Multi-Query Attention, MQA，Shazeer, arXiv:1911.02150）给出激进方案：<b>所有头共享一组 K/V</b>——KV Cache 直接缩小 $H$ 倍，但质量有明显损失。分组查询注意力（Grouped-Query Attention, GQA，Ainslie et al., arXiv:2305.13245，EMNLP 2023）取中庸：把 $H$ 个 Q 头分成 $g$ 组，每组共享一组 K/V（$g=H$ 退化为 MHA，$g=1$ 退化为 MQA）。LLaMA-2-70B、Llama-3 全系、Qwen2/3 全系、Mistral 均采用 $g=8$ 量级的 GQA。</p>
+
+<figure><svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" style="width:100%;background:#fff">
+  <defs><marker id="m4c" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+  <text x="380" y="24" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="sans-serif">MHA / MQA / GQA：Q 头与 KV 头的对应关系</text>
+  <!-- MHA -->
+  <rect x="20" y="46" width="220" height="216" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="1.8"/>
+  <text x="130" y="68" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#1e3a8a" font-family="sans-serif">MHA（基线）</text>
+  <g>
+    <rect x="46" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="61" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₁</text>
+    <rect x="86" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="101" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₂</text>
+    <rect x="126" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="141" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₃</text>
+    <rect x="166" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="181" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₄</text>
+    <rect x="46" y="130" width="30" height="24" rx="4" fill="#d97706"/><text x="61" y="146" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">K₁</text>
+    <rect x="86" y="130" width="30" height="24" rx="4" fill="#d97706"/><text x="101" y="146" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">K₂</text>
+    <rect x="126" y="130" width="30" height="24" rx="4" fill="#d97706"/><text x="141" y="146" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">K₃</text>
+    <rect x="166" y="130" width="30" height="24" rx="4" fill="#d97706"/><text x="181" y="146" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">K₄</text>
+    <rect x="46" y="174" width="30" height="24" rx="4" fill="#10b981"/><text x="61" y="190" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">V₁</text>
+    <rect x="86" y="174" width="30" height="24" rx="4" fill="#10b981"/><text x="101" y="190" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">V₂</text>
+    <rect x="126" y="174" width="30" height="24" rx="4" fill="#10b981"/><text x="141" y="190" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">V₃</text>
+    <rect x="166" y="174" width="30" height="24" rx="4" fill="#10b981"/><text x="181" y="190" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">V₄</text>
+  </g>
+  <text x="130" y="228" text-anchor="middle" font-size="11.5" fill="#334155" font-family="sans-serif">每组一一对应，质量最好</text>
+  <text x="130" y="248" text-anchor="middle" font-size="11.5" fill="#ef4444" font-family="sans-serif">KV Cache = H 份，最贵</text>
+  <!-- MQA -->
+  <rect x="270" y="46" width="220" height="216" rx="12" fill="#fef2f2" stroke="#ef4444" stroke-width="1.8"/>
+  <text x="380" y="68" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#991b1b" font-family="sans-serif">MQA（全共享）</text>
+  <g>
+    <rect x="296" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="311" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₁</text>
+    <rect x="336" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="351" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₂</text>
+    <rect x="376" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="391" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₃</text>
+    <rect x="416" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="431" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₄</text>
+    <rect x="336" y="130" width="60" height="24" rx="4" fill="#d97706"/><text x="366" y="146" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">共享 K</text>
+    <rect x="336" y="174" width="60" height="24" rx="4" fill="#10b981"/><text x="366" y="190" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">共享 V</text>
+  </g>
+  <path d="M311 110 L 361 128" stroke="#94a3b8" stroke-width="1.4"/>
+  <path d="M351 110 L 365 128" stroke="#94a3b8" stroke-width="1.4"/>
+  <path d="M391 110 L 369 128" stroke="#94a3b8" stroke-width="1.4"/>
+  <path d="M431 110 L 373 128" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="380" y="228" text-anchor="middle" font-size="11.5" fill="#334155" font-family="sans-serif">KV Cache 缩小 H 倍</text>
+  <text x="380" y="248" text-anchor="middle" font-size="11.5" fill="#ef4444" font-family="sans-serif">质量损失明显</text>
+  <!-- GQA -->
+  <rect x="520" y="46" width="220" height="216" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="1.8"/>
+  <text x="630" y="68" text-anchor="middle" font-size="13.5" font-weight="bold" fill="#065f46" font-family="sans-serif">GQA（分组共享，主流）</text>
+  <g>
+    <rect x="546" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="561" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₁</text>
+    <rect x="586" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="601" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₂</text>
+    <rect x="646" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="661" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₃</text>
+    <rect x="686" y="86" width="30" height="24" rx="4" fill="#2563eb"/><text x="701" y="102" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">Q₄</text>
+    <rect x="566" y="130" width="50" height="24" rx="4" fill="#d97706"/><text x="591" y="146" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">K₁₋₂</text>
+    <rect x="666" y="130" width="50" height="24" rx="4" fill="#d97706"/><text x="691" y="146" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">K₃₋₄</text>
+    <rect x="566" y="174" width="50" height="24" rx="4" fill="#10b981"/><text x="591" y="190" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">V₁₋₂</text>
+    <rect x="666" y="174" width="50" height="24" rx="4" fill="#10b981"/><text x="691" y="190" text-anchor="middle" font-size="10" fill="#fff" font-family="sans-serif">V₃₋₄</text>
+  </g>
+  <path d="M561 110 L 586 128" stroke="#94a3b8" stroke-width="1.4"/>
+  <path d="M601 110 L 596 128" stroke="#94a3b8" stroke-width="1.4"/>
+  <path d="M661 110 L 686 128" stroke="#94a3b8" stroke-width="1.4"/>
+  <path d="M701 110 L 696 128" stroke="#94a3b8" stroke-width="1.4"/>
+  <text x="630" y="228" text-anchor="middle" font-size="11.5" fill="#334155" font-family="sans-serif">质量接近 MHA，显存降 g 倍</text>
+  <text x="630" y="248" text-anchor="middle" font-size="11.5" fill="#065f46" font-family="sans-serif">g=8 是 2026 主流配置</text>
+  <text x="380" y="288" text-anchor="middle" font-size="12" fill="#64748b" font-family="sans-serif">g = H 时退化为 MHA，g = 1 时退化为 MQA；LLaMA-3-8B：32 个 Q 头共享 8 组 KV</text>
+</svg><figcaption>图 4-7　<b>MHA、MQA 与 GQA 的头对应结构</b>。GQA 的关键工程价值在于"uptraining"：把训好的 MHA checkpoint 的 K/V 投影矩阵按组平均池化，再用约 5% 的原始训练算力继续训练，即可转换成 GQA 模型——质量几乎无损（论文消融：转换后的质量显著优于同规模的 MQA，接近从头训练的 MHA）。</figcaption></figure>
+
+<p>顺带一提更新的 MLA（Multi-head Latent Attention，DeepSeek-V2/V3 采用）：把 KV 压缩进一个低秩潜在向量再展开，显存进一步下降，代价是 kernel 实现更复杂（需要吸收矩阵运算以保持速度）。它与 GQA 的取舍在 2026 年仍是活跃话题，但工程生态（FlashAttention/vLLM/TensorRT 原生支持）仍是 GQA 最成熟。</p>
+
+<div class="tbl-wrap"><table>
+<caption>表 4-3　注意力头结构与 KV Cache 的关系（同 $H{=}32$ 头、$d_{head}{=}128$、$L{=}32$ 层、FP16）</caption>
+<thead><tr><th>方案</th><th>KV 头数</th><th>每 token KV 开销</th><th>质量影响</th><th>代表模型</th></tr></thead>
+<tbody>
+<tr><td>MHA</td><td>32</td><td>512 KiB</td><td>基准</td><td>Llama-2-7B、GPT-3</td></tr>
+<tr><td>GQA-8</td><td>8</td><td>128 KiB</td><td>接近无损</td><td>Llama-3、Qwen2.5、Mistral</td></tr>
+<tr><td>MQA</td><td>1</td><td>16 KiB</td><td>可感知下降</td><td>PaLM、 Falcon（部分层）</td></tr>
+<tr><td>MLA</td><td>潜在维 $d_c$（如 512）</td><td>约 70 KiB（DeepSeek-V3 形态）</td><td>接近/优于 MHA（论文报告）</td><td>DeepSeek-V2/V3</td></tr>
+</tbody></table></div>
+
+<h2 id="sec-8"><span class="sec-no">8.</span>Varlen 注意力与多模态序列打包</h2>
+<p>训练数据里的序列长短悬殊：一段对话 300 token、一份图文文档 8000 token。把它们 pad 到同一长度再过注意力，既浪费计算（pad 部分照样过 kernel）也浪费显存。<b>varlen</b>（变长）注意力的做法是把多条序列<b>首尾相接拼成一条</b>，用偏移数组 <code>cu_seqlens</code> 记录每条的边界，kernel 内保证"注意力只在自己的序列内部进行"——零 padding、零跨序列泄漏。flash-attn 库为此提供专门接口：</p>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code># pip install flash-attn --no-build-isolation   （需要与 PyTorch/CUDA 匹配的编译环境）
+import torch
+from flash_attn import flash_attn_func, flash_attn_varlen_func
+
+B, T, H, D = 2, 4096, 32, 128
+q = torch.randn(B, T, H, D, device="cuda", dtype=torch.bfloat16)   # 注意：flash-attn 用 (B,T,H,D) 布局
+k, v = q.clone(), q.clone()
+
+# —— 场景 1：稠密等长批 ——
+out = flash_attn_func(q, k, v, causal=True, window_size=(-1, -1))   # 滑窗给 (左,右)，(-1,-1)=全局
+print(out.shape)                                                    # [2, 4096, 32, 128]
+
+# —— 场景 2：变长打包（多条序列拼成一条，比如图文样本打包）——
+# 总 token 8192 = 4 条序列：[2048, 1024, 3072, 2048]
+cu = torch.tensor([0, 2048, 3072, 6144, 8192], device="cuda", dtype=torch.int32)
+q_flat = q.transpose(1, 2).reshape(-1, H, D)      # [total_tokens, H, D]
+k_flat, v_flat = k.transpose(1, 2).reshape(-1, H, D), v.transpose(1, 2).reshape(-1, H, D)
+out_flat = flash_attn_varlen_func(
+    q_flat, k_flat, v_flat,
+    cu_seqlens_q=cu, cu_seqlens_k=cu,             # 各序列的起止偏移（长度可互不相同）
+    max_seqlen_q=3072, max_seqlen_k=3072,         # 仅用于 kernel 选 tile，给最大值即可
+    causal=True)                                  # 掩码在各序列内部独立生效，不跨序列
+print(out_flat.shape)                              # [8192, 32, 128]
+# 多模态意义：一条"样本"= 图像 token + 文本 token，注意力必须跨模态贯通；
+# 而"不同样本之间"必须隔离 —— varlen 恰好把这两件事一次做对（第 9 节展开）。</code></pre></div>
+
+<p>多模态打包的完整故事是：<b>样本内</b>（视觉+文本 token）注意力全局连通；<b>样本间</b>用 varlen 或位置重置（position ids 重置 + 文档掩码）隔离。HuggingFace 的 <code>FlashAttentionKwargs</code>（<code>cu_seq_lens_q</code> / <code>cu_seq_lens_k</code>）与 packing 数据加载器（如 <code>DataCollatorWithFlattening</code>）已经把这条路径工程化。另一个多模态特有的注意点：<b>视觉 token 常常是"双向感知"的</b>——若视觉编码器输出后再被因果掩码切一刀，部分实践（如 InternVL 系对 tile 的处理）会让每个 tile 内部的视觉 token 保持可学习的位置关系，具体掩码策略因模型而异，读源码时留意 <code>_update_causal_mask</code> 类函数对图像段的处理。</p>
+
+<h2 id="sec-9"><span class="sec-no">9.</span>对多模态的意义：高分辨率的平方税</h2>
+<p>现在把第 3 章与本章的账本合并，回答一个问题：<b>为什么多模态模型比纯文本模型更依赖 FlashAttention？</b>算一笔账。纯文本典型输入 2k token；而一个多模态样本：</p>
+<div class="tbl-wrap"><table>
+<caption>表 4-4　典型多模态输入的视觉 token 规模与注意力压力（patch 14×14）</caption>
+<thead><tr><th>输入形态</th><th>分辨率策略</th><th>视觉 token 数</th><th>加上文本后总长</th><th>标准实现单层 S 矩阵（32 头，FP16）</th></tr></thead>
+<tbody>
+<tr><td>单图（CLIP 式）</td><td>336×336</td><td>577</td><td>约 700</td><td>约 31 MiB</td></tr>
+<tr><td>高分辨率单图（AnyRes）</td><td>LLaVA-NeXT：4 tile + 全图</td><td>2,885</td><td>约 3,000</td><td>约 576 MiB</td></tr>
+<tr><td>多图对比（InternVL 式）</td><td>448×448 × 6 tile</td><td>6,150</td><td>约 6,400</td><td>约 2.6 GiB</td></tr>
+<tr><td>短视频 16 帧</td><td>448×448 × 16</td><td>16,384</td><td>约 17,000</td><td>约 18 GiB</td></tr>
+<tr><td>长视频 / 高清文档</td><td>Qwen2-VL 动态分辨率上限</td><td>30,000+</td><td>30,000+</td><td>约 58 GiB</td></tr>
+</tbody></table></div>
+<p>表格最后一列解释了两个工程事实。<b>其一</b>：2022 年前的 VLM 全部把图像压到 224/336 分辨率——不是不想看清，而是 $T^2$ 的账付不起；FlashAttention 普及后（2023 下半年起），LLaVA-NeXT、InternVL、Qwen2-VL 才敢把视觉 token 推到数千乃至数万。<b>其二</b>：即便 FA 解决了显存，<b>计算量仍是平方的</b>——3 万 token 的 prefill 单层就要约 5.7 TFLOPs（$4T^2d$），几十层叠加后高分辨率首 token 延迟显著，这直接催生了视觉 token 剪枝/压缩方向（FastV 等，第 39 章）与连接器压缩设计（第 15 章）。可以说：<b>多模态的"分辨率军备竞赛"是被 FlashAttention 解锁、又被平方复杂度封顶的</b>。</p>
+
+<div class="box-warn"><p class="box-title">⚠️ 陷阱：多模态训练里的注意力相关高频错误</p>
+<p><b>（1）位置 id 忘记重置</b>：多条样本打包后 RoPE 的位置必须按样本重置，否则第 2 条样本的 token 带着巨大的绝对位置参与旋转，注意力分布错乱（表现为 loss 收敛后突然升高）。<b>（2）varlen 边界算错</b>：<code>cu_seqlens</code> 是"前缀和"（首元素 0、末元素为总长），写成了"长度数组"会让注意力跨样本泄漏——数据泄漏的静默版本。<b>（3）SDPA 的布尔掩码语义</b>：传 <code>attn_mask</code> 布尔张量时 <code>True</code> 表示<b>参与</b>计算，与加性掩码（0/−inf）的直觉相反，且布尔掩码常使 kernel 退回慢速数学后端。<b>（4）fp16 训练配 FlashAttention</b>：FA 对 fp16 的分数会做内部缩放，但整个模型仍建议 bf16，避免 attention logit 溢出（第 1 章 FP16 位宽问题）。<b>（5）GQA 与 flash-attn 的头序</b>：flash-attn 要求 K/V 的头数能整除 Q 头数，且布局是 (B, T, H, D)——从 transformers 的 (B, H, T, D) 转换时忘记 <code>transpose(1,2)</code> 是最常见 bug。</p></div>
+
+<div class="code-wrap"><div class="code-head"><span class="lang">python</span><button class="copy-btn">复制</button></div>
+<pre><code>import torch
+import torch.nn.functional as F
+
+def kv_cache_bytes(n_layers, n_kv_heads, head_dim, seq_len, batch, bytes_per=2):
+    """KV Cache 显存公式（第 3 章式）的代码版：训练前先算账"""
+    per_token = 2 * n_layers * n_kv_heads * head_dim * bytes_per
+    return per_token * seq_len * batch
+
+# 例：Qwen2.5-VL-7B 形态（28 层、28 Q 头、4 KV 头、head_dim=128）做 32k 上下文视频理解
+gb = kv_cache_bytes(28, 4, 128, 32768, batch=1) / 2**30
+print(f"单请求 KV Cache: {gb:.2f} GiB")       # ≈ 1.75 GiB —— 长视频理解可行
+
+# —— SDPA 的三个后端与 GQA（PyTorch ≥ 2.5 支持 enable_gqa）——
+q = torch.randn(1, 28, 32768, 128, device="cuda", dtype=torch.bfloat16)  # [B, H_q, T, D]
+k = torch.randn(1, 4, 32768, 128, device="cuda", dtype=torch.bfloat16)   # [B, H_kv, T, D]：仅 4 头
+v = torch.randn(1, 4, 32768, 128, device="cuda", dtype=torch.bfloat16)
+from torch.nn.attention import sdpa_kernel, SDPBackend
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):         # 显式锁定 Flash 后端（可用的前提是形状合规）
+    out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+print(out.shape)                                       # [1, 28, 32768, 128]，K/V 自动按组广播
+# 提示：SDPA 会依据 dtype/形状/掩码自动挑后端（FLASH &gt; EFFICIENT &gt; MATH）；
+# 布尔掩码、任意 attn_mask、fp32 都可能让它退回慢速 MATH 后端 —— 生产代码要显式检查。 </code></pre></div>
+
+<div class="box-recipe"><p class="box-title">🍳 实战配方：注意力实现的选型决策树</p>
+<p><b>（1）默认起点</b>：训练与推理都直接用 <code>F.scaled_dot_product_attention(is_causal=True)</code>——PyTorch 自动分派，代码零维护。<b>（2）追求极限吞吐 / 需要滑窗、varlen、MLA 特性</b>：装 <code>flash-attn</code> 包，用 <code>flash_attn_func</code> / <code>flash_attn_varlen_func</code>；H100 + FP8 场景等 FA3 类 kernel（2026 年 PyTorch/transformers 已在逐步内置 Hopper 路径）。<b>（3）长上下文服务</b>：选 GQA 模型 + vLLM（PagedAttention 管理分页 KV，见第 8、39 章）；上下文扩展用 YaRN 配置而不是重训。<b>（4）多模态高分辨率</b>：先估视觉 token 数（表 4-4），超过 8k 就要配 token 压缩或分辨率分桶；训练用 varlen 打包 + 位置 id 重置。<b>（5）极端显存</b>：KV 量化（FP8/INT8）或 MLA 系模型；但先确认推理引擎支持。<b>（6）永远做对的两件事</b>：位置重置 + 序列边界隔离——这两个 bug 都是静默的。</p></div>
+
+<h2 id="sec-10"><span class="sec-no">10.</span>本章自测</h2>
+<div class="box-quiz"><p class="box-title">✏️ 自测（先独立作答，再看答案要点）</p>
+<p><b>1.</b> 为什么标准注意力实现是访存受限而不是计算受限？用算术强度说明。<br>
+<b>答案要点</b>：A100 上计算峰值的门槛约 156 FLOP/字节（312 TFLOPs ÷ 2 TB/s）；标准实现为 $T\times T$ 的 S/P 矩阵付出约 4–8 GB HBM 流量，而总 FLOPs 仅约 $4T^2d$，强度不足 50 FLOP/字节 → SM 等数据。大矩阵乘强度高（计算受限），注意力慢在"搬运"而非"计算"。</p>
+<p><b>2.</b> 写出 online softmax 的合并公式，并解释为什么它能保证与整行 softmax 一致。<br>
+<b>答案要点</b>：$m^{new}=\max(m^{old},m_j)$，$l^{new}=e^{m^{old}-m^{new}}l^{old}+l_j$，$\mathbf{o}^{new}=e^{m^{old}-m^{new}}\mathbf{o}^{old}+\mathbf{p}_j\mathbf{V}_j$（$\mathbf{p}_j$ 为块内未归一化权重），最后除以 $l^{new}$。一致性源于 $e^{x_j-m^{old}} = e^{x_j-m^{new}}\cdot e^{m^{old}-m^{new}}$：所有历史贡献按同一比例换基到新 max，归纳可得与全局 softmax 逐项相等。</p>
+<p><b>3.</b> FlashAttention 反向传播为什么要重计算？重算什么？多花了多少？<br>
+<b>答案要点</b>：为省掉 $T\times T$ 的 P 矩阵存储，前向只留输出 O 与每行统计量 $(m,l)$；反向重跑一遍分块前向重建 P（用 $m,l$ 归一），同时算 $\partial V=P^{\top}\partial O$、$\partial S=P\odot(\partial P-D)$（$D=\mathrm{rowsum}(\partial O\odot O)$）与 $\partial Q,\partial K$。额外约 1.5–2 倍注意力 FLOPs，但反向显存从 $O(T^2)$ 降到 $O(T)$，端到端仍更快（访存受限）。</p>
+<p><b>4.</b> FA2 相对 FA1 的两个主要改进是什么？FA3 靠什么在 H100 上再快 1.5–2 倍？<br>
+<b>答案要点</b>：FA2：外层循环改为 Q 行块提升并行度（SM 占满）、重排线程分工减少非 matmul FLOPs（前向达峰值约 73%）。FA3：利用 Hopper 的 WGMMA/TMA 做生产者-消费者异步流水、pingpong 调度让 GEMM 与 softmax 互补占用、FP8 支持吞吐翻倍（BF16 540–740 TFLOPs/s，FP8 近 1.2 PFLOPs/s）。</p>
+<p><b>5.</b> 一个 MHA 7B 模型（32 层、32 头、128 维）转 GQA-8 后，KV Cache 缩小多少？质量如何保住？<br>
+<b>答案要点</b>：KV 头从 32 → 8，KV Cache 缩小 4 倍（每 token 512 KiB → 128 KiB）。质量靠 uptraining：把 MHA 的 K/V 投影按组平均池化成 8 组，再用约 5% 原始算力继续预训练（GQA 论文的转换流程），质量接近原 MHA 且优于同规模 MQA。</p>
+<p><b>6.</b> 为什么说"FlashAttention 解锁了多模态的高分辨率"？请用视觉 token 数与显存量说明。<br>
+<b>答案要点</b>：高分辨率→视觉 token 千到万级（如 448×448×16 帧 ≈ 16k），标准实现单层 S 矩阵 32 头约 18 GiB、根本无法物化；FA 额外显存 O(T)，使数千-数万视觉 token 可训可推。但计算仍为 O(T²)（prefill 压力），因此高分辨率上限还受 token 压缩/剪枝制约（第 15、39 章）。</p>
+<p><b>7.</b> varlen 打包多模态样本时，哪两个 bug 是"静默"的？如何自查？<br>
+<b>答案要点</b>：（1）位置 id 未按样本重置（RoPE 位置串样本）；（2）cu_seqlens 写成长度数组导致注意力跨样本泄漏。自查：构造两条短样本打包，检查任一 token 的注意力是否对另一条样本的 token 权重为 0；并对比"打包 batch loss"与"逐样本单跑 loss"是否一致。</p></div>
+
+<footer>
+  <div class="refs">
+    <h2 id="refs">参考文献与推荐阅读</h2>
+    <ol>
+      <li>Dao T, et al. <a href="https://arxiv.org/abs/2205.14135">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a>. NeurIPS 2022. arXiv:2205.14135.</li>
+      <li>Dao T. <a href="https://arxiv.org/abs/2307.08691">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a>. arXiv 2023. arXiv:2307.08691.</li>
+      <li>Shah J, et al. <a href="https://arxiv.org/abs/2407.08608">FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</a>. NeurIPS 2024. arXiv:2407.08608.</li>
+      <li>Milakov M, Gimelshein N. <a href="https://arxiv.org/abs/1805.02867">Online normalizer calculation for softmax</a>. arXiv 2018. arXiv:1805.02867.</li>
+      <li>Shazeer N. <a href="https://arxiv.org/abs/1911.02150">Fast Transformer Decoding: One Write-Head is All You Need (MQA)</a>. arXiv 2019. arXiv:1911.02150.</li>
+      <li>Ainslie J, et al. <a href="https://arxiv.org/abs/2305.13245">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</a>. EMNLP 2023. arXiv:2305.13245.</li>
+      <li>DeepSeek-AI. <a href="https://arxiv.org/abs/2405.04434">DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model (MLA)</a>. arXiv 2024. arXiv:2405.04434.</li>
+      <li>Kwon W, et al. <a href="https://arxiv.org/abs/2309.06180">Efficient Memory Management for Large Language Model Serving with PagedAttention (vLLM)</a>. SOSP 2023. arXiv:2309.06180.</li>
+      <li>Vaswani A, et al. <a href="https://arxiv.org/abs/1706.03762">Attention Is All You Need</a>. NeurIPS 2017. arXiv:1706.03762.</li>
+      <li>Su J, et al. <a href="https://arxiv.org/abs/2104.09864">RoFormer: Enhanced Transformer with Rotary Position Embedding</a>. arXiv 2021. arXiv:2104.09864.</li>
+      <li>Peng B, et al. <a href="https://arxiv.org/abs/2309.00071">YaRN: Efficient Context Window Extension of Large Language Models</a>. arXiv 2023. arXiv:2309.00071.</li>
+      <li>Beltagy I, Peters M E, Cohan A. <a href="https://arxiv.org/abs/2004.05150">Longformer: The Long-Document Transformer</a>. arXiv 2020. arXiv:2004.05150.</li>
+      <li>Choromanski K, et al. <a href="https://arxiv.org/abs/2009.14794">Rethinking Attention with Performers</a>. ICLR 2021. arXiv:2009.14794.</li>
+      <li>Jiang A, et al. <a href="https://arxiv.org/abs/2310.06825">Mistral 7B</a>. arXiv 2023. arXiv:2310.06825.</li>
+      <li>Liu H, et al. <a href="https://arxiv.org/abs/2310.03744">Improved Baselines with Visual Instruction Tuning (LLaVA-1.5 / NeXT AnyRes)</a>. CVPR 2024. arXiv:2310.03744.</li>
+      <li>Wang P, et al. <a href="https://arxiv.org/abs/2409.12191">Qwen2-VL: Enhancing Vision-Language Model's Perception of the World at Any Resolution</a>. arXiv 2024. arXiv:2409.12191.</li>
+      <li>Chen Z, et al. <a href="https://arxiv.org/abs/2403.06764">FastV: An Image is Worth 1/2 Tokens After Layer 2</a>. ECCV 2024. arXiv:2403.06764.</li>
+      <li>Chen M, et al. <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 Technical Report</a>. arXiv 2024. arXiv:2412.19437.</li>
+      <li>Williams S, Waterman A, Patterson D. Roofline: An Insightful Visual Performance Model for Multicore Architectures. Communications of the ACM 2009.（无 arXiv 版）</li>
+      <li>flash-attn 开源仓库. <a href="https://github.com/Dao-AILab/flash-attention">Dao-AILab/flash-attention</a>.（API 与 kernel 实现参考）</li>
+    </ol>
+  </div>
+  <nav class="pager"></nav>
+</footer>
+
+</div></main>
+<button id="backtop">↑</button>
+<script src="../assets/js/manifest.js"></script>
+<script src="../assets/js/book.js"></script>
+</body>
+</html>
