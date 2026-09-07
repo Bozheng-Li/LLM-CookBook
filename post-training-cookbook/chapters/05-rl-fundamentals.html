@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 5 章 · 强化学习基础 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 1 部分 · 理论基础</div>
+      <h1>第 5 章 · 强化学习基础</h1>
+      <p class="chapter-lead">PPO、GRPO、RLHF 的所有工程术语——优势、clip、KL 惩罚、on-policy——都建立在本章的数学之上。我们从马尔可夫决策过程讲到策略梯度，从 REINFORCE 的方差困境讲到 Actor-Critic 与 GAE，最后完整推一遍 PPO 的 clip 目标函数。读完后，第 20 章的 PPO 实现对你将只是"把公式填进代码"。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★★☆ ｜ 先修：概率论（期望、方差、条件分布）、第 4 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 为什么后训练工程师需要系统学一遍 RL</h2>
+    <p>监督学习解决的是"给定正确答案，模仿它"；强化学习（Reinforcement Learning, RL）解决的是"没有标准答案，只有后果好坏，如何在尝试中改进"。这个差别在 LLM 后训练里具体表现为三类只有 RL 能解（或 RL 解得最好）的问题：<strong>其一，偏好优化</strong>——"哪个回答更好"有标注，但"最好的回答"写不出来，奖励模型给出标量评价，策略梯度是消化这种弱信号的标准工具（第 20 章）；<strong>其二，可验证奖励的推理强化</strong>——数学题答案对错可以程序判定，RLVR 直接把这个验证信号变成训练压力（第 26 章）；<strong>其三，智能体交互</strong>——工具调用、多轮操作，模型的行为会改变环境状态（第 31 章）。</p>
+    <p>与监督学习相比，RL 有四个本质特征，本章的每个算法都是在跟它们的副作用做斗争。<strong>数据是自己产生的</strong>：训练数据来自当前策略的采样，策略一变数据分布就变——没有固定的 i.i.d. 数据集；<strong>反馈是延迟的</strong>：一条轨迹末尾才有一个奖励，中间每个决策的贡献（credit assignment）需要推断；<strong>目标求期望不可微</strong>：\(J(\theta) = \mathbb{E}[R(\tau)]\) 里的期望作用在离散采样上，不能直接链式法则，需要本第 4 节的"log 导数技巧"；<strong>步长敏感</strong>：策略更新过猛会把数据分布推离采样分布，导致崩溃——第 7 节的信任域方法为此而生。</p>
+    <p>学习路径建议：第 2~3 节建立"价值"的语言，第 4~6 节是本章核心推导（策略梯度 → REINFORCE → GAE），第 7~8 节讲 PPO 与策略族谱，第 9~10 节落到实现。公式密度大，但每一节都从直觉出发，配的代码都可以直接跑。</p>
+    <p><strong>本节小结：</strong>后训练的三类核心问题（偏好、可验证奖励、智能体）都以 RL 为骨架；RL 的四个本质特征——数据自产、反馈延迟、期望不可微、步长敏感——正是各算法设计的出发点。</p>
+
+    <h2>2. MDP：五元组、回报与折扣</h2>
+    <p>马尔可夫决策过程（Markov Decision Process, MDP）用五元组 \( \langle \mathcal{S}, \mathcal{A}, P, R, \gamma \rangle \) 描述一个序贯决策问题：<strong>状态空间</strong> \( \mathcal{S} \)（环境可能处于的情形）、<strong>动作空间</strong> \( \mathcal{A} \)、<strong>状态转移函数</strong> \( P(s' \mid s, a) \)（在状态 \(s\) 执行 \(a\) 后落到 \(s'\) 的概率）、<strong>奖励函数</strong> \( R(s, a, s') \)（标量反馈）、<strong>折扣因子</strong> \( \gamma \in [0, 1) \)。"马尔可夫"指当前状态压缩了全部历史——给定 \(s_t\)，未来与过去无关。</p>
+    <p>智能体与环境按时间步交互：时刻 \(t\) 智能体观测 \(s_t\)，按策略 \( \pi \) 采样动作 \(a_t \sim \pi(\cdot \mid s_t)\)，环境返回奖励 \(r_{t+1}\) 与新状态 \(s_{t+1}\)。交互产生一条<strong>轨迹（trajectory）</strong>\( \tau = (s_0, a_0, r_1, s_1, a_1, \dots, s_T) \)，RL 的目标是最大化期望总回报。</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="智能体与环境交互循环">
+        <defs><marker id="arrow5a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <defs><marker id="arrow5b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#10b981"/></marker></defs>
+        <text x="360" y="26" text-anchor="middle" font-size="16" fill="#1e293b">强化学习的基本循环：智能体 ⇄ 环境</text>
+        <rect x="60" y="70" width="220" height="110" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="170" y="102" text-anchor="middle" font-size="16" fill="#1e3a8a">智能体 Agent</text>
+        <text x="170" y="130" text-anchor="middle" font-size="14" fill="#1e3a8a">策略 π_θ(a | s)</text>
+        <text x="170" y="156" text-anchor="middle" font-size="13" fill="#475569">观测 s_t → 采样动作 a_t</text>
+        <rect x="440" y="70" width="220" height="110" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="550" y="102" text-anchor="middle" font-size="16" fill="#065f46">环境 Environment</text>
+        <text x="550" y="130" text-anchor="middle" font-size="14" fill="#065f46">转移 P(s' | s, a)</text>
+        <text x="550" y="156" text-anchor="middle" font-size="13" fill="#475569">奖励 R(s, a, s')</text>
+        <path d="M280 100 C 350 55, 370 55, 440 100" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow5a)"/>
+        <text x="360" y="66" text-anchor="middle" font-size="14" fill="#1e3a8a">动作 a_t</text>
+        <path d="M440 155 C 370 200, 350 200, 280 155" fill="none" stroke="#10b981" stroke-width="2.5" marker-end="url(#arrow5b)"/>
+        <text x="360" y="212" text-anchor="middle" font-size="14" fill="#065f46">状态 s_{t+1}，奖励 r_{t+1}</text>
+        <rect x="60" y="228" width="600" height="36" rx="8" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="360" y="251" text-anchor="middle" font-size="14" fill="#5b21b6">轨迹 τ = (s_0, a_0, r_1, s_1, a_1, …, s_T)，回报 G_t = r_{t+1} + γ r_{t+2} + γ² r_{t+3} + …</text>
+      </svg>
+      <figcaption>图 5-1：智能体-环境交互循环与轨迹回报的定义（作者自绘）</figcaption>
+    </figure>
+    <p><strong>回报（return）</strong>定义为从时刻 \(t\) 起的折扣奖励累加：</p>
+    \[ G_t = r_{t+1} + \gamma r_{t+2} + \gamma^2 r_{t+3} + \dots = \sum_{k=0}^{\infty} \gamma^k r_{t+k+1} \]
+    <p>折扣因子 \( \gamma \) 有三重身份：数学上保证无穷级数收敛；优化上表达"未来的不确定性打折扣"；行为上控制视野——\( \gamma \to 0 \) 只看眼前一步，\( \gamma \to 1 \) 着眼长期。episode 型任务（有终止状态，如一局游戏、一次对话生成）也可以直接用未折扣和，LLM 的 RLHF 实践中通常取 \( \gamma = 1 \)（第 6 章解释原因）。一个容易忽略但重要的点：回报 \(G_t\) 是<strong>随机变量</strong>（取决于策略采样与环境随机性），它的期望才是确定的学习目标——这个"期望"就是下一节的价值函数。</p>
+    <p><strong>本节小结：</strong>MDP 五元组 + 轨迹 + 折扣回报构成 RL 的语言；奖励是每步信号，回报是从现在起累计的目标，二者不可混用。</p>
+
+    <h2>3. 策略、价值函数与贝尔曼方程</h2>
+    <p><strong>策略（policy）</strong>\( \pi(a \mid s) \) 是从状态到动作分布的映射，RL 的最终产物。围绕策略定义两组"价值"：<strong>状态价值函数</strong>（从状态 \(s\) 出发、遵循 \(\pi\) 的期望回报）与<strong>动作价值函数</strong>（在 \(s\) 执行 \(a\) 后再遵循 \(\pi\) 的期望回报）：</p>
+    \[ V^\pi(s) = \mathbb{E}_{\tau \sim \pi}[G_t \mid s_t = s], \qquad Q^\pi(s, a) = \mathbb{E}_{\tau \sim \pi}[G_t \mid s_t = s,\, a_t = a] \]
+    <p>两者由策略分布连接：\( V^\pi(s) = \sum_a \pi(a \mid s)\, Q^\pi(s, a) \)。<strong>贝尔曼方程（Bellman equation）</strong>刻画价值的递归结构——"现在的价值 = 立即奖励 + 下一个状态价值的折扣期望"。推导只需把回报拆成第一项与剩余项：</p>
+    \[ V^\pi(s) = \mathbb{E}_\pi[G_t \mid s_t = s] = \mathbb{E}_\pi\left[ r_{t+1} + \gamma \sum_{k=0}^{\infty} \gamma^k r_{t+k+2} \,\middle|\, s_t = s \right] = \mathbb{E}_\pi\left[ r_{t+1} + \gamma\, V^\pi(s_{t+1}) \mid s_t = s \right] \]
+    <p>展开成对动作与转移的双重期望，就是教科书上的形式：</p>
+    \[ V^\pi(s) = \sum_a \pi(a \mid s) \sum_{s'} P(s' \mid s, a)\left[ R(s, a, s') + \gamma V^\pi(s') \right] \]
+    <p>当转移与奖励已知时，贝尔曼方程是一组线性方程（策略评估）或动态规划的迭代目标（价值迭代）；当 \(P\) 未知（现实世界与 LLM 皆是），就要靠采样逼近——这引出了蒙特卡洛（整条轨迹跑完用真实 \(G_t\)）与时序差分（用 \(\delta_t = r_{t+1} + \gamma V(s_{t+1}) - V(s_t)\) 自举）两条路线的张力：前者无偏但高方差，后者低方差但有偏。这个张力会在第 6 节以 GAE 的形式得到最优雅的调和。对应最优策略 \(\pi^*\)，还有贝尔曼<strong>最优</strong>方程 \( V^*(s) = \max_a \mathbb{E}\left[ r + \gamma V^*(s') \right] \)——价值估计是 RL 的"影子目标"：即使最终只想要一个策略，价值函数也几乎是必需的脚手架。</p>
+    <p><strong>本节小结：</strong>\(V\) 与 \(Q\) 把随机回报压缩为确定的学习目标，贝尔曼方程给出递归结构；"蒙特卡洛 vs 自举"的偏差-方差张力贯穿所有实用算法。</p>
+
+    <h2>4. 策略梯度定理：从轨迹分布的导数讲起</h2>
+    <p>现在面对本章最核心的推导。把 RL 写成一个优化问题：最大化期望回报</p>
+    \[ J(\theta) = \mathbb{E}_{\tau \sim p_\theta(\tau)}[R(\tau)], \qquad R(\tau) = \sum_{t=0}^{T-1} \gamma^t r_{t+1} \]
+    <p>困难在于 \(J\) 里没有可以直接求导的积分号——期望作用在<strong>策略自己采样出来的分布</strong>上。写出轨迹的分布：初始状态分布、各步转移、各步策略决策的连乘：</p>
+    \[ p_\theta(\tau) = \rho_0(s_0) \prod_{t=0}^{T-1} P(s_{t+1} \mid s_t, a_t)\, \pi_\theta(a_t \mid s_t) \]
+    <p>对它取对数再求导，奇迹发生了：<strong>环境项全部消失</strong>（\(P\) 与 \(\rho_0\) 不含 \(\theta\)，其导数为零），只剩下策略的对数概率之和：</p>
+    \[ \nabla_\theta \log p_\theta(\tau) = \underbrace{\nabla_\theta \log \rho_0(s_0)}_{=0} + \sum_{t=0}^{T-1} \left[ \underbrace{\nabla_\theta \log P(s_{t+1} \mid s_t, a_t)}_{=0} + \nabla_\theta \log \pi_\theta(a_t \mid s_t) \right] = \sum_{t=0}^{T-1} \nabla_\theta \log \pi_\theta(a_t \mid s_t) \]
+    <p>用恒等式 \( \nabla_\theta p = p \, \nabla_\theta \log p \) 把期望"搬回"原分布，就得到<strong>策略梯度定理</strong>：</p>
+    \[ \nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim p_\theta}\left[ \left( \sum_{t=0}^{T-1} \nabla_\theta \log \pi_\theta(a_t \mid s_t) \right) R(\tau) \right] \]
+    <p>这个结果的深刻之处在于：<strong>梯度与环境的转移概率无关</strong>，只需要能采样轨迹、能算 \(\log \pi\)、能拿到回报。从优化视角看，它是一个"加权的最大似然"：好轨迹（\(R\) 高）上的动作概率被推高，坏轨迹被压低——权重就是回报。由于对数概率逐项可加，还可以用<strong>因果性</strong>进一步收缩：时刻 \(t\) 的动作不影响 \(t'\le t\) 的奖励（过去不因现在的动作而改变），把整条轨迹的 \(R(\tau)\) 换成"未来回报"（reward-to-go）\(G_t = \sum_{k \ge t} \gamma^{k-t} r_{k+1}\)，方差更低且仍无偏：</p>
+    \[ \nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim p_\theta}\left[ \sum_{t=0}^{T-1} \nabla_\theta \log \pi_\theta(a_t \mid s_t)\, G_t \right] \]
+    <p>请把这个式子记住——第 6 章会把它原封不动搬到 LLM 上：\(\pi_\theta(a_t \mid s_t)\) 就是 \(p_\theta(y_t \mid x, y_{&lt;t})\)，\(G_t\) 就是回答末尾的结果奖励（经折扣传播），损失函数就是 \(-\sum_t G_t \log p_\theta(y_t \mid x, y_{&lt;t})\)。"奖励加权的最大似然"是理解一切 LLM 强化方法的钥匙。</p>
+    <p><strong>本节小结：</strong>log 导数技巧把"不可微的期望"变成可估计的梯度，环境动态从公式中消失；策略梯度 = 好动作加权求似然，reward-to-go 让它更省样本。</p>
+
+    <h2>5. REINFORCE：能跑，但方差是灾难</h2>
+    <p>把第 4 节的定理直接落成算法，就是 1992 年的 <span class="term">REINFORCE</span>（Williams, 1992）：采样一批轨迹 → 算每步的未来回报 → 做加权最大似然更新。下面的实现跑 CartPole，几十行、几分钟收敛，建议亲手跑一遍感受"能工作"：</p>
+    <div class="code-wrap">
+      <span class="code-label">reinforce_cartpole.py</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn as nn
+from torch.distributions import Categorical
+import gymnasium as gym
+
+env = gym.make("CartPole-v1")
+policy = nn.Sequential(nn.Linear(4, 128), nn.Tanh(), nn.Linear(128, 2))
+optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+gamma = 0.99
+
+def run_episode() -&gt; list:
+    """采样一条轨迹，记录每步的 log pi(a|s) 与奖励"""
+    state, _ = env.reset()
+    logps, rewards = [], []
+    done = False
+    while not done:
+        logits = policy(torch.tensor(state, dtype=torch.float32))
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        logps.append(dist.log_prob(action))       # 保留计算图供反向传播
+        state, r, term, trunc, _ = env.step(action.item())
+        rewards.append(r)
+        done = term or trunc
+    return list(zip(logps, rewards))
+
+for episode in range(1500):
+    traj = run_episode()
+    # 1) 从后往前累加折扣回报 G_t（reward-to-go）
+    G, returns = 0.0, []
+    for _, r in reversed(traj):
+        G = r + gamma * G
+        returns.append(G)
+    returns.reverse()
+    returns = torch.tensor(returns)
+    # 2) 批内标准化：一个朴素的 baseline，显著降低方差
+    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+    # 3) 策略梯度：loss = -E[log pi(a|s) * G_t]
+    loss = -(torch.stack([lp for lp, _ in traj]) * returns).sum()
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    if episode % 100 == 0:
+        print(f"episode {episode}: total reward = {sum(r for _, r in traj)}")</code></pre>
+    </div>
+    <p>但如果你把批内标准化那两行删掉，训练大概率崩掉或振荡——这就是 <strong>REINFORCE 的高方差问题</strong>，根源有三：回报的尺度随任务波动（CartPole 总分 0~500，梯度幅度随之摆动）；环境与采样的随机性叠加在单条轨迹上；长轨迹的乘积效应让不同轨迹的回报差异巨大。缓解手段是一个优雅的恒等式：对任意与动作无关的基线 \(b(s)\)，</p>
+    \[ \mathbb{E}_{a \sim \pi}\left[ b(s)\, \nabla_\theta \log \pi_\theta(a \mid s) \right] = b(s) \sum_a \pi(a \mid s)\, \frac{\nabla_\theta \pi_\theta(a \mid s)}{\pi_\theta(a \mid s)} = b(s)\, \nabla_\theta \sum_a \pi(a \mid s) = b(s)\, \nabla_\theta 1 = 0 \]
+    <p>所以 \( \nabla_\theta J = \mathbb{E}\left[ \sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t)\, (G_t - b(s_t)) \right] \) <strong>仍然无偏</strong>，但方差可以被 \(b\) 吃掉一大截。最优基线近似为状态价值 \(b(s) \approx V^\pi(s)\)——把"绝对好坏"换成"比预期好多少"，定义：</p>
+    \[ A^\pi(s, a) = Q^\pi(s, a) - V^\pi(s) \]
+    <p>这就是<strong>优势函数（advantage function）</strong>：动作 \(a\) 相对于"在 \(s\) 按策略平均表现"的超额程度，为正说明该动作比平均好，应被推高；为负应被压低。它同时解决了尺度问题（单位是"相对差"）与信用分配问题（比"谁做的"更进一步回答"做得比预期好吗"）。</p>
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：baseline 必须与动作无关</div>
+      <p>基线 \(b\) 可以依赖状态 \(s\)（甚至依赖提示词、组统计量），但<strong>不能依赖本次采样的动作 \(a\)</strong>——否则第 4 节的恒等式不成立，梯度有偏。GRPO 用"同一 prompt 多个回答的平均奖励"做基线（第 25 章）、RLOO 用"留一法均值"，本质都是这个恒等式的合规用法；而"用当前回答自己的奖励当基线"则是错误示范。方差治理贯穿第 6 章：LLM RL 的奖励稀疏且尺度任意，没有 baseline 的 REINFORCE 在实践中不可用。</p>
+    </div>
+    <p><strong>本节小结：</strong>REINFORCE 证明了策略梯度能落地，但原始版本方差大到不可用；"无偏基线 + 优势函数"是治理方差的标准答案，也是 Actor-Critic 的理论起点。</p>
+
+    <h2>6. Actor-Critic 与 GAE：偏差-方差的黄金平衡</h2>
+    <p>优势函数需要 \(V^\pi(s)\)，而它恰好可以学出来——于是策略网络（Actor，负责决策）之外再加一个价值网络（Critic，负责评价），构成 <span class="term">Actor-Critic</span> 架构。Critic 不必等 episode 结束，可以<strong>自举（bootstrap）</strong>：用一步 TD 误差</p>
+    \[ \delta_t = r_{t+1} + \gamma V_\phi(s_{t+1}) - V_\phi(s_t) \]
+    <p>作为优势的无偏单步估计（当 \(V_\phi = V^\pi\) 时 \(\mathbb{E}[\delta_t] = A^\pi(s_t,a_t)\)）。单步估计方差低、但继承了 \(V_\phi\) 的偏差；多步蒙特卡洛 \(G_t - V(s_t)\) 无偏、方差高。两极之间有无穷个中间点，<strong>广义优势估计（Generalized Advantage Estimation, GAE）</strong>（Schulman et al., 2015, arXiv:1506.02438）用参数 \(\lambda\) 把它们统一起来：对 \(k\) 步估计 \( \hat{A}_t^{(k)} = \sum_{l=0}^{k-1} \gamma^l \delta_{t+l} \) 做指数加权平均，权重 \(\lambda^{k-1}\)：</p>
+    \[ \hat{A}_t^{\mathrm{GAE}(\gamma, \lambda)} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l} \]
+    <p>形式上等价于 \( \hat{A}_t = G_t^{\lambda} - V(s_t) \)（\(\lambda\)-回报减基线），并且有一个一行就能推的递推式，实现时从后往前扫一遍即可：</p>
+    \[ \hat{A}_t = \delta_t + \gamma \lambda\, \hat{A}_{t+1} \]
+    <p>两个端点各有含义：\(\lambda = 0\) 退化为单步 TD（\(\hat A_t = \delta_t\)），偏差大、方差小；\(\lambda = 1\) 近似蒙特卡洛（\(\hat A_t \approx G_t - V(s_t)\)），偏差小、方差大。实践中 \( \lambda \in [0.9, 0.99] \)、LLM 的 RLHF 常用 \( \lambda = 0.95 \)（且 \( \gamma = 1 \)）。下面的函数就是 GAE 的全部实现：</p>
+    <div class="code-wrap">
+      <span class="code-label">gae.py</span>
+      <pre class="code"><code class="language-python">def compute_gae(rewards, values, next_value, gamma=1.0, lam=0.95) -&gt; list:
+    """广义优势估计（GAE）。
+    rewards:    [r_0, ..., r_{T-1}]  每步奖励
+    values:     [V(s_0), ..., V(s_{T-1})]  Critic 对每个状态的估值
+    next_value: V(s_T)，episode 结束时为 0
+    返回每步优势 [A_0, ..., A_{T-1}]（从后往前递推）"""
+    T = len(rewards)
+    adv = [0.0] * T
+    gae = 0.0
+    for t in reversed(range(T)):
+        bootstrap = next_value if t == T - 1 else values[t + 1]
+        delta = rewards[t] + gamma * bootstrap - values[t]   # TD 误差 delta_t
+        gae = delta + gamma * lam * gae                      # A_t = delta_t + gamma*lam*A_{t+1}
+        adv[t] = gae
+    return adv
+
+# PPO 实现中的配套技巧：优势做批内标准化，
+# return = adv + values 作为 Critic 的回归目标
+# normalized = (adv - mean(adv)) / (std(adv) + 1e-8)</code></pre>
+    </div>
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：Critic 在 LLM 里为什么"又贵又难"</div>
+      <p>在 LLM 的 RLHF 中，Critic 是一个与策略同尺寸的值函数网络（对每个前缀位置输出 \(V(s_t)\)），显存与计算成本接近再加一个模型——这是 PPO 训练里四个模型（策略、参考、奖励、价值）中最贵的一个。更麻烦的是学习目标：奖励只在序列末尾出现且因 prompt 而异，值函数要拟合的目标噪声极大。第 25 章的 GRPO 正是"用组内相对奖励代替 Critic"来绕开它；第 6 章会从 MDP 视角解释为什么这个替代在 LLM 上格外合理。</p>
+    </div>
+    <p><strong>本节小结：</strong>Actor-Critic 用可学的 \(V\) 当基线，GAE 用 \(\lambda\) 在"自举的偏差"与"蒙特卡洛的方差"之间连续滑动；递推式 \(\hat A_t = \delta_t + \gamma\lambda\hat A_{t+1}\) 是任何 PPO 实现的必经之路。</p>
+
+    <h2>7. 信任域：从 TRPO 到 PPO 的 clip</h2>
+    <p>策略梯度还有一个隐蔽的坑：<strong>步长</strong>。监督学习的数据是固定的，步子大了顶多震荡；RL 中数据由当前策略产生，更新一步后数据分布就变了——若新策略偏离旧策略太远，下次采样的数据无法反映当前策略的质量，训练可能瞬间崩溃（一个坏更新能把一个好策略打成"胡言乱语"，且要花很多步才爬回来）。<span class="term">TRPO</span>（Schulman et al., 2015, arXiv:1502.05477）给出理论方案：定义重要性比率 \( r_t(\theta) = \pi_\theta(a_t \mid s_t) / \pi_{\theta_{\mathrm{old}}}(a_t \mid s_t) \)，构造<strong>代理目标（surrogate objective）</strong></p>
+    \[ L(\theta) = \mathbb{E}_t\left[ r_t(\theta)\, \hat{A}_t \right] \]
+    <p>并在"新旧策略 KL 散度不超过 \(\delta\)"的硬约束下最大化它——在信任域内，代理目标的提升近似真实目标的提升。TRPO 用二阶方法（共轭梯度 + Fisher 矩阵）求解，效果稳定但实现复杂、难以与大规模深度学习基础设施组合。<span class="term">PPO</span>（Schulman et al., 2017, arXiv:1707.06347）用一阶方法的取巧实现了同样的"别走太远"：<strong>clip 截断目标</strong></p>
+    \[ L^{\mathrm{CLIP}}(\theta) = \mathbb{E}_t\left[ \min\!\left( r_t(\theta)\, \hat{A}_t,\; \mathrm{clip}(r_t(\theta),\, 1-\epsilon,\, 1+\epsilon)\, \hat{A}_t \right) \right] \]
+    <p>逐项拆开看。\( r_t(\theta) \) 度量新旧策略对该动作的概率之比：等于 1 表示没变，大于 1 表示新策略更倾向这个动作，小于 1 表示更不倾向。\( \epsilon \)（典型 0.1~0.3）是允许的偏离带宽。分两种情况：<strong>当 \(\hat{A}_t &gt; 0\)</strong>（好动作，想推高），目标随 \(r_t\) 线性上升，但 \( r_t &gt; 1+\epsilon \) 后被钳制在 \((1+\epsilon)\hat{A}_t\)——已经"足够推高"了，再往上走没有梯度，更新自动刹车；<strong>当 \(\hat{A}_t &lt; 0\)</strong>（坏动作，想压低），目标随 \(r_t\) 下降，但 \( r_t &lt; 1-\epsilon \) 后被钳在 \((1-\epsilon)\hat{A}_t\)——"足够压低"即可，不再奖励继续远离。外层的 \(\min\) 取两种情形的悲观值：任何把比率推出 \([1-\epsilon, 1+\epsilon]\) 的更新都拿不到额外的好处，这正是"信任域"的一阶近似。注意 clip 只在 \(\theta_{\mathrm{old}}\) 附近一个 epoch 内有效——每个批次的多轮更新（通常 2~4 个 epoch）之间，比率会逐渐漂移，所以实现里要监控比率的均值与"被 clip 的比例"，超过阈值（如 0.2~0.4）就该停（第 46 章的调试清单里有对应条目）。</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PPO clip 目标函数图示">
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">PPO 的 clip 目标函数（ε = 0.2）：推高有上限，压低有下限</text>
+        <line x1="60" y1="300" x2="330" y2="300" stroke="#1e293b" stroke-width="1.5"/>
+        <line x1="60" y1="300" x2="60" y2="60" stroke="#1e293b" stroke-width="1.5"/>
+        <text x="195" y="336" text-anchor="middle" font-size="14" fill="#475569">比值 r(θ) = π_θ / π_θ_old（A &gt; 0）</text>
+        <text x="30" y="180" font-size="14" fill="#475569" transform="rotate(-90 30 180)">目标 L(θ)</text>
+        <line x1="60" y1="300" x2="330" y2="75" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+        <polyline points="60,300 276,120 330,120" fill="none" stroke="#2563eb" stroke-width="3"/>
+        <line x1="276" y1="300" x2="276" y2="60" stroke="#ef4444" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="276" y="52" text-anchor="middle" font-size="14" fill="#881337">1+ε</text>
+        <text x="120" y="270" font-size="13" fill="#64748b">未 clip（虚线）</text>
+        <text x="150" y="140" font-size="13" fill="#1e3a8a">clip 后：r &gt; 1+ε</text>
+        <text x="150" y="158" font-size="13" fill="#1e3a8a">梯度为 0，停止奖励</text>
+        <line x1="390" y1="300" x2="660" y2="300" stroke="#1e293b" stroke-width="1.5"/>
+        <line x1="390" y1="300" x2="390" y2="60" stroke="#1e293b" stroke-width="1.5"/>
+        <text x="525" y="336" text-anchor="middle" font-size="14" fill="#475569">比值 r(θ) = π_θ / π_θ_old（A &lt; 0）</text>
+        <line x1="390" y1="80" x2="660" y2="80" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="3 3"/>
+        <text x="396" y="74" font-size="12" fill="#94a3b8">L = 0</text>
+        <line x1="390" y1="80" x2="660" y2="286" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+        <polyline points="390,80 534,190 660,190" fill="none" stroke="#ef4444" stroke-width="3"/>
+        <line x1="534" y1="300" x2="534" y2="60" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="534" y="52" text-anchor="middle" font-size="14" fill="#1e3a8a">1−ε</text>
+        <text x="560" y="245" font-size="13" fill="#881337">clip 后：r &lt; 1−ε</text>
+        <text x="560" y="263" font-size="13" fill="#881337">惩罚封底，不追杀到底</text>
+        <rect x="60" y="348" width="600" height="38" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="360" y="372" text-anchor="middle" font-size="14" fill="#065f46">min 取悲观值：一旦比率跑出 [1−ε, 1+ε]，更新不再获得任何额外收益 → 一阶方法的信任域</text>
+      </svg>
+      <figcaption>图 5-2：PPO clip 目标函数：蓝线为 \( \hat{A}&gt;0 \)（好动作），红线为 \( \hat{A}&lt;0 \)（坏动作）；灰色虚线为未截断的代理目标。clip 让"走得太远"的更新得不到回报（作者自绘）</figcaption>
+    </figure>
+    <p><strong>本节小结：</strong>TRPO 用二阶约束划信任域，PPO 用 clip 惩罚比率的过度偏离——\(\min\) + 钳制让"好动作不过度自信、坏动作不被赶尽杀绝"，这就是它稳的原因。</p>
+
+    <h2>8. 熵正则、探索与 on-policy / off-policy</h2>
+    <p>PPO 的完整损失还有两个配角。<strong>熵正则（entropy bonus）</strong>：在目标里加 \( + c_2\, \mathbb{E}_t[H(\pi_\theta(\cdot \mid s_t))] \)，奖励策略保持随机性、防止过早收敛到确定性策略——确定性策略不再探索，采样的数据失去信息量，训练死锁。LLM 语境下它对应采样温度的角色（第 6 章第 6 节），但作用于训练目标的层面。<strong>价值函数损失</strong>：\( L^{V} = \mathbb{E}_t[(V_\phi(s_t) - \hat{R}_t)^2] \)（\(\hat{R}_t = \hat{A}_t + V_{\phi_{\mathrm{old}}}(s_t)\) 为回报目标），让 Critic 跟上策略的变化；PPO 原论文还建议对价值做类似的 clip。三者合成总目标 \( L = L^{\mathrm{CLIP}} - c_1 L^{V} + c_2 H \)（注意实现中符号方向：最大化目标等价于最小化其负数）。</p>
+    <p><strong>on-policy 与 off-policy</strong>的分野在于：用于更新的数据是否由"当前被更新的策略"产生。<strong>on-policy</strong>（REINFORCE、A2C、PPO、GRPO）：每次更新都重新采样，数据新鲜、梯度估计无偏、实现直接，代价是样本用一次就扔，采样成本高。<strong>off-policy</strong>（DQN、SAC）：用回放缓冲区（replay buffer）里旧数据甚至其他策略的数据更新，样本效率高、可复用历史，但需要重要性采样修正分布差异：</p>
+    \[ \mathbb{E}_{x \sim p}[f(x)] = \mathbb{E}_{x \sim q}\left[ \frac{p(x)}{q(x)}\, f(x) \right] \]
+    <p>且比率在高维下方差爆炸，实践中要靠各种截断与保守化（Degris et al., 2012, arXiv:1205.4839）。LLM 的 RL 大体站在 on-policy 一边，原因很直接：<strong>rollout（采样一条回答）非常昂贵</strong>，但策略变化对语言分布的影响是全局的——旧策略的回答对当前策略而言分布偏移太快，复用几轮就需要比率修正，而 token 级几千步的连乘比率几乎不可用。主流方案是"on-policy 为主 + 温和复用"：PPO 允许同批数据多跑 2~4 个 epoch 并监控比率漂移，GRPO/RLOO 基本一次一用（第 25 章），离线方法（DPO，第 22 章）则干脆改写目标函数绕开采样。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>维度</th><th>on-policy（PPO / GRPO）</th><th>off-policy（DQN / SAC）</th></tr></thead>
+        <tbody>
+          <tr><td>数据来源</td><td>当前策略即时采样</td><td>回放缓冲区 / 其他策略的历史数据</td></tr>
+          <tr><td>样本效率</td><td>低（数据用一两次即弃）</td><td>高（可反复复用）</td></tr>
+          <tr><td>分布偏移风险</td><td>小（数据-策略同步演化）</td><td>大（需重要性采样/保守修正）</td></tr>
+          <tr><td>实现复杂度</td><td>直接，超参好调</td><td>复杂，对截断与目标网络敏感</td></tr>
+          <tr><td>LLM 适配性</td><td>主流（rollout 昂贵但稳定性优先）</td><td>罕见（token 级比率连乘方差失控）</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 5-1：on-policy 与 off-policy 的取舍。LLM 场景在"采样贵"与"分布偏移致命"之间选择了后者优先</span>
+    </div>
+    <p><strong>本节小结：</strong>熵正则保探索、价值损失养 Critic，PPO 目标三分而成；LLM 的 RL 选边 on-policy，本质是在"采样昂贵"与"分布偏移致命"之间买后者的保险。</p>
+
+    <h2>9. 奖励、回报、价值与优势：一张辨析表</h2>
+    <p>初学者最常把四个词混用：reward、return、value、advantage。它们是四个不同时间尺度、不同统计含义的对象，混用的直接后果是损失函数写错（比如把奖励当优势、把回报当价值回归目标）。表 5-2 是全书的统一口径，第 6 章的 LLM 化、第 20 章的 PPO 实现都沿用此表。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>概念</th><th>记号</th><th>定义</th><th>随机性来源</th><th>在算法中的角色</th></tr></thead>
+        <tbody>
+          <tr><td>奖励 reward</td><td>\( r_{t+1} \)</td><td>单步即时标量信号</td><td>环境 / 奖励模型</td><td>环境给定的原始输入，不可优化本身</td></tr>
+          <tr><td>回报 return</td><td>\( G_t \)</td><td>从 \(t\) 起折扣奖励之和</td><td>策略采样 + 环境</td><td>蒙特卡洛目标；REINFORCE 的权重</td></tr>
+          <tr><td>价值 value</td><td>\( V^\pi(s) \)</td><td>期望回报 \( \mathbb{E}[G_t \mid s] \)</td><td>无（条件期望）</td><td>Critic 的输出；基线 / 自举锚点</td></tr>
+          <tr><td>优势 advantage</td><td>\( A^\pi(s,a) \)</td><td>\( Q - V \)：相对平均的超额</td><td>估计量，含 Critic 误差</td><td>PPO/GRPO 梯度的实际权重</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 5-2：四个核心量的辨析。一句话记忆：奖励是输入，回报是累计，价值是期望，优势是差值</span>
+    </div>
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：奖励 ≠ 目标</div>
+      <p>"最大化期望回报"是对<strong>真实目标</strong>（人类满意、答案正确）的代理。奖励函数一旦被强化，策略会精确地最大化它而非它本要代表的东西——这就是古德哈特定律在 RL 中的化身，即<strong>奖励黑客（reward hacking）</strong>：模型学会讨好奖励模型的形式（冗长、谄媚、套模板）而非真的变好。第 21 章用整章处理它；你现在只需记住：奖励是易被过拟合的代理信号，KL 正则与优势估计都是给它上的保险。</p>
+    </div>
+    <p><strong>本节小结：</strong>奖励/回报/价值/优势构成"输入 → 累计 → 期望 → 差值"的四级抽象；所有现代策略优化算法的梯度权重都是优势，而不是奖励或回报。</p>
+
+    <h2>10. PPO 完整算法：伪代码与最小实现</h2>
+    <p>把第 2~8 节的所有零件组装起来，PPO 的全貌如下（伪代码）：</p>
+    <div class="code-wrap">
+      <span class="code-label">PPO 算法伪代码</span>
+      <pre class="code"><code class="language-python">初始化：策略 pi_theta（LLM 场景：SFT 模型初始化），参考模型 pi_ref = pi_theta.copy()，
+         价值网络 V_phi（与策略同尺寸），老策略快照 pi_theta_old
+
+for iteration in range(K):
+    # ---------- 采集阶段（on-policy：数据必须来自当前策略） ----------
+    for i in range(N):
+        用 pi_theta 对 prompt x_i 采样完整回答 y_i（rollout，温度 &gt; 0 保证探索）
+        记录每个 token 的 log pi_theta_old(a_t | s_t)
+    用奖励模型 / 验证器打分，得到序列奖励 R_i（LLM 场景：常置于序列末位）
+    加 KL 惩罚（第 6 章）：r_t = R_t - beta * KLtoken(pi_theta || pi_ref)
+    用 GAE 计算优势 A_t 与回报目标 R_hat_t = A_t + V_phi(s_t)
+    对 A_t 做批内标准化：(A - mean) / (std + eps)
+
+    # ---------- 更新阶段（同批数据多跑 2~4 个 epoch） ----------
+    for epoch in range(E):
+        for minibatch in shuffle(batch):
+            r_t      = exp(logp_new - logp_old)          # 重要性比率
+            L_clip   = -mean(min(r_t * A_t, clamp(r_t, 1-eps, 1+eps) * A_t))
+            L_value  = mean((V_phi(s_t) - R_hat_t)^2)
+            L_ent    = -mean(entropy(pi_theta(.|s_t)))    # 取负号作损失
+            loss     = L_clip + c1 * L_value + c2 * L_ent
+            反向传播，梯度裁剪，AdamW 更新
+        若平均比率偏离 1 过多（如 mean|r-1| &gt; 0.2）或 KL 超阈，提前终止本轮
+    theta_old ← theta（快照新策略）</code></pre>
+    </div>
+    <p>其中最容易写错、也最值得逐行核对的是 clip 损失与 GAE 的组合。下面给出与伪代码严格对应的最小实现（去掉分布式、rollout 引擎等工程件，LLM 版完整实现见第 20 章）：</p>
+    <div class="code-wrap">
+      <span class="code-label">ppo_core.py</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def ppo_policy_loss(logp_new, logp_old, advantages, clip_eps=0.2):
+    """PPO 的 clip 策略损失（注意：返回的是最小化目标的负数）"""
+    ratio = torch.exp(logp_new - logp_old)                    # r(theta) = pi_new / pi_old
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
+    return -torch.min(surr1, surr2).mean()                    # 悲观取 min，防止单步过远
+
+def ppo_value_loss(values, values_old, returns, clip_eps=0.2):
+    """价值损失（带 clip：Critic 的更新幅度同样受信任域约束）"""
+    v_clipped = values_old + torch.clamp(values - values_old, -clip_eps, clip_eps)
+    loss1 = (values - returns).pow(2)
+    loss2 = (v_clipped - returns).pow(2)
+    return 0.5 * torch.max(loss1, loss2).mean()
+
+def ppo_update_step(policy, critic, batch, optimizer,
+                    clip_eps=0.2, c1=0.5, c2=0.01):
+    """一次 minibatch 更新：batch 含 logp_old / advantages / returns / values_old / ent"""
+    logp_new, entropy = policy(batch["states"], need_entropy=True)
+    values = critic(batch["states"]).squeeze(-1)
+
+    # 优势标准化：让正负优势大致对称，梯度尺度稳定
+    adv = (batch["advantages"] - batch["advantages"].mean()) / (batch["advantages"].std() + 1e-8)
+
+    loss = (ppo_policy_loss(logp_new, batch["logp_old"], adv, clip_eps)
+            + c1 * ppo_value_loss(values, batch["values_old"], batch["returns"], clip_eps)
+            - c2 * entropy.mean())                            # 熵项：越大越好，故以负号入损失
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        list(policy.parameters()) + list(critic.parameters()), 1.0)  # 梯度裁剪：又一重保险
+    optimizer.step()
+    with torch.no_grad():
+        ratio = torch.exp(logp_new - batch["logp_old"])
+    return {"clip_frac": ((ratio - 1).abs() &gt; clip_eps).float().mean().item(),
+            "approx_kl": ((batch["logp_old"] - logp_new).mean()).item()}</code></pre>
+    </div>
+    <p>落到 LLM 场景时，超参数有一套经过验证的经验区间，表 5-3 汇总（完整推导与调参路线图见第 20、21 章）。与经典连续控制相比，最显眼的差异是 \( \gamma = 1 \)：文本生成的"回合"就是一条回答，奖励在回合末尾一次性给出，没有理由对未来奖励打折扣——但 \( \lambda \) 仍保留 0.95 左右，用于在 Critic 估计噪声与蒙特卡洛方差之间取平衡。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>超参数</th><th>经典 RL（CartPole/机器人）</th><th>LLM RLHF 常见取值</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>学习率</td><td>3e-4 ~ 1e-3</td><td>1e-6 ~ 5e-6</td><td>LLM 微调天然要小 2~3 个数量级</td></tr>
+          <tr><td>clip 区间 ε</td><td>0.2</td><td>0.1 ~ 0.2</td><td>模型越大越保守</td></tr>
+          <tr><td>折扣 γ</td><td>0.99</td><td>1.0</td><td>回合末一次性奖励，无需折扣</td></tr>
+          <tr><td>GAE λ</td><td>0.95 ~ 0.99</td><td>0.95</td><td>平衡 Critic 偏差与 MC 方差</td></tr>
+          <tr><td>每批 epoch 数</td><td>10（小网络）</td><td>1 ~ 4</td><td>过大导致比率漂移、策略崩坏</td></tr>
+          <tr><td>熵系数 c2</td><td>0.01</td><td>0 ~ 0.001（或用采样温度代替）</td><td>LLM 靠温度控制探索</td></tr>
+          <tr><td>KL 系数 β</td><td>无</td><td>0.02 ~ 0.1</td><td>LLM 特有：拴住参考模型（第 6 章）</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 5-3：PPO 超参从经典 RL 到 LLM RLHF 的迁移（经验区间，具体以第 20 章实战为准）</span>
+    </div>
+    <p><strong>本节小结：</strong>PPO = 采集（rollout + 打分 + KL 惩罚）→ GAE 优势 → clip 策略损失 + 价值损失 + 熵正则的多轮小步更新；LLM 版的差异集中在"学习率再小三个量级、γ=1、KL 系数登场"。</p>
+
+    <h2>11. 本章小结</h2>
+    <ul>
+      <li><strong>问题形式</strong>：MDP 五元组 \( \langle \mathcal{S}, \mathcal{A}, P, R, \gamma \rangle \)，目标是期望折扣回报；奖励是单步信号，回报是累计目标，价值是期望，优势是相对超额——四级抽象不可混用。</li>
+      <li><strong>策略梯度</strong>：轨迹分布求导使环境项消失，\( \nabla J = \mathbb{E}[\sum_t \nabla\log\pi \cdot G_t] \)——本质是"奖励加权的最大似然"，这是 LLM 强化方法的母公式。</li>
+      <li><strong>方差治理</strong>：REINFORCE 高方差 → 无偏基线（\( \mathbb{E}[b\nabla\log\pi]=0 \)）→ 优势函数 → Actor-Critic → GAE 的 \( \lambda \) 插值，一条"偏差换方差"的主线。</li>
+      <li><strong>信任域</strong>：策略更新的危险在分布漂移；TRPO 用二阶 KL 约束，PPO 用 \( \min(r\hat A, \mathrm{clip}(r, 1\pm\epsilon)\hat A) \) 一阶近似——推高有上限、压低有下限。</li>
+      <li><strong>策略族谱</strong>：LLM RL 主流是 on-policy（数据新鲜、稳定优先），off-policy 的样本效率优势被 token 级比率方差吞噬。</li>
+      <li><strong>落地要点</strong>：LLM 版 PPO 的标志性改动是 \( \gamma=1 \)、学习率降至 1e-6 量级、KL 系数成为第一重要的旋钮。</li>
+    </ul>
+    <p>至此，强化学习的数学工具已经齐备。但"语言模型"作为被优化的对象还有一层特殊性：动作空间 15 万维、回合长达数千步、奖励只在一瞬间出现。下一章把本章的公式逐项翻译到 LLM 上，解释 KL 正则从哪来、为什么可以并入奖励、以及 KL 散度的三种估计器——那是理解第 4 部分全部算法的最后一层地基。</p>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：证明 \( \mathbb{E}_{a \sim \pi(\cdot \mid s)}[b(s) \nabla_\theta \log \pi_\theta(a \mid s)] = 0 \)，并说明该结论对基线的约束。</summary><p>由恒等式 \( \nabla_\theta \pi_\theta(a \mid s) = \pi_\theta(a \mid s) \nabla_\theta \log \pi_\theta(a \mid s) \)，得 \( \mathbb{E}_{a \sim \pi}[b(s)\nabla_\theta \log \pi_\theta(a \mid s)] = b(s) \sum_a \nabla_\theta \pi_\theta(a \mid s) = b(s) \nabla_\theta \sum_a \pi_\theta(a \mid s) = b(s) \nabla_\theta 1 = 0 \)。推导只用到"分布归一化为 1"，因此约束是：基线 \(b\) 不能依赖被采样到的动作 \(a\)（否则求和不再覆盖完整分布），依赖状态 \(s\)、提示词、组统计量均可。GRPO 的组均值基线与 RLOO 的留一均值均满足该约束。</p></details>
+      <details><summary>问题 2：GAE 中 \( \lambda = 0 \) 与 \( \lambda = 1 \) 分别退化为哪种估计？各有什么偏差-方差特征？LLM RLHF 为什么默认 \( \gamma=1 \)、\( \lambda=0.95 \)？</summary><p>\( \lambda=0 \)：\( \hat A_t = \delta_t = r_{t+1} + \gamma V(s_{t+1}) - V(s_t) \)，单步 TD，方差最小但继承 Critic 偏差；\( \lambda=1 \)：\( \hat A_t = G_t - V(s_t) \)，蒙特卡洛减基线，无偏但方差大。LLM 的回合（一条回答）有明确终点、奖励集中于末位，对未来奖励没有"越远越不确定"的直观依据，故 \( \gamma=1 \)；而 Critic 对"部分前缀的期望奖励"估计噪声很大，需要 \( \lambda=0.95 \) 留在 TD 与 MC 之间偏 MC 一侧，用少量偏差换掉难以承受的方差。</p></details>
+      <details><summary>问题 3：PPO 为什么用 \( \min(r\hat A, \mathrm{clip}(r)\hat A) \) 而不是直接把 \( r \) 钳制后计算？外层 min 起到什么作用？</summary><p>直接钳制比率会改变梯度的方向信息，且无法表达"悲观"语义。min 的作用是选择性截断：当 \( \hat A&gt;0 \) 且 \( r&gt;1+\epsilon \) 时，min 取到被钳的常数项，目标对 \( \theta \) 的梯度为 0，不再奖励"更远"；当 \( \hat A&gt;0 \) 且 \( r&lt;1+\epsilon \) 时取未钳项，正常推高。\( \hat A&lt;0 \) 的情形对称：\( r&lt;1-\epsilon \) 后惩罚封底。也就是说 clip 是"出了信任域就不再给收益"，而不是"强制拉回"——更新方向由数据与优势决定，PPO 只是拒绝为过度更新付酬。</p></details>
+      <details><summary>问题 4：off-policy 方法可以用旧数据反复训练，样本效率更高。为什么 LLM 的 RLHF/RLVR 主流方法仍然选择 on-policy？</summary><p>三个原因。其一，语言策略的更新是全局的：几步梯度后 token 分布整体偏移，旧 rollout 对新策略的重要性比率在数千 token 上连乘，方差爆炸，修正几乎不可行。其二，RLHF 的奖励信号本身依赖策略-数据匹配：奖励模型在旧分布上的打分不能代表当前策略行为的优劣，分布偏移会放大奖励过优化。其三，工程上 rollout 虽贵但可并行（推理引擎吞吐高），团队宁愿为稳定性付出采样成本，或用"同批 2~4 个 epoch + 比率监控"做温和复用；彻底的离线需求则由 DPO 类改写目标的方法承接。</p></details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Sutton &amp; Barto, 2018]</span> Sutton, R., Barto, A. "Reinforcement Learning: An Introduction (2nd ed.)." MIT Press, 2018.（教科书，无 arXiv）</li>
+      <li><span class="rid">[Williams, 1992]</span> Williams, R. "Simple statistical gradient-following algorithms for connectionist reinforcement learning." <i>Machine Learning</i>, 1992.（REINFORCE 原文，期刊）</li>
+      <li><span class="rid">[Sutton+, 2000]</span> Sutton, R. et al. "Policy Gradient Methods for Reinforcement Learning with Function Approximation." <i>NeurIPS</i>, 2000.（策略梯度定理）</li>
+      <li><span class="rid">[Mnih+, 2013]</span> Mnih, V. et al. "Playing Atari with Deep Reinforcement Learning." 2013. <span class="rid">arXiv:1312.5602</span></li>
+      <li><span class="rid">[Schulman+, 2015a]</span> Schulman, J. et al. "Trust Region Policy Optimization." <i>ICML</i>, 2015. <span class="rid">arXiv:1502.05477</span></li>
+      <li><span class="rid">[Schulman+, 2015b]</span> Schulman, J. et al. "High-Dimensional Continuous Control Using Generalized Advantage Estimation." 2015. <span class="rid">arXiv:1506.02438</span></li>
+      <li><span class="rid">[Degris+, 2012]</span> Degris, T., White, M., Sutton, R. "Off-Policy Actor-Critic." <i>ICML</i>, 2012. <span class="rid">arXiv:1205.4839</span></li>
+      <li><span class="rid">[Mnih+, 2016]</span> Mnih, V. et al. "Asynchronous Methods for Deep Reinforcement Learning." <i>ICML</i>, 2016. <span class="rid">arXiv:1602.01783</span></li>
+      <li><span class="rid">[Schulman+, 2017]</span> Schulman, J. et al. "Proximal Policy Optimization Algorithms." 2017. <span class="rid">arXiv:1707.06347</span></li>
+      <li><span class="rid">[Haarnoja+, 2018]</span> Haarnoja, T. et al. "Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor." <i>ICML</i>, 2018. <span class="rid">arXiv:1801.01290</span></li>
+      <li><span class="rid">[Engstrom+, 2019]</span> Engstrom, L. et al. "Implementation Matters in Deep RL: A Case Study on PPO and TRPO." <i>ICLR</i>, 2020. <span class="rid">arXiv:1909.12238</span></li>
+      <li><span class="rid">[Espeholt+, 2018]</span> Espeholt, L. et al. "IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures." <i>ICML</i>, 2018. <span class="rid">arXiv:1802.01561</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

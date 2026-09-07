@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 10 章 · 数据清洗、去重与质量过滤 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 2 部分 · 后训练数据工程</div>
+      <h1>第 10 章 · 数据清洗、去重与质量过滤</h1>
+      <p class="chapter-lead">第 7~9 章解决了数据从哪来，本章回答哪些数据有资格进训练集：一条覆盖格式校验、规则过滤、两级去重、质量打分、人工抽检与污染检测的完整清洗流水线，配 MinHash+LSH 与语义去重的原理和可运行代码，并把"少而精"的论文证据摆给你看。</p>
+      <div class="chapter-meta">⏱ 预计学习 90 分钟 ｜ 难度 ★★★☆☆ ｜ 先修：第 7 章、第 8 章、第 9 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 为什么"少而精"胜过"多而杂"</h2>
+    <p>拿到第 7~9 章攒出来的数据集，很多团队的第一反应是"越多越好，直接训"。本章要立的第一个论点恰恰相反：<strong>数据选择的收益经常大于数据收集本身</strong>。这不是口号，而是三条互相独立的研究证据。第一条来自 LIMA（第 7 章已详述其"浅层对齐假说"）：从上万条候选中人工精选 1,000 条微调 LLaMA-65B，回答质量就能逼近 GPT-4 的案例水准——它证明对齐所需的信息量极小，瓶颈在"挑得准"而不在"堆得多"（Zhou et al., 2023, arXiv:2305.11206）。</p>
+    <p>第二条来自 <span class="term">AlpaGasus</span>（Chen et al., 2024, arXiv:2307.08701），它把"精选"自动化了：用 ChatGPT 当打分器，逐条给 Alpaca 的 5.2 万条数据评质量分，只保留评分最高的一档——约 9,000 条（17%）。用这 9K 数据训出的 LLaMA-7B 在自动与人类评估中均超过用全量 52K 训出的原版 Alpaca，而且 7B 训练时间从 80 分钟降到 14 分钟（约 5.7 倍加速）。一条 ChatGPT 打分线，同时买到了质量与训练成本。</p>
+    <div class="paper-ref">
+      <div class="pr-title">AlpaGasus: Training A Better Alpaca with Fewer Data</div>
+      <div class="pr-meta">Chen et al., 2024 · <a href="https://arxiv.org/abs/2307.08701" target="_blank">arXiv:2307.08701</a> · ICLR 2024：ChatGPT 打分把 52K 滤成 9K，又快又好</div>
+    </div>
+    <p>第三条来自 <span class="term">DEITA</span>（Chen et al., 2023, arXiv:2312.15685），它进一步回答了"按什么挑"：对候选池做<strong>复杂度、质量、多样性</strong>三维打分并贪心选择，只用 6K 样本训出的模型拿到 MT-Bench 6.46，超过用十万级混合数据训练的对照模型。DEITA 的消融还有一个重要细节：只按质量和复杂度挑而不控多样性，效果会明显回退——"少而精"的"精"必须包含多样性维度，否则选出来的 6K 条是 6K 个近亲。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>研究</th><th>数据操作</th><th>关键结果（引自原文）</th><th>一句话结论</th></tr></thead>
+        <tbody>
+          <tr><td>LIMA（arXiv:2305.11206）</td><td>1,000 条人工精选微调 LLaMA-65B</td><td>回答质量在案例评估中接近 GPT-4</td><td>对齐缺的是质量，不是数量</td></tr>
+          <tr><td>AlpaGasus（arXiv:2307.08701）</td><td>ChatGPT 打分，52K → 9K（17%）</td><td>超过原版 Alpaca；7B 训练 80 → 14 分钟（5.7×）</td><td>打分筛选同时买质量与速度</td></tr>
+          <tr><td>DEITA（arXiv:2312.15685）</td><td>复杂度+质量+多样性三维选择，仅 6K</td><td>MT-Bench 6.46，胜过十万级混合数据对照</td><td>选择重于生成，多样性不可少</td></tr>
+          <tr><td>phi-1（arXiv:2306.11644）</td><td>约 7B token 教科书级数据，1.3B 模型</td><td>HumanEval pass@1 50.6%</td><td>数据质量可以兑换模型规模</td></tr>
+          <tr><td>Tulu 3（arXiv:2411.15124）</td><td>93.9 万条多源配比 + 全程去污染</td><td>开源后训练配方第一梯队</td><td>规模路线与质量路线在"配比"处汇合</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 10-1：质量 vs 数量的代表性研究汇总（各项数值均引自对应论文）</span>
+    </div>
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析："少而精"有前提，别把它读成万能药</div>
+      <p>四条"少而精"证据共享一个前提：<strong>基座模型足够强</strong>。LIMA 的 1,000 条只负责"教会表达"，解决不了覆盖度问题——弱基座或需要多任务覆盖的产品，仍要走 Tulu 3 式的规模配比路线（第 7 章对此已有辩证分析）。更准确的工程表述是：无论规模大小，<strong>清洗与选择都不是可选项</strong>；分歧只在于最终保留多少条。把两条路线统一的动作，正是本章的流水线。</p>
+    </div>
+    <p><strong>本节小结：</strong>LIMA、AlpaGasus、DEITA 三条证据共同指向"数据选择是独立的收益来源"；精选必须同时覆盖质量与多样性，且其收益以强基座为前提。</p>
+
+    <h2>2. 清洗流水线全图：八道工序与漏斗统计</h2>
+    <p>先把全景图立起来。图 10-1 是本章的标准清洗流水线：从原始数据到入库共八道工序，成本递增，逐级收窄。它与第 8 章第 9 节的"生成侧过滤级联"分工不同——那一节处理的是"模型刚吐出来的候选"，本章处理的是"已有全集的系统性工程"，两者共用同一思想：<strong>便宜且能拦住明显坏样本的工序放前面，昂贵的精确工序只处理漏网之鱼</strong>。</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="数据清洗流水线八道工序">
+        <defs><marker id="arrow10a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">数据清洗流水线：八道工序，成本递增，逐级收窄</text>
+        <rect x="15" y="48" width="150" height="84" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="90" y="74" text-anchor="middle" font-size="15" fill="#1e3a8a">① 原始数据</text>
+        <text x="90" y="96" text-anchor="middle" font-size="14" fill="#1e3a8a">JSONL / CSV / 日志</text>
+        <text x="90" y="116" text-anchor="middle" font-size="14" fill="#1e3a8a">全量进入</text>
+        <rect x="195" y="48" width="150" height="84" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="270" y="74" text-anchor="middle" font-size="15" fill="#92400e">② 格式校验</text>
+        <text x="270" y="96" text-anchor="middle" font-size="14" fill="#92400e">字段齐全·角色合法</text>
+        <text x="270" y="116" text-anchor="middle" font-size="14" fill="#92400e">零成本</text>
+        <rect x="375" y="48" width="150" height="84" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="450" y="74" text-anchor="middle" font-size="15" fill="#92400e">③ 规则过滤</text>
+        <text x="450" y="96" text-anchor="middle" font-size="14" fill="#92400e">长度·乱码·语言</text>
+        <text x="450" y="116" text-anchor="middle" font-size="14" fill="#92400e">零成本，拦明显坏样本</text>
+        <rect x="555" y="48" width="150" height="84" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="630" y="74" text-anchor="middle" font-size="15" fill="#065f46">④ 启发式去重</text>
+        <text x="630" y="96" text-anchor="middle" font-size="14" fill="#065f46">精确哈希 + MinHash</text>
+        <text x="630" y="116" text-anchor="middle" font-size="14" fill="#065f46">低成本</text>
+        <rect x="555" y="168" width="150" height="84" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="630" y="194" text-anchor="middle" font-size="15" fill="#065f46">⑤ 语义去重</text>
+        <text x="630" y="216" text-anchor="middle" font-size="14" fill="#065f46">嵌入 + 阈值</text>
+        <text x="630" y="236" text-anchor="middle" font-size="14" fill="#065f46">中成本</text>
+        <rect x="375" y="168" width="150" height="84" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="450" y="194" text-anchor="middle" font-size="15" fill="#5b21b6">⑥ 质量打分</text>
+        <text x="450" y="216" text-anchor="middle" font-size="14" fill="#5b21b6">启发式 / 模型 / judge</text>
+        <text x="450" y="236" text-anchor="middle" font-size="14" fill="#5b21b6">中高成本</text>
+        <rect x="195" y="168" width="150" height="84" rx="10" fill="#fef2f7" stroke="#ef4444" stroke-width="2"/>
+        <text x="270" y="194" text-anchor="middle" font-size="15" fill="#881337">⑦ 人工抽检</text>
+        <text x="270" y="216" text-anchor="middle" font-size="14" fill="#881337">5% 分层抽样</text>
+        <text x="270" y="236" text-anchor="middle" font-size="14" fill="#881337">校准上游阈值</text>
+        <rect x="15" y="168" width="150" height="84" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="90" y="194" text-anchor="middle" font-size="15" fill="#1e3a8a">⑧ 入库</text>
+        <text x="90" y="216" text-anchor="middle" font-size="14" fill="#1e3a8a">数据卡片 · 版本冻结</text>
+        <text x="90" y="236" text-anchor="middle" font-size="14" fill="#1e3a8a">唯一出口</text>
+        <path d="M167 90 L 193 90" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10a)"/>
+        <path d="M347 90 L 373 90" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10a)"/>
+        <path d="M527 90 L 553 90" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10a)"/>
+        <path d="M630 134 L 630 166" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10a)"/>
+        <path d="M553 210 L 527 210" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10a)"/>
+        <path d="M373 210 L 347 210" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10a)"/>
+        <path d="M193 210 L 167 210" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10a)"/>
+        <text x="360" y="285" text-anchor="middle" font-size="14" fill="#1e293b">每一级记录进入/剔除数量形成漏斗报告；剔除率突变 = 阈值或上游分布出了问题（图为工序示意）</text>
+      </svg>
+      <figcaption>图 10-1：数据集侧的八道清洗工序——格式校验、规则过滤、两级去重、质量打分、人工抽检依次收窄（作者自绘）</figcaption>
+    </figure>
+    <p>流水线的可运维性比工序本身更重要，两个必做动作。<strong>其一，漏斗报告</strong>：每道工序记录进入数、剔除数、剔除原因分布，形如"原始 100% → 格式校验 98% → 规则过滤 78% → 精确去重 71% → 模糊去重 62% → 质量打分 47% → 抽检通过 46%"（示意口径，实际取决于数据来源）。任何一级剔除率较上一次运行突变超过 5~10 个百分点，先查上游数据源或阈值变更，再谈训练。<strong>其二，分布漂移监控</strong>：对比过滤前后任务类型、长度、语言的比例（第 8 章的"过滤即分布重塑"警告在此同样成立），漂移超过 10% 就回头审阈值。第 8 章讲过每个过滤器自身的偏差，本章第 10 节会把排查方法落成清单。</p>
+    <p><strong>本节小结：</strong>清洗是流水线而不是单点工具，漏斗报告与分布漂移监控让每道工序可审计、可回滚。</p>
+
+    <h2>3. 规则过滤：便宜的第一道闸门</h2>
+    <p>规则过滤器用正则与统计特征拦截明显坏样本，零 GPU 成本、毫秒级吞吐，是整条流水线的第一道闸。四类核心规则值得逐条讲透。</p>
+    <h3>3.1 长度规则：按分位数定阈值</h3>
+    <p>长度阈值不该拍脑袋。先对全量数据画指令长度与回答长度的分布（字符与 token 各一张），取 P1 与 P99 作为截断点，再人工抽查两侧被截断的样本确认"该杀"。经验起点：指令 10~2,000 字符、回答 20~8,000 字符；代码类数据单独放宽，否则长函数会被误杀。长度规则的真正价值是拦截两类灾难：空回复、残缺截断（数据导出事故的典型产物）。</p>
+    <h3>3.2 乱码检测：字符集与重复度</h3>
+    <p>乱码来源很杂：编码转换事故、OCR 噪声、爬虫截断、模板填充失败。三个统计特征组合能拦住绝大多数：<strong>（1）字符集占比</strong>——中文数据里 CJK 字符占比过低、或出现大量私有区/替换字符（U+FFFD）即可疑；<strong>（2）重复片段</strong>——同一 8 字以上片段连现 3 次以上，是复读机与模板垃圾的指纹；<strong>（3）NFKC 归一化后的异常字符密度</strong>——全角英文、不可见字符堆积说明上游出了问题。这三个特征都不需要模型参与。</p>
+    <h3>3.3 HTML 残留与转义残留</h3>
+    <p>爬取或网页导出的数据常带着 <code>&lt;div&gt;</code>、<code>&amp;nbsp;</code>、内联样式残留。检测用"标签密度"：HTML 标签总数超过一定比例即剔除或先清洗再重检。注意区分两种情况——<strong>真正的残留</strong>要清洗，而<strong>教学性出现</strong>（回答本身在教 HTML，代码块里当然有标签）绝不能按标签数误杀；对代码类数据关掉这条规则，改用"标签出现在代码块之外"的更精确判定。</p>
+    <h3>3.4 语言检测：fastText 十八线模型也能上岗</h3>
+    <p>多语言数据集要先确认"这条数据是什么语言"，再用语言白名单决定去留。标准工具是 fastText 的语言识别模型（176 语种，lid.176.bin，Joulin et al., 2016, arXiv:1607.01759）：单条亚毫秒级，返回语言标签与置信度。工程上用双条件过滤——标签命中白名单且置信度 ≥0.85 才放行；中英混杂的代码数据单独建规则，别硬套语言白名单。更早的 Gopher 规则族（Rae et al., 2022, arXiv:2112.11446）把"停用词比例、符号/词比例、行末标点比例、重复 n-gram 比例"打包成标准清单，C4（Raffel et al., 2020, arXiv:1910.10683）则是它的更早原型，两者至今仍是预训练数据清洗的参考模板，其中的文档级规则大多可以直接搬来过滤 SFT 样本。</p>
+    <div class="code-wrap">
+      <span class="code-label">rule_filter.py</span>
+      <pre class="code"><code class="language-python">"""规则过滤四件套：长度 / 乱码与复读 / HTML 残留 / 语言检测
+依赖：pip install fasttext-wheel
+语言模型下载：https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
+"""
+import re
+import unicodedata
+import fasttext
+
+LID = fasttext.load_model("lid.176.bin")           # 176 语种识别模型
+
+RE_WS     = re.compile(r"\s+")                     # 连续空白
+RE_TAG    = re.compile(r"&lt;[^&gt;]+&gt;")                 # HTML 标签
+RE_REPEAT = re.compile(r"(.{8,}?)\1{2,}")          # 同一 8 字以上片段连现 3 次
+RE_CTRL   = re.compile(r"[\ufffd\u200b-\u200f]")   # 替换符与零宽字符
+
+def normalize(text: str) -&gt; str:
+    """NFKC 统一全半角与兼容字符，压空白：所有后续统计都在归一化文本上做"""
+    text = unicodedata.normalize("NFKC", str(text))
+    return RE_WS.sub(" ", text).strip()
+
+def is_target_lang(text: str, lang: str = "zh", prob: float = 0.85) -&gt; bool:
+    labels = LID.predict(text.replace("\n", " ")[:2000])   # fasttext 不接受换行
+    return labels[0][0] == f"__label__{lang}" and labels[1][0] &gt;= prob
+
+def rule_ok(sample: dict, min_q=10, min_a=20, max_a=8000) -&gt; bool:
+    """一条指令-回答样本的零成本门禁；返回 False 即剔除（阈值按你的分布分位数调）"""
+    q, a = normalize(sample.get("instruction", "")), normalize(sample.get("output", ""))
+    if len(q) &lt; min_q or not (min_a &lt;= len(a) &lt;= max_a):
+        return False                                    # 长度区间
+    if RE_REPEAT.search(a) or len(RE_CTRL.findall(a)) &gt; 5:
+        return False                                    # 复读 / 乱码字符
+    if "CJK" in unicodedata.name(a[0], "") and len(a) &gt; 100:
+        n_cjk = sum(1 for ch in a if "CJK" in unicodedata.name(ch, ""))
+        if n_cjk / len(a) &lt; 0.2:
+            return False                                # 声称中文但 CJK 占比过低
+    if RE_TAG.search(a) and a.count("&gt;") &gt; 20 and "```" not in a:
+        return False                                    # HTML 残留（代码块除外）
+    return is_target_lang(q + " " + a[:500], "zh")</code></pre>
+    </div>
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：规则过严，"干净的废话"幸存，"粗糙的真知"阵亡</div>
+      <p>规则过滤器有个系统性盲区：它按"表面整洁"筛样本，于是留下大量模板化的干净废话，误杀信息密度高但格式粗糙的领域回答（长公式推导、调试记录、口语化笔记）。Gopher 式的"符号比例""行末标点比例"规则对代码与数学数据几乎是灭顶之灾。对策：给不同任务类型配不同规则集；每条规则上线前用 200 条人工样本测误杀率，误杀率超过 2% 的规则必须加白名单条件。</p>
+    </div>
+    <p><strong>本节小结：</strong>规则过滤管"明显坏样本"：长度看分位数、乱码看字符集与重复度、HTML 看标签密度、语言看 fastText 双条件；所有规则都要测误杀率，代码与数学数据单独豁免。</p>
+
+    <h2>4. 精确去重与模糊去重：MinHash + LSH</h2>
+    <h3>4.1 精确去重：先杀"换皮重复"</h3>
+    <p>最便宜的去重是哈希：把文本归一化（NFKC、压空白、统一大小写、去标点）后取 MD5，完全相同的重复一条不漏。别小看它——同一开源数据集被多个网站转载、同一条指令被脚本重复写入、只改了名字的模板题，大多死在这一步。精确去重是 O(n) 的，1 亿条数据也只是分钟级。先跑它，再谈模糊去重，能把模糊去重的输入量砍掉一截。</p>
+    <h3>4.2 Jaccard 相似度与 MinHash 原理</h3>
+    <p>模糊去重要度量"像不像"。字面级的标准度量是 <span class="term">Jaccard 相似度</span>：把两篇文本切成 k-字符（或 k-词）片段的集合后，</p>
+    \[ J(A, B) = \frac{|A \cap B|}{|A \cup B|} \]
+    <p>两两枚举算 Jaccard 是 O(n²)，千万级数据完全不可行。MinHash 的巧思在于"先抽样再比较"：对集合做一次随机置换，取置换后位次最小的元素作为该集合的一个签名值——两个集合最小签名相等的概率，恰好等于 Jaccard 相似度 \( J \)。用 128 个独立置换得到 128 维签名后，两文本的相似度估计就是"128 维里相等的比例"，单维标准差约 \( 1/\sqrt{128} \approx 9\% \)，足以在文档级区分 0.7 与 0.9 的相似度。</p>
+    <h3>4.3 LSH 分带：把两两比较变成桶内比较</h3>
+    <p>有了签名还是要两两比较，<span class="term">局部敏感哈希（Locality Sensitive Hashing, LSH）</span>再砍一刀：把 128 维签名切成 b 个带、每带 r 行（b×r=128），<strong>任何一带内全部行相等就进同一个桶，成为候选对</strong>。两文本成为候选的概率是：</p>
+    \[ P_{\text{candidate}}(s) = 1 - (1 - s^{r})^{\,b} \]
+    <p>其中 s 是真实 Jaccard。这条 S 曲线的含义：相似度高于阈值的对几乎必然入桶，低于阈值的对几乎必然错过——用可控的漏检率换来数量级的加速。工程上不必手推 b 与 r：datasketch 会按给定阈值自动寻优。图 10-2 串起全流程。</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MinHash 与 LSH 流程">
+        <defs><marker id="arrow10b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">MinHash + LSH：先分带粗筛候选对，再精确验证</text>
+        <rect x="15" y="56" width="105" height="72" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="67" y="80" text-anchor="middle" font-size="14" fill="#1e3a8a">文档对</text>
+        <text x="67" y="100" text-anchor="middle" font-size="14" fill="#1e3a8a">指令+回答</text>
+        <text x="67" y="118" text-anchor="middle" font-size="14" fill="#1e3a8a">归一化拼接</text>
+        <rect x="133" y="56" width="105" height="72" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="185" y="80" text-anchor="middle" font-size="14" fill="#92400e">k-shingle</text>
+        <text x="185" y="100" text-anchor="middle" font-size="14" fill="#92400e">切 4 字片段</text>
+        <text x="185" y="118" text-anchor="middle" font-size="14" fill="#92400e">集合化</text>
+        <rect x="251" y="56" width="105" height="72" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="303" y="80" text-anchor="middle" font-size="14" fill="#065f46">MinHash</text>
+        <text x="303" y="100" text-anchor="middle" font-size="14" fill="#065f46">128 维签名</text>
+        <text x="303" y="118" text-anchor="middle" font-size="14" fill="#065f46">逐维取最小</text>
+        <rect x="369" y="56" width="105" height="72" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="421" y="80" text-anchor="middle" font-size="14" fill="#5b21b6">分带 LSH</text>
+        <text x="421" y="100" text-anchor="middle" font-size="14" fill="#5b21b6">b×r 自动寻优</text>
+        <text x="421" y="118" text-anchor="middle" font-size="14" fill="#5b21b6">同带进桶</text>
+        <rect x="487" y="56" width="105" height="72" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="539" y="80" text-anchor="middle" font-size="14" fill="#92400e">候选对</text>
+        <text x="539" y="100" text-anchor="middle" font-size="14" fill="#92400e">同带碰撞</text>
+        <text x="539" y="118" text-anchor="middle" font-size="14" fill="#92400e">数量骤减</text>
+        <rect x="605" y="56" width="105" height="72" rx="10" fill="#fef2f7" stroke="#ef4444" stroke-width="2"/>
+        <text x="657" y="80" text-anchor="middle" font-size="14" fill="#881337">精确验证</text>
+        <text x="657" y="100" text-anchor="middle" font-size="14" fill="#881337">真实 Jaccard</text>
+        <text x="657" y="118" text-anchor="middle" font-size="14" fill="#881337">≥0.85 判重</text>
+        <path d="M122 92 L 131 92" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10b)"/>
+        <path d="M240 92 L 249 92" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10b)"/>
+        <path d="M358 92 L 367 92" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10b)"/>
+        <path d="M476 92 L 485 92" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10b)"/>
+        <path d="M594 92 L 603 92" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10b)"/>
+        <text x="360" y="166" text-anchor="middle" font-size="14" fill="#1e293b">原理：随机置换下，两集合最小哈希值相等的概率 = Jaccard 相似度 s</text>
+        <text x="360" y="192" text-anchor="middle" font-size="14" fill="#1e293b">分带后候选概率 P(s) = 1-(1-s^r)^b，随 s 呈 S 曲线：相似必入桶，不相似几乎不入桶</text>
+        <text x="360" y="218" text-anchor="middle" font-size="14" fill="#1e293b">收益：两两比较 O(n²) 降为桶内比较；去重还能降低模型对重复样本的记忆与提取（Lee et al., 2021）</text>
+      </svg>
+      <figcaption>图 10-2：MinHash+LSH 近重复检测流程——签名降维、分带建桶、精确验证兜底（作者自绘）</figcaption>
+    </figure>
+    <div class="code-wrap">
+      <span class="code-label">minhash_dedup.py</span>
+      <pre class="code"><code class="language-python">"""MinHash + LSH 模糊去重：数万条指令数据单核分钟级
+依赖：pip install datasketch
+"""
+import json
+from datasketch import MinHash, MinHashLSH
+
+K, NUM_PERM, THRESH = 4, 128, 0.85   # 4 字符 shingle / 128 置换 / Jaccard 阈值
+
+def minhash_sig(text: str) -&gt; MinHash:
+    m = MinHash(num_perm=NUM_PERM)
+    for i in range(max(1, len(text) - K + 1)):
+        m.update(text[i:i + K].encode("utf-8"))
+    return m
+
+rows = [json.loads(l) for l in open("sft_raw.jsonl", encoding="utf-8")]
+sigs = {i: minhash_sig(r["instruction"]) for i, r in enumerate(rows)}
+
+lsh = MinHashLSH(threshold=THRESH, num_perm=NUM_PERM)   # b、r 自动寻优
+with lsh.insertion_session() as s:
+    for i, m in sigs.items():
+        s.insert(str(i), m)
+
+dup = set()                                  # 簇代表 = 索引最小且未被判重的
+for i in sorted(sigs):
+    if i in dup:
+        continue
+    for j in lsh.query(sigs[i]):
+        if int(j) &gt; i:                       # 同簇靠后的全部标记删除
+            dup.add(int(j))
+kept = [r for i, r in enumerate(rows) if i not in dup]
+print(f"{len(rows)} -&gt; {len(kept)}（剔除 {len(dup)} 条近重复）")</code></pre>
+    </div>
+    <p>还有一族"子串级"问题 MinHash 处理不了：长文档里整段整段的样板文、抄袭片段。<span class="term">后缀数组（Suffix Array）</span>类方法（Lee et al., 2021, arXiv:2107.06499，其 ExactSubstr 工具被 GPT-3 及后续多家数据管线采用）能在语料中找到所有超过长度阈值的重复子串并改写或剔除；该工作同时证明，去重能把模型可提取的隐私记忆减少一个数量级——去重不只是提效，还是隐私工程（第 7 章的 PII 讨论在此闭环）。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>方法</th><th>粒度</th><th>复杂度与规模</th><th>擅长捕捉</th><th>代表实现</th></tr></thead>
+        <tbody>
+          <tr><td>精确哈希</td><td>文档级</td><td>O(n)，亿级分钟</td><td>归一化后完全相同的"换皮"重复</td><td>MD5/SHA + set</td></tr>
+          <tr><td>MinHash+LSH</td><td>文档/段落级，近似</td><td>近似线性，千万级可行</td><td>字面近重复（改动 10~20%）</td><td>datasketch、Spark MinHashLSH</td></tr>
+          <tr><td>语义嵌入</td><td>指令/文档级，近似</td><td>编码一次 + ANN 检索</td><td>同义不同形（改写、换问法）</td><td>bge/e5 + FAISS</td></tr>
+          <tr><td>后缀数组子串</td><td>子串级，精确</td><td>O(n log n)，工程较重</td><td>文档内长片段抄袭、样板文</td><td>ExactSubstr（Lee et al., 2021）</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 10-2：四类去重方法对比；生产流水线通常按此自上而下依次执行</span>
+    </div>
+    <p><strong>本节小结：</strong>精确哈希杀换皮重复，MinHash+LSH 用"签名降维 + 分带建桶 + 精确验证"把两两比较降到近似线性，后缀数组补子串级抄袭；去重同时是效率、质量与隐私三件事。</p>
+
+    <h2>5. 语义去重：embedding + 阈值</h2>
+    <p>MinHash 度量的是字面重叠，对"换个问法的同一道题"无能为力：把"解释什么是过拟合"改写成"能不能通俗讲讲过拟合的意思"，字符 shingle 重叠可能只有 0.3，但对模型是完全重复的教学信号。语义去重用嵌入向量补这一层：用句向量模型（中文常用 bge 系列、e5 系列）把指令编码成归一化向量，余弦相似度超过阈值即视为近重复，再用并查集把相似对聚成簇，每簇只留一条。</p>
+    <p>三个工程细节决定效果。<strong>（1）阈值必须先看分布再定</strong>：对一批样本算近邻相似度直方图，绝大多数数据集在 0.85~0.95 之间出现"重复峰"与"正常谷"的分离，取谷底当阈值；经验起点 0.92，编码器换了就必须重标。<strong>（2）簇代表的选择策略</strong>：不是随便留一条，而是留"质量分最高"或"回答最完整"的一条——去重环节同时在做一次隐性筛选。<strong>（3）规模</strong>：百万级以下用 FAISS 精确内积检索即可，更大规模再上 IVF/HNSW 近似索引。</p>
+    <div class="code-wrap">
+      <span class="code-label">semantic_dedup.py</span>
+      <pre class="code"><code class="language-python">"""语义去重：嵌入 + 余弦阈值 + 并查集聚簇，每簇留质量分最高的一条
+依赖：pip install sentence-transformers faiss-cpu
+"""
+import json
+from collections import defaultdict
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+THRESH = 0.92                       # 先看近邻相似度分布的分位数，再定阈值！
+model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+rows = [json.loads(l) for l in open("sft_rule_ok.jsonl", encoding="utf-8")]
+emb = model.encode([r["instruction"] for r in rows], batch_size=256,
+                   normalize_embeddings=True, show_progress_bar=True).astype("float32")
+
+index = faiss.IndexFlatIP(emb.shape[1])          # 归一化后内积 = 余弦相似度
+index.add(emb)
+lims, _, I = index.range_search(emb, THRESH)     # 每条返回相似度 ≥ 阈值的邻居
+
+n = len(rows)
+parent = list(range(n))
+def find(x):
+    while parent[x] != x:
+        parent[x] = parent[parent[x]]            # 路径压缩
+        x = parent[x]
+    return x
+def union(a, b):
+    ra, rb = find(a), find(b)
+    if ra != rb:
+        parent[rb] = ra
+
+for i in range(n):                               # i 的邻居 j：只要 j&gt;i 就并簇
+    for k in range(lims[i], lims[i + 1]):
+        if int(I[k]) &gt; i:
+            union(i, int(I[k]))
+
+clusters = defaultdict(list)
+for i in range(n):
+    clusters[find(i)].append(i)
+quality = [r.get("score", 0) for r in rows]      # 上游质量打分，簇代表按它选
+kept = [max(m, key=lambda i: quality[i]) for m in clusters.values()]
+print(f"{n} -&gt; {len(kept)}（聚成 {len(clusters)} 簇，剔除 {n - len(kept)} 条）")</code></pre>
+    </div>
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：偏好数据不能按"整条样本"做语义去重</div>
+      <p>偏好数据（第 9 章）的形态是"同一提示词 + 一好一坏两个回答"。如果对整条样本（prompt+chosen+rejected 拼接）做语义去重，同一 prompt 的多组偏好对会被判成近重复而误删——但"同一题的多个回答对比"正是偏好数据的正常形态。正确做法：<strong>只对 prompt 做去重</strong>，同一 prompt 下的多组 pair 全部保留（还可以合并成一个回答集合）；同理，数学题库中"一题多解"是特性不是缺陷，语义去重阈值要放得更宽，或只按题目结构（变量、考点）去重。</p>
+    </div>
+    <p>语义去重的局限也要说清：嵌入模型自带偏置，它可能把"同一知识点的不同题型"混为一谈（相似度 0.93 的两道数学题，考点完全不同），也可能被指令开头的固定句式绑架（前缀相同、后半不同，相似度虚高）。所以语义去重只放在 MinHash 之后做"补充"，不替代它；对数学、代码这类结构化任务，阈值宁宽勿严。</p>
+    <p><strong>本节小结：</strong>语义去重用嵌入+阈值抓住"同义不同形"，阈值看分布定标、簇代表按质量分选、偏好数据只对 prompt 去重；它补 MinHash 的盲区，不替代 MinHash。</p>
+
+    <h2>6. 质量打分三派：启发式、模型与影响函数</h2>
+    <p>过滤掉"坏"的之后，还要回答"谁更好"。给样本打质量分的方法论分裂成三派，哲学完全不同，值得放在一起比较。</p>
+    <h3>6.1 派别一：规则启发式</h3>
+    <p>延续第 3 节的思路，把"什么像好文本"写成统计特征：Gopher 规则族的停用词比例、符号/词比例，C4 的标点规则，以及"复制率"（回答中从指令复制过来的片段占比——复制率过高说明模型式复读）。这一派极便宜、完全可解释，适合百亿级语料的第一道粗筛；但对"什么是好回答"的刻画粗糙，代码与数学文本系统性吃亏，在 SFT 数据上只适合做兜底门禁而非主力打分。</p>
+    <h3>6.2 派别二：模型打分</h3>
+    <p>用一个"参考物"给样本打分，四种具体形态按成本递增。<strong>（1）困惑度分层</strong>：用 KenLM 或小型 LM 给样本算 PPL，三等分取 head（CCNet 的经典做法，arXiv:1911.00359）；便宜，但会误杀信息密度高的专业文本。<strong>（2）轻量质量分类器</strong>：让强模型标注几万条"教育价值/有用性"，训一个小分类器再全量打分——FineWeb 用这条路筛出 1.3T token 的教育级语料（Penedo et al., 2024, arXiv:2406.17557），一次标注、终身复用。<strong>（3）奖励模型打分</strong>：现成 RM 直接给"指令-回答"打分，注意它继承 RM 的长度与格式偏差（第 8 章）。<strong>（4）LLM-as-judge</strong>：AlpaGasus 与 DEITA 都属此派，多维结构化打分 + 阈值门禁，质量最高、成本最高、偏差也最需要管理（偏差详解见第 11 章第 4 节与第 39 章）。</p>
+    <h3>6.3 派别三：影响函数式</h3>
+    <p>前两派问"这条数据看起来好不好"，影响函数问"这条数据<strong>对训练的贡献</strong>好不好"：<span class="term">影响函数（Influence Functions）</span>估计"把某条训练样本权重上调无穷小，目标验证损失会怎么变"（Koh &amp; Liang, 2017, arXiv:1703.04730）；TracIN 用训练过程中的梯度累积近似它（Pruthi et al., 2020, arXiv:2002.08484）；DataInf 把计算改造到 LoRA 场景，快几个数量级（Yoon et al., 2024, arXiv:2310.00902）。它的独特价值：能找出"高损失上分"的数据——删掉后验证损失反而上升的样本。局限同样明显：必须先有一个训练好的模型与明确的验证集，计算贵，而且它只能度量"对目标损失的边际贡献"，抓不住多样性这种集合性质——删掉一整簇相似样本的影响函数值都很小，但集合效应是真实的。所以它适合数万条以内精选集的最后一轮精修，不适合当主力。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>派别</th><th>代表方法</th><th>成本</th><th>主要偏差与局限</th><th>适用场景</th></tr></thead>
+        <tbody>
+          <tr><td>规则启发式</td><td>Gopher 规则族、C4 规则、复制率、重复度</td><td>极低（正则+统计）</td><td>刻画粗糙；对代码/数学/长文本系统性误伤</td><td>海量语料粗筛；SFT 兜底门禁</td></tr>
+          <tr><td>模型打分</td><td>PPL 分层、质量分类器、RM 打分、LLM-as-judge</td><td>低 → 高</td><td>打分器偏差：长度偏好、自我偏好、域偏置</td><td>SFT 质量门禁主力，级联使用</td></tr>
+          <tr><td>影响函数式</td><td>Koh &amp; Liang、TracIN、DataInf</td><td>高</td><td>需已训模型与验证集；度量不了集合性质（多样性）</td><td>小规模精选集的最后一轮精修</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 10-3：质量打分三派对比——"看起来好"（启发式）、"参考物说好"（模型）、"对训练贡献好"（影响函数）</span>
+    </div>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：三派是级联，不是三选一</div>
+      <p>性价比顺序固定：规则启发式全量跑（零成本）→ 轻量分类器或 PPL 砍掉 20~40% → judge 或 RM 只给剩下的灰色地带打分 → 数据量在十万条以内、且已有一个可用的基线模型时，再考虑影响函数精修。每一级打分器上线前，抽 100 条人工复核与打分器的一致率——一致率低于 70% 的打分器，阈值定得再精细也是在放大噪声。</p>
+    </div>
+    <p><strong>本节小结：</strong>启发式管"像不像坏样本"，模型打分管"像不像好回答"，影响函数管"对验证损失有没有贡献"；三派按成本级联，任何打分器都要先对齐人工判断再上岗。</p>
+
+    <h2>7. 数据配比：domain mixing 思想在 SFT 的应用</h2>
+    <p>清洗把"坏样本"请出去，配比决定"剩下的怎么组队"。这个概念在预训练领域叫 <span class="term">domain mixing</span>（领域混合）：不同领域语料的配比对模型能力影响巨大，而且配比可以被系统地优化——DoReMi 用一个 280M 的小代理模型 + 组分布鲁棒优化自动学出领域权重，替换人工经验配比后训练 8B 模型在多个下游任务取得稳定提升（Xie et al., 2023, arXiv:2305.10429）；RegMix 训练几百个小模型扫配比空间，再回归外推到大模型的最优配比（Ye et al., 2025, arXiv:2403.03453）。两篇工作的共同启示：<strong>配比是可优化的参数，不是玄学</strong>。</p>
+    <p>SFT 侧的对应做法是把混合体沿四个轴显式分层，再给每层定权重：</p>
+    <p><strong>（1）任务类型轴</strong>：写作、问答、代码、数学、抽取、改写、规划……按产品目标定配额（第 8 章的指令分类学在这里复用）。<strong>（2）语言轴</strong>：按真实用户分布定中英比例，而不是照抄开源数据的默认比例。<strong>（3）难度轴</strong>：入门/进阶/挑战按模型能力分层（第 8 章 7.2 节）。<strong>（4）来源轴</strong>：人工标注、开源精选、合成数据各占多少——合成数据的占比问题第 11 章专门讨论。落地流程四步：先验配比写成配置文件 → 用 1~3B 的小模型跑 2~3 组配比消融 → 在与目标一致的验证集上定案 → 配比与漏斗报告一起写进数据卡片（第 7 章）。</p>
+    <p>配比还有个容易被忽视的变量：<strong>重复轮数</strong>。数据受限时反复喂同一份数据的收益有硬边界——Muennighoff 等人的缩放实验表明，重复数据在约 4 个 epoch 内的收益接近新数据，超过后边际收益快速归零（Muennighoff et al., 2023, arXiv:2305.16264）。对 SFT 的启示：精选的 1 万条数据训 3~4 个 epoch 是合理区间，把同一份数据喂 10 个 epoch 属于把算力倒进水里，不如把时间花在扩充多样性上。</p>
+    <p><strong>本节小结：</strong>配比沿任务、语言、难度、来源四轴显式定义，用小模型消融代替直觉，重复收益约 4 个 epoch 见顶；配比永远是"验证集的函数"——配比错了不是数据错了，是目标定义错了。</p>
+
+    <h2>8. 数据污染检测：与评测集的 n-gram 重叠</h2>
+    <p>最后一道工序最容易被跳过，也最致命：<strong>去污染（decontamination）</strong>——把与评测基准重叠的样本从训练集里剔出去。训练集里混进 MMLU 或 GSM8K 的测试原题，评测分数虚高，所有下游决策（选型、配比、迭代方向）都被污染数据带偏，这正是第 41 章"评测陷阱"的数据侧根源。Tulu 3 把系统性去污染列为现代配方的标配（第 7 章已提），不是可选项。</p>
+    <p>标准做法是 <span class="term">n-gram 重叠检测</span>：把每个评测样本归一化后切成 n-gram 放进"黑名单"，训练样本命中任意一个 n-gram 即判疑似污染并剔除。粒度选择有先例可循：GPT-3 用 13-gram 剔除与评测基准的重叠（Brown et al., 2020, arXiv:2005.14165），OLMo 与 Tulu 3 一系采用归一化后的 8-gram（Groeneveld et al., 2024, arXiv:2402.00153；Lambert et al., 2024, arXiv:2411.15124）——n 越小越严格（误杀越多），中文要按字符切而不是按词切。</p>
+    <div class="code-wrap">
+      <span class="code-label">decontaminate.py</span>
+      <pre class="code"><code class="language-python">"""数据污染检测：训练集 vs 评测集的 8-gram 重叠（OLMo/Tulu 3 口径）
+思路：评测样本归一化后切 n-gram 进黑名单；训练样本命中任意一个即剔除。
+"""
+import json
+import re
+
+def norm(t: str) -&gt; str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", t.lower())).strip()
+
+def ngrams(t: str, n: int = 8) -&gt; set:
+    t = norm(t)
+    if not t:
+        return set()
+    if any("\u4e00" &lt;= ch &lt;= "\u9fff" for ch in t):   # 中文：字符级 n-gram
+        return {t[i:i + n] for i in range(max(1, len(t) - n + 1))}
+    ws = t.split(" ")                                 # 英文：词级 n-gram
+    if len(ws) &lt; n:
+        return set()
+    return {" ".join(ws[i:i + n]) for i in range(len(ws) - n + 1)}
+
+EVAL_FILES = ["mmlu_test.jsonl", "gsm8k_test.jsonl", "ifeval_prompts.jsonl"]
+blacklist = set()
+for f in EVAL_FILES:
+    for line in open(f, encoding="utf-8"):
+        ex = json.loads(line)
+        blacklist |= ngrams(ex["question"] + " " + ex.get("answer", ""))
+
+hits, out = 0, open("sft_decontaminated.jsonl", "w", encoding="utf-8")
+for line in open("sft_final.jsonl", encoding="utf-8"):
+    ex = json.loads(line)
+    if ngrams(ex["instruction"]) &amp; blacklist:         # 交集非空 → 剔除
+        hits += 1
+        continue
+    out.write(line)
+print(f"剔除疑似污染 {hits} 条（黑名单 {len(blacklist)} 个 8-gram）")</code></pre>
+    </div>
+    <p>n-gram 只能抓"原题级"污染，抓不住改写污染（换措辞、换数字的同题）。两档加强：<strong>（1）嵌入检索</strong>——把评测题编码后检索训练集中最近邻，近邻相似度超过阈值的样本人工复核；<strong>（2）行为式检测</strong>——Golchin 与 Surdeanu 的 Time Travel 方法（arXiv:2308.08493）利用"模型能否从残缺提示补全出评测原题"的行为差异做成员推断，能发现更隐蔽的污染。规模上，n-gram 是必修、嵌入检索是加强、行为式检测用于关键发布前的审计。</p>
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：污染是双向的，合成数据是高危源头</div>
+      <p>别以为污染只来自爬虫数据。用强模型合成训练数据时，强模型很可能直接"背出"它见过的公开评测原题——你的合成数据是污染的温床（第 11 章会展开）。防线只有一条：任何数据（无论来源）入库前都必须过与目标评测集的重叠检测，评测集变更后要重跑全量检测。反过来也要防"自我污染"：用自家训练数据当评测集，分数毫无意义。</p>
+    </div>
+    <p><strong>本节小结：</strong>去污染是入库前的强制工序——8-gram 黑名单是标配，嵌入检索补改写污染，行为式检测做发布前审计；合成数据必须同样过线。</p>
+
+    <h2>9. 全流程脚本：pandas + datasketch 的最小清洗线</h2>
+    <p>把前六节串成一个可直接运行的最小工程：pandas 负责数据校验与统计，datasketch 负责两级去重，漏斗报告负责审计。真实项目的清洗线当然更复杂（分布式、增量、多语言规则），但骨架与此完全一致。</p>
+    <div class="code-wrap">
+      <span class="code-label">clean_pipeline.py</span>
+      <pre class="code"><code class="language-python">"""最小完整清洗线：格式校验 → 规则过滤 → 精确去重 → MinHash 模糊去重 → 漏斗报告
+依赖：pip install pandas datasketch
+用法：python clean_pipeline.py --in sft_raw.jsonl --out sft_clean.jsonl
+"""
+import argparse
+import hashlib
+import re
+import unicodedata
+import pandas as pd
+from datasketch import MinHash, MinHashLSH
+
+RE_WS = re.compile(r"\s+")
+
+def norm_text(t: str) -&gt; str:
+    t = unicodedata.normalize("NFKC", str(t))
+    return RE_WS.sub(" ", t).strip()
+
+def exact_key(t: str) -&gt; str:
+    """规范化后哈希：改标点、改大小写、改空白的"换皮重复"也能命中"""
+    return hashlib.md5(norm_text(t).lower().encode("utf-8")).hexdigest()
+
+def rule_ok(q: str, a: str) -&gt; bool:
+    if not (20 &lt;= len(q) &lt;= 400 and 10 &lt;= len(a) &lt;= 6000):
+        return False
+    if re.search(r"(.{10,}?)\1{2,}", a):              # 复读片段
+        return False
+    if ("&amp;lt;" in a or "&lt;html" in a.lower()) and a.count("&gt;") &gt; 20 and "```" not in a:
+        return False                                  # HTML 残留（代码块除外）
+    return True
+
+def minhash_of(t: str, num_perm: int = 128, k: int = 4) -&gt; MinHash:
+    m = MinHash(num_perm=num_perm)
+    for i in range(max(1, len(t) - k + 1)):
+        m.update(t[i:i + k].encode("utf-8"))
+    return m
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in", dest="src", default="sft_raw.jsonl")
+    ap.add_argument("--out", default="sft_clean.jsonl")
+    ap.add_argument("--thresh", type=float, default=0.85)
+    args = ap.parse_args()
+
+    df = pd.read_json(args.src, lines=True)
+    report = [("原始", len(df))]
+
+    # 1) 格式校验：必备字段齐全且非空
+    ok = df["instruction"].notna() &amp; df["output"].notna()
+    df, report = df[ok], report + [("格式校验", int(ok.sum()))]
+
+    # 2) 规则过滤：长度区间 / 复读 / HTML 残留
+    ok = df.apply(lambda r: rule_ok(r["instruction"], r["output"]), axis=1)
+    df, report = df[ok], report + [("规则过滤", int(ok.sum()))]
+
+    # 3) 精确去重：规范化哈希
+    df["key"] = df["instruction"].map(exact_key)
+    df, report = df.drop_duplicates("key"), report + [("精确去重", len(df))]
+
+    # 4) MinHash+LSH 模糊去重：同簇只留最早一条
+    lsh = MinHashLSH(threshold=args.thresh, num_perm=128)
+    sigs = {idx: minhash_of(row["instruction"]) for idx, row in df.iterrows()}
+    with lsh.insertion_session() as s:
+        for idx, m in sigs.items():
+            s.insert(str(idx), m)
+    dup = set()
+    for idx in df.index:                              # 升序遍历：留簇代表
+        if idx in dup:
+            continue
+        for j in lsh.query(sigs[idx]):
+            if int(j) != idx:
+                dup.add(int(j))
+    df = df[~df.index.isin(dup)]
+    report.append(("模糊去重", len(df)))
+
+    # 5) 入库 + 漏斗报告
+    df.drop(columns=["key"]).to_json(args.out, orient="records",
+                                     lines=True, force_ascii=False)
+    base = report[0][1]
+    for name, n in report:
+        print(f"{name:8s} {n:8d} ({n / base:.1%})")
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <p>三处设计值得注意。<strong>其一</strong>，模糊去重的簇代表取"索引最小的幸存者"，工业版本会改成"质量分最高者"——把第 6 节的打分器接到这里即可。<strong>其二</strong>，`exact_key` 的归一化强度决定了精确去重的灵敏度：归一化越狠，误合并越多，建议先在 1,000 条样本上目测哈希碰撞的正确率。<strong>其三</strong>，入库不只是写文件：数据卡片（第 7 章）要同步记录漏斗报告、阈值版本与评测集黑名单版本，保证下一批数据能复现同一口径。</p>
+    <p><strong>本节小结：</strong>格式校验 → 规则过滤 → 精确去重 → MinHash 模糊去重 → 入库，五个环节一条命令跑完；可复现的关键在漏斗报告与卡片化的阈值版本记录。</p>
+
+    <h2>10. 常见坑与排查清单</h2>
+    <h3>10.1 阈值拍脑袋，不看分布</h3>
+    <p>最常见的翻车点：照抄别人博客的"Jaccard 0.85""余弦 0.9"，而自己的数据分布完全不同。排查动作固定：画长度分布与相似度近邻直方图，找"重复峰—正常谷"的分离点；阈值定在谷底，并用 100 对边界样本人工验证"该删的删了、不该删的留了"。</p>
+    <h3>10.2 去重删光了"必要的重复"</h3>
+    <p>去重与多样性有天然张力：一题多解、同模板不同实例、偏好数据的同 prompt 多 pair，都是"有价值的重复"。排查动作：去重后统计任务类型与题型的比例变化（第 2 节的分布漂移监控）；对偏好数据只按 prompt 去重（第 5 节）；对数学/代码数据放宽阈值。反过来，如果你的模型开始复读训练集句式，先查是不是去重阈值太松让模板数据刷屏了。</p>
+    <h3>10.3 清洗后不重新配比</h3>
+    <p>每一级过滤都是分布重塑（第 8 章的警告）：清洗前代码数据占 20%，几轮过滤后可能只剩 8%，模型能力悄悄偏向 surviving 分布。排查动作：清洗流水线的最后一步固定跑一次配比核对，与目标配比逐项对比，缺口用第 7 节的配比调整补齐——必要时回上游补数据，而不是放宽阈值。</p>
+    <h3>10.4 没有漏斗报告，清洗不可复现</h3>
+    <p>三个月后你无法回答"这版数据为什么比上版好"，因为没人记得阈值改过几轮。排查动作：阈值全部写进配置文件并随数据入库（数据卡片），漏斗报告按版本归档；任何一级剔除率突变超过 10 个百分点即触发回查。清洗线没有版本管理，等于每轮训练都在换数据集。</p>
+    <p><strong>本节小结：</strong>四个坑对应四条纪律——阈值看分布、去重保多样性、清洗后核配比、阈值版本化；清洗线的可复现性优先于单点最优。</p>
+
+    <h2>11. 本章小结</h2>
+    <ul>
+      <li><strong>少而精的证据</strong>：LIMA（1,000 条精选微调 65B）、AlpaGasus（52K→9K，5.7× 加速且更好）、DEITA（6K 达 MT-Bench 6.46）、phi-1（1.3B 拿 HumanEval 50.6%）；前提是强基座，精选必须兼顾多样性。</li>
+      <li><strong>流水线全图</strong>：格式校验 → 规则过滤 → 精确去重 → 模糊去重 → 语义去重 → 质量打分 → 人工抽检 → 入库；漏斗报告与分布漂移监控是可运维性的底线。</li>
+      <li><strong>规则过滤</strong>：长度看分位数、乱码看字符集与重复度、HTML 看标签密度、语言用 fastText 双条件；Gopher/C4 规则族是参考模板，代码与数学数据要单独豁免。</li>
+      <li><strong>MinHash+LSH</strong>：最小签名相等的概率等于 Jaccard，分带后候选概率 \( P(s)=1-(1-s^r)^b \)；签名降维 + 分带建桶 + 精确验证，把 O(n²) 降到近似线性。</li>
+      <li><strong>语义去重</strong>：嵌入+阈值抓"同义不同形"，阈值看分布定标、簇代表按质量分选；偏好数据只按 prompt 去重，一题多解不是缺陷。</li>
+      <li><strong>质量打分三派</strong>：规则启发式（便宜粗糙）、模型打分（PPL/分类器/RM/judge，主力）、影响函数式（贵，只管"对验证损失的贡献"）；三派按成本级联。</li>
+      <li><strong>数据配比</strong>：任务/语言/难度/来源四轴显式分层，小模型消融代替直觉；重复收益约 4 个 epoch 见顶（arXiv:2305.16264）。</li>
+      <li><strong>去污染</strong>：8-gram 黑名单（OLMo/Tulu 3 口径）是标配，嵌入检索抓改写污染，Time Travel 做发布前审计；合成数据同样必须过线。</li>
+      <li><strong>四大纪律</strong>：阈值看分布、去重保多样性、清洗后核配比、阈值版本化并写进数据卡片。</li>
+    </ul>
+    <p>清洗与配比解决的是"从现有数据里选出最好的"，下一章 <a href="11-synthetic-data.html">第 11 章 · 合成数据与 RLAIF 数据化</a>转向增量：数据不够时如何安全地"造"，从模型坍塌、三大生成范式到数据飞轮。</p>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：为什么 MinHash 签名中"两个集合最小哈希值相等的概率"等于 Jaccard 相似度？128 维签名的估计精度量级是多少？</summary>
+        <p>对两个集合 A、B 做同一个随机置换，"置换后位次最小的元素"等价于从并集 A∪B 中均匀随机抽一个元素；抽到的元素属于交集 A∩B 的概率正是 |A∩B|/|A∪B|，即 Jaccard 相似度——所以两个最小签名相等的概率就是 Jaccard。用 128 个独立置换得到 128 维签名后，以"相等维度的比例"估计相似度，单维是伯努利变量，标准差约 \( 1/\sqrt{128} \approx 9\% \)；配合 LSH 分带与候选对上的精确 Jaccard 验证，这个精度足以在文档级区分 0.7 与 0.9 的相似度。</p>
+      </details>
+      <details><summary>问题 2：偏好数据为什么不能按"整条样本"做语义去重？正确的去重对象是什么？</summary>
+        <p>偏好样本的形态是"同一提示词 + chosen + rejected"。若对拼接后的整条样本做语义去重，同一 prompt 的多组偏好对（哪怕 chosen/rejected 不同）会被判为近重复而误删——但"同一题下的多组回答对比"正是偏好数据的正常形态，删掉它们等于丢失了难度与风格的对比信号。正确做法是只对 prompt 做去重（配合簇代表选择），同一 prompt 下的多组 pair 全部保留并可合并为一个回答集合；这同时意味着语义去重的阈值要针对"指令分布"单独定标，而不是沿用整个数据集的阈值。</p>
+      </details>
+      <details><summary>问题 3：把 Gopher 规则族直接搬到 SFT 指令数据上，哪些规则会系统性误伤？如何处理？</summary>
+        <p>三类高危规则。（1）符号/词比例上限：代码与数学回答充满花括号、运算符，会被判为"符号堆砌"；（2）行末标点比例：代码行没有句号，数学推导常用公式结尾；（3）停用词比例：代码与术语密集文本的功能词占比天然偏低。处理方式：按任务类型给不同规则集——代码/数学数据关闭上述规则或显著放宽；每条规则上线前用 200 条人工样本测误杀率（目标低于 2%），误杀率超标就加白名单条件（如"代码块内不计入统计"）；同时用清洗前后的任务类型分布漂移做兜底监控，任何类型占比骤降都回查对应规则。</p>
+      </details>
+      <details><summary>问题 4：8-gram 重叠检测为什么挡不住"改写型污染"？两档加强手段分别是什么？</summary>
+        <p>8-gram 黑名单匹配的是原文片段的精确命中（归一化后逐字一致），改写污染通过换措辞、换数字、调语序就能绕开——n-gram 相似度掉到 0，但题目本质相同，模型照样"背过答案"。加强一：嵌入检索——把评测题编码后检索训练集最近邻，近邻相似度超阈值的样本人工复核，能抓住语义相同、字面不同的污染；加强二：行为式检测（如 Time Travel，arXiv:2308.08493）——比较模型在"完整提示"与"残缺提示"下补全出评测原文的概率差，据此推断该样本是否被记忆，可以发现更隐蔽的污染。实践组合：8-gram 必跑、嵌入检索加强、关键发布前做行为式审计。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Zhou+, 2023]</span> Zhou, C. et al. "LIMA: Less Is More for Alignment." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2305.11206</span></li>
+      <li><span class="rid">[Chen+, 2024]</span> Chen, L. et al. "AlpaGasus: Training A Better Alpaca with Fewer Data." <i>ICLR</i>, 2024. <span class="rid">arXiv:2307.08701</span></li>
+      <li><span class="rid">[Chen+, 2023]</span> Chen, Z. et al. "DEITA: What Makes Good Data for Alignment? A Comprehensive Study of Instruction-Tuning Data." 2023. <span class="rid">arXiv:2312.15685</span></li>
+      <li><span class="rid">[Rae+, 2022]</span> Rae, J. W. et al. "Scaling Language Models: Methods, Analysis &amp; Insights from Training Gopher." 2022. <span class="rid">arXiv:2112.11446</span></li>
+      <li><span class="rid">[Raffel+, 2020]</span> Raffel, C. et al. "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer." <i>JMLR</i>, 2020. <span class="rid">arXiv:1910.10683</span></li>
+      <li><span class="rid">[Wenzek+, 2020]</span> Wenzek, G. et al. "CCNet: Extracting High Quality Monolingual Datasets from Web Crawl Data." <i>LREC</i>, 2020. <span class="rid">arXiv:1911.00359</span></li>
+      <li><span class="rid">[Penedo+, 2024]</span> Penedo, G. et al. "The FineWeb Datasets: Decanting the Web for the Finest LLM Training Data." 2024. <span class="rid">arXiv:2406.17557</span></li>
+      <li><span class="rid">[Brown+, 2020]</span> Brown, T. et al. "Language Models are Few-Shot Learners." <i>NeurIPS</i>, 2020. <span class="rid">arXiv:2005.14165</span></li>
+      <li><span class="rid">[Lee+, 2022]</span> Lee, K. et al. "Deduplicating Training Data Makes Language Models Better." <i>ACL</i>, 2022. <span class="rid">arXiv:2107.06499</span></li>
+      <li><span class="rid">[Joulin+, 2016]</span> Joulin, A. et al. "Bag of Tricks for Efficient Text Classification." <i>EACL</i>, 2017. <span class="rid">arXiv:1607.01759</span></li>
+      <li><span class="rid">[Xie+, 2023]</span> Xie, S. M. et al. "DoReMi: Optimizing Data Mixtures Speeds Up Language Model Pretraining." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2305.10429</span></li>
+      <li><span class="rid">[Ye+, 2025]</span> Ye, J. et al. "RegMix: Data Mixture as Regression for Language Model Pre-Training." <i>ICLR</i>, 2025. <span class="rid">arXiv:2403.03453</span></li>
+      <li><span class="rid">[Muennighoff+, 2023]</span> Muennighoff, N. et al. "Scaling Data-Constrained Language Models." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2305.16264</span></li>
+      <li><span class="rid">[Groeneveld+, 2024]</span> Groeneveld, D. et al. "OLMo: Accelerating the Science of Language Models." <i>ACL</i>, 2024. <span class="rid">arXiv:2402.00153</span></li>
+      <li><span class="rid">[Lambert+, 2024]</span> Lambert, N. et al. "Tulu 3: Pushing Frontiers in Open Language Model Post-Training." 2024. <span class="rid">arXiv:2411.15124</span></li>
+      <li><span class="rid">[Koh-Liang, 2017]</span> Koh, P. W., Liang, P. "Understanding Black-box Predictions via Influence Functions." <i>ICML</i>, 2017. <span class="rid">arXiv:1703.04730</span></li>
+      <li><span class="rid">[Pruthi+, 2020]</span> Pruthi, G. et al. "Estimating Training Data Influence by Tracing Gradient Descent." <i>NeurIPS</i>, 2020. <span class="rid">arXiv:2002.08484</span></li>
+      <li><span class="rid">[Yoon+, 2024]</span> Yoon, S. et al. "DataInf: Efficiently Estimating Data Influence in LoRA-tuned LLMs." <i>ICLR</i>, 2024. <span class="rid">arXiv:2310.00902</span></li>
+      <li><span class="rid">[Golchin-Surdeanu, 2023]</span> Golchin, S., Surdeanu, M. "Time Travel in LLMs: Tracing Data Contamination in Large Language Models." <i>ICLR</i>, 2024. <span class="rid">arXiv:2308.08493</span></li>
+      <li><span class="rid">[datasketch]</span> Zhu, E. "datasketch: Big Data Looks Small." <a href="https://github.com/ekzhu/datasketch" target="_blank">github.com/ekzhu/datasketch</a>（MinHash/LSH 参考实现，无 arXiv 号）</li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 17 章 · 领域继续预训练与适配 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 3 部分 · 监督微调（SFT）</div>
+      <h1>第 17 章 · 领域继续预训练与适配</h1>
+      <p class="chapter-lead">当通用基础大模型进入金融、医疗、法律或特定工业垂直领域时，仅仅依靠数千条 SFT 对话样本往往难以注入庞大且严密的领域专有事实，甚至会引发严重的虚假自信与幻觉。本章系统解析领域继续预训练（CPT）与监督微调的分工时序、数据混合与防遗忘配比机制、学习率退火动态、领域分词词表扩充与嵌入层对齐、长上下文 RoPE/NTK/YaRN 扩展推导，并给出工业级 DeepSpeed ZeRO-3 分布式预训练与领域评测体系。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★★☆ ｜ 先修：第 4 章、第 12 章、第 16 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 领域适配的技术谱系：CPT 与 SFT 的分工、时序与决策边界</h2>
+    <p>在大模型产业落地中，工程师面临的首要架构抉择是：面对企业海量的私有数据（如数千万份研报、百万份电子病历、数十万份裁判文书），应当直接进行监督微调（Supervised Fine-Tuning, SFT），还是必须先进行<span class="term">领域继续预训练（Continual Pre-Training, CPT）</span>？</p>
+    <p>在第 12 章中我们明确了 SFT 的本质是“格式激活与表达对齐”，其监督信号仅分布在回答的生成 Token 之上，训练数据通常在数万至数十万条。这种微弱的梯度更新量不足以重塑深层知识权重，而更倾向于激活基础模型在海量预训练阶段业已学到的隐空间表征。如果强行把数万篇长文档改造成粗糙的问答对直接送入 SFT，模型将大概率陷入“表面风格模仿而事实胡编乱造”的灾难境地，这种现象在金融法规、生化药理等低容错领域是致命的。</p>
+    <p>领域继续预训练（CPT）承接自通用预训练，以海量无标注领域纯文本（数十亿至数千亿 Token）为输入，延续自回归因果语言建模（Causal Language Modeling, CLM）目标：</p>
+    \[ \mathcal{L}_{\mathrm{CPT}}(\theta) = -\sum_{t=1}^{T} \log p_\theta(x_t \mid x_{<t}) \]
+    <p>CPT 的核心使命是<strong>向模型权重注入领域实体、概念关系、专业语法结构与长程推理逻辑</strong>；而随后接入的 SFT 则负责<strong>塑造专业咨询专家的人设、指令遵循能力与输出格式规范</strong>。两者的分工与全生命周期时序如图 17-1 所示。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="领域继续预训练与后训练全生命周期">
+        <defs>
+          <marker id="arrow17" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+        </defs>
+        <!-- 阶段 1: 通用预训练 -->
+        <rect x="20" y="40" width="140" height="90" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="90" y="70" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e3a8a">通用基座模型</text>
+        <text x="90" y="92" text-anchor="middle" font-size="13" fill="#3b82f6">10T+ Token</text>
+        <text x="90" y="112" text-anchor="middle" font-size="12" fill="#64748b">通用常识/语言骨架</text>
+
+        <!-- 箭头 1 -->
+        <path d="M160 85 L 195 85" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow17)"/>
+
+        <!-- 阶段 2: 领域 CPT -->
+        <rect x="200" y="30" width="160" height="110" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="280" y="60" text-anchor="middle" font-size="15" font-weight="bold" fill="#92400e">领域继续预训练</text>
+        <text x="280" y="82" text-anchor="middle" font-size="13" fill="#d97706">10B~100B Token</text>
+        <text x="280" y="102" text-anchor="middle" font-size="12" fill="#64748b">7:3 混入通用回放</text>
+        <text x="280" y="122" text-anchor="middle" font-size="12" fill="#b45309">词表扩充 / 知识注入</text>
+
+        <!-- 箭头 2 -->
+        <path d="M360 85 L 395 85" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow17)"/>
+
+        <!-- 阶段 3: 领域 SFT -->
+        <rect x="400" y="40" width="140" height="90" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="470" y="70" text-anchor="middle" font-size="15" font-weight="bold" fill="#065f46">领域指令 SFT</text>
+        <text x="470" y="92" text-anchor="middle" font-size="13" fill="#059669">10K~100K 样本</text>
+        <text x="470" y="112" text-anchor="middle" font-size="12" fill="#64748b">任务形式与角色对齐</text>
+
+        <!-- 箭头 3 -->
+        <path d="M540 85 L 575 85" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow17)"/>
+
+        <!-- 阶段 4: 领域 RLHF / DPO -->
+        <rect x="580" y="40" width="120" height="90" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="640" y="70" text-anchor="middle" font-size="15" font-weight="bold" fill="#5b21b6">领域偏好对齐</text>
+        <text x="640" y="92" text-anchor="middle" font-size="13" fill="#7c3aed">DPO / PPO</text>
+        <text x="640" y="112" text-anchor="middle" font-size="12" fill="#64748b">合规/拒答/事实惩罚</text>
+
+        <!-- 下方生命周期说明框 -->
+        <rect x="20" y="170" width="680" height="90" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1"/>
+        <text x="40" y="196" font-size="14" font-weight="bold" fill="#1e293b">💡 架构决策准则：什么时候必须执行 CPT？</text>
+        <text x="40" y="222" font-size="13" fill="#475569">1. 领域语料含有大量专业术语或未登录词，通用分词器分词碎片率（Token/Word 膨胀比）超过 2.5；</text>
+        <text x="40" y="244" font-size="13" fill="#475569">2. 专有知识总量达到 GB/TB 级纯文本（如医学文献、法律条文），且任务需要模型掌握密集的未见事实；</text>
+      </svg>
+      <figcaption>图 17-1：领域模型全生命周期演进路径（CPT 注入深层知识，SFT 规范交互行为，偏好对齐约束边界）</figcaption>
+    </figure>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>对比维度</th>
+            <th>领域继续预训练（CPT）</th>
+            <th>领域监督微调（SFT）</th>
+            <th>检索增强生成（RAG）</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>输入数据形态</td>
+            <td>无标注连续文本（数十亿至千亿 Token）</td>
+            <td>高质量结构化对话（Prompt-Response Pairs）</td>
+            <td>切片文档块（Chunk）与向量索引数据库</td>
+          </tr>
+          <tr>
+            <td>参数更新范围</td>
+            <td>全参数或深层网络更新</td>
+            <td>全参数或 LoRA 低秩挂件</td>
+            <td>不更新主干参数（纯外挂上下文）</td>
+          </tr>
+          <tr>
+            <td>知识沉淀机制</td>
+            <td>隐式固化于神经网络权重参数</td>
+            <td>主要对齐指令意图与回复格式规范</td>
+            <td>显式加载于输入注意力窗口内部</td>
+          </tr>
+          <tr>
+            <td>硬件与算力成本</td>
+            <td>昂贵（通常需 8~64 卡 A100/H800 数天）</td>
+            <td>中等（单机 8 卡数小时至数天）</td>
+            <td>极低（离线嵌入向量化与检索服务器）</td>
+          </tr>
+          <tr>
+            <td>事实更新灵活性</td>
+            <td>极慢，重新训练成本高昂</td>
+            <td>中等，容易发生格式固化与知识覆盖</td>
+            <td>极快，秒级插入或废止数据库记录</td>
+          </tr>
+          <tr>
+            <td>推理延迟与吞吐</td>
+            <td>原生推理延迟，无额外上下文开销</td>
+            <td>原生推理延迟，无额外上下文开销</td>
+            <td>延迟显著上升（受检索耗时与长上下文拖累）</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 17-1：大模型领域知识注入与适配三种主要范式的全方位技术对比</span>
+    </div>
+
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：CPT、SFT 与 RAG 的黄金组合法则</div>
+      <p>生产实践中最成熟的垂直领域方案从来不是三选一，而是协同闭环：<strong>通过 CPT 建立领域语感与底层概念关联</strong>（例如让模型理解“二甲双胍”与“2型糖尿病”、“胰岛素敏感性”的生化关系）；<strong>通过 SFT 训练医生处方与病历分析的结构化输出风格</strong>；<strong>通过 RAG 在最终推理时检索患者当下的生化验血单与最新诊疗指南</strong>。三者在不同时空粒度上完美互补。</p>
+    </div>
+
+    <p><strong>本节小结：</strong>CPT 解决深层知识与概念分布迁移问题，SFT 解决交互行为与任务指令遵循问题，两者不可相互替代；当专业术语碎片率高、私有数据量级在十亿 Token 以上时，CPT 是跨越领域鸿沟的必经之路。</p>
+
+    <h2>2. 领域语料配比机制与灾难性遗忘防御</h2>
+    <p>在通用预训练完成的模型上直接用 100% 的纯领域语料进行持续梯度下降，会瞬间触发毁灭性的<span class="term">灾难性遗忘（Catastrophic Forgetting）</span>。具体表现为：经过数千步金融文本训练后，模型的金融术语理解力提升，但通用的代码生成、数学推导、多语言理解与逻辑反思能力迅速暴跌，甚至彻底丧失连贯的多轮对话能力。</p>
+
+    <p>遗忘的本质机理在于神经网络权重的参数漂移。预训练模型在流形空间中找到的最优解处于一个深而宽的平坦极小值凹地中。当且仅当数据分布剧烈向局部领域偏移时，损失函数的梯度向量方向将与通用知识梯度的零空间正交，强行拉扯权重向领域极值点迁移，破坏了原先维持通用推理能力的浅层与深层特征注意力模式。</p>
+
+    <p>工业界解决该问题的基石方法是<strong>经验回放（Experience Replay）混合数据配比</strong>。多项经典工作（如 BloombergGPT、BioNeMo、Llama 3 持续微调报告）证实：领域文本与通用语料的严格混合配比是保持通用基座生命力的唯一稳健手段。当前公认的黄金经验配比如下：</p>
+    <ul>
+      <li><strong>领域核心专业语料（60% ~ 70%）</strong>：经过高标准清洗、去重与语料分级的专业书籍、论文、研报、合同、行业标准与领域高质量代码。</li>
+      <li><strong>通用文本重放（20% ~ 25%）</strong>：从高质量通用预训练集（如 Common Crawl 优质清洗集、Wikipedia、教科书）中均匀抽取的文本，用于锚定模型的常识世界观与语言流畅度。</li>
+      <li><strong>通用代码与数学语料（5% ~ 10%）</strong>：代码与数学是维持大语言模型复杂逻辑推理与分步思考（Chain of Thought）骨架的“钙质”，必须强制回放，否则模型的推理能力将最先瓦解。</li>
+    </ul>
+
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：以为通用回放“稀释”了领域知识</div>
+      <p>初学者常误以为混入 30% 的通用语料会拖慢领域学习效率。实际评测数据显示，加入通用与代码回放的模型，其领域下游任务评测指标往往比纯领域训练模型<strong>高出 3%~8%</strong>。原因在于高推理密度的代码语料激活了模型的全局注意力机制与中间层解耦能力，极大提升了模型消化吸收复杂领域长逻辑的“理解力”。</p>
+    </div>
+
+    <p>除了静态配比混合，工程上常用的高级防遗忘技术还包括：</p>
+    <ol>
+      <li><strong>权重衰减与正则约束（EWC 变体）</strong>：在损失函数中增加对基座关键权重的距离惩罚：
+      \[ \mathcal{L}(\theta) = \mathcal{L}_{\mathrm{domain}}(\theta) + \frac{\lambda}{2} \sum_{i} F_i (\theta_i - \theta_{0, i})^2 \]
+      其中 \( F_i \) 为基座模型通用数据上的 Fisher 信息矩阵对角元素，对通用任务高敏感的参数施加极高位移惩罚。</li>
+      <li><strong>梯度投影（Gradient Projection）</strong>：计算领域梯度在通用基准梯度负方向上的投影并将其剔除，强制梯度更新仅发生在对通用能力无害的正交子空间中。</li>
+    </ol>
+    <p><strong>本节小结：</strong>领域继续预训练必须坚持“7:3 混合配制法则”，严禁全量纯领域单向训练；必须按比例强制回放通用文本与代码数学语料以锚定推理能力。</p>
+
+    <h2>3. 学习率退火策略与优化动态（Cosine with Min-LR）</h2>
+    <p>预训练模型往往在数万亿 Token 训练的尾声已经完成了学习率的衰减退火，其权重处于梯度范数非常小的局部稳态。此时若直接接入高学习率，会导致预训练特征表示产生剧烈的“冷启动地震”（Shock effect）；若使用极低学习率，则模型在有限算力时间内根本无法跨越鞍点学习新知识。</p>
+
+    <p>因此，CPT 必须采用独立的二次退火调度策略。工业界验证最成熟的优化器配方为 <strong>Cosine Annealing with Warmup & Min-LR</strong>，如图 17-2 所示。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="学习率二次退火与调度动态曲线">
+        <!-- 坐标轴 -->
+        <line x1="60" y1="200" x2="680" y2="200" stroke="#64748b" stroke-width="2"/>
+        <line x1="60" y1="200" x2="60" y2="30" stroke="#64748b" stroke-width="2"/>
+        <text x="680" y="225" font-size="13" fill="#64748b">训练步数 (Steps)</text>
+        <text x="25" y="30" font-size="13" fill="#64748b">学习率 \(\eta\)</text>
+
+        <!-- 刻度线与标注 -->
+        <line x1="140" y1="200" x2="140" y2="205" stroke="#64748b" stroke-width="1"/>
+        <text x="140" y="220" text-anchor="middle" font-size="12" fill="#64748b">Warmup 结束</text>
+        <line x1="640" y1="200" x2="640" y2="205" stroke="#64748b" stroke-width="1"/>
+        <text x="640" y="220" text-anchor="middle" font-size="12" fill="#64748b">CPT 终点</text>
+
+        <!-- 曲线 -->
+        <!-- 预热阶段: (60,190) -> (140, 50) -->
+        <path d="M 60 190 L 140 50" stroke="#2563eb" stroke-width="3" fill="none"/>
+        <!-- 余弦退火: (140,50) -> (640, 165) -->
+        <path d="M 140 50 C 260 55, 420 120, 640 165" stroke="#2563eb" stroke-width="3" fill="none"/>
+
+        <!-- 阈值水平虚线 -->
+        <line x1="60" y1="50" x2="640" y2="50" stroke="#ef4444" stroke-dasharray="4 4" stroke-width="1.5"/>
+        <text x="150" y="45" font-size="12" fill="#ef4444">\(\eta_{\max}\) (通常为预训练峰值的 10%~30%，如 3e-5 ~ 1e-4)</text>
+
+        <line x1="60" y1="165" x2="640" y2="165" stroke="#10b981" stroke-dasharray="4 4" stroke-width="1.5"/>
+        <text x="450" y="160" font-size="12" fill="#10b981">\(\eta_{\min}\) (设为 \(\eta_{\max}\) 的 10%，如 3e-6 ~ 1e-5)</text>
+
+        <!-- 注解点 -->
+        <circle cx="140" cy="50" r="5" fill="#f59e0b"/>
+        <text x="150" y="75" font-size="12" fill="#b45309">线性预热 1%~3% 步数</text>
+      </svg>
+      <figcaption>图 17-2：领域继续预训练（CPT）专属余弦退火调度曲线（含 Min-LR 保底与平缓 Warmup）</figcaption>
+    </figure>
+
+    <p>学习率调度的解析表达式可完整写为：</p>
+    \[ \eta(t) = \begin{cases}
+    \eta_{\min} + \frac{t}{T_{\mathrm{warmup}}} (\eta_{\max} - \eta_{\min}), & 0 \le t < T_{\mathrm{warmup}} \\
+    \eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min}) \left(1 + \cos\left(\frac{t - T_{\mathrm{warmup}}}{T_{\mathrm{total}} - T_{\mathrm{warmup}}} \pi\right)\right), & T_{\mathrm{warmup}} \le t \le T_{\mathrm{total}}
+    \end{cases} \]
+
+    <p>在实际设置时，必须牢记三大数值定律：</p>
+    <ol>
+      <li><strong>峰值学习率 \(\eta_{\max}\) 绝对数值压缩</strong>：其值绝不可使用原基座预训练的峰值（如 3e-4）。对于 7B/8B 模型，CPT 的峰值学习率严格锁定在 <code>3e-5 ~ 8e-5</code>；对于 70B 模型，严格锁定在 <code>1e-5 ~ 3e-5</code>。过大会导致注意力头崩溃输出乱码，过小则在 50B Token 跑完时 loss 几乎纹丝不动。</li>
+      <li><strong>保底学习率 \(\eta_{\min}\) 绝不设为 0</strong>：保持在峰值的 10% 左右。若学习率退火至 0，优化器在后期步数将彻底丧失参数重构能力。</li>
+      <li><strong>梯度范数裁剪（Gradient Clipping）严格控制</strong>：设为 <code>1.0</code>。由于私有文档偶现特殊未清洗字符或畸形超长表格，极易在反向传播时产生局部巨额梯度，裁剪是保护全局权重的防火墙。</li>
+    </ol>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>参数名称</th>
+            <th>7B ~ 8B 模型推荐值</th>
+            <th>13B ~ 14B 模型推荐值</th>
+            <th>70B 模型推荐值</th>
+            <th>工程含义与调优指导</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>峰值学习率 \(\eta_{\max}\)</td>
+            <td>5e-5 ~ 8e-5</td>
+            <td>3e-5 ~ 5e-5</td>
+            <td>1.5e-5 ~ 2.5e-5</td>
+            <td>防止冲垮预训练流形，规模越大越需保守</td>
+          </tr>
+          <tr>
+            <td>保底学习率 \(\eta_{\min}\)</td>
+            <td>5e-6</td>
+            <td>3e-6</td>
+            <td>1.5e-6</td>
+            <td>锁定为峰值的 10%，维持后期持续更新活力</td>
+          </tr>
+          <tr>
+            <td>预热步数比例</td>
+            <td>1.5% ~ 2% 总步数</td>
+            <td>2% 总步数</td>
+            <td>2% ~ 3% 总步数</td>
+            <td>消除 Adam 动量统计量初期的剧烈方差震荡</td>
+          </tr>
+          <tr>
+            <td>Weight Decay</td>
+            <td>0.1</td>
+            <td>0.1</td>
+            <td>0.1</td>
+            <td>对大模型权重施加泛化正则化约束</td>
+          </tr>
+          <tr>
+            <td>全局 Batch Size</td>
+            <td>2M ~ 4M Token</td>
+            <td>4M Token</td>
+            <td>4M ~ 8M Token</td>
+            <td>保证因果注意力统计量的梯度信噪比</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 17-2：不同参数体量大模型领域继续预训练典型优化超参数基准表</span>
+    </div>
+    <p><strong>本节小结：</strong>CPT 的学习率峰值应压缩为基座预训练的 10%~20%，配以 1%~2% 的 Warmup 与余弦退火，保底 Min-LR 设定在峰值的 10%，以实现平稳吸纳知识与防止数值震荡。</p>
+
+    <h2>4. 领域词表扩充：从 SentencePiece 训练到 Embedding 投影对齐</h2>
+    <p>英文主导的通用基座模型（如 Llama 2）在中文或垂类代码环境下的致命缺陷是：通用分词器没有专有的领域词汇。例如遇到专业医疗名词“右美托咪定”，通用 Tokenizer 可能会将其粉碎为 5 到 7 个冷僻的单字或字节碎片（Byte Fallback）。</p>
+    <p>高碎片率带来三维打击：<strong>一是有效上下文压缩率腰斩</strong>（原可容纳 4096 词的窗口实际只能容纳 1500 词）；<strong>二是计算吞吐量剧降</strong>；<strong>三是语义注意力破碎</strong>，模型必须耗费高层注意力去重新拼装字符，直接导致专业实体理解推理能力退化。因此，在 CPT 前扩充领域专用词表（Vocabulary Expansion）是极其关键的前置步骤。</p>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：什么时候需要扩充词表？</div>
+      <p>在你的领域清洗文本中随机抽取 100 万字，计算压缩率：\(\text{Compression Ratio} = \frac{\text{Token 数}}{\text{字符数}}\)。若中文领域的压缩比超过 <code>1.5</code>，或特定专业词汇高频被拆散，扩充 8,000 ~ 20,000 个专业词汇将带来显著的下游收益；若基础分词器如 Qwen2 拥有 150K 超大词表且中文压缩比已在 <code>0.6~0.7</code>，则无需承担扩充词表带来的参数对齐开销。</p>
+    </div>
+
+    <p>词表扩充的技术全流程包含三步：</p>
+    <ol>
+      <li>使用 <code>sentencepiece</code> 在纯领域无标注语料上训练一个新的 Byte-Pair Encoding (BPE) 分词模型，设定新增词表大小（如 10,000）；</li>
+      <li>将新词表与原基座分词器做并集操作，剔除冲突特殊字符，构建合并后的新分词模型；</li>
+      <li>最核心的工程难点：<strong>如何初始化新增词汇对应的输入嵌入矩阵（Input Embedding）与输出分类头（Output LM Head）权重</strong>。</li>
+    </ol>
+    <p>直接随机初始化（如高斯分布）是灾难性的。随机初始化的新增 Token 嵌入向量在初期前向传播时会输出巨大的范数差异，破坏原有自注意力层的方差平衡，引发梯度爆炸。科学的做法包括两种：<strong>局部均值初始化（Mean Initialization）</strong>与<strong>基于已有子词拆分加权对齐（Subword Compositional Projection）</strong>。代码清单 17-1 演示了完整的词表合并与嵌入权重均值投影工程实现。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">expand_vocab_and_align_embeddings.py</span>
+      <pre class="code"><code class="language-python">import os
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import sentencepiece as spm
+from sentencepiece import sentencepiece_model_pb2 as sp_pb2_model
+
+def train_domain_spm(domain_corpus_path: str, model_prefix: str, vocab_size: int = 10000):
+    """使用 SentencePiece 训练领域专有 BPE 词表"""
+    spm.SentencePieceTrainer.train(
+        input=domain_corpus_path,
+        model_prefix=model_prefix,
+        vocab_size=vocab_size,
+        model_type="bpe",
+        character_coverage=0.9995,
+        byte_fallback=True,
+        split_digits=True,
+        max_sentence_length=16384,
+        num_threads=16
+    )
+    print(f"领域 SentencePiece 词表训练完成：{model_prefix}.model")
+
+def merge_and_initialize_embeddings(
+    base_model_path: str,
+    domain_sp_model_path: str,
+    output_dir: str
+):
+    """合并词表并对新增 Token 的 Embedding / LM Head 执行语义对齐初始化"""
+    # 1. 加载基座 Tokenizer 与模型
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=False)
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="cpu"
+    )
+
+    orig_vocab_size = len(tokenizer)
+    print(f"基座分词器原始词表大小: {orig_vocab_size}")
+
+    # 2. 读取领域 SPM 词表
+    sp_model = sp_pb2_model.ModelProto()
+    with open(domain_sp_model_path, "rb") as f:
+        sp_model.ParseFromString(f.read())
+    
+    domain_tokens = [piece.piece for piece in sp_model.pieces]
+    
+    # 3. 提取非重叠新增 Token
+    new_tokens = []
+    for token in domain_tokens:
+        if token not in tokenizer.get_vocab():
+            new_tokens.append(token)
+    
+    print(f"发现新领域 Token 数量: {len(new_tokens)}")
+    
+    # 4. 向分词器添加新词并调整模型嵌入矩阵维度
+    num_added = tokenizer.add_tokens(new_tokens)
+    print(f"成功向分词器写入 Token 数量: {num_added}")
+    new_vocab_size = len(tokenizer)
+    
+    # 备份旧权重
+    old_input_embeds = model.get_input_embeddings().weight.data
+    old_output_embeds = model.get_output_embeddings().weight.data
+    hidden_dim = old_input_embeds.shape[1]
+
+    # 调整模型词表维度（自动补全至新大小）
+    model.resize_token_embeddings(new_vocab_size)
+    
+    # 5. 权重科学初始化：均值回退策略
+    # 对于每个新增词，如果它能被原分词器拆为子词，则用其子词 Embedding 的平均值赋初值；
+    # 否则使用旧全量词表嵌入向量的全局均值与噪声。
+    global_mean = old_input_embeds.mean(dim=0)
+    global_std = old_input_embeds.std(dim=0) * 0.1
+    
+    new_input_embeds = model.get_input_embeddings().weight.data
+    new_output_embeds = model.get_output_embeddings().weight.data
+
+    with torch.no_grad():
+        for token in new_tokens:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            # 用原基座分词器尝试切词（必须用原始词表）
+            sub_ids = tokenizer.encode(token, add_special_tokens=False)
+            # 过滤掉刚分配给该 token 自身的 id（避免自循环引用）
+            valid_sub_ids = [sid for sid in sub_ids if sid &lt; orig_vocab_size]
+
+            if len(valid_sub_ids) &gt; 0:
+                # 语义合成：取子词向量的均值
+                avg_sub_in = old_input_embeds[valid_sub_ids].mean(dim=0)
+                avg_sub_out = old_output_embeds[valid_sub_ids].mean(dim=0)
+                new_input_embeds[token_id] = avg_sub_in
+                new_output_embeds[token_id] = avg_sub_out
+            else:
+                # 兜底：全局高斯均值微扰
+                noise = torch.randn(hidden_dim, dtype=torch.bfloat16) * global_std
+                new_input_embeds[token_id] = global_mean + noise
+                new_output_embeds[token_id] = global_mean + noise
+
+    print("新增词汇 Embedding 与 LM-Head 初始化对齐完成。")
+    # 保存扩充后的模型与分词器
+    os.makedirs(output_dir, exist_ok=True)
+    tokenizer.save_pretrained(output_dir)
+    model.save_pretrained(output_dir)
+    print(f"新模型与分词器成功持久化至: {output_dir}")
+
+if __name__ == "__main__":
+    # 示例调用
+    # train_domain_spm("data/medical_corpus.txt", "medical_sp")
+    # merge_and_initialize_embeddings("meta-llama/Llama-2-7b-hf", "medical_sp.model", "models/llama-2-7b-medical-base")
+    pass
+</code></pre>
+    </div>
+    <p><strong>本节小结：</strong>词表扩充能够显著提升领域分词压缩率与推理吞吐；新增 Token 的嵌入向量严禁纯随机填充，必须利用原始分词器子词分解的均值初始化，以避免前向数值方差失衡。</p>
+
+    <h2>5. 长上下文能力扩展：RoPE 线性缩放、NTK-aware 与 YaRN 数学推导与实现</h2>
+    <p>在金融研报拆解、司法卷宗审查、长篇病历追踪等垂直业务中，模型的上下文处理长度往往需要从默认的 4K/8K 暴力扩展至 32K、64K 乃至 128K。然而，由于主流大模型普遍采用<span class="term">旋转位置编码（Rotary Position Embedding, RoPE）</span>，模型对未在预训练中见过的位置索引 \( m > L_{\mathrm{train}} \) 具有灾难性的外推崩溃（Perplexity 骤升至无穷大）。</p>
+
+    <h3>5.1 RoPE 的数学基础回顾</h3>
+    <p>给定位置 \( m \) 处的二维切片查询向量 \( \mathbf{q}_m \)，RoPE 通过正交旋转矩阵将其旋转：</p>
+    \[ \mathbf{q}_m = \mathbf{R}_{\Theta, m}^d \mathbf{q}, \quad \mathbf{R}_{\Theta, m}^d = \begin{pmatrix} \cos(m\theta_i) & -\sin(m\theta_i) \\ \sin(m\theta_i) & \cos(m\theta_i) \end{pmatrix}, \quad \theta_i = b^{-2(i-1)/d} \]
+    <p>其中基底常数 \( b \) 默认通常为 10,000（或在较新模型如 Llama 3 中设为 500,000），\( d \) 为注意力头的维度。此时内积仅依赖相对距离：</p>
+    \[ \langle \mathbf{q}_m, \mathbf{k}_n \rangle = \mathbf{q}^T \mathbf{R}_{\Theta, n-m}^d \mathbf{k} \]
+
+    <h3>5.2 线性内插（Linear Position Interpolation）</h3>
+    <p>直接外推（Extrapolation）测试失败的原因在于高频旋转维度的相对角度跨越了预训练未曾见过的取值区间。Chen et al. (2023) 提出将位置索引线性缩放因子 \( s = L_{\mathrm{target}} / L_{\mathrm{train}} > 1 \)：</p>
+    \[ m' = \frac{m}{s} \]
+    <p>此时将长文本的所有位置压缩映射回原始的 \([0, L_{\mathrm{train}}]\) 范围内。这是典型的<strong>内插（Interpolation）</strong>思路。然而线性缩放的硬伤在于：它对所有频率维度采用相同的缩放系数 \( s \)，导致极高频维度的波长变得极其紧凑，严重损伤了模型对紧邻局域 Token 的精细高频分辨力，需要大量步数的继续微调才能缓慢恢复。</p>
+
+    <h3>5.3 NTK-aware 缩放</h3>
+    <p>神经正切核（Neural Tangent Kernel, NTK）理论指出，深度网络学习高频分量的速度远快于低频分量。为了在扩展长上下文时既不丢失局域高频信息，又能拉长低频以实现长程距离分辨，开源社区与学术界提出了 NTK-aware 缩放：</p>
+    <p>保持位置索引 \( m \) 不变，而是动态缩放 RoPE 的基底常数 \( b \)。定义新的基底 \( b' \)：</p>
+    \[ b' = b \cdot s^{\frac{d}{d-2}} \]
+    <p>将 \( b' \) 代入原旋转角计算：最低频维度（\( i = d/2 \)）实现了完美的 \( 1/s \) 线性内插缩放，而最高频维度（\( i = 1 \)）的旋转角变化趋近于 0，几乎完全保持了原始的高频局域几何结构！NTK-aware 使得模型甚至在<strong>无需微调（Zero-shot）</strong>的情况下，即可将上下文窗口外推 2~4 倍且困惑度不爆炸。</p>
+
+    <h3>5.4 YaRN（Yet another RoPE extensioN）综合架构</h3>
+    <p>YaRN (Peng et al., 2023) 是当前长上下文扩展最先进、表现最优雅的 RoPE 修正方案。它将频域分为三个截断区间，并针对内插后注意力熵的增加引入了温度系数校正：</p>
+    <p>定义波长 \( \lambda_i = 2\pi / \theta_i \)。根据波长与原始上下文长度 \( L \) 的比值引入斜坡平滑函数 \( \gamma(r) \)：</p>
+    \[ \gamma(r_i) = \begin{cases}
+    0, & r_i < \alpha \\
+    \frac{r_i - \alpha}{\beta - \alpha}, & \alpha \le r_i \le \beta \\
+    1, & r_i > \beta
+    \end{cases} \]
+    <p>其中对高频维度（小波长）保持纯外推（不缩放），对低频维度（大波长）执行纯内插缩放，中间过渡带平滑插值。同时，YaRN 针对注意力分布的均匀化弥散引入了非线性温度除数：在 Softmax 前将注意力 logits 缩放乘以 \( \sqrt{1/t} \)，其中 \( t \approx 0.1 \ln(s) + 1 \)。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RoPE 频率空间插值机理对比">
+        <rect x="20" y="20" width="680" height="240" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1"/>
+        <text x="360" y="45" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">RoPE 频域扩展机理：线性内插 vs NTK-aware / YaRN</text>
+
+        <!-- 高频区域 -->
+        <rect x="60" y="70" width="180" height="120" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="150" y="95" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a">高频维度 (低通道 i)</text>
+        <text x="150" y="118" text-anchor="middle" font-size="12" fill="#3b82f6">波长极短，表征局部相对位置</text>
+        <text x="150" y="145" text-anchor="middle" font-size="12" fill="#ef4444">线性内插: 暴力压缩 1/s (损伤分辨率)</text>
+        <text x="150" y="170" text-anchor="middle" font-size="12" fill="#10b981">YaRN: 纯外推 (保持 1.0 原频不变)</text>
+
+        <!-- 中频过渡区域 -->
+        <rect x="270" y="70" width="180" height="120" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="360" y="95" text-anchor="middle" font-size="14" font-weight="bold" fill="#92400e">中频过渡带</text>
+        <text x="360" y="118" text-anchor="middle" font-size="12" fill="#d97706">临界过渡波长</text>
+        <text x="360" y="155" text-anchor="middle" font-size="13" fill="#b45309">平滑斜坡线性混合</text>
+        <text x="360" y="175" text-anchor="middle" font-size="12" fill="#475569">避免频域截断高频吉布斯震荡</text>
+
+        <!-- 低频区域 -->
+        <rect x="480" y="70" width="180" height="120" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="570" y="95" text-anchor="middle" font-size="14" font-weight="bold" fill="#065f46">低频维度 (高通道 i)</text>
+        <text x="570" y="118" text-anchor="middle" font-size="12" fill="#059669">波长超长，表征宏观全局位移</text>
+        <text x="570" y="145" text-anchor="middle" font-size="12" fill="#10b981">YaRN: 线性内插缩放 1/s</text>
+        <text x="570" y="170" text-anchor="middle" font-size="12" fill="#1e293b">平滑拉伸避免跨越未知相对相位</text>
+
+        <text x="360" y="225" text-anchor="middle" font-size="13" fill="#64748b">结合注意力 Softmax 熵补偿系数 \(\sqrt{1/t}\)，彻底解决长文本注意力弥散退化问题</text>
+      </svg>
+      <figcaption>图 17-3：RoPE 长上下文频域扩展机理（高频外推保局部精度，低频内插保全局秩序，YaRN 平滑混合）</figcaption>
+    </figure>
+
+    <div class="code-wrap">
+      <span class="code-label">yarn_rope_implementation.py</span>
+      <pre class="code"><code class="language-python">import math
+import torch
+import torch.nn as nn
+
+class YaRNScaledRotaryEmbedding(nn.Module):
+    """
+    YaRN (Yet another RoPE extensioN) 位置编码 PyTorch 生产级实现
+    论文来源: Peng et al., 2023 (arXiv:2309.00071)
+    """
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 2048,
+        base: float = 10000.0,
+        scale: float = 4.0,           # 扩展倍率，如 2048 -> 8192 则为 4.0
+        original_max_position: int = 2048,
+        extrapolation_factor: float = 1.0,
+        attn_factor: float = 1.0,
+        beta_fast: float = 32.0,
+        beta_slow: float = 1.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.scale = scale
+        self.original_max_position = original_max_position
+        self.extrapolation_factor = extrapolation_factor
+        self.attn_factor = attn_factor
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+
+        self._set_cos_sin_cache()
+
+    def _set_cos_sin_cache(self):
+        # 1. 计算原始频率
+        pos = torch.arange(0, self.dim, 2, dtype=torch.float32)
+        inv_freq = 1.0 / (self.base ** (pos / self.dim))
+
+        # 2. 计算每个维度的波长 (Wavelength)
+        wavelength = 2.0 * math.pi / inv_freq
+
+        # 3. 计算斜坡过渡因子
+        low_bound = self.original_max_position / self.beta_fast
+        high_bound = self.original_max_position / self.beta_slow
+
+        # 线性斜坡映射
+        ramp = (wavelength - low_bound) / (high_bound - low_bound)
+        ramp = torch.clamp(ramp, 0.0, 1.0)
+
+        # 4. 混合频率：高频纯外推（不除以 scale），低频线性内插（除以 scale）
+        inv_freq_interpolated = inv_freq / self.scale
+        inv_freq_final = (1.0 - ramp) * inv_freq + ramp * inv_freq_interpolated
+        self.register_buffer("inv_freq", inv_freq_final, persistent=False)
+
+        # 5. YaRN 温度缩放系数：纠正注意力熵弥散
+        if self.scale &gt; 1.0:
+            self.mscale = 0.1 * math.log(self.scale) + 1.0
+        else:
+            self.mscale = 1.0
+
+    def forward(self, x: torch.Tensor, seq_len: int):
+        """
+        x: [batch, num_heads, seq_len, head_dim]
+        返回与 x 形状匹配的 cos, sin
+        """
+        t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        # 施加注意力温度修正系数
+        cos = emb.cos() * self.mscale
+        sin = emb.sin() * self.mscale
+        return cos.to(x.dtype), sin.to(x.dtype)
+</code></pre>
+    </div>
+    <p><strong>本节小结：</strong>单纯的线性内插会破坏局部高频精度，而 NTK-aware 与 YaRN 通过“高频保真外推、低频平滑内插、注意力熵补正”，是大模型低算力扩展 32K~128K 上下文的首选算法。</p>
+
+    <h2>6. 生产级领域继续预训练实战：DeepSpeed ZeRO-3 分布式脚本</h2>
+    <p>在数十亿 Token 的 CPT 实战中，全参数更新一个 7B 或 70B 模型对显存架构提出了极高要求。我们必须使用 DeepSpeed ZeRO-3（零冗余优化器第三阶段），将优化器状态、梯度以及模型参数完全切片分散至集群各显卡中，配合 FlashAttention-2 与梯度检查点技术（Gradient Checkpointing），实现千亿 Token 的高吞吐稳定训练。</p>
+
+    <p>图 17-4 呈现了 ZeRO-3 状态切分与分布式数据并行的流水线拓扑。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DeepSpeed ZeRO-3 分布式状态切分拓扑">
+        <rect x="20" y="20" width="680" height="180" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="360" y="45" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e3a8a">DeepSpeed ZeRO-3：多卡显存均摊切分拓扑架构</text>
+
+        <!-- 卡 0 -->
+        <rect x="40" y="65" width="140" height="115" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="110" y="88" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e293b">GPU 0</text>
+        <rect x="50" y="98" width="120" height="22" fill="#eff6ff" stroke="#3b82f6"/>
+        <text x="110" y="114" text-anchor="middle" font-size="11" fill="#1d4ed8">1/N 优化器状态</text>
+        <rect x="50" y="123" width="120" height="22" fill="#ecfdf5" stroke="#10b981"/>
+        <text x="110" y="139" text-anchor="middle" font-size="11" fill="#047857">1/N 梯度 (Gradients)</text>
+        <rect x="50" y="148" width="120" height="22" fill="#fffbeb" stroke="#f59e0b"/>
+        <text x="110" y="164" text-anchor="middle" font-size="11" fill="#b45309">1/N 模型参数 (Weights)</text>
+
+        <!-- 卡 1 -->
+        <rect x="205" y="65" width="140" height="115" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="275" y="88" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e293b">GPU 1</text>
+        <rect x="215" y="98" width="120" height="22" fill="#eff6ff" stroke="#3b82f6"/>
+        <text x="275" y="114" text-anchor="middle" font-size="11" fill="#1d4ed8">1/N 优化器状态</text>
+        <rect x="215" y="123" width="120" height="22" fill="#ecfdf5" stroke="#10b981"/>
+        <text x="275" y="139" text-anchor="middle" font-size="11" fill="#047857">1/N 梯度 (Gradients)</text>
+        <rect x="215" y="148" width="120" height="22" fill="#fffbeb" stroke="#f59e0b"/>
+        <text x="275" y="164" text-anchor="middle" font-size="11" fill="#b45309">1/N 模型参数 (Weights)</text>
+
+        <!-- 卡 2 ... 卡 N-1 -->
+        <rect x="370" y="65" width="140" height="115" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="440" y="88" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e293b">GPU 2</text>
+        <rect x="380" y="98" width="120" height="22" fill="#eff6ff" stroke="#3b82f6"/>
+        <text x="440" y="114" text-anchor="middle" font-size="11" fill="#1d4ed8">1/N 优化器状态</text>
+        <rect x="380" y="123" width="120" height="22" fill="#ecfdf5" stroke="#10b981"/>
+        <text x="440" y="139" text-anchor="middle" font-size="11" fill="#047857">1/N 梯度 (Gradients)</text>
+        <rect x="380" y="148" width="120" height="22" fill="#fffbeb" stroke="#f59e0b"/>
+        <text x="440" y="164" text-anchor="middle" font-size="11" fill="#b45309">1/N 模型参数 (Weights)</text>
+
+        <rect x="535" y="65" width="145" height="115" rx="6" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="607" y="88" text-anchor="middle" font-size="14" font-weight="bold" fill="#5b21b6">通信与动态重构</text>
+        <text x="607" y="115" text-anchor="middle" font-size="12" fill="#6d28d9">前向: AllGather 收集</text>
+        <text x="607" y="138" text-anchor="middle" font-size="12" fill="#6d28d9">反向: ReduceScatter</text>
+        <text x="607" y="160" text-anchor="middle" font-size="11" fill="#7c3aed">计算完毕立即释放全量</text>
+      </svg>
+      <figcaption>图 17-4：DeepSpeed ZeRO-3 分布式训练显存切片与通信机制（前向动态拉取，反向聚合分散）</figcaption>
+    </figure>
+
+    <p>代码清单 17-2 展示了标准的生产级预训练脚本，整合了混合精度、ZeRO-3 JSON 编排以及 HuggingFace Trainer 的流式分块预处理。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">run_cpt_zero3.py</span>
+      <pre class="code"><code class="language-python">import os
+import math
+from dataclasses import dataclass, field
+from typing import Optional
+import torch
+from datasets import load_dataset
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Trainer,
+    TrainingArguments,
+    default_data_collator
+)
+
+# 领域 CPT 专用 DeepSpeed ZeRO-3 配置字典
+ds_zero3_config = {
+    "fp16": {"enabled": False},
+    "bf16": {"enabled": True},
+    "zero_optimization": {
+        "stage": 3,
+        "overlap_comm": True,
+        "contiguous_gradients": True,
+        "sub_group_size": 1e9,
+        "reduce_bucket_size": "auto",
+        "stage3_prefetch_bucket_size": "auto",
+        "stage3_param_persistence_threshold": "auto",
+        "stage3_max_live_parameters": 1e9,
+        "stage3_max_reuse_distance": 1e9,
+        "stage3_gather_16bit_weights_on_model_save": True
+    },
+    "gradient_clipping": 1.0,
+    "train_batch_size": "auto",
+    "train_micro_batch_size_per_gpu": "auto",
+    "gradient_accumulation_steps": "auto"
+}
+
+def main():
+    model_name_or_path = "models/llama-3-8b-domain-aligned"
+    data_file = "data/domain_train_7_3_mixture.jsonl"
+    output_dir = "checkpoints/llama-3-8b-cpt-final"
+    block_size = 4096  # 预训练长文档打包切片长度
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # 1. 载入模型配置并开启 FlashAttention-2 与 RoPE 扩展配置
+    config = AutoConfig.from_pretrained(model_name_or_path)
+    config._attn_implementation = "flash_attention_2"
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        config=config,
+        torch_dtype=torch.bfloat16
+    )
+    # 强制开启梯度检查点以大幅节省显存
+    model.gradient_checkpointing_enable()
+
+    # 2. 高效分块加载与流式 Packing 处理
+    raw_dataset = load_dataset("json", data_files=data_file, split="train")
+
+    def tokenize_and_group(examples):
+        # 将无标注连续文本按 block_size 进行紧凑打包（Packing），无缝填满上下文
+        concatenated_ids = []
+        for text in examples["text"]:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            concatenated_ids.extend(ids + [tokenizer.eos_token_id])
+        
+        total_length = len(concatenated_ids)
+        # 整除截断
+        total_length = (total_length // block_size) * block_size
+        
+        result = {
+            "input_ids": [concatenated_ids[i : i + block_size] for i in range(0, total_length, block_size)]
+        }
+        # 因果语言建模的 labels 即为 input_ids 本身
+        result["labels"] = [x[:] for x in result["input_ids"]]
+        return result
+
+    packed_dataset = raw_dataset.map(
+        tokenize_and_group,
+        batched=True,
+        batch_size=1000,
+        remove_columns=raw_dataset.column_names,
+        desc=f"Grouping texts in chunks of {block_size}"
+    )
+
+    # 3. 训练超参数定义
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        overwrite_output_dir=True,
+        do_train=True,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=16,   # 全局 batch size = 2 * 16 * 8 GPUs * 4096 = 1M Tokens
+        learning_rate=5e-5,               # CPT 经典峰值学习率
+        weight_decay=0.1,
+        max_grad_norm=1.0,
+        num_train_epochs=1,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.02,
+        logging_steps=10,
+        save_strategy="steps",
+        save_steps=200,
+        save_total_limit=3,
+        bf16=True,
+        deepspeed=ds_zero3_config,
+        dataloader_num_workers=4,
+        report_to="none"
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=packed_dataset,
+        tokenizer=tokenizer,
+        data_collator=default_data_collator,
+    )
+
+    print("开始 DeepSpeed ZeRO-3 领域继续预训练...")
+    train_result = trainer.train()
+    trainer.save_model(output_dir)
+    print("CPT 训练完毕，模型已持久化保存。")
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+    </div>
+    <p><strong>本节小结：</strong>采用 <code>Packing</code> 拼接机制能够彻底消除 Padding Token 对因果注意力的浪费；配合 ZeRO-3 分布式状态切片与 FlashAttention-2，能将单卡显存开销降至最低，支撑千亿级高吞吐运算。</p>
+
+    <h2>7. 领域适配评测体系：困惑度、专有基准与防退化监控</h2>
+    <p>如何科学衡量一次 CPT 的成败？初学者往往只看下游任务的最终问答准确率。然而，后训练评测必须构建<strong>三位一体的立体金字塔评测矩阵</strong>：底层评测困惑度收敛，中层评测专业基准客观题，顶层实施通用能力防退化红线监控。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>评测层级</th>
+            <th>监控核心指标</th>
+            <th>测试数据集</th>
+            <th>判定合格基准线</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>底层：无监督表征密度</td>
+            <td>领域验证集困惑度（Perplexity, PPL）</td>
+            <td>未见行业研报、医学教科书测试切片（100M Token）</td>
+            <td>PPL 持续下降且相比基座下降 25%~40%</td>
+          </tr>
+          <tr>
+            <td>中层：领域专业客观题</td>
+            <td>Zero-shot / Few-shot 准确率（Accuracy）</td>
+            <td>C-Eval / MedQA / FinQA / 司法资格考题</td>
+            <td>单选/多选题 Accuracy 提升 10%~25%</td>
+          </tr>
+          <tr>
+            <td>顶层：通用防退化红线</td>
+            <td>通用常识、代码能力与多语言得分</td>
+            <td>MMLU / GSM8K / HumanEval / HellaSwag</td>
+            <td>通用得分相比原基座<strong>下降不得超过 3%</strong></td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 17-3：领域模型三层立体评测体系指标矩阵</span>
+    </div>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：PPL 下降不等于下游任务能力提升</div>
+      <p>极其常见的一种翻车情况是：训练 loss 和测试集 PPL 极度漂亮地下降，但模型在实际业务问答上满嘴胡话。这是因为数据清洗时未剔除大量的重复模板（如研报的免责声明、页眉页脚、版权水印）。模型把极大的概率质量分配给了预测这些无意义的死板字符，导致整体困惑度大幅虚假下降。因此，PPL 只能作为收敛健康度的监控，绝不可作为最终模型质量的唯一验收指标。</p>
+    </div>
+
+    <p>代码清单 17-3 提供了用于在训练周期内自动化监控领域困惑度与通用防退化的轻量级评测脚本。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">eval_ppl_and_benchmarks.py</span>
+      <pre class="code"><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.utils.data import DataLoader
+from datasets import load_dataset
+import numpy as np
+
+def calculate_perplexity(model, tokenizer, test_file_path: str, max_length: int = 2048):
+    """计算模型在特定文本切片上的平均困惑度 PPL"""
+    model.eval()
+    dataset = load_dataset("text", data_files={"test": test_file_path})["test"]
+    
+    nlls = []
+    total_tokens = 0
+
+    with torch.no_grad():
+        for example in dataset:
+            text = example["text"].strip()
+            if not text:
+                continue
+            encodings = tokenizer(text, max_length=max_length, truncation=True, return_tensors="pt")
+            input_ids = encodings.input_ids.to(model.device)
+            target_ids = input_ids.clone()
+
+            outputs = model(input_ids, labels=target_ids)
+            neg_log_likelihood = outputs.loss * input_ids.size(1)
+            
+            nlls.append(neg_log_likelihood.item())
+            total_tokens += input_ids.size(1)
+
+    mean_nll = sum(nlls) / total_tokens
+    ppl = np.exp(mean_nll)
+    return ppl
+
+def run_evaluation_suite(base_model_path: str, cpt_model_path: str, domain_test_file: str):
+    """对比 CPT 前后模型的领域 PPL 下降率"""
+    tokenizer = AutoTokenizer.from_pretrained(cpt_model_path)
+    
+    print(f"正在加载基座模型: {base_model_path}")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    base_ppl = calculate_perplexity(base_model, tokenizer, domain_test_file)
+    del base_model
+    torch.cuda.empty_cache()
+
+    print(f"正在加载 CPT 模型: {cpt_model_path}")
+    cpt_model = AutoModelForCausalLM.from_pretrained(
+        cpt_model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    cpt_ppl = calculate_perplexity(cpt_model, tokenizer, domain_test_file)
+    del cpt_model
+    torch.cuda.empty_cache()
+
+    delta_pct = ((cpt_ppl - base_ppl) / base_ppl) * 100
+    print("=" * 50)
+    print(f"基座模型领域测试集 PPL: {base_ppl:.2f}")
+    print(f"CPT 模型领域测试集 PPL : {cpt_ppl:.2f}")
+    print(f"PPL 变化百分比: {delta_pct:.2f}% (合格线: 下降 25% 以上)")
+    print("=" * 50)
+
+if __name__ == "__main__":
+    # run_evaluation_suite("meta-llama/Llama-3-8B", "checkpoints/llama-3-8b-cpt-final", "data/medical_eval.txt")
+    pass
+</code></pre>
+    </div>
+    <p><strong>本节小结：</strong>领域评测必须横跨“PPL 隐式建模、专业知识客观题、通用常识防退化”三层防线；任何以牺牲 3% 以上通用能力为代价的领域特化，都属于不可持续的局部过拟合。</p>
+
+    <h2>8. 本章小结</h2>
+    <ul>
+      <li><strong>分工定位清晰</strong>：CPT 用于向权重深层注入数十亿至千亿 Token 的专业未见知识与实体结构；SFT 则聚焦于少量（数万条）高质量指令对齐与专家交互规范，不可本末倒置。</li>
+      <li><strong>防御遗忘配制</strong>：严格坚持 7:3 混合配比（70% 领域核心 + 20% 通用文本 + 10% 通用代码与数学），代码回放是守护高维逻辑推理骨架的关键。</li>
+      <li><strong>平稳学习率调度</strong>：采用 Cosine with Min-LR，峰值设为预训练阶段的 10%~20%（7B 模型 5e-5 左右），并保留 10% 的保底学习率以维持更新活性。</li>
+      <li><strong>扩词表语义对齐</strong>：对于中文或冷僻领域，扩充 SentencePiece 专用词表能够翻倍吞吐并增强实体语义密度；新增 Token 必须使用原始子词切分的局部均值初始化，防范方差冲击。</li>
+      <li><strong>长程位置外推</strong>：RoPE 在面对 32K+ 上下文时需引入 YaRN 机制，结合“高频保真外推、低频线性内插与注意力温度熵补正”，实现平滑的长上下文适配。</li>
+      <li><strong>工业级工程落地</strong>：依赖 DeepSpeed ZeRO-3 状态切分与 FlashAttention-2 达成高吞吐分布式预训练，并通过三层立体矩阵全天候监控防止通用能力退化。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：某团队在 7B 通用基座上直接使用 100% 纯法律文书继续预训练 50B Token，发现法律概念理解增强，但在 GSM8K 数学题与 Python 代码生成上的得分骤降了 40%。根本原因是什么？应该如何挽救？</summary>
+        <p><strong>答案：</strong>根本原因是触发了严重的<strong>灾难性遗忘（Catastrophic Forgetting）</strong>。单向分布偏移拉扯模型参数偏离了通用流形空间，破坏了原先维持复杂推理的注意力特征通路。挽救方案：重新构建训练数据集，采用严格的经验回放混合配方（如 65% 法律语料 + 25% 通用高质量文本 + 10% Python/数学推理代码），同时引入 1%~2% 的学习率 Warmup 与梯度裁剪，将峰值学习率压低至 5e-5 并配合 Cosine 退火。</p>
+      </details>
+      <details>
+        <summary>问题 2：为什么新增领域词表后，不能直接用标准正态分布随机初始化新 Token 的 Embedding 和 LM-Head 权重？</summary>
+        <p><strong>答案：</strong>随机初始化的嵌入向量与基座模型历经数十万步优化收敛的语义超球流形完全不兼容，在范数、方差和均值上存在巨大断层。在自注意力前向计算时，未对齐的随机高方差向量会输出异常畸变的分数，反向传播时产生巨大的局部梯度尖峰，直接摧毁相邻自注意力层和后续前馈网络的既有知识。因此必须使用原分词器对该新词进行子词切分，并用子词的嵌入向量均值赋予初值。</p>
+      </details>
+      <details>
+        <summary>问题 3：在 RoPE 旋转位置编码中，线性内插（Linear Interpolation）与 YaRN 相比，最核心的缺陷是什么？</summary>
+        <p><strong>答案：</strong>线性内插对所有频率维度简单粗暴地乘以恒定的压缩系数 \( 1/s \)。这导致原本波长很短的高频维度（负责刻画相邻 Token 之间的局域微观先后顺序）被过度压缩，严重损失了细粒度的相对位置分辨能力，且注意力分布容易弥散。而 YaRN 采取频域分治策略：高频维度保持原始频率纯外推以保留局部感知，低频维度进行内插以拉伸全局窗口，并在 Softmax 前施加温度因子修复注意力熵，兼顾了局部高频精度与全局长程建模。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Wu+, 2023]</span> Wu, S. et al. "BloombergGPT: A Large Language Model for Finance." <i>arXiv preprint</i>, 2023. <a href="https://arxiv.org/abs/2303.17564" target="_blank">arXiv:2303.17564</a></li>
+      <li><span class="rid">[Peng+, 2023]</span> Peng, B. et al. "YaRN: Efficient Context Window Extension of Large Language Models." <i>ICLR</i>, 2024. <a href="https://arxiv.org/abs/2309.00071" target="_blank">arXiv:2309.00071</a></li>
+      <li><span class="rid">[Chen+, 2023]</span> Chen, S. et al. "Extending Context Window of Large Language Models via Positional Interpolation." <i>arXiv preprint</i>, 2023. <a href="https://arxiv.org/abs/2306.15595" target="_blank">arXiv:2306.15595</a></li>
+      <li><span class="rid">[Su+, 2024]</span> Su, J. et al. "RoFormer: Enhanced Transformer with Rotary Position Embedding." <i>Neurocomputing</i>, 2024. <a href="https://arxiv.org/abs/2104.09864" target="_blank">arXiv:2104.09864</a></li>
+      <li><span class="rid">[Rajbhandari+, 2020]</span> Rajbhandari, S. et al. "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models." <i>SC20</i>, 2020. <a href="https://arxiv.org/abs/1910.02054" target="_blank">arXiv:1910.02054</a></li>
+      <li><span class="rid">[Kirkpatrick+, 2017]</span> Kirkpatrick, J. et al. "Overcoming catastrophic forgetting in neural networks." <i>PNAS</i>, 2017. <a href="https://arxiv.org/abs/1612.00796" target="_blank">arXiv:1612.00796</a></li>
+      <li><span class="rid">[Rozière+, 2023]</span> Rozière, B. et al. "Code Llama: Open Foundation Models for Code." <i>arXiv preprint</i>, 2023. <a href="https://arxiv.org/abs/2308.12950" target="_blank">arXiv:2308.12950</a></li>
+      <li><span class="rid">[Touvron+, 2023]</span> Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models." <i>arXiv preprint</i>, 2023. <a href="https://arxiv.org/abs/2307.09288" target="_blank">arXiv:2307.09288</a></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

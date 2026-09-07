@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 0 章 · 导读：为什么需要后训练 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 0 部分 · 导读与学习路径</div>
+      <h1>第 0 章 · 导读：为什么需要后训练</h1>
+      <p class="chapter-lead">模型预训练完了，为什么还不能用？本章从 ChatGPT 发布前后的对比讲起，给出后训练的正式定义与三大支柱（SFT、偏好对齐、推理增强），用一张总览图和一组成本数字建立全局直觉，并给出全书的结构地图与三类读者的阅读路线。读完本章，你应该能向别人讲清楚"后训练到底在做什么"。</p>
+      <div class="chapter-meta">⏱ 预计学习 30 分钟 ｜ 难度 ★☆☆☆☆ ｜ 先修：无</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 从"续写器"到"助手"：ChatGPT 改变了什么</h2>
+    <p>2022 年 11 月 30 日，OpenAI 以"研究预览"的名义放出了一个内部原型：ChatGPT。据 UBS 基于 Similarweb 流量的估算，它在 5 天内收获 100 万用户，约两个月后月活跃用户突破 1 亿，成为当时历史上用户增长最快的消费级应用之一。整个科技行业在几周内被重新排了座次：谷歌拉响"红色警报"，各家大厂与创业公司的对话产品在随后几个月里密集上线。</p>
+    <p>但这件事有一个反直觉的背景：ChatGPT 所依赖的绝大部分语言能力，早在 2020 年的 GPT-3 论文里就已现出雏形，而 GPT-3 的 API 在 2020 年 6 月就对公众开放了。整整两年，工程师们调用着同一个家族的模型，却没有人做出"人人都在聊"的产品。模型没有变聪明多少——变的是模型与人的<b>交互方式</b>。GPT-3 时代的典型用法是"提示词补全"：你写一段前缀，模型替你续写；ChatGPT 时代的用法是"对话"：你提问、它回答、你追问、它澄清。表面上是产品形态变了，底层其实是模型被<b>重新训练</b>过了。</p>
+    <p>要看清这个差别，最直接的办法是把同一个问题分别喂给"基座模型"和"对话模型"。所谓基座模型（base model），就是刚从预训练（pre-training）流水线下线、没经过任何后续加工的原始产物。它唯一被训练去做的事情，是在给定前文的条件下预测下一个词元（token）的概率分布——本质上是一台"续写器"。下面这段代码可以直接在一张消费级显卡上运行，对比同一个 5 亿参数家族的基座版和对话版：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">base_vs_instruct.py</span>
+      <pre class="code"><code class="language-python">from transformers import AutoModelForCausalLM, AutoTokenizer
+
+base_id = "Qwen/Qwen2.5-0.5B"          # 基座模型（未做后训练）
+inst_id = "Qwen/Qwen2.5-0.5B-Instruct" # 同一基座、经过后训练的对话版
+
+# ① 直接把问题喂给基座模型：它把输入当成"待续写的前文"
+tok_base = AutoTokenizer.from_pretrained(base_id)
+model_base = AutoModelForCausalLM.from_pretrained(base_id)
+prompt = "中国的首都是哪里？"
+ids = tok_base(prompt, return_tensors="pt")
+out = model_base.generate(**ids, max_new_tokens=48, do_sample=False)
+print("基座模型输出：", tok_base.decode(out[0][ids.input_ids.shape[1]:], skip_special_tokens=True))
+# 典型输出：续写出"日本的首都是哪里？韩国的首都是哪里？……"之类的题目列表，
+# 或一段百科式文字——它不是不知道答案，而是不知道"你在向它提问"。
+
+# ② 对话版模型：先套对话模板，把"用户在提问"这一信息编码进输入
+tok_i = AutoTokenizer.from_pretrained(inst_id)
+model_i = AutoModelForCausalLM.from_pretrained(inst_id)
+msgs = [{"role": "user", "content": "中国的首都是哪里？"}]
+text = tok_i.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+ids_i = tok_i(text, return_tensors="pt")
+out_i = model_i.generate(**ids_i, max_new_tokens=48, do_sample=False)
+print("对话模型输出：", tok_i.decode(out_i[0][ids_i.input_ids.shape[1]:], skip_special_tokens=True))
+# 典型输出："中国的首都是北京。"——直接回答，而不是续写。</code></pre>
+    </div>
+
+    <p>基座模型为什么会"答非所问"？因为它读过的语料是网页、书籍和代码。在这些文本里，"中国的首都是哪里？"这句话后面，经常跟着的是更多同类问题（题目列表、题库、搜索引擎联想词），而不是答案。下一词预测器忠实地复现了这个统计规律。它并不"笨"——预训练早已把海量知识压缩进了参数——它只是从未学过"此刻应该扮演一个回答问题的助手"这个行为模式。让模型从"会续写"变成"会对话、会听话、会推理"的全部技术，就是本书的主角：<b>后训练（Post-Training）</b>。环境怎么搭、第一个实验怎么跑，可以直接翻 <a href="02-setup.html">第 2 章</a>；本章先把"为什么"讲透。</p>
+    <p><em>小结：基座模型是概率意义上的续写器，ChatGPT 与 GPT-3 API 之间隔的不是智力差距，而是后训练这道工序。</em></p>
+
+    <h2>2. 后训练的正式定义：从概率分布到行为塑造</h2>
+    <p>先给定义。<b>后训练</b>指：在预训练结束之后，利用规模小得多、质量高得多的监督信号——指令-回答对、人类偏好比较、可自动判分的任务奖励——继续优化模型参数（全部或部分），使其从"下一词元预测器"转变为"能理解指令、符合人类偏好、可进行长程推理的交互系统"的一整套技术。这里有三个关键词值得展开。</p>
+    <p><b>第一，数据更小但更精。</b>预训练语料以万亿（10^12）token 计，例如 Llama 3 使用了超过 15T token 的语料；后训练的指令数据通常只有数万到数百万条，两者相差五到七个数量级。数量换了，性质也换了：预训练数据"越多越好"，后训练数据"越对越好"——一份 1000 条的精品数据集（如 LIMA）可以胜过数万条噪声数据。</p>
+    <p><b>第二，训练目标从"模仿"走向"对齐"乃至"超越"。</b>监督微调（Supervised Fine-Tuning, SFT）仍然是最小化交叉熵，只是把数据分布从网页换成了高质量对话；而偏好对齐与推理强化用的是强化学习：模型自己生成多个回答，由奖励信号挑出更好的方向，这已经不是在模仿任何现成文本。预训练的优化目标可以写成：</p>
+    \[ \mathcal{L}_{\text{pre}}(\theta) \;=\; -\,\mathbb{E}_{x \sim D_{\text{web}}}\; \sum_{t=1}^{|x|} \log p_\theta\!\left(x_t \mid x_{\lt t}\right) \]
+    <p>而 SFT 只是把 \( D_{\text{web}} \) 换成指令数据集 \( D = \{(x, y)\} \)，只对回答部分的词元计算损失：</p>
+    \[ \mathcal{L}_{\text{SFT}}(\theta) \;=\; -\frac{1}{|D|}\sum_{(x,y)\in D}\sum_{t=1}^{|y|} \log \pi_\theta\!\left(y_t \mid x, y_{\lt t}\right) \]
+    <p>形式几乎一样，分布完全不同——这正是"格式与行为"被注入的方式。至于偏好对齐（RLHF/DPO）与推理强化（RLVR），它们的训练信号从"逐词元的对错"升级为"整段回答之间的相对好坏"或"最终答案是否正确"，我们将在 <a href="18-alignment-overview.html">第 18 章</a>与 <a href="26-reasoning-paradigm.html">第 26 章</a>详细展开。</p>
+    <p><b>第三，产物是"行为"而不是"知识"。</b>后训练几乎不往模型里灌新知识（领域知识注入是另一条技术路线，见第 17 章的领域继续预训练），它重塑的是模型面对输入时的响应模式：用对话格式回应、拒绝越界请求、先给结论再给理由、在数学题上先写推理再写答案。理解这一点非常重要——它解释了为什么后训练数据量小、为什么灾难性遗忘是核心风险（第 16 章）、也解释了为什么"用 SFT 灌知识"往往是错误用法。</p>
+
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：后训练、微调、对齐</div>
+      <p>三个词经常混用，但侧重不同：<b>微调（fine-tuning）</b>是操作手段，泛指在已有权重上继续训练；<b>后训练（post-training）</b>是阶段，指预训练之后的一切训练工序；<b>对齐（alignment）</b>是目标，指让模型行为符合人类意图与价值（有用、诚实、无害）。一个具体技术可以同时属于三者：DPO 既是微调（在训练参数），也是后训练（发生在预训练后），更是对齐（优化人类偏好）。本书按"阶段"组织章节，按"目标"命名部分（第 4 部分就叫偏好对齐与 RLHF）。</p>
+    </div>
+
+    <p><em>小结：后训练的本质是用小而精的数据与更强的优化信号，把模型的"知识"重塑为用户需要的"行为"。</em></p>
+
+    <h2>3. 三大支柱：SFT、偏好对齐、推理增强</h2>
+    <p>现代后训练已经分化出三条相对独立又层层递进的技术线，本书称之为三大支柱。它们回答的是三个不同的问题：<b>模型怎么学会说话？怎么学会说"更好的话"？怎么学会"想清楚了再说"？</b></p>
+    <p><b>支柱一：监督微调（SFT）——教会格式与知识调用。</b>给模型看大量"（指令，回答）"样例，让它学会对话模板、指令跟随、输出结构，以及如何调用预训练中已经学到的知识。类比：一个天资聪颖的新员工通读了公司全部资料（预训练），SFT 就是入职培训——教会他回复邮件的格式、开会的规矩、查资料的路径。SFT 数据从哪来、怎么洗、怎么合成，是第 2 部分（第 07–11 章）的主题；损失实现与模板细节在第 12–15 章。一条 SFT 样本的最小形态就是一条多轮对话记录（<code>messages</code> 格式），训练框架会自动套用对话模板（第 15 章），并且只对回答部分计算损失——条件部分（system 与 user）不参与损失，这一点是 SFT 实现的第一个关键细节。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">sft_sample.json（SFT 样本的 messages 格式）</span>
+      <pre class="code"><code class="language-json">{
+  "messages": [
+    {"role": "system", "content": "你是一位严谨的中文助手。"},
+    {"role": "user", "content": "把这句话翻译成英文：今天天气很好。"},
+    {"role": "assistant", "content": "The weather is very nice today."}
+  ]
+}</code></pre>
+    </div>
+    <p><b>支柱二：偏好对齐（RLHF/DPO）——教会人类偏好。</b>SFT 只能让模型"像训练数据那样回答"，但无法区分"合格"与"优秀"：同一条提示下，两个回答都语法通顺，人类却明显更喜欢其中一个。偏好对齐把这种"相对好坏"变成训练信号：要么先训练一个奖励模型（Reward Model, RM）再用 PPO 优化（RLHF），要么直接在偏好对上做梯度更新（直接偏好优化，Direct Preference Optimization, DPO）。它教会模型的是分寸感——更有帮助、更诚实、更安全。这是第 4 部分（第 18–25 章）的主题。偏好数据的最小形态是一个"优劣对"：同一条提示下，<code>chosen</code> 是人类更偏好的回答，<code>rejected</code> 是被拒绝的回答。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">pref_sample.json（偏好样本的 chosen/rejected 格式）</span>
+      <pre class="code"><code class="language-json">{
+  "prompt": "我想快速学会游泳，有什么建议？",
+  "chosen": "建议分三步：先在浅水区练习呼吸与打腿，再学完整动作，最后逐步增加距离。第一次下水最好有教练或会游泳的同伴在场。",
+  "rejected": "游泳很简单，跳下去扑腾几次就会了，不用专门学。"
+}</code></pre>
+    </div>
+    <p><b>支柱三：推理增强（RLVR/o1/R1）——教会思考。</b>2024 年 9 月 OpenAI 发布 o1 系列，第一次把"回答前先进行长链条内部推理"做成产品能力；2025 年 1 月 DeepSeek 发布 R1，证明了只用"答案可自动判分"的规则奖励（可验证奖励强化学习，Reinforcement Learning with Verifiable Rewards, RLVR）加上 GRPO 算法，就能让模型在强化学习中<b>自发涌现</b>长链推理、自我验证与回溯——R1 在 AIME 2024 上取得 79.8% 的 pass@1，与 OpenAI o1-1215 的 79.2% 相当。这一支柱是第 5 部分（第 26–31 章）的主题。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 290" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="后训练总览数据流">
+        <defs>
+          <marker id="ov-blue" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker>
+          <marker id="ov-green" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#10b981"/></marker>
+          <marker id="ov-purple" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8b5cf6"/></marker>
+        </defs>
+        <rect x="10" y="52" width="130" height="64" rx="12" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="75" y="78" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">基座模型</text>
+        <text x="75" y="100" text-anchor="middle" font-size="14" fill="#1e293b">只会续写</text>
+        <rect x="200" y="52" width="130" height="64" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="265" y="78" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">SFT 模型</text>
+        <text x="265" y="100" text-anchor="middle" font-size="14" fill="#1e293b">会对话·听指令</text>
+        <rect x="390" y="52" width="130" height="64" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="455" y="78" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">对齐模型</text>
+        <text x="455" y="100" text-anchor="middle" font-size="14" fill="#1e293b">符合偏好·安全</text>
+        <rect x="580" y="52" width="130" height="64" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="645" y="78" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">产品模型</text>
+        <text x="645" y="100" text-anchor="middle" font-size="14" fill="#1e293b">会思考·可验证</text>
+        <text x="170" y="40" text-anchor="middle" font-size="16" font-weight="bold" fill="#2563eb">①</text>
+        <text x="360" y="40" text-anchor="middle" font-size="16" font-weight="bold" fill="#10b981">②</text>
+        <text x="550" y="40" text-anchor="middle" font-size="16" font-weight="bold" fill="#8b5cf6">③</text>
+        <path d="M142 84 L196 84" stroke="#2563eb" stroke-width="2" marker-end="url(#ov-blue)"/>
+        <path d="M332 84 L386 84" stroke="#2563eb" stroke-width="2" marker-end="url(#ov-blue)"/>
+        <path d="M522 84 L576 84" stroke="#2563eb" stroke-width="2" marker-end="url(#ov-blue)"/>
+        <text x="75" y="140" text-anchor="middle" font-size="14" fill="#1e293b">预训练产物</text>
+        <text x="265" y="140" text-anchor="middle" font-size="14" fill="#1e293b">+ 指令跟随</text>
+        <text x="455" y="140" text-anchor="middle" font-size="14" fill="#1e293b">+ 偏好与安全</text>
+        <text x="645" y="140" text-anchor="middle" font-size="14" fill="#1e293b">+ 深度思考</text>
+        <path d="M170 186 L170 92" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ov-blue)"/>
+        <path d="M360 186 L360 92" stroke="#10b981" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ov-green)"/>
+        <path d="M550 186 L550 92" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#ov-purple)"/>
+        <rect x="85" y="186" width="170" height="76" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="170" y="210" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">阶段① SFT</text>
+        <text x="170" y="232" text-anchor="middle" font-size="14" fill="#1e293b">指令数据：数万~百万条</text>
+        <text x="170" y="254" text-anchor="middle" font-size="14" fill="#1e293b">交叉熵 / 模仿学习</text>
+        <rect x="275" y="186" width="170" height="76" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="360" y="210" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">阶段② 偏好对齐</text>
+        <text x="360" y="232" text-anchor="middle" font-size="14" fill="#1e293b">偏好数据：数万组对比</text>
+        <text x="360" y="254" text-anchor="middle" font-size="14" fill="#1e293b">RLHF · DPO</text>
+        <rect x="465" y="186" width="170" height="76" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="550" y="210" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">阶段③ 推理 RL</text>
+        <text x="550" y="232" text-anchor="middle" font-size="14" fill="#1e293b">可验证题库：数万道</text>
+        <text x="550" y="254" text-anchor="middle" font-size="14" fill="#1e293b">RLVR · GRPO</text>
+        <text x="360" y="284" text-anchor="middle" font-size="14" fill="#1e293b">数据流：预训练产物 → 三阶段后训练 → 上线产品</text>
+      </svg>
+      <figcaption>图 0-1：后训练三大支柱总览（自绘）。基座模型依次经过 SFT（注入指令跟随能力）、偏好对齐（注入人类偏好与安全边界）、推理强化（注入长链思考能力）成为产品级模型；三个阶段的数据形态与算法各不相同，实践中可有取舍与反复。</figcaption>
+    </figure>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>支柱</th><th>教会模型什么</th><th>典型数据形态</th><th>代表算法</th><th>什么时候需要</th></tr></thead>
+        <tbody>
+          <tr><td>监督微调（SFT）</td><td>对话格式、指令跟随、知识调用方式</td><td>（指令，回答）样例对</td><td>交叉熵微调、LoRA 微调</td><td>一切后训练的起点，必做</td></tr>
+          <tr><td>偏好对齐</td><td>"更好"的分寸：有帮助、诚实、无害</td><td>同一提示下的优劣回答对</td><td>RLHF（PPO）、DPO 及变体</td><td>面向用户的产品基本必需</td></tr>
+          <tr><td>推理增强</td><td>多步推理、自我验证、纠错回溯</td><td>可自动判分的题目 + 规则奖励</td><td>RLVR、GRPO、过程奖励</td><td>数学/代码/智能体等可验证场景</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 0-1：后训练三大支柱对比。三者数据形态、优化信号、所需基础设施差异很大，第 4 部分与第 5 部分会逐一拆解。</span>
+    </div>
+
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：把后训练当成"数据越多越好"</div>
+      <p>预训练时代"堆数据就是赢"的直觉，在后训练里常常失效。LIMA 论文用约 1000 条精选数据微调 LLaMA-65B 即取得惊人效果（arXiv:2305.11206），而质量差的 100 万条指令数据反而会让模型学会胡编、套模板、格式错乱。后训练的第一性原理是：<b>数据质量与分布，决定模型行为的上限。</b>这也是本书把数据工程（第 07–11 章）放在 SFT 之前讲的原因。</p>
+    </div>
+
+    <p><em>小结：SFT 教格式、偏好对齐教分寸、推理 RL 教思考——三支柱分别改变模型行为的不同维度，合起来构成现代产品模型的全部"教养"。</em></p>
+
+    <h2>4. 历史的坐标：InstructGPT 与三阶段范式</h2>
+    <p>后训练不是 2022 年才发明的。它的思想源头可以追溯到 2017 年 Christiano 等人的工作《Deep Reinforcement Learning from Human Preferences》——在强化学习智能体还只会玩 Atari 游戏的年代，他们证明：人类只需要给出"两段轨迹哪个更好"的比较信号，就能训练出奖励函数并塑造智能体行为。2020 年，OpenAI 的 Stiennon 等人把这套方法第一次搬到大语言模型上，用人类偏好训练摘要模型（1.3B 参数），效果超过参数量大 6 倍的监督模型。这两个工作分别埋下了"方法种子"和"LLM 适配"的伏笔。</p>
+    <p>真正的分水岭是 2022 年 3 月的 InstructGPT 论文。它把整个流程固化为教科书式的三个阶段：<b>① SFT</b>——标注员为真实用户提示写示范回答（约 1.3 万条）；<b>② 奖励模型训练</b>——标注员对模型输出做两两比较（约 3.3 万组）；<b>③ PPO 强化学习</b>——用奖励模型作为信号优化策略（约 3.1 万条提示）。结果震撼了当时的研究社区：标注者显著更偏好 1.3B 参数的 InstructGPT 的输出，而非 175B 参数的原版 GPT-3——参数量小 100 倍，胜在"被调教过"。同年 11 月，同样的范式以对话形式包装成 ChatGPT 发布，后训练从此从论文术语变成了工业常识。</p>
+
+    <figure class="figure">
+      <img src="../assets/figs/instructgpt-pipeline.png" alt="InstructGPT 三阶段 RLHF 流程">
+      <figcaption>图 0-2：InstructGPT 的三阶段后训练流程——SFT、奖励模型训练、PPO 强化学习（来源：Ouyang et al., 2022, arXiv:2203.02155）。注意图中三个阶段的数据量都远小于预训练语料，且第二、三阶段共享同一套人类偏好标注。</figcaption>
+    </figure>
+
+    <div class="paper-ref">
+      <div class="pr-title">Training language models to follow instructions with human feedback</div>
+      <div class="pr-meta">Ouyang et al., 2022 · <a href="https://arxiv.org/abs/2203.02155" target="_blank">arXiv:2203.02155</a> · InstructGPT：把"预训练模型 → 可用助手"的完整工序固化为三阶段范式，是全书第 3、4 部分一切技术的历史起点</div>
+    </div>
+
+    <p>此后四年，范式在两条轴线上快速演化。第一条是<b>对齐方法的简化</b>：2023 年 5 月的 DPO 论文证明可以绕开奖励模型与 PPO 的复杂回路，直接在偏好对上做类似分类的稳定训练，开源社区随之迎来微调民主化——同年斯坦福的 Alpaca 项目用不到 500 美元的 API 调用成本生成 5.2 万条指令数据并微调出 Alpaca-7B（整项工作总成本低于 600 美元，项目公开记录），拉开了"人人都能后训练"的序幕。第二条是<b>推理范式的觉醒</b>：2024 年 9 月 o1 展示"测试时计算扩展"；2025 年 1 月 DeepSeek-R1 用纯规则奖励的 RL（R1-Zero）复现出推理能力的涌现，并把完整配方开源。下述时间线值得记住——本书的章节顺序，大体就是沿着这条时间线的技术逻辑展开的。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="后训练方法演进时间线">
+        <defs>
+          <marker id="tl-end" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker>
+        </defs>
+        <path d="M50 130 L700 130" stroke="#2563eb" stroke-width="2" marker-end="url(#tl-end)"/>
+        <circle cx="75" cy="130" r="7" fill="#2563eb"/>
+        <line x1="75" y1="123" x2="75" y2="112" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="75" y="80" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">2017</text>
+        <text x="75" y="100" text-anchor="middle" font-size="14" fill="#1e293b">人类偏好进入强化学习</text>
+        <circle cx="190" cy="130" r="7" fill="#10b981"/>
+        <line x1="190" y1="137" x2="190" y2="148" stroke="#10b981" stroke-width="1.5"/>
+        <text x="190" y="162" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">2020</text>
+        <text x="190" y="182" text-anchor="middle" font-size="14" fill="#1e293b">GPT-3 × RLHF 用于摘要</text>
+        <circle cx="310" cy="130" r="7" fill="#f59e0b"/>
+        <line x1="310" y1="123" x2="310" y2="112" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="310" y="64" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">2022</text>
+        <text x="310" y="84" text-anchor="middle" font-size="14" fill="#1e293b">InstructGPT 三阶段范式</text>
+        <text x="310" y="102" text-anchor="middle" font-size="14" fill="#1e293b">ChatGPT 发布</text>
+        <circle cx="425" cy="130" r="7" fill="#8b5cf6"/>
+        <line x1="425" y1="137" x2="425" y2="148" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="425" y="162" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">2023</text>
+        <text x="425" y="182" text-anchor="middle" font-size="14" fill="#1e293b">DPO · 开源对齐浪潮</text>
+        <circle cx="540" cy="130" r="7" fill="#ef4444"/>
+        <line x1="540" y1="123" x2="540" y2="112" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="540" y="80" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">2024</text>
+        <text x="540" y="100" text-anchor="middle" font-size="14" fill="#1e293b">o1：测试时计算</text>
+        <circle cx="650" cy="130" r="7" fill="#2563eb"/>
+        <line x1="650" y1="137" x2="650" y2="148" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="650" y="162" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">2025</text>
+        <text x="650" y="182" text-anchor="middle" font-size="14" fill="#1e293b">R1 开源推理浪潮</text>
+      </svg>
+      <figcaption>图 0-3：后训练方法演进时间线（自绘，依关键论文与产品发布时间整理）。从人类偏好 RL 的提出，到三阶段范式定型、对齐方法民主化，再到推理范式的开源复现。</figcaption>
+    </figure>
+
+    <p><em>小结：InstructGPT 用 1.3B 打赢 175B 的故事确立了三阶段范式；此后五年，范式沿着"更简单的对齐算法"与"更强大的推理能力"两条轴线演化至今。</em></p>
+
+    <h2>5. 后训练 vs 预训练：成本与量级的错位</h2>
+    <p>很多初学者对后训练的第一印象是"预训练的缩小版"，这个理解在算力上大体成立，在其他维度上完全错位。先看算力。预训练的 FLOPs 有一个经典估算式 \( C \approx 6ND \)（\(N\) 为参数量、\(D\) 为训练 token 数，出自 Kaplan 等人的缩放定律论文，并被 GPT-3 论文用于报告训练开销）：GPT-3 175B 在约 3000 亿 token 上训练，总计约 \(3.14\times10^{23}\) FLOPs（论文附录报告值）；Llama 3 405B 在超过 15T token 上预训练，总计 \(3.8\times10^{25}\) FLOPs（Llama 3 论文报告值）。而后训练阶段，模型参数量 \(N\) 不变（甚至只训练 1% 以下的适配器参数），数据 \(D\) 小了五到七个数量级，总 FLOPs 通常比预训练低两到四个数量级。一个可感知的对照：Alpaca 项目生成 5.2 万条指令数据的 API 调用成本不到 500 美元，7B 模型的微调在 8 张 A100 上约 3 小时完成（项目公开记录）。</p>
+    <p>数据量级的差距更加悬殊。预训练语料以万亿 token 计；InstructGPT 的 SFT 数据只有 1.3 万条示范，LIMA 只用约 1000 条精选样例，工业级的开源配方（如 Tulu 3）把 SFT、偏好、RLVR 数据全加起来也在百万到千万条量级。换算成"信息注入量"，后训练对参数的直接改写小得惊人——这再次印证了第 2 节的判断：<b>后训练改变的是行为分布，而不是知识总量。</b></p>
+    <p>但"便宜"绝不等于"轻松"。预训练的瓶颈是钱（GPU 时），后训练的瓶颈是三样更难对付的东西：<b>数据质量</b>（标注一致性、分布覆盖、污染控制）、<b>训练稳定性</b>（奖励黑客、KL 崩溃、策略退化）、<b>评估</b>（"变好了没有"远比"loss 降了没有"难回答）。第 21 章会专门讲奖励黑客与稳定性，第 7 部分整章讲评测——这些章节的存在本身，就是对"后训练只是小规模预训练"这个误解的否定。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>维度</th><th>预训练</th><th>后训练</th></tr></thead>
+        <tbody>
+          <tr><td>优化目标</td><td>下一词元预测：压缩世界知识</td><td>行为塑造：会对话、合偏好、会推理</td></tr>
+          <tr><td>数据来源</td><td>网页、书籍、代码等海量语料</td><td>人工标注与合成的指令、偏好、可验证题</td></tr>
+          <tr><td>数据量级</td><td>10T+ token（Llama 3 报告值）</td><td>1 万~数千万条样例，小五到七个数量级</td></tr>
+          <tr><td>算力量级</td><td>10^23~10^25 FLOPs</td><td>通常低 2~4 个数量级</td></tr>
+          <tr><td>算法形态</td><td>交叉熵（单阶段、一次跑完）</td><td>SFT + RL 多阶段，含采样与奖励回路</td></tr>
+          <tr><td>主要瓶颈</td><td>算力预算、数据清洗</td><td>数据质量、训练稳定性、评估</td></tr>
+          <tr><td>典型失败模式</td><td>吸收偏见、隐私泄漏、涌现不可控</td><td>奖励黑客、灾难性遗忘、模板过拟合</td></tr>
+          <tr><td>评估方式</td><td>困惑度、下游基准</td><td>偏好胜率、LLM-as-a-Judge、可验证基准</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 0-2：预训练与后训练的多维对比。量级数据引自 GPT-3（arXiv:2005.14165）、Llama 3（arXiv:2407.21783）、InstructGPT（arXiv:2203.02155）等论文的报告值；"低 2~4 个数量级"为依 \(C \approx 6ND\) 的推算与业界普遍经验。</span>
+    </div>
+
+    <p><em>小结：预训练买来的是潜力，后训练决定这份潜力能否兑现——它便宜在算力，贵在数据与工程判断力。</em></p>
+
+    <h2>6. 本书结构导览：十二个部分的地图</h2>
+    <p>本书共 65 章，按技术逻辑组织为 12 个部分。整本书可以当成三本书来读：第 0–2 部分是"地基"（理论 + 数据），第 3–7 部分是"方法主线"（SFT → 对齐 → 推理 → 安全 → 评测），第 8–11 部分是"工程与实战"。每一章都遵循同样的体例：先直觉、再公式、后代码，章末附自测题与文献。下面是各部分的一句话导览：</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>部分</th><th>章节</th><th>一句话定位</th></tr></thead>
+        <tbody>
+          <tr><td>第 0 部分 · 导读与学习路径</td><td>第 0–2 章</td><td>为什么学、按什么顺序学、环境怎么搭</td></tr>
+          <tr><td>第 1 部分 · 理论基础</td><td>第 03–06 章</td><td>Transformer、缩放定律与强化学习语言：读懂后训练论文的词汇表</td></tr>
+          <tr><td>第 2 部分 · 后训练数据工程</td><td>第 07–11 章</td><td>指令与偏好数据从哪来、怎么洗、怎么合成——后训练八成的工作量在这里</td></tr>
+          <tr><td>第 3 部分 · 监督微调（SFT）</td><td>第 12–17 章</td><td>从损失函数、LoRA 到对话模板与灾难性遗忘：把基座变成会对话的模型</td></tr>
+          <tr><td>第 4 部分 · 偏好对齐与 RLHF</td><td>第 18–25 章</td><td>奖励模型、PPO、DPO 及全家桶：让模型从"会"到"好"</td></tr>
+          <tr><td>第 5 部分 · 推理增强后训练</td><td>第 26–31 章</td><td>o1/R1 范式、GRPO、过程奖励、蒸馏与智能体 RL：让模型学会思考</td></tr>
+          <tr><td>第 6 部分 · 安全与价值对齐</td><td>第 32–36 章</td><td>安全训练、红队测试、诚实性与可扩展监督</td></tr>
+          <tr><td>第 7 部分 · 评测</td><td>第 37–41 章</td><td>基准、LLM 评委、人类评估与评测陷阱：不评测等于没做</td></tr>
+          <tr><td>第 8 部分 · 训练工程</td><td>第 42–47 章</td><td>显存公式、分布式并行、推理引擎与调试急救手册</td></tr>
+          <tr><td>第 9 部分 · 前沿专题</td><td>第 48–53 章</td><td>模型融合、自我改进、多模态后训练与开放问题</td></tr>
+          <tr><td>第 10 部分 · 完整实战项目</td><td>第 54–59 章</td><td>五个端到端项目：SFT、DPO、GRPO 数学、奖励模型、智能体 RL</td></tr>
+          <tr><td>附录</td><td>第 60–64 章</td><td>必读论文库、工具大全、术语表、FAQ 与课程资源</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 0-3：全书十二部分导览。下一章（第 1 章）会把这些部分重排成一条 10~12 周的学习路线，并给出不同角色的取舍建议。</span>
+    </div>
+
+    <p>两点阅读提示。其一，各部分之间并非严格串行：<a href="43-distributed-training.html">第 43 章</a>（分布式训练）可以与第 4 部分并行读；评测（第 37–41 章）其实从你写下第一行训练代码那天起就该用。其二，每章的"参考文献"小节都是精选入口——追论文不必贪多，每章精读 2~3 篇即可，配合 <a href="60-paper-library.html">第 60 章</a>的论文库查漏补缺。</p>
+    <p><em>小结：全书是"地基—方法—工程实战"三段式结构，方法主线（SFT、对齐、推理、安全、评测）对应工业界后训练团队的真实分工。</em></p>
+
+    <h2>7. 三类读者的路线，以及如何使用与贡献本书</h2>
+    <h3>7.1 你是哪类读者？</h3>
+    <p><b>学生与研究生（打地基、追论文）</b>：按顺序通读第 0–6 部分与第 9 部分，第 8 部分选读 <a href="42-training-flops-memory.html">第 42 章</a>与第 43 章。目标不是"跑通最大的模型"，而是建立能读懂 arXiv 新论文的知识框架，并完整复现一项工作（推荐 Zephyr 的 DPO 配方或缩小版 R1-Zero）。<b>算法工程师（扛业务、出模型）</b>：第 2、3、4 部分逐章精读，第 5 部分按业务需要选读，第 8 部分全部精读，最后直接进第 10 部分的五个实战项目。你的关键词是：数据质量、显存效率、可复现配方。<b>应用开发者（用模型、做产品）</b>：精读第 3 部分中的 <a href="14-peft-lora.html">第 14 章</a>（LoRA）与第 15 章（对话模板）、第 7 部分（评测），第 4 部分只读 DPO 一章。你的关键词是：最小可行后训练、评测闭环、成本控制。第 1 章会给出三条路径的逐章清单。</p>
+    <h3>7.2 怎么用这本书</h3>
+    <p>本书是纯静态 HTML，不需要构建步骤。在 GitHub 仓库页面从 <code>index.html</code> 进入，左侧边栏即全书目录，顶部提供全文搜索；每一章都是独立的 HTML 文件（<code>chapters/</code> 目录），直接按 Ctrl+P 就能打印或导出 PDF，公式与插图均为矢量或高清位图，纸面阅读体验完整。所有代码块右键即可复制，配套脚本以"文件名 + 完整可运行"的标准撰写，超参与关键行均有中文注释。自测题采用折叠答案设计，建议先作答再展开。</p>
+    <h3>7.3 怎么贡献</h3>
+    <p>发现技术错误、过时数值或失效链接，请在 GitHub 仓库提 issue，注明章节号与原文位置；直接提交 PR 也受欢迎，但请先读仓库根目录的 AGENTS_GUIDE.md——它规定了统一的术语、体例与引用规范（例如：引用他人实验数值必须给出论文出处与 arXiv 号，禁止无出处的"据说"）。勘误会在每章末尾以批注形式累积。如果你用本书开了课程或做了内训，也欢迎反馈哪些章节的顺序与深度需要调整。</p>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 给初学者的一句忠告：先跑通，再深究</div>
+      <p>不要试图"先学完理论再动手"。后训练的几乎所有关键直觉——KL 约束的手感、学习率与灾难性遗忘的关系、奖励黑客长什么样——都无法从文字中获得，只能从"跑一个实验、看一条曲线、修一个 bug"中获得。正确的顺序是：今天按 <a href="02-setup.html">第 2 章</a>把环境搭好，用 Qwen2.5-0.5B 跑通第一个 SFT 冒烟测试（10 分钟），之后每读一章就跑一个对应的最小实验。跑通之后的深究，效率是不跑通的十倍。</p>
+    </div>
+
+    <p><em>小结：按角色选路线、按"先跑通再深究"排节奏，把这本书当成一本可以边做边翻的菜谱，而不是一本需要从头背诵的教材。</em></p>
+
+    <blockquote>预训练决定模型的上限，后训练决定这份上限能不能被用户真正用到。</blockquote>
+
+    <h2>8. 本章小结</h2>
+    <ul>
+      <li>基座模型是下一词元预测器，会"续写"但不会"对话"：ChatGPT 的突破不在于模型更聪明，而在于后训练重塑了模型行为。</li>
+      <li>后训练的正式定义：预训练之后，用小而精的监督信号（指令对、偏好比较、可验证奖励）继续优化模型，使其成为可控的交互系统。</li>
+      <li>三大支柱各司其职：SFT 教会格式与知识调用，偏好对齐（RLHF/DPO）教会人类偏好与安全分寸，推理增强（RLVR/o1/R1）教会长链思考。</li>
+      <li>InstructGPT（arXiv:2203.02155）用 1.3 万条示范、3.3 万组比较、3.1 万条提示，让 1.3B 模型的输出胜过 175B GPT-3，确立了沿用至今的三阶段范式。</li>
+      <li>量级直觉：后训练数据比预训练小 5~7 个数量级，算力低 2~4 个数量级；瓶颈从"算力"转移到"数据质量、训练稳定性与评估"。</li>
+      <li>全书 12 个部分、65 章，按"地基—方法—工程实战"组织；不同角色应选择不同的阅读路线，共同的原则是"先跑通，再深究"。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：基座模型被问到"中国的首都是哪里？"时，为什么会续写出更多问题而不是给出答案？</summary>
+      <p>因为基座模型的唯一训练目标是对网页语料做下一词元预测。在它见过的文本中，这类问句后面经常出现的是更多同类问句（题库、联想列表）而非答案。它不是缺乏知识——知识已在预训练中被压缩进参数——而是从未学过"被询问时应扮演回答者"这一行为模式，这正是后训练要注入的东西。</p></details>
+      <details><summary>问题 2：后训练三大支柱分别"教会模型什么"？各自依赖什么形态的数据？</summary>
+      <p>SFT 教会对话格式、指令跟随与知识调用方式，数据是（指令，回答）样例对，用交叉熵模仿学习；偏好对齐教会"人类觉得哪个回答更好"的分寸感与安全边界，数据是同一提示下的优劣回答对，代表算法为 RLHF（PPO）与 DPO；推理增强教会多步推理、自我验证与纠错，数据是可自动判分的题目加规则奖励，代表范式为 RLVR、o1 与 DeepSeek-R1 使用的 GRPO。</p></details>
+      <details><summary>问题 3：InstructGPT 论文中，多大的后训练数据量让 1.3B 模型的输出被标注者偏好于 175B GPT-3？三个阶段分别对应多少数据？</summary>
+      <p>SFT 阶段约 1.3 万条标注员示范；奖励模型阶段约 3.3 万组两两比较；PPO 阶段约 3.1 万条提示。三阶段数据加起来不到 8 万条样例，与预训练语料相差数个数量级，却彻底改变了模型的行为——这是"后训练改行为、不改知识"最有说服力的历史证据（arXiv:2203.02155）。</p></details>
+      <details><summary>问题 4：后训练比预训练"便宜"在哪里？它真正的难点又在哪里？</summary>
+      <p>便宜在算力与数据量：由 \(C \approx 6ND\)，后训练的 token 量小五到七个数量级，总 FLOPs 通常低 2~4 个数量级，7B 级别的 LoRA 微调一张消费级显卡即可完成。难点在数据质量（标注一致性、分布覆盖）、训练稳定性（奖励黑客、KL 崩溃、灾难性遗忘）与评估（"变好没有"难以客观判定）——这三者正是本书第 2、4、7 部分花费大量篇幅的原因。</p></details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Ouyang+, 2022]</span> Ouyang, L. et al. "Training language models to follow instructions with human feedback." <i>NeurIPS</i>, 2022. <span class="rid"><a href="https://arxiv.org/abs/2203.02155" target="_blank">arXiv:2203.02155</a></span></li>
+      <li><span class="rid">[Brown+, 2020]</span> Brown, T. et al. "Language Models are Few-Shot Learners." <i>NeurIPS</i>, 2020. <span class="rid"><a href="https://arxiv.org/abs/2005.14165" target="_blank">arXiv:2005.14165</a></span></li>
+      <li><span class="rid">[Christiano+, 2017]</span> Christiano, P. et al. "Deep Reinforcement Learning from Human Preferences." <i>NeurIPS</i>, 2017. <span class="rid"><a href="https://arxiv.org/abs/1706.03741" target="_blank">arXiv:1706.03741</a></span></li>
+      <li><span class="rid">[Stiennon+, 2020]</span> Stiennon, N. et al. "Learning to Summarize with Human Feedback." <i>NeurIPS</i>, 2020. <span class="rid"><a href="https://arxiv.org/abs/2009.01325" target="_blank">arXiv:2009.01325</a></span></li>
+      <li><span class="rid">[Rafailov+, 2023]</span> Rafailov, R. et al. "Direct Preference Optimization: Your Language Model is Secretly a Reward Model." <i>NeurIPS</i>, 2023. <span class="rid"><a href="https://arxiv.org/abs/2305.18290" target="_blank">arXiv:2305.18290</a></span></li>
+      <li><span class="rid">[DeepSeek-AI, 2025]</span> DeepSeek-AI. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." 2025. <span class="rid"><a href="https://arxiv.org/abs/2501.12948" target="_blank">arXiv:2501.12948</a></span></li>
+      <li><span class="rid">[Lightman+, 2023]</span> Lightman, H. et al. "Let's Verify Step by Step." <i>ICLR</i>, 2024. <span class="rid"><a href="https://arxiv.org/abs/2305.20050" target="_blank">arXiv:2305.20050</a></span></li>
+      <li><span class="rid">[Wang+, 2023]</span> Wang, Y. et al. "Self-Instruct: Aligning Language Models with Self-Generated Instructions." <i>ACL</i>, 2023. <span class="rid"><a href="https://arxiv.org/abs/2212.10560" target="_blank">arXiv:2212.10560</a></span></li>
+      <li><span class="rid">[Zhou+, 2023]</span> Zhou, C. et al. "LIMA: Less Is More for Alignment." <i>NeurIPS</i>, 2023. <span class="rid"><a href="https://arxiv.org/abs/2305.11206" target="_blank">arXiv:2305.11206</a></span></li>
+      <li><span class="rid">[Lambert+, 2024]</span> Lambert, N. et al. "Tulu 3: Pushing Frontiers in Open Language Model Post-Training." 2024. <span class="rid"><a href="https://arxiv.org/abs/2411.15124" target="_blank">arXiv:2411.15124</a></span></li>
+      <li><span class="rid">[Kaplan+, 2020]</span> Kaplan, J. et al. "Scaling Laws for Neural Language Models." 2020. <span class="rid"><a href="https://arxiv.org/abs/2001.08361" target="_blank">arXiv:2001.08361</a></span></li>
+      <li><span class="rid">[Grattafiori+, 2024]</span> Grattafiori, A. et al. "The Llama 3 Herd of Models." 2024. <span class="rid"><a href="https://arxiv.org/abs/2407.21783" target="_blank">arXiv:2407.21783</a></span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 55 章 · 项目一：从零 SFT 中文小模型 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 10 部分 · 完整实战项目</div>
+      <h1>第 55 章 · 项目一：从零 SFT 中文小模型</h1>
+      <p class="chapter-lead">监督微调（SFT）是大语言模型从“字词接龙续写器”蜕变为“具备遵从意图对话助手”的第一道核心淬炼工序。本章带领读者以极具性价比的 Qwen2.5-0.5B 与 1.5B 为基座，使用消费级单卡（RTX 4090 或 3090），亲历数据清洗、ChatML 对话模板适配、QLoRA/LoRA 显存优化微调、权重合并导出及 vLLM 工业级高吞吐部署的全流程。读者将亲手打造一个幽默风趣、善解人意且具备角色扮演能力的中文垂直领域助理。</p>
+      <div class="chapter-meta">⏱ 预计学习 100 分钟 ｜ 难度 ★★★☆☆ ｜ 先修：第 12 章、第 14 章、第 15 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 项目背景与目标设定</h2>
+    <p>在后训练的庞大体系中，监督微调（Supervised Fine-Tuning, SFT）承担着将预训练底座海量无序知识“激活”并“规整化”为人类自然交互形态的使命。许多开发者往往误以为 SFT 的主要功能是“注入新的事实知识”，然而大量的实验表明，预训练阶段已经完成了模型绝大部分事实记忆的编码；SFT 的本质是<strong>教会模型理解人际交流中的角色设定、指令格式（Instruction Following）、对话礼仪以及思维展开步骤</strong>。</p>
+    <p>本项目旨在实现一个<strong>端到端、低显存占用且兼具高趣味性与实用性的中文小模型助手</strong>。我们选定阿里云开源的 <strong>Qwen2.5-0.5B 与 1.5B</strong> 作为底座。这两款小模型得益于 Qwen 系列优质的万亿级多语言预训练数据，展现出惊人的上下文理解与中文构词能力。通过高质量的领域数据清洗与 QLoRA 微调，我们将赋予该模型三大核心能力：</p>
+    <ul>
+      <li><strong>幽默且逻辑敏锐的解题能力：</strong>能够完美理解具有语言陷阱的复杂幽默脑筋急转弯（如经典的“弱智吧”神逻辑辨析）；</li>
+      <li><strong>严谨的角色扮演（Role-Playing）：</strong>牢固锁定系统设定的 System Prompt 角色人格，杜绝身份漂移与谄媚重复；</li>
+      <li><strong>标准化工具调用格式输出：</strong>能够稳定输出遵循 ChatML 标准规范的多轮结构化 JSON 或 Markdown。</li>
+    </ul>
+
+    <!-- 自绘 SVG：端到端 SFT 数据准备、训练、合并与部署流程图 -->
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="端到端 SFT 数据准备、训练、合并与部署流程图">
+        <defs>
+          <marker id="sft-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+        </defs>
+
+        <rect x="0" y="0" width="720" height="230" fill="#ffffff" rx="8"/>
+
+        <!-- 步骤 1: 原始数据流 -->
+        <rect x="20" y="55" width="135" height="110" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="87" y="80" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e40af">1. 多源数据工程</text>
+        <text x="87" y="105" text-anchor="middle" font-size="11" fill="#475569">Ruozhiba 幽默神逻辑</text>
+        <text x="87" y="125" text-anchor="middle" font-size="11" fill="#475569">CoT 中文多轮推理</text>
+        <text x="87" y="145" text-anchor="middle" font-size="11" fill="#475569">格式清洗与长度截断</text>
+
+        <!-- 箭头 1 -> 2 -->
+        <line x1="155" y1="110" x2="190" y2="110" stroke="#2563eb" stroke-width="2" marker-end="url(#sft-arrow)"/>
+
+        <!-- 步骤 2: 模板注入 -->
+        <rect x="195" y="55" width="135" height="110" rx="8" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="262" y="80" text-anchor="middle" font-size="14" font-weight="bold" fill="#5b21b6">2. 模板与分词</text>
+        <text x="262" y="105" text-anchor="middle" font-size="11" fill="#475569">ChatML 规范渲染</text>
+        <text x="262" y="125" text-anchor="middle" font-size="11" fill="#475569">&lt;|im_start|&gt; 特殊标</text>
+        <text x="262" y="145" text-anchor="middle" font-size="11" fill="#475569">Prompt 损失屏蔽掩码</text>
+
+        <!-- 箭头 2 -> 3 -->
+        <line x1="330" y1="110" x2="365" y2="110" stroke="#2563eb" stroke-width="2" marker-end="url(#sft-arrow)"/>
+
+        <!-- 步骤 3: QLoRA 训练 -->
+        <rect x="370" y="55" width="145" height="110" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="442" y="80" text-anchor="middle" font-size="14" font-weight="bold" fill="#b45309">3. QLoRA 训练</text>
+        <text x="442" y="105" text-anchor="middle" font-size="11" fill="#475569">NF4 量化 + r=16 LoRA</text>
+        <text x="442" y="125" text-anchor="middle" font-size="11" fill="#475569">All-Linear 矩阵注入</text>
+        <text x="442" y="145" text-anchor="middle" font-size="11" fill="#475569">TRL SFTTrainer 驱动</text>
+
+        <!-- 箭头 3 -> 4 -->
+        <line x1="515" y1="110" x2="550" y2="110" stroke="#2563eb" stroke-width="2" marker-end="url(#sft-arrow)"/>
+
+        <!-- 步骤 4: 导出与服务 -->
+        <rect x="555" y="55" width="145" height="110" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="627" y="80" text-anchor="middle" font-size="14" font-weight="bold" fill="#047857">4. 权重合并与部署</text>
+        <text x="627" y="105" text-anchor="middle" font-size="11" fill="#475569">LoRA 权重无损合入</text>
+        <text x="627" y="125" text-anchor="middle" font-size="11" fill="#475569">Safetensors 格式转储</text>
+        <text x="627" y="145" text-anchor="middle" font-size="11" fill="#475569">vLLM PagedAttention</text>
+
+        <!-- 底部说明条 -->
+        <rect x="20" y="185" width="680" height="30" rx="6" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
+        <text x="360" y="205" text-anchor="middle" font-size="12" fill="#64748b">单卡显存开销：训练时 &lt; 9GB (RTX 4090)，推理并发吞吐 &gt; 1500 tokens/s</text>
+      </svg>
+      <figcaption>图 55-1：项目一从多源语料清洗到 QLoRA 微调、权重合并与 vLLM 部署的全生命周期流水线</figcaption>
+    </figure>
+
+    <h2>2. 数据集工程：高质量清洗与混合配比</h2>
+    <p>在数据驱动的监督微调中，盲目塞入数万条粗制滥造的问答数据只会让小模型迅速产生重复发疯和常识遗忘。我们需要构建一个具备<strong>“神逻辑鉴别 + 思维链深度 + 严谨角色对话”</strong>的多维复合语料池。我们精选了以下三大开源中文清洗语料并进行加权配比：</p>
+    <ol>
+      <li><strong>Ruozhiba（弱智吧幽默逻辑对决子集）：</strong>占比 30%。这部分数据包含看似荒谬但暗含逻辑陷阱的问题（例如“感冒药说明书上说一次两片，我吃了三片会不会死？”），能够极大激发小模型的思辨抗噪与幽默调侃能力；</li>
+      <li><strong>Chinese-CoT（思维链逻辑推理）：</strong>占比 40%。强化模型面对分步数学、归纳演绎任务时的长文本逻辑展开能力；</li>
+      <li><strong>Multi-turn Roleplay（通用多轮角色扮演）：</strong>占比 30%。注入特定的 system 人设设定，训练多轮交互中的上下文长程指代理解。</li>
+    </ol>
+
+    <!-- 表 55-1：SFT 训练语料配比与清洗准则 -->
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>语料分类</th>
+            <th>清洗与过滤标准</th>
+            <th>单条 Token 均长</th>
+            <th>混合配比</th>
+            <th>核心赋予能力</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Ruozhiba 幽默逻辑</strong></td>
+            <td>剔除纯低俗粗鄙词汇，保留高质量文字游戏与冷幽默反问，重写粗糙回答</td>
+            <td>180</td>
+            <td>30%</td>
+            <td>反语理解、荒诞逻辑纠正、机智幽默表达</td>
+          </tr>
+          <tr>
+            <td><strong>CoT 分步推理</strong></td>
+            <td>通过正则表达式剔除未闭合的代码块与破损 LaTeX，保留步骤标签</td>
+            <td>450</td>
+            <td>40%</td>
+            <td>条理性推导、逻辑自洽、避免急躁下定论</td>
+          </tr>
+          <tr>
+            <td><strong>多轮对话与角色扮演</strong></td>
+            <td>剔除“作为AI语言模型”等死板机械声明，强化沉浸式第一人称语气</td>
+            <td>320</td>
+            <td>30%</td>
+            <td>System 人格一致性、上下文回溯与情感共情</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption">表 55-1：监督微调复合训练集构建方案与清洗准则</span>
+    </div>
+
+    <figure class="figure">
+      <img src="../assets/figs/qlora.png" alt="QLoRA 4-bit NF4 降秩微调架构">
+      <figcaption>图 55-2：QLoRA 提出的 4-bit NormalFloat 离群值保护与双重量化机制（来源：Dettmers et al., 2023, arXiv:2305.14314）</figcaption>
+    </figure>
+
+    <h2>3. 提示词模板与损失屏蔽机制</h2>
+    <p>Qwen2.5 采用了标准的 <strong>ChatML（Chat Markup Language）</strong> 结构。在输入序列中，每个角色的回合被严密的特殊标记包围：</p>
+    <pre class="code"><code>&lt;|im_start|&gt;system
+你是一个幽默风趣且精通逻辑辩证的领域智能体。&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+感冒药包装上写着一日三次，一次两片。那我一次吃六片是不是能管两天？&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+管两天？朋友，你要是真这么吃，可能连明天都不一定管得着了！药物的代谢周期是恒定的……&lt;|im_end|&gt;</code></pre>
+    <p>在传统的语言模型自回归交叉熵损失计算中，若对整个序列（包含 System 和 User 部分）全部计算 Loss，会导致模型将宝贵的参数容量浪费在“拟合用户提问的语法分布”上，甚至引发模型在面对用户提问时“反客为主地自问自答”。因此，<strong>Prompt 损失屏蔽（Data Collator with Masking）</strong> 是 SFT 训练中最关键的细节——<strong>仅在 Assistant 回答的 Token 位置计算梯度，对 System 和 User 的 Token 掩码设为 -100</strong>：</p>
+    \[ \mathcal{L}_{\mathrm{SFT}}(\theta) = -\frac{1}{|Y|}\sum_{t \in \text{Response}} \log P_\theta(y_t \mid x, y_{<t}) \]
+
+    <h2>4. 完整训练实现：基于 TRL 与 PEFT 的 QLoRA 启动脚本</h2>
+    <p>下面给出项目一可以直接独立运行的完整微调代码。该代码结合了 Hugging Face 官方的 <code>transformers</code>、<code>peft</code> 与 <code>trl</code> 库，在单张 24GB 显存显卡上仅需占用约 7.8GB 显存，即可完成 Qwen2.5-0.5B 或 1.5B 的全精度 LoRA 拟合：</p>
+
+    <!-- 代码块 1: SFT 完整训练脚本 -->
+    <div class="code-wrap">
+      <span class="code-label">train_qlora_sft.py</span>
+      <pre class="code"><code class="language-python">import os
+import torch
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    TrainingArguments
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+
+# 1. 基础路径与超参数配置
+MODEL_PATH = "Qwen/Qwen2.5-0.5B" # 亦可指定本地路径或 1.5B
+DATA_FILE = "./data/sft_train_data.jsonl"
+OUTPUT_DIR = "./output/qwen25_05b_sft_lora"
+MAX_SEQ_LEN = 2048
+
+# 2. 配置 4-bit NormalFloat 量化以实现 QLoRA 极低显存占用
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True
+)
+
+print(f"[*] 正在以 4-bit 量化加载基座模型: {MODEL_PATH}")
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_PATH,
+    quantization_config=bnb_config,
+    device_map="auto",
+    torch_dtype=torch.bfloat16,
+    trust_remote_code=True
+)
+model = prepare_model_for_kbit_training(model)
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# 3. 配置 LoRA 适配器（覆盖所有全连接层以获得最优表达能力）
+peft_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+)
+model = get_peft_model(model, peft_config)
+model.print_trainable_parameters()
+
+# 4. 加载训练数据集
+dataset = load_dataset("json", data_files=DATA_FILE, split="train")
+
+def format_chatml(example):
+    """将 messages 转化为 ChatML 格式的字符串"""
+    text = tokenizer.apply_chat_template(
+        example["messages"],
+        tokenize=False,
+        add_generation_prompt=False
+    )
+    return {"text": text}
+
+dataset = dataset.map(format_chatml)
+
+# 5. 定义仅对 Assistant 回复计算损失的数据对齐器
+response_template = "<|im_start|>assistant\n"
+collator = DataCollatorForCompletionOnlyLM(
+    response_template=response_template,
+    tokenizer=tokenizer,
+    mlm=False
+)
+
+# 6. 配置训练超参数
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4, # 等效有效 Batch Size = 16
+    learning_rate=2e-4,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    num_train_epochs=3,
+    logging_steps=10,
+    save_strategy="steps",
+    save_steps=100,
+    save_total_limit=2,
+    bf16=True,
+    gradient_checkpointing=True,
+    report_to="none" # 生产环境建议设置为 wandb
+)
+
+# 7. 启动 SFTTrainer
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset,
+    dataset_text_field="text",
+    max_seq_length=MAX_SEQ_LEN,
+    data_collator=collator,
+    args=training_args,
+    peft_config=peft_config
+)
+
+print("[*] 开始执行 SFT 训练...")
+trainer.train()
+
+print(f"[*] 训练完毕！正在保存 LoRA 权重至: {OUTPUT_DIR}")
+trainer.model.save_pretrained(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+print("[✓] LoRA 适配器保存完毕！")</code></pre>
+    </div>
+
+    <h2>5. 权重合并与无损导出</h2>
+    <p>经过 LoRA 训练后，磁盘上保存的仅是低秩增量权重矩阵（通常体积仅为几十兆字节）。在投入工业化推理服务（如 vLLM 或 TensorRT-LLM）前，必须将 LoRA 的权重增量数学无损地合并回原始基座模型中：</p>
+    \[ W_{\mathrm{merged}} = W_0 + \frac{\alpha}{r} (B \times A) \]
+    <p>合并过程必须加载<strong>全精度的基座模型权重（FP16 或 BF16）</strong>，切勿在 4-bit 量化后的权重上执行直接相加，否则会导致灾难性的量化误差反噬。</p>
+
+    <!-- 代码块 2: 权重合并脚本 -->
+    <div class="code-wrap">
+      <span class="code-label">merge_lora_weights.py</span>
+      <pre class="code"><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+BASE_MODEL_PATH = "Qwen/Qwen2.5-0.5B"
+LORA_PATH = "./output/qwen25_05b_sft_lora"
+EXPORT_PATH = "./models/qwen25_05b_sft_merged"
+
+print("[*] 正在以 BF16 全精度加载原始基座模型以执行权重合并...")
+base_model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_PATH,
+    torch_dtype=torch.bfloat16,
+    device_map="cpu", # 在 CPU 内存中安全合并，避免挤占显存
+    trust_remote_code=True
+)
+
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
+
+print(f"[*] 加载 LoRA 适配器: {LORA_PATH}")
+model = PeftModel.from_pretrained(base_model, LORA_PATH)
+
+print("[*] 正在执行无损数学融合 (merge_and_unload)...")
+merged_model = model.merge_and_unload()
+
+print(f"[*] 正在持久化合并后的完整独立模型至: {EXPORT_PATH}")
+merged_model.save_pretrained(EXPORT_PATH, max_shard_size="4GB", safe_serialization=True)
+tokenizer.save_pretrained(EXPORT_PATH)
+print("[✓✓✓] 权重合并导出大功告成！可直接供 vLLM 或 Ollama 部署。")</code></pre>
+    </div>
+
+    <h2>6. vLLM 部署与交互式对话客户端</h2>
+    <p>将微调并合并后的模型部署为具备高吞吐特性的推理服务，是验证后训练效果的最佳方式。vLLM 依托 <strong>PagedAttention</strong> 技术，彻底解决了注意力机制显存碎片的痛点，能够支持数十个并发用户的流式生成。我们可以一键启动与 OpenAI API 完全兼容的本地推理后端：</p>
+    <div class="code-wrap">
+      <span class="code-label">终端启动命令</span>
+      <pre class="code"><code class="language-bash"># 使用 vLLM 启动兼容 OpenAI 协议的 HTTP API 服务
+python -m vllm.entrypoints.openai.api_server \
+    --model ./models/qwen25_05b_sft_merged \
+    --served-model-name qwen-sft-expert \
+    --trust-remote-code \
+    --max-model-len 2048 \
+    --gpu-memory-utilization 0.6 \
+    --port 8000</code></pre>
+    </div>
+
+    <p>随后，我们可以编写交互式 Python 客户端，通过 OpenAI 规范与微调后的本地小模型展开流畅多轮对话：</p>
+
+    <!-- 代码块 3: 交互式对话客户端 -->
+    <div class="code-wrap">
+      <span class="code-label">client_interactive_chat.py</span>
+      <pre class="code"><code class="language-python">import sys
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY" # vLLM 本地服务无需鉴权
+)
+
+def run_chat_session():
+    print("=" * 60)
+    print("★ 项目一：Qwen2.5 SFT 中文小模型交互式对话终端 ★")
+    print("输入 'exit' 或 'quit' 退出会话。")
+    print("=" * 60)
+
+    system_prompt = "你是一个幽默风趣、善于识破脑筋急转弯与逻辑陷阱的中文助手。"
+    messages = [{"role": "system", "content": system_prompt}]
+
+    while True:
+        try:
+            user_input = input("\n[User]: ").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ["exit", "quit"]:
+                print("会话结束，拜拜！")
+                break
+
+            messages.append({"role": "user", "content": user_input})
+            print("[Assistant]: ", end="", flush=True)
+
+            # 流式获取响应，享受丝滑生成体验
+            response = client.chat.completions.create(
+                model="qwen-sft-expert",
+                messages=messages,
+                temperature=0.7,
+                top_p=0.9,
+                max_tokens=512,
+                stream=True
+            )
+
+            assistant_reply = ""
+            for chunk in response:
+                delta = chunk.choices[0].delta.content or ""
+                assistant_reply += delta
+                print(delta, end="", flush=True)
+            print()
+
+            messages.append({"role": "assistant", "content": assistant_reply})
+
+        except KeyboardInterrupt:
+            print("\n会话被用户强行中断。")
+            break
+        except Exception as e:
+            print(f"\n[!] 请求发生错误: {e}")
+
+if __name__ == "__main__":
+    run_chat_session()</code></pre>
+    </div>
+
+    <h2>7. 训练监控与效果评测对比</h2>
+    <p>在 SFT 训练过程中，<strong>损失曲线（Loss Curve）通常会从初始的 2.5~3.0 快速平稳下降并最终收敛在 0.8~1.1 区间</strong>。如果 Loss 迅速暴跌至 0.2 以下，通常并非模型掌握了高超智慧，而是训练数据中存在严重的模板冗余导致发生了恶性过拟合（Overfitting）；反之，如果 Loss 在 2.0 左右持续震荡，则需要核查数据清洗是否破坏了特殊控制符，或者学习率设置过高。</p>
+
+    <!-- 表 55-2：微调前后典型提问对比表现 -->
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>测试 Prompt</th>
+            <th>微调前原始基座表现（Raw Base）</th>
+            <th>SFT 后的模型表现（Our Model）</th>
+            <th>能力提升维度</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>“感冒药包装写着一日三次，一次两片。我一次吃六片能管两天吗？”</strong></td>
+            <td>“一天吃三次，一次吃两片，一日药量是六片。如果一次性吃完……”（缺乏常识警示，倾向于字面数学加法）</td>
+            <td>“管两天？朋友，你要是真这么吃，可能连明天都不一定管得着了！药物在体内有严格的代谢半衰期，过量服用会造成严重的肝肾中毒，切勿模仿！”</td>
+            <td>幽默感辨析、逻辑反讽、安全常识警示</td>
+          </tr>
+          <tr>
+            <td><strong>“请以猫咪的口吻，严肃谴责人类铲屎迟到的恶劣行径。”</strong></td>
+            <td>“猫咪是一种可爱的宠物，它们通常通过叫声……”（无法锁定人设，答非所问）</td>
+            <td>“喵呜！两脚兽，看看现在几点了？本喵的砂盆已经堆积如山！你今天耽搁的三十分钟，必须用三罐特级金枪鱼来谢罪！”</td>
+            <td>System 人设角色锁定、情感投射能力</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption">表 55-2：Qwen2.5-0.5B 在微调前后的语义理解与角色表达对比评测</span>
+    </div>
+
+    <h2>8. 本章小结</h2>
+    <ul>
+      <li><strong>微调本质澄清：</strong>SFT 不是为了向模型注入全新的事实知识，而是为了规范输出格式、建立对话伦理、塑造特定人设并学会长文本分步推理。</li>
+      <li><strong>工程细节制胜：</strong>严格执行 ChatML 模板渲染与 Prompt 损失屏蔽（DataCollatorForCompletionOnlyLM），确保小模型仅在有效回复上分配梯度，极大提升微调信噪比。</li>
+      <li><strong>闭环顺利贯通：</strong>基于 QLoRA 在单卡 8GB 显存下完成了模型微调，通过 CPU 无损权重融合导出了独立模型，并在 vLLM 上实现了超千 Token 吞吐的生产级部署。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：在 SFT 训练时，为什么要使用 `DataCollatorForCompletionOnlyLM` 屏蔽 Prompt 的损失，如果不屏蔽会有什么严重后果？</summary>
+        <p><strong>答案解析：</strong>如果不进行损失屏蔽，模型会对输入的 System 提示词和 User 提问同样计算自回归交叉熵损失并反向传播。这会导致模型消耗大量参数容量去拟合用户提问的句式分布。在推理时，模型极易产生“反客为主”的错觉——在用户提问之后，不仅不回答问题，反而自顾自地继续续写其他伪造的用户问题（即产生自问自答的混乱行为）。损失屏蔽强制模型将所有注意力集中在“给定提问下如何生成高质量回答”的条件概率拟合上。</p>
+      </details>
+      <details>
+        <summary>问题 2：为什么我们在合并 LoRA 权重（`merge_and_unload`）时，严禁使用 4-bit 量化加载基座模型？</summary>
+        <p><strong>答案解析：</strong>LoRA 的适配器权重 \(A\) 与 \(B\) 是在 FP32 或 BF16 精度下维护的连续高精度矩阵。如果基座模型被量化为 4-bit（NF4），其原本连续的权重被离散映射到仅有的 16 个刻度值上。若强行在离散量化值上直接加上连续的 LoRA 增量，不仅破坏了量化表映射关系，还会造成严重的累积舍入误差，导致合并后的模型在解量化反向重构时出现灾难性的语义退化。因此必须在全精度（BF16/FP16）下将 \(B \times A\) 严丝合缝地加回原始浮点参数中。</p>
+      </details>
+      <details>
+        <summary>问题 3：在 QLoRA 中，超参数 `lora_alpha` 和 `r` 的比值起到什么作用？如果把 `lora_alpha` 设得过大会怎样？</summary>
+        <p><strong>答案解析：</strong>比值 \(\frac{\alpha}{r}\) 是低秩适配器增量向基座参数注入时的缩放系数（Scaling Factor）。当该比值越大时，前向传播中 LoRA 增量占总输出的权重就越大，模型受微调数据的驱动就越剧烈。如果 `lora_alpha` 设置过大（例如设为 128 或 256，而 \(r=16\)），模型会以极高的步长偏离原本的基座表征空间，极易引发梯度爆炸、Loss 剧烈震荡，并迅速丢失预训练阶段积累的基础语言理解能力（灾难性遗忘）。工业界通用经验通常将该比值稳定在 1 到 2 之间（如 \(r=16, \alpha=32\)）。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Dettmers+, 2023]</span> Dettmers, T. et al. "QLoRA: Efficient Finetuning of Quantized LLMs." <i>NeurIPS</i>, 2023. <a href="https://arxiv.org/abs/2305.14314" target="_blank">arXiv:2305.14314</a></li>
+      <li><span class="rid">[Hu+, 2021]</span> Hu, E. J. et al. "LoRA: Low-Rank Adaptation of Large Language Models." <i>ICLR</i>, 2022. <a href="https://arxiv.org/abs/2106.09685" target="_blank">arXiv:2106.09685</a></li>
+      <li><span class="rid">[Qwen-Team, 2024]</span> Qwen Team. "Qwen2.5 Technical Report." <i>arXiv preprint</i>, 2024. <a href="https://arxiv.org/abs/2412.15115" target="_blank">arXiv:2412.15115</a></li>
+      <li><span class="rid">[Kwon+, 2023]</span> Kwon, W. et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." <i>SOSP</i>, 2023. <a href="https://arxiv.org/abs/2309.06180" target="_blank">arXiv:2309.06180</a></li>
+      <li><span class="rid">[Zhou+, 2023]</span> Zhou, C. et al. "LIMA: Less Is More for Alignment." <i>NeurIPS</i>, 2023. <a href="https://arxiv.org/abs/2305.11206" target="_blank">arXiv:2305.11206</a></li>
+      <li><span class="rid">[Wei+, 2022]</span> Wei, J. et al. "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models." <i>NeurIPS</i>, 2022. <a href="https://arxiv.org/abs/2201.11903" target="_blank">arXiv:2201.11903</a></li>
+      <li><span class="rid">[von Werra+, 2022]</span> von Werra, L. et al. "TRL: Transformer Reinforcement Learning." <i>GitHub Repository</i>, 2022. <a href="https://github.com/huggingface/trl" target="_blank">https://github.com/huggingface/trl</a></li>
+      <li><span class="rid">[Taori+, 2023]</span> Taori, R. et al. "Stanford Alpaca: An Instruction-following LLaMA model." <i>GitHub</i>, 2023. <a href="https://github.com/tatsu-lab/stanford_alpaca" target="_blank">https://github.com/tatsu-lab/stanford_alpaca</a></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

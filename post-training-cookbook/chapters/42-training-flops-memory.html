@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 42 章 · 算力与显存估算 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 8 部分 · 训练工程</div>
+      <h1>第 42 章 · 算力与显存估算</h1>
+      <p class="chapter-lead">训练大语言模型绝不仅是算法设计，更是一门严密的硬件资源统筹工程。在启动训练脚本前，工程师必须精确回答：模型能放得进几张显卡？训练千亿 Token 需要多少 GPU 天？Batch Size 到底能开多大？本章从底层字节和浮点运算出发，系统拆解模型权重、梯度、优化器状态与激活值的显存构成，推导 6P FLOPs/token 理论法则，构建包含 SFT、LoRA、DPO、PPO 与 GRPO 的显存矩阵，并提供 MFU 测算公式与生产级容量估算工具。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★☆☆ ｜ 先修：第 3 章、第 14 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 显存与算力：后训练工程的物理底座</h2>
+    <p>在自然语言处理从“参数量百万/千万级”跨越到“十亿至千亿级”的现代大模型时代，训练任务的瓶颈早已从模型架构的设计转移到了底层硬件资源的物理约束。<span class="term">显存（High Bandwidth Memory, HBM）</span>的容量决定了模型能不能跑起来、单个 Batch 最多能塞入多长的文本序列；而<span class="term">算力（FLOPS, Floating Point Operations Per Second）</span>与硬件利用效率则决定了训练周期的长短和昂贵的算力账单。很多初涉后训练工程的开发者常遇到如下尴尬境地：修改了一个超参数，启动脚本后立即遭遇 <code>CUDA out of memory</code>（OOM）；或者租用了昂贵的 8 卡 H100 集群，训练吞吐却只有理论峰值的 15%，完全不知道时间被消耗在何处。</p>
+    <p>造成这种失控的核心原因在于缺乏对显存占用与浮点运算量的第一性原理建模。许多工程师习惯凭借经验不断试探 <code>per_device_train_batch_size</code>，一旦报错就调小，直至能跑通为止。这种盲目试错在全参数 7B 微调时或许尚能勉强应付，但在面对长文本（如 32k、128k 上下文）、复杂强化学习对齐（如 PPO 涉及 4 个甚至更多模型副本在显存中流转）、或者千亿多模态模型时，试错的成本极高，甚至会导致跨节点分布式通信拓扑设计完全脱靶。</p>
+    <p>因此，掌握严格的显存与算力前向推导，是大模型后训练工程师的必修内功。通过建立精确的数学模型，我们可以在写下第一行训练配置之前，直接在纸面上算出静态权重、梯度、优化器状态、中间激活值以及 KV 缓存的显存开销，并根据集群硬件规格（如 A100-80GB SXM4、H100-80GB SXM5、H800、L40S）准确预估多卡切分方案、所需机器数以及完成特定 Token 量训练所消耗的绝对时间与 MFU（Model FLOPs Utilization）。</p>
+
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：静态显存 vs 动态显存</div>
+      <p>显存开销严格划分为两大类别：</p>
+      <ul>
+        <li><strong>静态显存（Static Memory）</strong>：与批次大小（Batch Size）和输入序列长度（Sequence Length）无关，仅取决于模型参数量、训练策略（全参、LoRA 或冻结）以及优化器类型的固定开销。它包括模型权重参数、参数梯度、优化器状态（如 Adam 的一阶与二阶动量以及高精度权重副本）。</li>
+        <li><strong>动态显存（Dynamic Memory）</strong>：与批次大小、序列长度强相关的显存开销。在训练阶段主要由前向传播中为了计算反向传播梯度而缓存的中间隐藏层激活值（Activation Memory）组成；在 RL 对齐采样阶段则还包括 KV 缓存（KV Cache）与临时生成的 Logits 空间。</li>
+      </ul>
+    </div>
+    <p><strong>本节小结：</strong>大模型训练是严密的物理约束系统，必须在写代码前对显存的动静态开销和浮点计算量进行第一性原理推导，杜绝盲目试错调参。</p>
+
+    <h2>2. 静态显存精细拆解：权重、梯度与优化器状态</h2>
+    <p>静态显存是模型训练的“基石”。对于参数量为 \( \Phi \)（通常以十亿或 Billion 为单位，下文亦写作 \( P \)）的模型，只要训练进程初始化完成并加载模型与优化器，这部分显存就会被完全锁定，直到训练结束释放。</p>
+
+    <h3>2.1 模型权重（Model Parameters）</h3>
+    <p>在混合精度训练成为标配的当下，模型的前向传播通常采用 16 位浮点数进行加速，主要为半精度浮点 <span class="term">FP16（IEEE 754 half-precision）</span> 或大脑浮点 <span class="term">BF16（Brain Floating Point）</span>。每个 16 位浮点数占用 2 个字节（bytes）。</p>
+    \[ M_{\text{params}} = 2 \times \Phi \text{ bytes} \]
+    <p>例如，一个 7B（\( 7 \times 10^9 \)）参数量的模型，其 FP16/BF16 权重本身占用显存为：</p>
+    \[ 7 \times 10^9 \times 2 \text{ bytes} = 14 \times 10^9 \text{ bytes} \approx 14 \times 10^9 / (1024^3) \text{ GiB} \approx 13.04 \text{ GiB} \]
+    <p>工业界在粗算时常以 \( 10^9 \text{ bytes} \approx 1 \text{ GB} \) 作为快捷心算标尺，因此 7B 权重约 14 GB，13B 约 26 GB，70B 约 140 GB。</p>
+
+    <h3>2.2 模型梯度（Gradients）</h3>
+    <p>在反向传播过程中，计算图会为每一个可训练参数计算关于损失函数的一阶导数（梯度）。梯度张量与模型权重具有完全相同的形状。在使用混合精度训练时，反向传播产生的梯度通常以 FP16 或 BF16 格式存储，以便与权重直接交互：</p>
+    \[ M_{\text{grads}} = 2 \times \Phi \text{ bytes} \]
+    <p>因此对于 7B 模型，梯度张量同样需要占用约 14 GB 显存。如果某层参数被完全冻结（如 LoRA 微调中的主干模型），则这部分参数不需要存储梯度，对应梯度的显存开销为 0。</p>
+
+    <h3>2.3 优化器状态（Optimizer States）：AdamW 的 16 字节推导</h3>
+    <p>很多初学者最容易忽略的“显存吞噬兽”是优化器状态。深度学习后训练绝大多数采用 <span class="term">AdamW（Decoupled Weight Decay Adam）</span> 优化器。为了保证更新步长在极小梯度时不至于欠流（Underflow）、保证数值稳定性，标准的混合精度 AdamW 必须在单精度 FP32（4 字节）下维护更新状态。</p>
+    <p>让我们严格拆解 AdamW 优化器在每一步更新时必须驻留在显存中的具体张量：</p>
+    <ol>
+      <li><strong>一阶动量（First Momentum, \( m_t \)）</strong>：记录梯度的指数移动平均，使用 FP32 存储，占用 \( 4 \times \Phi \) 字节。</li>
+      <li><strong>二阶动量（Second Momentum, \( v_t \)）</strong>：记录梯度平方的指数移动平均，使用 FP32 存储，占用 \( 4 \times \Phi \) 字节。</li>
+      <li><strong>主权重副本（FP32 Master Weights）</strong>：这是混合精度训练的核心机制。FP16/BF16 权重的有效尾数位较短（FP16 仅 10 位，BF16 仅 7 位），当学习率乘以更新量非常小时（例如 \( \eta \cdot \frac{m_t}{\sqrt{v_t} + \epsilon} \approx 10^{-6} \)），将其直接加在 FP16/BF16 权重上会发生严重的“舍入为零”（swallowing）现象，导致模型参数无法微调。因此，优化器内部必须维护一份 FP32 精度的完整模型主权重副本，更新在此副本上执行，随后再将更新后的数值缩放或截断转存为 BF16/FP16 供下一个 step 的前向传播使用。该副本占用 \( 4 \times \Phi \) 字节。</li>
+      <li><strong>FP32 梯度副本（FP32 Gradient Residual / Copy）</strong>：在某些框架实现（如标准 PyTorch AMP 配合原生 AdamW）中，反向传播计算出的 FP16/BF16 梯度在送入优化器时会被类型转换并累加为 FP32 临时张量，占用 \( 4 \times \Phi \) 字节；而在部分针对性优化过的优化器（如 DeepSpeed ZeRO 实现或 Apex FusedAdam）中，该步骤被原地融合直接更新到动量中，可省去该独立显存。</li>
+    </ol>
+    <p>按照保守且标准的生产实践配置（带 FP32 Master Weight + 两个 FP32 动量），优化器状态本身占用的显存为：</p>
+    \[ M_{\text{opt}} = (4_{\text{momentum}} + 4_{\text{variance}} + 4_{\text{master\_weight}}) \times \Phi = 12 \times \Phi \text{ bytes} \]
+    <p>如果算上未经极致融合的 PyTorch AMP 优化器 FP32 梯度缓存（4 字节），则优化器状态总计可达 \( 16 \times \Phi \) 字节。</p>
+
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 必须牢记的“16 字节法则”与“20 字节全参法则”</div>
+      <p>如果将<strong>权重（2 bytes）+ 梯度（2 bytes）+ 优化器状态（12~16 bytes）</strong>加总，全参数混合精度训练在每个参数上的静态开销高达：</p>
+      \[ 2 + 2 + 12 = 16 \text{ 字节/参数} \quad (\text{采用融合优化器，如 DeepSpeed/Apex}) \]
+      \[ 2 + 2 + 16 = 20 \text{ 字节/参数} \quad (\text{采用原生 PyTorch AMP 未全量优化实现}) \]
+      <p>这意味着：训练一个 7B 模型，仅静态显存就需要 \( 16 \times 7 = 112 \text{ GB} \)！这彻底解释了为什么<strong>单张 80GB 的 A100/H100 显卡连一个 7B 模型的全参训练都无法启动</strong>，必须借助 ZeRO 切分或者 LoRA 才能运行。</p>
+    </div>
+
+    <h3>2.4 静态显存柱状堆叠图</h3>
+    <p>为了直观展示全参训练、LoRA 微调以及 ZeRO-1 分布式状态下的静态显存对比，下图给出了显存构成的横向堆叠与拆解：</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="静态显存占用组成对比图">
+        <defs>
+          <marker id="arrow42" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+        </defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#1e293b">7B 模型不同训练模式下的静态显存构成对比（每卡开销）</text>
+        
+        <!-- 图例 -->
+        <rect x="60" y="42" width="14" height="14" fill="#2563eb" rx="2"/>
+        <text x="80" y="54" font-size="13" fill="#1e293b">模型权重 (2B/p)</text>
+        <rect x="200" y="42" width="14" height="14" fill="#10b981" rx="2"/>
+        <text x="220" y="54" font-size="13" fill="#1e293b">模型梯度 (2B/p)</text>
+        <rect x="340" y="42" width="14" height="14" fill="#f59e0b" rx="2"/>
+        <text x="360" y="54" font-size="13" fill="#1e293b">优化器动量 (8B/p)</text>
+        <rect x="490" y="42" width="14" height="14" fill="#8b5cf6" rx="2"/>
+        <text x="510" y="54" font-size="13" fill="#1e293b">FP32主权重 (4B/p)</text>
+
+        <!-- 条形 1: 全参数单卡 (112 GB) - 超过80G红线 -->
+        <text x="30" y="95" font-size="14" font-weight="bold" fill="#1e293b">全参 (单卡)</text>
+        <rect x="130" y="80" width="70" height="26" fill="#2563eb"/>
+        <rect x="200" y="80" width="70" height="26" fill="#10b981"/>
+        <rect x="270" y="80" width="280" height="26" fill="#f59e0b"/>
+        <rect x="550" y="80" width="140" height="26" fill="#8b5cf6"/>
+        <text x="630" y="98" font-size="12" font-weight="bold" fill="#ffffff">112 GB</text>
+        
+        <!-- 80GB 警戒线 -->
+        <line x1="530" y1="70" x2="530" y2="245" stroke="#ef4444" stroke-width="2" stroke-dasharray="4 4"/>
+        <text x="535" y="76" font-size="12" font-weight="bold" fill="#ef4444">单卡 80GB 显存物理上限</text>
+
+        <!-- 条形 2: 全参 ZeRO-1 (8卡) -->
+        <text x="30" y="145" font-size="14" font-weight="bold" fill="#1e293b">全参 ZeRO-1 (8卡)</text>
+        <rect x="130" y="130" width="70" height="26" fill="#2563eb"/>
+        <rect x="200" y="130" width="70" height="26" fill="#10b981"/>
+        <rect x="270" y="130" width="35" height="26" fill="#f59e0b"/>
+        <rect x="305" y="130" width="17" height="26" fill="#8b5cf6"/>
+        <text x="335" y="148" font-size="13" font-weight="bold" fill="#1e293b">约 38.5 GB/卡</text>
+
+        <!-- 条形 3: LoRA r=16 (单卡) -->
+        <text x="30" y="195" font-size="14" font-weight="bold" fill="#1e293b">LoRA (r=16, 单卡)</text>
+        <rect x="130" y="180" width="70" height="26" fill="#2563eb"/>
+        <rect x="200" y="180" width="4" height="26" fill="#10b981"/>
+        <rect x="204" y="180" width="8" height="26" fill="#f59e0b"/>
+        <rect x="212" y="180" width="4" height="26" fill="#8b5cf6"/>
+        <text x="235" y="198" font-size="13" font-weight="bold" fill="#1e293b">14.3 GB (LoRA 参数仅 ~20MB)</text>
+
+        <!-- 条形 4: QLoRA 4-bit (单卡) -->
+        <text x="30" y="245" font-size="14" font-weight="bold" fill="#1e293b">QLoRA (NF4, 单卡)</text>
+        <rect x="130" y="230" width="20" height="26" fill="#2563eb" fill-opacity="0.6"/>
+        <rect x="150" y="230" width="4" height="26" fill="#10b981"/>
+        <rect x="154" y="230" width="8" height="26" fill="#f59e0b"/>
+        <rect x="162" y="230" width="4" height="26" fill="#8b5cf6"/>
+        <text x="180" y="248" font-size="13" font-weight="bold" fill="#1e293b">3.8 GB (消费级显卡 4090 轻松加载)</text>
+      </svg>
+      <figcaption>图 42-1：7B 模型在不同训练模式下的静态显存分配柱状图（以单卡占用视角展示）</figcaption>
+    </figure>
+
+    <p><strong>本节小结：</strong>混合精度训练中，每个参数需消耗 16 字节静态显存（权重 2B + 梯度 2B + AdamW 状态 12B）；7B 全参静态需 112GB，单卡 80GB 必须通过分布式切分或 PEFT 缩减。</p>
+
+    <h2>3. 动态显存与激活值计算：重计算与长上下文</h2>
+    <p>与静态显存的固定大小不同，动态显存由微调时的批次规模（Batch Size）和序列长度（Sequence Length）直接主导。许多开发者往往发现：静态权重明明只占了 14 GB，但将 <code>max_length</code> 从 2048 调整为 8192 时，显存瞬间从 30GB 暴涨至 OOM。这个罪魁祸首就是<span class="term">中间激活值显存（Activation Memory）</span>。</p>
+
+    <h3>3.1 标准 Transformer 层的激活值精细推导</h3>
+    <p>在前向传播过程中，为了能够在反向传播阶段根据链式法则求出各层权重的偏导数，计算图必须保留所有前向操作的输入或中间输出。设单个批次大小为 \( b \)，序列长度为 \( s \)，隐藏层维度为 \( h \)，注意力头数为 \( a \)（每个头的维度 \( d = h/a \)），多层感知机（MLP/FFN）的中间隐藏层膨胀倍数通常为 4（在 LLaMA 类 SwiGLU 架构中膨胀倍数为 \( \frac{8}{3}h \)）。设模型总层数为 \( L \)。</p>
+    <p>对于一层标准的 Transformer 解码器结构，前向传播中必须缓存的激活值包括：</p>
+    <ol>
+      <li><strong>注意力机制部分（Attention Block）</strong>：
+        <ul>
+          <li>自注意力输入层归一化（RMSNorm/LayerNorm）：需要保留归一化前的输入用于反向传播求导，占用 \( 2 b s h \) 字节。</li>
+          <li>Q、K、V 投影矩阵的线性运算：投影前的输入同样为 \( X \)，由于复用同一输入，不重复计算；但生成 Q、K、V 张量需要显存，且在计算 Attention Score \( Q K^T \) 时，其输出维度为 \( (b, a, s, s) \)。在没有使用 FlashAttention 的标准计算图中，该注意力权重矩阵占用 \( 2 b a s^2 \) 字节！</li>
+          <li>Softmax 与 Dropout 操作：Softmax 结果占用 \( 2 b a s^2 \) 字节，Dropout 掩码需占用 \( 1 b a s^2 \) 字节。</li>
+          <li>对 V 的注意力加权（Attention Over Values）：输出结果占用 \( 2 b s h \) 字节。</li>
+          <li>注意力输出投影线性层（Out Projection）：线性层输入占用 \( 2 b s h \) 字节。</li>
+        </ul>
+      </li>
+      <li><strong>前馈网络部分（Feed-Forward Block）</strong>：
+        <ul>
+          <li>MLP 输入层归一化：占用 \( 2 b s h \) 字节。</li>
+          <li>LLaMA 架构的 SwiGLU 激活：由 Gate Projection 与 Up Projection 组成，中间隐藏维度 \( h' \approx \frac{8}{3}h \)。计算门控激活需要缓存输入 \( 2 b s h \)，以及两条投影通路的未激活张量 \( 2 \times (2 b s h') = 4 b s (\frac{8}{3}h) \approx 10.67 b s h \) 字节。</li>
+          <li>Down Projection：线性输入缓存占用 \( 2 b s (\frac{8}{3}h) \approx 5.33 b s h \) 字节。</li>
+        </ul>
+      </li>
+    </ol>
+    <p>综合累加后，一层 Transformer 在不采用任何优化时，激活值显存随着序列长度 \( s \) 呈二次方增长：</p>
+    \[ M_{\text{act/layer}} \approx b s h \cdot \left( 34 + \frac{5 a s}{h} \right) \text{ bytes} \]
+    <p>对于 \( L \) 层模型，全模型激活值显存总量为 \( L \times M_{\text{act/layer}} \)。以 7B 模型（\( L=32, h=4096, a=32 \)）为例，当 \( b=2, s=4096 \) 时，如果直接将所有中间张量保存在显存中，仅激活值就会突破 120 GB！这在单卡甚至多卡上都是绝对不可承受的。</p>
+
+    <h3>3.2 激活值重计算（Activation Checkpointing / Gradient Checkpointing）</h3>
+    <p>为了打破激活值对显存的恐怖消耗，Chen et al. (2016) 提出了<span class="term">梯度检查点技术（Gradient Checkpointing）</span>，在工业界通常被称为“重计算”（Recomputation）：</p>
+    <ul>
+      <li><strong>完全不重计算（None）</strong>：前向传播缓存所有中间激活，显存开销最高，但反向传播速度最快（无需额外计算）。</li>
+      <li><strong>全量重计算（Full Checkpointing）</strong>：前向传播只保留每一层 Transformer Block 的最初输入张量（大小仅为 \( 2 b s h \) 字节/层），其余所有注意力打分矩阵、MLP 中间激活值全部丢弃！在反向传播到达该层时，以该层最初的输入重新执行一遍前向计算，动态生成所需的激活值，求完梯度后立即释放。</li>
+    </ol>
+    <p>全量重计算将激活值显存由 \( O(L \cdot s^2) \) 或 \( O(L \cdot s) \) 强力压缩为仅保留每层输入的线性极低量：</p>
+    \[ M_{\text{act, full-ckpt}} \approx 2 \times b \times s \times h \times L \text{ bytes} \]
+    <p>同样以 7B 模型（\( L=32, h=4096 \)）、\( b=2, s=4096 \) 为例，采用全量重计算后，激活值显存直接从 120 GB 暴降至：</p>
+    \[ 2 \times 2 \times 4096 \times 4096 \times 32 \text{ bytes} \approx 2.14 \text{ GiB} \]
+    <p>代价是什么？因为每一层在前向和反向中被计算了两次，全量重计算会引入大约 <strong>20% ~ 30% 的额外前向计算耗时</strong>。但在大模型训练中，用 30% 的算力开销换取 50 倍以上的激活值显存缩减，使得 Batch Size 可以大幅提升、上下文能拉长数倍，在工程上是极划算的绝对标准选择。</p>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：选择性重计算（Selective Activation Checkpointing）</div>
+      <p>在使用 FlashAttention（第 44 章）时，由于 FlashAttention 自身在 GPU SRAM 中利用 Tiling 切块计算并在反向时重新计算 Softmax，原本占用显存最大的 \( O(s^2) \) 注意力打分矩阵已经被消除。此时配合 Megatron-LM 的“选择性重计算”（Selective Checkpointing）——只重新计算显存大、算力开销极小的 LayerNorm 和 Dropout，而保留 MLP 的矩阵乘结果，可以仅用 2%~4% 的算力开销就省下 70% 的非必要激活显存，比全量重计算更具吞吐优势。</p>
+    </div>
+    <p><strong>本节小结：</strong>原生激活值随序列长度二次方暴涨；通过启用激活值重计算，可以用 ~25% 的额外前向计算代价换取激活显存数十倍的断崖式下降。</p>
+
+    <h2>4. 后训练各阶段显存需求矩阵</h2>
+    <p>后训练不仅包含 SFT，还包含参数高效微调（LoRA/QLoRA）以及复杂的强化学习偏好对齐算法。不同阶段由于引入的模型副本数量不同、可训练参数范围不同，其显存需求呈现天壤之别。</p>
+
+    <figure class="figure">
+      <img src="../assets/figs/scaling-laws.png" alt="算力与模型规模缩放关系">
+      <figcaption>图 42-2：算力预算与参数规模的缩放权衡（来源：Kaplan et al., 2020, arXiv:2001.08361）</figcaption>
+    </figure>
+
+    <h3>4.1 各主流后训练范式显存构成拆解</h3>
+    <ol>
+      <li><strong>全参数 SFT（Full SFT）</strong>：1 个模型副本。该模型既做前向也做反向，因此拥有全量权重（2B/p）、全量梯度（2B/p）和全量 AdamW 状态（12B/p），外加前向激活显存。总静态显存为 \( 16 \Phi \)。</li>
+      <li><strong>LoRA（Rank=16~64）</strong>：1 个主干模型 + 旁路低秩矩阵 \( A, B \)。主干模型权重冻结（2B/p），梯度为 0，优化器状态为 0；仅 LoRA 适配器（可训练参数量 \( \Phi_{\text{lora}} \approx 0.1\% \sim 0.5\% \Phi \)）需要计算梯度（2B/p）与优化器状态（12B/p）。静态显存约等于 \( 2\Phi + 16\Phi_{\text{lora}} \approx 2.05 \Phi \)。</li>
+      <li><strong>QLoRA（4-bit NF4）</strong>：主干模型采用 NormalFloat4（NF4）量化，每个参数仅占 0.5 字节（4-bit），并结合双重量化（Double Quantization）进一步将常数开销压到极限；LoRA 适配器在 FP16/BF16 下训练。静态显存降至约 \( 0.55 \Phi \)。</li>
+      <li><strong>直接偏好优化（DPO）</strong>：DPO 理论上无需显式奖励模型，但在损失计算中需要计算当前策略模型 \( \pi_\theta \) 与参考模型 \( \pi_{\text{ref}} \) 对 <code>chosen</code> 和 <code>rejected</code> 两条回答的隐式概率。显存中需同时常驻 2 个模型副本：
+        <ul>
+          <li>策略模型 \( \pi_\theta \)：全参训练模式下需权重（2B/p）+ 梯度（2B/p）+ AdamW（12B/p）= \( 16\Phi \)；</li>
+          <li>参考模型 \( \pi_{\text{ref}} \)：完全冻结，只需前向推理，占用权重（2B/p），无梯度与优化器状态。总静态显存为 \( 18\Phi \)。</li>
+          <li>若策略模型采用 LoRA，则参考模型可直接由底座模型充当（共享基础权重），额外显存几乎仅为 LoRA 参数部分。</li>
+        </ul>
+      </li>
+      <li><strong>近端策略优化（PPO）经典四模型架构</strong>：PPO 是后训练中显存开销的峰值，它在最原始设定下需要同时协同 4 个模型：
+        <ul>
+          <li>Actor（策略模型 \( \pi_\theta \)）：需微调，占用 \( 16\Phi \)（全参）；</li>
+          <li>Critic（价值模型 \( V_\phi \)）：需微调，通常与 Actor 规模相同（或稍小），占用 \( 16\Phi_{\text{critic}} \)；</li>
+          <li>Reference（参考模型 \( \pi_{\text{ref}} \)）：冻结，用于提供 KL 散度惩罚，占用 \( 2\Phi \)；</li>
+          <li>Reward（奖励模型 \( R_\psi \)）：冻结，用于对生成轨迹打分，占用 \( 2\Phi_{\text{reward}} \)。</li>
+        </ul>
+        若 4 个模型均为 7B 规格且全参训练，静态显存累加为 \( 16 + 16 + 2 + 2 = 36 \text{ 字节/参数} \)，7B 模型的静态总开销突破 <strong>250 GB</strong>！因此生产环境通常将 Actor 与 Reference 共用底座（LoRA），或者将 Critic 与 Reward 调度到独立显卡节点上以流水线形式轮番推理。</li>
+      <li><strong>群体相对策略优化（GRPO, DeepSeek-Math / R1）</strong>：GRPO 最具颠覆性的工程突破在于<strong>完全移除了 Critic 模型</strong>。它通过针对同一 Query 采样一组输出（如 \( G=8 \) 个响应），利用组内所有输出的奖励均值与方差进行归一化，充当基线优势函数（Baseline Advantage）。同时，Reference 模型的概率值可以在 Rollout 阶段与 Actor 一同计算并缓存，或完全用 LoRA 模式共用。显存开销从 PPO 的四模型急剧收敛，几乎回退至接近普通 SFT 的水平。</li>
+    </ol>
+
+    <h3>4.2 后训练各阶段显存需求矩阵表</h3>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>阶段与训练范式</th>
+            <th>模型副本数量</th>
+            <th>可训练参数量比例</th>
+            <th>静态显存（字节/参数）</th>
+            <th>7B 模型静态显存</th>
+            <th>70B 模型静态显存</th>
+            <th>单机 8×80G A100 能否全显存容纳</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Full SFT（混合精度）</strong></td>
+            <td>1（Policy）</td>
+            <td>100%</td>
+            <td>16 B</td>
+            <td>112 GB</td>
+            <td>1,120 GB</td>
+            <td>7B 需 ZeRO-1/2；70B 需 ZeRO-3</td>
+          </tr>
+          <tr>
+            <td><strong>LoRA SFT (r=16)</strong></td>
+            <td>1（Base + LoRA）</td>
+            <td>~0.2%</td>
+            <td>~2.05 B</td>
+            <td>14.4 GB</td>
+            <td>144 GB</td>
+            <td>7B 单卡可跑；70B 单机 8 卡轻松装下</td>
+          </tr>
+          <tr>
+            <td><strong>QLoRA SFT (4-bit)</strong></td>
+            <td>1（NF4 Base + LoRA）</td>
+            <td>~0.2%</td>
+            <td>~0.55 B</td>
+            <td>3.9 GB</td>
+            <td>39 GB</td>
+            <td>7B 消费级 16G 卡；70B 单卡 48G/80G 可跑</td>
+          </tr>
+          <tr>
+            <td><strong>DPO（全参数）</strong></td>
+            <td>2（Policy + Ref）</td>
+            <td>100% (Policy)</td>
+            <td>18 B</td>
+            <td>126 GB</td>
+            <td>1,260 GB</td>
+            <td>7B 需 ZeRO-1/2 跨卡；70B 需多机 ZeRO-3</td>
+          </tr>
+          <tr>
+            <td><strong>DPO（LoRA 模式）</strong></td>
+            <td>1 共享底座 + 1 LoRA</td>
+            <td>~0.2%</td>
+            <td>~2.05 B</td>
+            <td>14.5 GB</td>
+            <td>145 GB</td>
+            <td>7B 单卡 24G 可跑；70B 单机 8 卡</td>
+          </tr>
+          <tr>
+            <td><strong>PPO（经典四模型全参）</strong></td>
+            <td>4（Actor, Critic, Ref, RM）</td>
+            <td>200% (Actor+Critic)</td>
+            <td>36 B</td>
+            <td>252 GB</td>
+            <td>2,520 GB</td>
+            <td>7B 需多卡深度混合切分；70B 需大规模集群</td>
+          </tr>
+          <tr>
+            <td><strong>GRPO（全参训练）</strong></td>
+            <td>1（Actor）+ 1 逻辑 Ref</td>
+            <td>100%</td>
+            <td>16 ~ 18 B</td>
+            <td>112 ~ 126 GB</td>
+            <td>1,120 ~ 1,260 GB</td>
+            <td>相比 PPO 节省约 50% 显存，无需 Critic</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 42-1：主流后训练阶段静态显存理论开销矩阵对比表（假设主干架构规模一致，未包含激活显存）</span>
+    </div>
+
+    <p><strong>本节小结：</strong>后训练显存受制于驻留模型的数量；PPO 需 4 模型开销高达 36 B/p，GRPO 裁掉 Critic 砍半显存，LoRA/QLoRA 则将静态显存压制在 2B/p 与 0.55B/p。</p>
+
+    <h2>5. 训练 FLOPs 理论计算：2P/4P/6P 公式推导</h2>
+    <p>理解了显存（空间维度），下一步是推导算力（时间维度）。在估算训练时间、计算资源预算时，浮点运算次数（FLOPs）是脱离具体硬件架构的最客观度量标尺。</p>
+
+    <h3>5.1 为什么一次矩阵乘法是 2 次浮点运算？</h3>
+    <p>深度学习计算的核心算子是通用矩阵乘法（GEMM）。考虑一个维度为 \( (M, K) \) 的矩阵与维度为 \( (K, N) \) 的矩阵相乘，生成维度为 \( (M, N) \) 的输出矩阵：</p>
+    \[ C_{i, j} = \sum_{k=1}^K A_{i, k} \cdot B_{k, j} \]
+    <p>对于输出矩阵中的每一个元素 \( C_{i, j} \)，需要执行 \( K \) 次标量乘法（Multiplication）和 \( K-1 \) 次标量加法（Addition，通常近似为 \( K \) 次累加）。因此，计算单个元素需要 \( 2K \) 次浮点操作。输出矩阵共有 \( M \times N \) 个元素，总计算量为：</p>
+    \[ \text{FLOPs} = 2 \times M \times N \times K \]
+
+    <h3>5.2 前向传播计算量：2P FLOPs/token</h3>
+    <p>考虑一个参数量为 \( P \) 的 Transformer 模型。语言模型的绝大部分参数集中在注意力机制的 QKV/Out 投影权重以及 MLP 块的升维/降维权重中。在一次前向传播中，输入一个 Token 的 Embedding 向量 \( x \in \mathbb{R}^{1 \times h} \)，需要与所有的权重矩阵进行逐层矩阵乘法。</p>
+    <p>对于模型中总大小为 \( P \) 的所有线性层权重，乘以 1 个 Token 的激活向量，本质上等价于执行了一系列乘累加运算。根据 GEMM 计算法则：输入张量为 \( (1, K) \)，权重为 \( (K, N) \)，权重参数量 \( \Phi_{\text{linear}} = K \times N \)。计算消耗的 FLOPs 为 \( 2 \times 1 \times K \times N = 2 \times \Phi_{\text{linear}} \)。由于 Attention 自身除投影外的 Softmax 计算量在上下文适中时占比极小（通常在 1% 以内），我们可以给出大模型前向传播的黄金准则：</p>
+    \[ \text{FLOPs}_{\text{forward}} \approx 2 P \quad (\text{每处理一个 Token 消耗 } 2P \text{ 次浮点运算}) \]
+
+    <h3>5.3 反向传播计算量：为什么是 4P FLOPs/token？</h3>
+    <p>反向传播计算涉及两个独立的梯度链式传递过程，很多初学者常误以为反向传播与前向计算量相同。实际上，在对线性层 \( Y = X W \) 求导时：</p>
+    <ol>
+      <li><strong>对输入的梯度（Activation Gradients）</strong>：为了将梯度反向传递给前一层，必须计算：
+        \[ \frac{\partial \mathcal{L}}{\partial X} = \frac{\partial \mathcal{L}}{\partial Y} \cdot W^T \]
+        这里是输出梯度矩阵与权重转置矩阵相乘，浮点计算量为 \( 2 \times \text{参数量} = 2 P \)。</li>
+      <li><strong>对权重参数的梯度（Weight Gradients）</strong>：为了执行优化器参数更新，必须计算损失对权重本身的偏导数：
+        \[ \frac{\partial \mathcal{L}}{\partial W} = X^T \cdot \frac{\partial \mathcal{L}}{\partial Y} \]
+        这里是输入激活矩阵与输出梯度矩阵相乘，浮点计算量同样为 \( 2 \times \text{参数量} = 2 P \)。</li>
+    </ol>
+    <p>因此，对于每一个训练参数，反向传播总共需要执行<strong>两次</strong>与前向传播同等规模的矩阵乘法！</p>
+    \[ \text{FLOPs}_{\text{backward}} \approx 2P + 2P = 4 P \quad (\text{每处理一个 Token}) \]
+    <p>若启用了全量激活值重计算（Activation Checkpointing），在反向传播前还需要重新执行一次前向传播，此时反向阶段实际计算量变为 \( 2P (\text{重计算}) + 4P (\text{梯度求导}) = 6P \)。</p>
+
+    <div class="callout note">
+      <div class="callout-title">📘 核心法则：大模型全参训练 6P 公式</div>
+      <p>在<strong>不开启重计算</strong>的标准全参反向传播中：</p>
+      \[ \text{FLOPs}_{\text{train/token}} = \text{FLOPs}_{\text{forward}} + \text{FLOPs}_{\text{backward}} = 2P + 4P = 6P \]
+      <p>若<strong>开启全量激活值重计算</strong>：</p>
+      \[ \text{FLOPs}_{\text{train/token}} = 2P_{\text{forward}} + 2P_{\text{recompute}} + 4P_{\text{backward}} = 8P \]
+      <p>如果训练数据集包含 \( T \) 个 Token，则全参微调的总计算量理论上等于 \( 6 P T \)（无重计算）或 \( 8 P T \)（带全量重计算）FLOPs。</p>
+    </div>
+    <p><strong>本节小结：</strong>矩阵乘法乘加算子决定了前向 2P、反向 4P 的计算分配；标准全参训练每 Token 需 6P FLOPs，开启全量重计算后升至 8P FLOPs。</p>
+
+    <h2>6. 硬件利用率度量：MFU 与 HFU 测算</h2>
+    <p>掌握了理论 FLOPs 公式后，如何评估我们的训练任务跑得够不够快？这就需要引入硬件浮点运算利用率的衡量标准：<span class="term">MFU（Model FLOPs Utilization）</span> 与 <span class="term">HFU（Hardware FLOPs Utilization）</span>。</p>
+
+    <h3>6.1 MFU 与 HFU 的数学定义</h3>
+    <p>厂商给出的 GPU 标称算力是理论峰值（Peak Theoretical FLOPS）。例如，一张 NVIDIA A100-SXM4-80GB 在密集张量核心 BF16/FP16 模式下的标称理论算力为 <strong>312 TFLOPS</strong>（即 \( 312 \times 10^{12} \) 次浮点每秒）；而 H100-SXM5-80GB 在非稀疏 FP16/BF16 下高达 <strong>989 TFLOPS</strong>。</p>
+    <p>设实际训练集群拥有 \( N_{\text{gpu}} \) 张显卡，在连续运行时间 \( t \)（秒）内，总共处理了 \( T_{\text{processed}} \) 个 Token。则：</p>
+    <ol>
+      <li><strong>模型有效浮点利用率（Model FLOPs Utilization, MFU）</strong>：仅统计模型最纯粹的前向与反向理论计算量（固定按 \( 6P \) 计），完全排除任何由于算法技巧引入的冗余计算（如重计算、分布式通信打散算子）：
+        \[ \text{MFU} = \frac{6 \times P \times \text{Tokens/sec}}{N_{\text{gpu}} \times \text{Peak\_FLOPS}_{\text{per\_gpu}}} = \frac{6 \times P \times (T_{\text{processed}} / t)}{N_{\text{gpu}} \times \text{Peak\_FLOPS}} \]
+      </li>
+      <li><strong>硬件浮点利用率（Hardware FLOPs Utilization, HFU）</strong>：将硬件实际上跑过的所有浮点运算全额计入（例如将激活重计算的 \( 2P \) 计入，按 \( 8P \) 算，同时包含长文本 Attention 实际消耗的额外计算）：
+        \[ \text{HFU} = \frac{\text{实际执行的所有 FLOPs}}{N_{\text{gpu}} \times t \times \text{Peak\_FLOPS}} \]
+      </li>
+    </ol>
+    <p>在工业界，<strong>MFU 是唯一具有横向可比性的黄金度量标准</strong>。因为开发者如果写了一个极其低效的内核、或者滥用了多余的重计算，HFU 看起来可能会非常高（显卡风扇狂转、算力看似被打满），但由于很多算力浪费在无效计算上，转化出来的有效产出（Tokens/sec）极低，其 MFU 将非常难看。</p>
+
+    <h3>6.2 工业界 MFU 水平对照与天花板分析</h3>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>训练框架与规模场景</th>
+            <th>典型 MFU 范围</th>
+            <th>利用率等级评价</th>
+            <th>核心性能瓶颈分析</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>原生 HuggingFace Trainer (单机多卡 DDP)</td>
+            <td>15% ~ 25%</td>
+            <td>较低（存在严重优化空间）</td>
+            <td>未启用高效内核，显存搬运碎片化，通信与计算无重叠</td>
+          </tr>
+          <tr>
+            <td>DeepSpeed ZeRO-2 / ZeRO-3（优化良好）</td>
+            <td>35% ~ 45%</td>
+            <td>工业及格水准</td>
+            <td>通信与梯度计算重叠良好，FlashAttention 开启</td>
+          </tr>
+          <tr>
+            <td>Megatron-LM 3D 并行（大规模预训练千卡集群）</td>
+            <td>48% ~ 58%</td>
+            <td>业界顶尖水准</td>
+            <td>张量并行/流水线并行极致调优，通信拓扑与 NVLink 完美匹配</td>
+          </tr>
+          <tr>
+            <td>理论天花板（硬件物理极限）</td>
+            <td>~65%</td>
+            <td>物理极限</td>
+            <td>受限于非 GEMM 算子（LayerNorm、Softmax 访存带宽限制）及通信开销</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 42-2：不同工程架构下大模型训练的典型 MFU 表现基准表</span>
+    </div>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警示：不可跨精度、不可带稀疏性对比 FLOPS</div>
+      <p>NVIDIA 官方宣传页在标榜 H100 算力时，通常会给出“1979 TFLOPS（FP16 Tensor Core with Sparsity）”这一数字。请务必注意：<strong>该数值包含 2:4 结构化稀疏性假设</strong>，而在通用语言模型常规预训练与后训练中，权重通常为稠密矩阵（Dense），非稀疏标称值实际为 <strong>989 TFLOPS</strong>！若在计算 MFU 分母时误用了 1979 TFLOPS，算出来的利用率将直接腰斩一半，导致对工程瓶颈产生严重误判。</p>
+    </div>
+    <p><strong>本节小结：</strong>MFU 是评估训练工程效率的唯一客观尺度；工业优良产线 MFU 通常在 40%~55% 之间，计算分母切勿混淆带稀疏性的标称峰值。</p>
+
+    <h2>7. 显存与算力快速估算工具 Python 实战</h2>
+    <p>为了将上述所有抽象推导落地为日常可执行的工程实践，我们编写一个工业级、轻量级的显存与算力预估脚本 <code>calc_training_resources.py</code>。它能够精确模拟不同参数量、不同序列长度、不同批次以及各后训练策略下的显存需求与训练天数。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">calc_training_resources.py</span>
+      <pre class="code"><code class="language-python">import math
+
+class LLMTrainingResourceEstimator:
+    """
+    大模型训练工程显存与算力资源估算器
+    支持全参微调、LoRA、QLoRA、DPO 以及多卡分布式场景的显存与耗时推导
+    """
+    def __init__(
+        self,
+        param_billions: float,        # 模型参数量 (单位: Billion，如 7.0 表示 7B)
+        hidden_size: int,             # 隐藏层维度 (h)
+        num_layers: int,              # Transformer 层数 (L)
+        num_heads: int,               # 注意力头数 (a)
+        vocab_size: int = 128256      # 词表大小
+    ):
+        self.P = param_billions * 1e9
+        self.h = hidden_size
+        self.L = num_layers
+        self.a = num_heads
+        self.vocab_size = vocab_size
+
+    def estimate_static_memory_gb(self, method: str = "full_sft") -> dict:
+        """
+        计算静态显存 (权重、梯度、优化器状态)，单位: GiB
+        method 可选: 'full_sft', 'lora', 'qlora', 'dpo_full', 'dpo_lora'
+        """
+        gb_factor = 1024 ** 3
+
+        if method == "full_sft":
+            weights = (2 * self.P) / gb_factor
+            grads = (2 * self.P) / gb_factor
+            # AdamW: FP32 Master Weights (4) + 1st Momentum (4) + 2nd Momentum (4) = 12 bytes
+            opt_states = (12 * self.P) / gb_factor
+            total = weights + grads + opt_states
+            return {"weights_gib": weights, "grads_gib": grads, "opt_gib": opt_states, "total_static_gib": total}
+
+        elif method == "lora":
+            # 假设 LoRA 插入所有线性层，可训练参数量约为全参的 0.2%
+            lora_ratio = 0.002
+            p_lora = self.P * lora_ratio
+            weights = (2 * self.P) / gb_factor            # 底座冻结
+            grads = (2 * p_lora) / gb_factor              # 仅 LoRA 产生梯度
+            opt_states = (12 * p_lora) / gb_factor        # 仅为 LoRA 分配 Adam 状态
+            total = weights + grads + opt_states
+            return {"weights_gib": weights, "grads_gib": grads, "opt_gib": opt_states, "total_static_gib": total}
+
+        elif method == "qlora":
+            lora_ratio = 0.002
+            p_lora = self.P * lora_ratio
+            weights = (0.55 * self.P) / gb_factor         # 4-bit 量化底座 + 双重量化开销
+            grads = (2 * p_lora) / gb_factor
+            opt_states = (12 * p_lora) / gb_factor
+            total = weights + grads + opt_states
+            return {"weights_gib": weights, "grads_gib": grads, "opt_gib": opt_states, "total_static_gib": total}
+
+        elif method == "dpo_full":
+            # 策略模型 (16B) + 冻结参考模型 (2B)
+            policy = (16 * self.P) / gb_factor
+            reference = (2 * self.P) / gb_factor
+            return {"policy_gib": policy, "ref_gib": reference, "total_static_gib": policy + reference}
+
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+
+    def estimate_activation_memory_gb(
+        self,
+        batch_size: int,
+        seq_length: int,
+        use_recompute: bool = True
+    ) -> float:
+        """
+        估算单个 GPU 上的中间激活值显存 (GiB)
+        """
+        gb_factor = 1024 ** 3
+        b = batch_size
+        s = seq_length
+
+        if use_recompute:
+            # 开启全量激活重计算：仅保留各层输入激活
+            # 显存约为 2 * b * s * h * L 字节
+            act_bytes = 2 * b * s * self.h * self.L
+        else:
+            # 未开启重计算：每层保存中间变量 (包含注意力打分矩阵投影)
+            # 简化公式：b * s * h * (34 + 5 * a * s / h) * L
+            bytes_per_layer = b * s * self.h * (34 + 5 * (self.a * s) / self.h)
+            act_bytes = bytes_per_layer * self.L
+
+        return act_bytes / gb_factor
+
+    def estimate_training_time_hours(
+        self,
+        total_tokens_billion: float,
+        num_gpus: int,
+        gpu_peak_tflops: float = 312.0,   # 默认 A100 SXM4 80GB (312 TFLOPS)
+        expected_mfu: float = 0.45,       # 预期 MFU 45%
+        use_recompute: bool = True
+    ) -> float:
+        """
+        计算完成训练所需时间 (小时)
+        """
+        total_tokens = total_tokens_billion * 1e9
+        # 无重计算 6P FLOPs/token，全量重计算按 8P FLOPs/token 消耗算力
+        flops_per_token = 8.0 * self.P if use_recompute else 6.0 * self.P
+        total_flops_required = flops_per_token * total_tokens
+
+        # 集群实际每秒提供的有效计算力 (FLOPS)
+        effective_flops_cluster = num_gpus * (gpu_peak_tflops * 1e12) * expected_mfu
+        total_seconds = total_flops_required / effective_flops_cluster
+        return total_seconds / 3600.0
+
+
+# 运行演示
+if __name__ == "__main__":
+    # 以 LLaMA-3-8B 规格为例
+    llama3 = LLMTrainingResourceEstimator(
+        param_billions=8.03,
+        hidden_size=4096,
+        num_layers=32,
+        num_heads=32
+    )
+
+    print("=== 8B 模型不同模式静态显存估算 ===")
+    for m in ["full_sft", "lora", "qlora", "dpo_full"]:
+        res = llama3.estimate_static_memory_gb(m)
+        print(f"模式: {m:<10} | 总静态显存: {res['total_static_gib']:.2f} GiB")
+
+    print("\n=== 激活显存对比 (Batch=2, Seq=4096) ===")
+    act_no_ckpt = llama3.estimate_activation_memory_gb(2, 4096, use_recompute=False)
+    act_ckpt = llama3.estimate_activation_memory_gb(2, 4096, use_recompute=True)
+    print(f"原生未重计算激活显存: {act_no_ckpt:.2f} GiB (极高概率 OOM)")
+    print(f"启用激活重计算激活显存: {act_ckpt:.2f} GiB")
+
+    print("\n=== 训练时间预估 (10B Token, 8卡 A100-80G, 预期 MFU 42%) ===")
+    hours = llama3.estimate_training_time_hours(
+        total_tokens_billion=10.0,
+        num_gpus=8,
+        gpu_peak_tflops=312.0,
+        expected_mfu=0.42,
+        use_recompute=True
+    )
+    print(f"预估完成时间: {hours:.2f} 小时 ({hours/24.0:.2f} 天)")
+</code></pre>
+    </div>
+
+    <h3>7.2 实测 MFU 的线上监控钩子代码</h3>
+    <p>在基于原生 PyTorch 或 HuggingFace Trainer 的训练循环中，可以通过在每隔若干个 step 插入回调（Callback），动态采集吞吐量并直接在控制台输出真实的实时 MFU：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">mfu_tracker_callback.py</span>
+      <pre class="code"><code class="language-python">import time
+import torch
+from transformers import TrainerCallback
+
+class MFUTrackingCallback(TrainerCallback):
+    """
+    在线实时 MFU 监控回调组件
+    """
+    def __init__(self, param_count: int, gpu_peak_tflops: float = 312.0):
+        super().__init__()
+        self.P = param_count
+        self.peak_flops = gpu_peak_tflops * 1e12
+        self.last_time = None
+        self.last_step = 0
+        self.world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if self.last_time is None:
+            self.last_time = time.time()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        # 仅在日志记录周期打印
+        if state.global_step > 0 and state.global_step % args.logging_steps == 0:
+            current_time = time.time()
+            elapsed = current_time - self.last_time
+            steps_delta = state.global_step - self.last_step
+
+            # 计算此区间内全集群处理的总 Token 数量
+            # 每 step 处理 Token = per_device_bs * grad_accum_steps * seq_len * world_size
+            tokens_per_step = (
+                args.per_device_train_batch_size
+                * args.gradient_accumulation_steps
+                * args.max_seq_length
+                * self.world_size
+            )
+            total_tokens = tokens_per_step * steps_delta
+            tokens_per_sec = total_tokens / elapsed
+
+            # 理论计算量按 6P 估算 MFU (排除重计算的虚高)
+            theoretical_flops = 6.0 * self.P * tokens_per_sec
+            cluster_peak_flops = self.world_size * self.peak_flops
+            mfu = theoretical_flops / cluster_peak_flops
+
+            print(f"\n[Step {state.global_step}] 吞吐: {tokens_per_sec:.1f} tok/s | 实时 MFU: {mfu*100:.2f}%")
+
+            # 状态复位
+            self.last_time = time.time()
+            self.last_step = state.global_step
+</code></pre>
+    </div>
+
+    <h3>7.3 显存瓶颈排查与常见降容技巧</h3>
+    <p>如果在训练阶段依然遇到显存超标，可以按照以下排查链路逐一执行外科手术式优化：</p>
+    <div class="code-wrap">
+      <span class="code-label">memory_optimization_checklist.sh</span>
+      <pre class="code"><code class="language-bash"># 1. 开启 FlashAttention-2 消除二次方打分矩阵
+export FLASH_ATTENTION_FORCE_BUILD=TRUE
+# 在训练脚本参数中指定 --attn_implementation flash_attention_2
+
+# 2. 启用激活值重计算 (Gradient Checkpointing)
+# 在 Trainer 参数中加入: --gradient_checkpointing True
+
+# 3. 如果是全参数训练，引入 DeepSpeed ZeRO-2 或 ZeRO-3 切分优化器状态与梯度
+# 详见第 43 章分布式配置
+
+# 4. 如果是单卡长上下文 OOM，启用 PyTorch 2.x 的 SDPA (Scaled Dot Product Attention)
+# 并检查是否存在未被垃圾回收的张量驻留: torch.cuda.empty_cache()
+</code></pre>
+    </div>
+
+    <p><strong>本节小结：</strong>通过 Python 脚本推导能实现资源的确定性规划；生产中配合 MFU Tracker 在线监控，能杜绝算力浪费与虚假高利用率假象。</p>
+
+    <h2>8. 本章小结</h2>
+    <ul>
+      <li><strong>显存构成</strong>：混合精度训练静态显存遵循严格的 16 字节法则（权重 2B + 梯度 2B + AdamW 状态 12B）；7B 模型仅静态即需 112 GB，必须借助 PEFT 或分布式切分。</li>
+      <li><strong>激活值控制</strong>：原生激活值包含 \( O(s^2) \) 打分矩阵，随序列变长极速爆炸。开启梯度检查点（重计算）后，激活显存压缩至仅存储层输入的线性水平，开销仅为 20%~30% 的额外前向运算。</li>
+      <li><strong>后训练显存矩阵</strong>：PPO 包含 4 个模型副本，静态显存高达 36 B/p；GRPO 移除 Critic 模型大幅减负；LoRA 与 QLoRA 分别将显存压制在 2.05 B/p 与 0.55 B/p。</li>
+      <li><strong>算力法则</strong>：矩阵乘法决定了前向 2P、反向 4P（总计 6P FLOPs/token）；开启重计算后单步消耗升至 8P FLOPs/token。</li>
+      <li><strong>利用率度量</strong>：MFU 是衡量训练工程水平的唯一公正标尺，工业界优良线在 40%~55%；计算时务必使用未开启稀疏性的硬件原生浮点峰值。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：为什么在使用 AdamW 优化器进行全参数训练时，仅仅优化器状态就占用了 12 个字节/参数，而不是 8 个字节？</summary>
+        <p><strong>答案：</strong>因为除了记录梯度的 FP32 一阶动量（4 字节）和二阶动量（4 字节）之外，在混合精度（BF16/FP16）训练中，还必须在优化器内部维护一份 <strong>FP32 精度的模型主权重副本（Master Weights，4 字节）</strong>。如果直接在低精度的 BF16/FP16 权重上进行微小步长的梯度更新累加，会因为尾数精度不足导致“舍入为零”的数值下溢问题。因此 \( 4 + 4 + 4 = 12 \) 字节/参数是混合精度 AdamW 的必要下限。</p>
+      </details>
+      <details>
+        <summary>问题 2：为什么说在长序列训练中，开启激活值重计算（Gradient Checkpointing）几乎是一笔“稳赚不赔”的买卖？</summary>
+        <p><strong>答案：</strong>在长序列下，若不开启重计算，每层必须缓存大量的中间打分矩阵与 MLP 激活张量，激活显存随序列长度和层数呈爆炸式上升（动辄上百 GB）。开启全量重计算后，只需保留每层的初始输入（显存降为极低的线性量，可节约 80%~90% 以上的激活显存），而付出的代价仅仅是在反向传播前额外执行一次前向计算（增加约 20%~30% 的前向 FLOPs）。显存大幅腾出后，可以跑更大 Batch 或更长上下文，显著提高 GPU 张量核心的吞吐效率，综合收益远超计算开销。</p>
+      </details>
+      <details>
+        <summary>问题 3：某工程师在 8 卡 H100（单卡峰值 989 TFLOPS）上全参训练 70B 模型，测试得到每秒全集群产出 2000 个 Token。请问该训练任务的 MFU 是多少？处于何种工程水平？</summary>
+        <p><strong>答案：</strong>根据 MFU 计算公式：
+        \[ \text{MFU} = \frac{6 \times P \times \text{Tokens/sec}}{N_{\text{gpu}} \times \text{Peak\_FLOPS}} \]
+        代入数据：\( P = 70 \times 10^9 \)，每秒集群 Token 数为 2000，卡数 8，单卡峰值 \( 989 \times 10^{12} \) FLOPS：
+        \[ \text{分子} = 6 \times (70 \times 10^9) \times 2000 = 8.4 \times 10^{14} \text{ FLOPS} = 840 \text{ TFLOPS} \]
+        \[ \text{分母} = 8 \times 989 \text{ TFLOPS} = 7912 \text{ TFLOPS} \]
+        \[ \text{MFU} = \frac{840}{7912} \approx 10.61\% \]
+        该 MFU 仅为 10.6%，远低于 40% 的及格线，说明该任务存在严重的显存通信瓶颈、过小的 micro-batch 导致 GPU 空转、或者没有合理配置高效并行策略，需要彻底重构分布式通信与流水线。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Kaplan+, 2020]</span> Kaplan, J., McCandlish, S., Henighan, T., et al. "Scaling Laws for Neural Language Models." <i>arXiv preprint</i>, 2020. <span class="rid">arXiv:2001.08361</span></li>
+      <li><span class="rid">[Chen+, 2016]</span> Chen, T., Xu, B., Zhang, C., &amp; Guestrin, C. "Training Deep Nets with Sublinear Memory Cost." <i>arXiv preprint</i>, 2016. <span class="rid">arXiv:1604.06174</span></li>
+      <li><span class="rid">[Shoeybi+, 2019]</span> Shoeybi, M., Patwary, M., Puri, R., et al. "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism." <i>arXiv preprint</i>, 2019. <span class="rid">arXiv:1909.08053</span></li>
+      <li><span class="rid">[Rajbhandari+, 2020]</span> Rajbhandari, S., Rasley, J., Ruwase, O., &amp; He, Y. "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models." <i>SC20: International Conference for High Performance Computing, Networking, Storage and Analysis</i>, 2020. <span class="rid">arXiv:1910.02054</span></li>
+      <li><span class="rid">[Chowdhery+, 2022]</span> Chowdhery, A., Narang, S., Devlin, J., et al. "PaLM: Scaling Language Modeling with Pathways." <i>Journal of Machine Learning Research</i>, 2022. <span class="rid">arXiv:2204.02311</span></li>
+      <li><span class="rid">[Dao+, 2022]</span> Dao, T., Fu, D. Y., Ermon, S., Rudra, A., &amp; Ré, C. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." <i>NeurIPS</i>, 2022. <span class="rid">arXiv:2205.14135</span></li>
+      <li><span class="rid">[Korthikanti+, 2023]</span> Korthikanti, V. A., Casper, J., Dey, S., et al. "Reducing Activation Recomputation in Large Transformer Models." <i>Proceedings of Machine Learning and Systems (MLSys)</i>, 2023. <span class="rid">arXiv:2205.05198</span></li>
+      <li><span class="rid">[Shao+, 2024]</span> Shao, Z., Wang, P., Zhu, Q., et al. "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2402.03300</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

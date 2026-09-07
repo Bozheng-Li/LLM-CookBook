@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 13 章 · SFT 损失实现细节 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 3 部分 · 监督微调 SFT</div>
+      <h1>第 13 章 · SFT 损失实现细节</h1>
+      <p class="chapter-lead">SFT 的算法只有一行负对数似然，工程实现却埋着上百行决定成败的细节：shift 对齐、ignore_index、loss mask 策略、packing 与块对角注意力、长序列的 logits 显存。本章把"从一段多轮对话到 loss 标量"的完整链路逐站拆开，给出手写 collator、TRL 与 LLaMA-Factory 的对应配置，以及一份"训练正常却越训越笨"的静默 bug 清单。</p>
+      <div class="chapter-meta">⏱ 预计学习 100 分钟 ｜ 难度 ★★★★☆ ｜ 先修：第 12 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 从一行公式到一次"正确"的训练</h2>
+    <p>第 12 章给出了监督微调（Supervised Fine-Tuning, SFT）的目标函数：给定指令 \(x\) 与目标回答 \(y\)，最小化回答部分的负对数似然</p>
+    \[ \mathcal{L}_{\mathrm{SFT}}(\theta) = -\frac{1}{\sum_i |r_i|}\sum_{i}\sum_{t \in r_i} \log \pi_\theta\!\left(y_t \mid x_i, y_{t &lt; t}\right) \]
+    <p>其中 \(r_i\) 表示第 \(i\) 条样本中<strong>参与训练的 token 集合</strong>。这行公式在纸面上毫无争议，但在代码里，它的每一次落地都要回答四个实现问题：预测目标与 logits 如何对齐（shift）；哪些 token 算 \(r_i\) 的成员（loss mask）；多条样本如何拼成一个 batch（padding 与 packing）；分母是按 token 平均还是按样本平均（loss 归一化）。这四个问题每一个都有 2~4 种选项，组合起来就是几十种实现——其中大多数在数值上"看起来都在正常下降"，只有少数是真正对的。</p>
+    <p>更麻烦的是，损失实现的错误几乎全是<strong>静默错误</strong>：它不会抛异常，loss 曲线平滑下降，评测分数却明显低于预期。最典型的三类是：prompt 意外参与训练（模型学会复述问题）、EOS 没进训练目标（生成停不下来）、特殊 token 被 BPE 拆碎（模板边界失真）。第 15 章会专门处理模板一侧，本章聚焦损失一侧，按数据流动顺序讲完整条链路：</p>
+    <div class="code-wrap">
+      <span class="code-label">SFT 数据流（伪代码总览）</span>
+      <pre class="code"><code class="language-python"># 从对话数据到 loss 标量的完整链路（本章 2~8 节按此顺序展开）
+messages = [
+    {"role": "system",    "content": "你是一个严谨的助手。"},      # ① 是否训练？
+    {"role": "user",      "content": "解释什么是过拟合。"},        # ② 是否训练？
+    {"role": "assistant", "content": "过拟合是指……&lt;|im_end|&gt;"},   # ③ 必须训练 + 学会停
+]
+# 1) chat template 渲染成纯文本（第 15 章）
+text = tokenizer.apply_chat_template(messages, tokenize=False)
+# 2) tokenize 并构造 labels：非训练位置填 -100（本章 2、5 节）
+enc  = tokenize_with_labels(text, assistant_spans)
+# 3) collator：padding 或 packing 成 batch（本章 4 节）
+batch = collator([enc1, enc2, enc3])   # input_ids / labels / attention_mask
+# 4) forward + shift + 向量化交叉熵（本章 2、6 节）
+loss  = model(input_ids=..., labels=...).loss
+loss.backward()                        # 5) 反向传播（本章 6 节：显存大头在 logits）</code></pre>
+    </div>
+    <p>后面 2~9 节按这条链路展开：先讲逐 token 交叉熵的向量化实现（第 2 节），再讲四种 mask 策略（第 3 节）、packing 与块对角注意力（第 4 节）、assistant_masks 与多轮 loss（第 5 节）、长序列显存（第 6 节），然后给出现成框架的对应参数（第 7 节）、一个完整的手写 collator（第 8 节），最后是 bug 清单（第 9 节）。</p>
+    <p><strong>本节小结：</strong>SFT 实现的正确性不体现在"能不能跑"，而体现在 shift 对齐、mask 边界、归一化方式这些看不见的选择上；本章的目标是让你能对任何一个训练脚本的 loss 路径做逐行审计。</p>
+
+    <h2>2. 逐 token 交叉熵：shift、reshape 与 ignore_index</h2>
+    <p>因果语言模型在位置 \(i\) 的输出，是对第 \(i+1\) 个 token 的预测分布。这意味着 <strong>logits 与"预测目标"天然错开一位</strong>：要把 \(T\) 个位置的 logits 变成 \(T\) 个监督信号，必须把标签序列向左移一位——位置 \(i\) 的 logits 对齐到 labels 的第 \(i+1\) 位。这一步 shift 是所有 CE 实现的起点，也是 off-by-one bug 的高发区。先看对齐关系：</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="logits 与 labels 的 shift 对齐关系">
+        <defs><marker id="arrow13a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <text x="360" y="26" text-anchor="middle" font-size="16" fill="#1e293b">shift 对齐：位置 i 的 logits 预测第 i+1 个 token</text>
+        <text x="24" y="72" font-size="14" fill="#475569">input_ids</text>
+        <rect x="110" y="48" width="72" height="36" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="146" y="71" text-anchor="middle" font-size="14" fill="#1e3a8a">用户:</text>
+        <rect x="182" y="48" width="72" height="36" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="218" y="71" text-anchor="middle" font-size="14" fill="#1e3a8a">你是谁</text>
+        <rect x="254" y="48" width="72" height="36" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="290" y="71" text-anchor="middle" font-size="14" fill="#1e3a8a">im_start</text>
+        <rect x="326" y="48" width="72" height="36" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="362" y="71" text-anchor="middle" font-size="14" fill="#065f46">assistant</text>
+        <rect x="398" y="48" width="72" height="36" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="434" y="71" text-anchor="middle" font-size="14" fill="#065f46">我是…</text>
+        <rect x="470" y="48" width="72" height="36" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="506" y="71" text-anchor="middle" font-size="14" fill="#065f46">im_end</text>
+        <text x="24" y="152" font-size="14" fill="#475569">labels</text>
+        <rect x="110" y="128" width="72" height="36" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="5 4"/>
+        <text x="146" y="151" text-anchor="middle" font-size="14" fill="#64748b">-100</text>
+        <rect x="182" y="128" width="72" height="36" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="5 4"/>
+        <text x="218" y="151" text-anchor="middle" font-size="14" fill="#64748b">-100</text>
+        <rect x="254" y="128" width="72" height="36" rx="8" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="5 4"/>
+        <text x="290" y="151" text-anchor="middle" font-size="14" fill="#64748b">-100</text>
+        <rect x="326" y="128" width="72" height="36" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="362" y="151" text-anchor="middle" font-size="14" fill="#065f46">assistant</text>
+        <rect x="398" y="128" width="72" height="36" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="434" y="151" text-anchor="middle" font-size="14" fill="#065f46">我是…</text>
+        <rect x="470" y="128" width="72" height="36" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="506" y="151" text-anchor="middle" font-size="14" fill="#065f46">im_end</text>
+        <line x1="110" y1="84" x2="182" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow13a)"/>
+        <line x1="182" y1="84" x2="254" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow13a)"/>
+        <line x1="254" y1="84" x2="326" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow13a)"/>
+        <line x1="326" y1="84" x2="398" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow13a)"/>
+        <line x1="398" y1="84" x2="470" y2="128" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow13a)"/>
+        <text x="590" y="150" font-size="13" fill="#64748b">labels 与 input_ids</text>
+        <text x="590" y="170" font-size="13" fill="#64748b">同长同位存放；</text>
+        <text x="590" y="190" font-size="13" fill="#64748b">shift 在 CE 内部完成</text>
+        <text x="360" y="196" text-anchor="middle" font-size="13" fill="#5b21b6">灰色 -100 的位置被 ignore_index 跳过，不产生梯度</text>
+      </svg>
+      <figcaption>图 13-1：logits 与 labels 的错位对齐。labels 与 input_ids 同长同位存放（绿色为应训练的 response token），"labels 右移一位对齐 logits"的 shift 在交叉熵内部完成；实现时最容易在这里发生 off-by-one（作者自绘）</figcaption>
+    </figure>
+    <p>有了对齐关系，逐 token 交叉熵就可以完全向量化：把 \(B \times (T-1)\) 个位置的 logits 摊平成 \((B(T-1)) \times V\) 的矩阵，直接调用一次 <span class="term">交叉熵（Cross Entropy）</span>。下面这段代码就是 SFT 损失的全部数学内容，任何框架里的实现都是它的变体：</p>
+    <div class="code-wrap">
+      <span class="code-label">sft_loss.py — 向量化 SFT 损失</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def sft_loss(logits: torch.Tensor, labels: torch.Tensor) -&gt; torch.Tensor:
+    """逐 token 交叉熵的向量化实现。
+    logits: [B, T, V]  模型输出（未 softmax）
+    labels: [B, T]     与 input_ids 同长同位；不训练的位置已填 -100
+    """
+    B, T, V = logits.shape
+    # 关键一步：logits 取前 T-1 个位置，labels 取后 T-1 个位置，完成错位对齐
+    shift_logits = logits[:, :-1, :].contiguous()        # [B, T-1, V] 预测方
+    shift_labels = labels[:, 1:].contiguous()             # [B, T-1]    监督方
+    # 摊平后一次算完所有位置的 CE；ignore_index=-100 的位置不参与求和与平均
+    loss = F.cross_entropy(
+        shift_logits.view(-1, V),                         # [B*(T-1), V]
+        shift_labels.view(-1),                            # [B*(T-1)]
+        ignore_index=-100,
+        reduction="mean",                                 # 对"有效 token"求平均
+    )
+    return loss
+
+# 等价的手写版本（帮助理解 reduction 语义）：
+# valid = shift_labels.view(-1) != -100
+# per_tok = F.cross_entropy(shift_logits.view(-1, V), shift_labels.view(-1),
+#                           reduction="none")
+# loss = per_tok[valid].mean()      # 分母 = 有效 token 数，而不是 B*(T-1)</code></pre>
+    </div>
+    <p>三个细节值得说透。<strong>第一，为什么偏偏是 -100</strong>：PyTorch 的 <code>F.cross_entropy</code> 默认 <code>ignore_index=-100</code>，词表 ID 永远非负，所以 -100 天然不会与任何合法 token 冲突；你也可以换成别的负数，但必须同步传 <code>ignore_index</code> 参数，且张量运算库、拼接函数都要一致——没有理由偏离默认值。<strong>第二，reduction="mean" 的分母是"有效 token 数"</strong>，不是 \(B \times T\)：被 mask 的位置既不贡献分子也不贡献分母，这正是第 4 节"packing 污染 loss 统计"的根源——不同样本的有效 token 数不同，token 级平均等于变相按长度加权。<strong>第三，labels 里保留的是"当前位"的 token，不是"下一位"</strong>：mask 应该按 input_ids 的位置构造（哪个 token 是回答，哪个位置才训练），shift 交给 CE；先手动 shift 再 mask 是最常见的 double-shift 错误来源。</p>
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：HuggingFace 模型的 labels 约定</div>
+      <p>HF 的 <code>AutoModelForCausalLM.forward(labels=…)</code> <strong>内部已经做了 shift</strong>：传入的 labels 应与 input_ids 同长同位（模型内部取 <code>labels[..., 1:]</code> 与 <code>logits[..., :-1]</code> 对齐）。因此自写 collator 时直接在"当前位"填 -100 即可；如果你照抄了训练循环里 <code>labels[:, 1:]</code> 的写法再传给模型，就发生了双重 shift，监督目标整体右移一格——症状是 loss 略低、模型学到的条件分布整体错位一个 token。自己手写 loss（如上面的 <code>sft_loss</code>）时才需要显式 shift。</p>
+    </div>
+    <p><strong>本节小结：</strong>逐 token CE = 错位对齐 + 摊平 + ignore_index=-100 的向量求平均；"labels 同位存放、shift 交给框架"是避免 off-by-one 的最稳约定。</p>
+
+    <h2>3. Loss Masking 四种策略：到底训哪些 token</h2>
+    <p>"训哪些 token"是 SFT 里影响最大的实现决策，没有之一。同一条多轮对话数据（system + 两轮 user/assistant），按训练范围可以划出四种策略，它们改变的是有效监督信号的<strong>数量、来源与目标分布</strong>：</p>
+    <ul>
+      <li><strong>策略 A：只训 response</strong>——只有 assistant 轮的内容（含收尾的 <code>im_end</code>/EOS）参与训练，system 与 user 全部 mask。这是 InstructGPT 以来最主流的做法，目标分布与推理时"给定上下文生成回答"完全一致。</li>
+      <li><strong>策略 B：全序列训练</strong>——包括 system 和 user 在内全部算 loss。等价于把对话当成普通语料做语言建模，监督信号最多，但模型会用容量去学"如何写用户的问题"。</li>
+      <li><strong>策略 C：多轮 per-turn 控制</strong>——逐轮决定训不训：典型变体是只训<strong>最后一轮</strong> assistant（LLaMA-Factory 的 <code>mask_history</code>），或对后面的轮次加权。适合"历史轮质量参差、但最后一轮是精修答案"的数据。</li>
+      <li><strong>策略 D：system 不训、其余全训</strong>——system 是行为说明书而非要复述的内容，mask 掉；user 与 assistant 都训练。介于 A、B 之间，常见于数据量小、想榨干监督信号的场合。</li>
+    </ul>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="四种 loss mask 策略对同一段多轮对话的训练范围着色">
+        <defs><marker id="arrow13b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/></marker></defs>
+        <text x="360" y="26" text-anchor="middle" font-size="16" fill="#1e293b">同一段多轮对话在四种 mask 策略下的训练范围</text>
+        <!-- 行 A -->
+        <text x="12" y="86" font-size="14" fill="#1e293b">A 只训 response</text>
+        <rect x="150" y="60" width="88" height="40" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="194" y="84" text-anchor="middle" font-size="13" fill="#64748b">system</text>
+        <rect x="238" y="60" width="104" height="40" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="290" y="84" text-anchor="middle" font-size="13" fill="#64748b">user 1</text>
+        <rect x="342" y="60" width="128" height="40" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="406" y="84" text-anchor="middle" font-size="13" fill="#065f46">assistant 1</text>
+        <rect x="470" y="60" width="104" height="40" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="522" y="84" text-anchor="middle" font-size="13" fill="#64748b">user 2</text>
+        <rect x="574" y="60" width="126" height="40" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="637" y="84" text-anchor="middle" font-size="13" fill="#065f46">assistant 2</text>
+        <!-- 行 B -->
+        <text x="12" y="146" font-size="14" fill="#1e293b">B 全序列训练</text>
+        <rect x="150" y="120" width="88" height="40" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="194" y="144" text-anchor="middle" font-size="13" fill="#1e3a8a">system</text>
+        <rect x="238" y="120" width="104" height="40" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="290" y="144" text-anchor="middle" font-size="13" fill="#92400e">user 1</text>
+        <rect x="342" y="120" width="128" height="40" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="406" y="144" text-anchor="middle" font-size="13" fill="#065f46">assistant 1</text>
+        <rect x="470" y="120" width="104" height="40" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="522" y="144" text-anchor="middle" font-size="13" fill="#92400e">user 2</text>
+        <rect x="574" y="120" width="126" height="40" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="637" y="144" text-anchor="middle" font-size="13" fill="#065f46">assistant 2</text>
+        <!-- 行 C -->
+        <text x="12" y="206" font-size="14" fill="#1e293b">C 只训最后一轮</text>
+        <rect x="150" y="180" width="88" height="40" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="194" y="204" text-anchor="middle" font-size="13" fill="#64748b">system</text>
+        <rect x="238" y="180" width="104" height="40" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="290" y="204" text-anchor="middle" font-size="13" fill="#64748b">user 1</text>
+        <rect x="342" y="180" width="128" height="40" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="406" y="204" text-anchor="middle" font-size="13" fill="#64748b">assistant 1</text>
+        <rect x="470" y="180" width="104" height="40" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="522" y="204" text-anchor="middle" font-size="13" fill="#64748b">user 2</text>
+        <rect x="574" y="180" width="126" height="40" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="637" y="204" text-anchor="middle" font-size="13" fill="#065f46">assistant 2</text>
+        <!-- 行 D -->
+        <text x="12" y="266" font-size="14" fill="#1e293b">D system 不训</text>
+        <rect x="150" y="240" width="88" height="40" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="194" y="264" text-anchor="middle" font-size="13" fill="#64748b">system</text>
+        <rect x="238" y="240" width="104" height="40" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="290" y="264" text-anchor="middle" font-size="13" fill="#92400e">user 1</text>
+        <rect x="342" y="240" width="128" height="40" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="406" y="264" text-anchor="middle" font-size="13" fill="#065f46">assistant 1</text>
+        <rect x="470" y="240" width="104" height="40" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="522" y="264" text-anchor="middle" font-size="13" fill="#92400e">user 2</text>
+        <rect x="574" y="240" width="126" height="40" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="637" y="264" text-anchor="middle" font-size="13" fill="#065f46">assistant 2</text>
+        <!-- 注释箭头 -->
+        <line x1="640" y1="204" x2="640" y2="238" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#arrow13b)"/>
+        <text x="655" y="222" font-size="12" fill="#64748b">历史轮 masked</text>
+        <!-- 图例 -->
+        <rect x="150" y="300" width="18" height="16" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="174" y="313" font-size="13" fill="#334155">参与训练</text>
+        <rect x="240" y="300" width="18" height="16" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="264" y="313" font-size="13" fill="#334155">被 mask（-100）</text>
+        <rect x="386" y="300" width="18" height="16" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="410" y="313" font-size="13" fill="#334155">system（仅 B 训练）</text>
+        <rect x="546" y="300" width="18" height="16" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="570" y="313" font-size="13" fill="#334155">user（B/D 训练）</text>
+      </svg>
+      <figcaption>图 13-2：四种 loss mask 策略对照。绿色=参与训练；灰色虚线=被 mask 为 -100；蓝色=system；橙色=user。注意无论哪种策略，assistant 轮的收尾 token（im_end/EOS）都应包含在训练范围内（作者自绘）</figcaption>
+    </figure>
+    <p>四种策略的取舍核心是"监督信号的纯度换数量"。把范围铺得越宽（B、D），单条样本提供的梯度信号越多、loss 下降越快，但优化方向里混入了"生成用户输入"的任务；收敛到"只训 response"（A），目标分布最纯，代价是有效 token 数变少、对数据量更敏感。实证结果也支持"因数据而异"：Flan Collection 的消融发现，在大规模多任务混合上 packing 后不加 mask 对多数任务无害，但对话类数据不 mask 会明显变差（Longpre et al., 2023）；LIMA 只用 1000 条精选数据训练 response，说明高质量、目标对齐的信号比信号数量更重要（Zhou et al., 2023）。此外无论选哪种，<strong>assistant 轮的收尾 token 必须在训练范围内</strong>——它承担"学会停止"的职责，mask 掉它是"生成停不下来"的头号原因。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>策略</th><th>训练范围</th><th>有效信号量</th><th>主要风险 / 副作用</th><th>典型适用场景</th></tr></thead>
+        <tbody>
+          <tr><td>A 只训 response</td><td>assistant 轮内容 + 收尾 token</td><td>低</td><td>数据需求量大；user 写得好坏不学</td><td>指令跟随、对话助手（默认首选）</td></tr>
+          <tr><td>B 全序列</td><td>全部 token</td><td>高</td><td>容量分给"生成提问"；对话数据上易学坏</td><td>领域继续预训练、语料稀少的风格迁移</td></tr>
+          <tr><td>C per-turn（只训最后一轮）</td><td>最后一个 assistant 轮</td><td>中（历史只作上下文）</td><td>丢弃历史轮监督；长对话利用率低</td><td>历史轮由弱模型/人工粗写、末轮精修</td></tr>
+          <tr><td>D system 不训、其余全训</td><td>user + assistant</td><td>较高</td><td>介于 A/B 之间，需评测护航</td><td>小数据集、模板固定且 system 敏感</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 13-1：四种 loss mask 策略对比。实践中默认选 A，仅在数据量不足或数据形态特殊时切换 B/D，并通过固定评测集对比验证（Longpre et al., 2023, arXiv:2301.13688；Zhou et al., 2023, arXiv:2305.11206）</span>
+    </div>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：用"loss 差值"快速审计 mask</div>
+      <p>审计一个陌生脚本的 mask 是否生效，最便宜的测试是构造一条已知样本：把 assistant 回答整段替换成一个从未见过的随机 token 串。如果第 1 步 loss 远高于该模型词表的 \(\ln |V|\)（如 15 万词表约 11.9），说明随机 token 确实被算进 loss（mask 生效）；再检查把回答整段 mask 掉后 loss 是否变成"nan 或报错"——如果 mask 后仍能算出很低的 loss，说明 prompt 也在参与训练。</p>
+    </div>
+    <p><strong>本节小结：</strong>mask 策略决定模型学"生成回答"还是"复述全篇"；默认只训 response 并保留收尾 token，切换策略前先想清楚目标分布是否还与推理一致。</p>
+
+    <h2>4. Packing：序列拼接、块对角注意力与 loss 统计污染</h2>
+    <p>一个 batch 里的样本长度参差（几百到几千 token），朴素的右 padding 会把大量算力浪费在 pad 位上——经验上浪费 20%~40% 的计算很常见。<span class="term">序列拼接训练（Packing）</span>的解法是：把多条样本首尾相接拼成长度恰好为 <code>max_length</code> 的"块"，一个 batch 的每一行都是"满"的，彻底消灭 padding。这个思想来自预训练语料的组织方式（T5、GPT 系预训练都对语料做拼接，Raffel et al., 2020），SFT 把它搬过来时却多了一个<strong>预训练没有的问题</strong>：SFT 样本之间互相独立，拼在一起后如果注意力畅通无阻，样本 B 的回答会"看见"样本 A 的内容——既污染训练信号，也让推理与训练的条件分布不一致。</p>
+    <p>因此 SFT 的 packing 必须配合<span class="term">块对角注意力（Block-Diagonal Attention）</span>：注意力矩阵只在每个样本内部允许交互，样本之间的块全部置为 \(-\infty\)。直观结构如下：</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="packing 的块对角注意力矩阵示意">
+        <defs><marker id="arrow13c" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <text x="360" y="26" text-anchor="middle" font-size="16" fill="#1e293b">Packing 与块对角注意力：样本内允许交互，样本间必须挡住</text>
+        <!-- 左：拼接序列 -->
+        <text x="20" y="58" font-size="14" fill="#475569">拼接序列（一行 batch）</text>
+        <rect x="20" y="70" width="180" height="36" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="110" y="93" text-anchor="middle" font-size="13" fill="#065f46">样本 A：6 个 token</text>
+        <rect x="200" y="70" width="120" height="36" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="260" y="93" text-anchor="middle" font-size="13" fill="#92400e">样本 B：4 token</text>
+        <rect x="320" y="70" width="90" height="36" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="365" y="93" text-anchor="middle" font-size="13" fill="#1e3a8a">样本 C：3</text>
+        <text x="20" y="132" font-size="13" fill="#64748b">attention：A 只能看 A，B 只能看 B，C 只能看 C</text>
+        <line x1="215" y1="106" x2="450" y2="152" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrow13c)"/>
+        <!-- 右：块对角矩阵 -->
+        <text x="560" y="58" text-anchor="middle" font-size="14" fill="#475569">注意力掩码（对角块内可见）</text>
+        <rect x="440" y="70" width="90" height="66" rx="4" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="485" y="108" text-anchor="middle" font-size="13" fill="#065f46">A×A</text>
+        <rect x="530" y="70" width="60" height="66" rx="4" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <rect x="590" y="70" width="50" height="66" rx="4" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <rect x="440" y="136" width="90" height="44" rx="4" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <rect x="530" y="136" width="60" height="44" rx="4" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="560" y="163" text-anchor="middle" font-size="13" fill="#065f46">B×B</text>
+        <rect x="590" y="136" width="50" height="44" rx="4" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <rect x="440" y="180" width="90" height="33" rx="4" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <rect x="530" y="180" width="60" height="33" rx="4" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <rect x="590" y="180" width="50" height="33" rx="4" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="615" y="201" text-anchor="middle" font-size="12" fill="#065f46">C×C</text>
+        <text x="440" y="238" font-size="13" fill="#64748b">绿色块：允许注意力；灰色块：置 -∞ 挡住</text>
+        <text x="440" y="258" font-size="13" fill="#64748b">行内顺序与拼接序列一致</text>
+        <!-- 底部实现说明 -->
+        <rect x="20" y="200" width="380" height="92" rx="10" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="40" y="226" font-size="13" fill="#334155">实现要点（FlashAttention varlen）：</text>
+        <text x="40" y="248" font-size="13" fill="#475569">· 不构造 65536×65536 的大掩码矩阵</text>
+        <text x="40" y="270" font-size="13" fill="#475569">· 用 cu_seqlens=[0,6,10,13] 记录样本边界</text>
+        <text x="40" y="290" font-size="13" fill="#475569">· position_ids 在每个样本内从 0 重新计数（RoPE）</text>
+      </svg>
+      <figcaption>图 13-3：packing 把多条样本拼进同一行，块对角注意力保证"样本只看见自己"。高效实现不显式构造大掩码，而是把样本边界交给 FlashAttention 的 varlen 接口按段计算（作者自绘）</figcaption>
+    </figure>
+    <p><strong>为什么必须块对角：</strong>如果不挡，样本间的注意力等价于"每条样本的数据分布被同一个 batch 里的其他样本污染"，模型会学到虚假的跨样本依赖；此外 padding-free 拼接后 position_ids、RoPE 的相对位置也要在样本内归零，否则位置编码同样串味。工程上没人显式构造 \(N \times N\) 的大掩码（32k 上下文的掩码矩阵本身就要 GB 级内存），标准做法是 FlashAttention 的 <span class="term">变长接口（varlen API）</span>：传一个 <code>cu_seqlens</code>（累积长度）数组，kernel 按段计算注意力，显存与算力都只花在真实 token 上（Dao et al., 2023）。HuggingFace 的 <code>DataCollatorWithFlattening</code> 与 TRL 的 <code>packing_strategy="bfd"</code>（best-fit-decreasing 装箱）走的就是这条路。</p>
+    <div class="code-wrap">
+      <span class="code-label">packing_varlen.py — varlen packing 的最小数据流</span>
+      <pre class="code"><code class="language-python">from transformers import DataCollatorWithFlattening, AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+# DataCollatorWithFlattening：把 batch 内样本摊平成一行（batch=1），
+# 自动生成 position_ids（样本内从 0 重计），labels 自动 -100 对齐样本首 token
+collator = DataCollatorWithFlattening(tokenizer=tok, return_position_ids=True)
+
+feats = [{"input_ids": e["input_ids"], "labels": e["labels"]} for e in batch_rows]
+packed = collator(feats)
+# packed: {"input_ids": [1, T_total], "position_ids": [1, T_total],
+#          "labels": [1, T_total]}
+# 前提：model attn_implementation="flash_attention_2"，模型侧按 position_ids
+# 推断 cu_seqlens 做 varlen 注意力；T5 类 encoder-decoder 与不支持 FA2 的模型不适用
+
+# 底层等价物（示意，flash_attn 包的实际调用）：
+# from flash_attn import flash_attn_varlen_qkvpacked_func
+# out = flash_attn_varlen_qkvpacked_func(
+#     qkv, cu_seqlens=[0, 6, 10, 13], max_seqlen=6,
+#     dropout_p=0.0, causal=True)   # 每个 (q, k, v) 段独立做因果注意力</code></pre>
+    </div>
+    <p><strong>packing 的第二重坑：loss 统计被污染。</strong>拼接本身不改变数学目标，但它改变了"哪些梯度共享一个分母"。token 级平均（<code>reduction="mean"</code>）下，一个优化步的 loss 是整个 batch 所有有效 token 的平均——长样本贡献的梯度假日权重与它的长度成正比；packing 把样本边界抹掉后，这种按长度加权被进一步放大且更隐蔽（例如 1 条 8k 的样本与 8 条 1k 的样本在 token 平均下权重相差 8 倍）。样本级平均（每条样本先对自身 token 求平均，再对样本求平均）则让每条数据"一人一票"，对小数据、精修数据更公平，代价是实现复杂（要在 loss 里保留样本维度）。两种口径没有绝对对错，但<strong>必须知道自己在用哪种</strong>：当你从"逐样本循环训练"切到"packing 大 batch 训练"后发现最优学习率变了，多半就是这个口径切换在起作用。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>归一化口径</th><th>公式</th><th>隐含的加权方式</th><th>适用场景与风险</th></tr></thead>
+        <tbody>
+          <tr><td>token 级平均（框架默认）</td><td>\(\mathcal{L} = -\frac{1}{N_{\mathrm{tok}}}\sum \log p\)</td><td>长样本权重大（按 token 数）</td><td>大数据、长度分布均匀时最稳；长度方差大时被长样本主导，packing 下更明显</td></tr>
+          <tr><td>样本级平均</td><td>\(\mathcal{L} = -\frac{1}{N_{\mathrm{seq}}}\sum_i \frac{1}{|r_i|}\sum_{t \in r_i}\log p\)</td><td>每条样本等权</td><td>精修小数据、混长度数据；需自写 loss，注意梯度尺度变化</td></tr>
+          <tr><td>轮次级平均（多轮扩展）</td><td>每个 assistant 轮内平均后再平均</td><td>每轮等权</td><td>多轮对话防"长回答轮垄断"；实现成本最高</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 13-2：loss 归一化口径对比。切换口径后学习率通常需要重新搜索，两者不可混用比较</span>
+    </div>
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：开了 packing 就默认安全</div>
+      <p>不是所有框架的 packing 都带块对角注意力。历史上不少实现（包括一些知名项目的早期版本）用"朴素拼接 + 普通因果注意力"，即预训练式 packing：训练照常收敛、loss 正常下降，但样本间互相泄漏，模型在多轮对话与长上下文任务上的表现悄悄劣化。核对方法：看框架文档是否明确写着 block-diagonal / varlen / FlashAttention-2（如 TRL 的 <code>packing_strategy="bfd"</code>、LLaMA-Factory 的 <code>neat_packing: true</code>）；只写 "packing" 而无注意力说明的要存疑。</p>
+    </div>
+    <p><strong>本节小结：</strong>packing 消灭 padding 但引入两个新问题——注意力必须块对角（varlen 实现）、loss 归一化口径决定样本权重；两者都是静默影响效果的旋钮。</p>
+
+    <h2>5. assistant_masks 与多轮对话的 loss 设计</h2>
+    <p>第 3 节的 mask 策略落到实现层，核心是"assistant 轮在 token 序列里占据哪些区间"。手写区间容易错位，HF tokenizer 从 4.44 起提供了官方机制：<code>apply_chat_template(..., return_assistant_tokens_mask=True)</code> 返回一个 0/1 的 <code>assistant_masks</code>，前提是对话模板用 <code>{% generation %}...{% endgeneration %}</code> 块标出了"assistant 生成的内容"。模板作者用 generation 标记声明边界，tokenzier 负责把边界翻译成 token 级掩码——这正是模板与 loss mask 的联动点（第 15 章会回到这个话题）。</p>
+    <div class="code-wrap">
+      <span class="code-label">assistant_mask_demo.py</span>
+      <pre class="code"><code class="language-python">from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "写一首关于秋天的短诗。"},
+    {"role": "assistant", "content": "落叶铺满小径，风把夏天折叠收好。"},
+]
+enc = tok.apply_chat_template(
+    messages,
+    add_generation_prompt=False,
+    return_dict=True,                     # 返回 dict 而不是裸张量
+    return_assistant_tokens_mask=True,    # 关键：返回 assistant_masks
+)
+input_ids = enc["input_ids"]              # List[int]
+mask      = enc["assistant_masks"]        # List[bool]，1=assistant 生成内容
+# 训练标签：同位存放，mask 为 0 的位置填 -100（shift 交给模型内部）
+labels = [tok_id if m else -100 for tok_id, m in zip(input_ids, mask)]
+# 注意：若模板没有 {% generation %} 块，这里会直接抛 ValueError，
+# 不少模板（如早期 Qwen）需要自己补写 generation 标记</code></pre>
+    </div>
+    <p>多轮对话还有一层设计自由度：<strong>每个 assistant 轮都训，还是只训最后一轮，或者加权</strong>。三者对应第 3 节的策略 A 与 C 的不同变体。决策依据是数据的"历史可信度"：如果历史轮是精标数据（模型的历史行为就是目标行为），逐轮训练最大化信号；如果历史轮来自弱模型回放（self-instruct 类管线），历史行为本身是要被淘汰的旧策略，只训最后一轮（或对后面轮次更高权重）能让目标分布更接近"以当前模型的历史为上下文生成新回答"，同时缓解多轮数据里"长回答轮垄断梯度"的问题。工程上不需要发明新机制：把 0/1 的 <code>assistant_masks</code> 换成每轮的权重数组即可，CE 侧用逐 token 加权实现（等价于对 <code>reduction="none"</code> 的结果乘权重再归一）。</p>
+    <div class="callout note">
+      <div class="callout-title">📘 与 TRL 的对应关系</div>
+      <p>TRL 对"只训 response"提供了两条路线：<code>assistant_only_loss=True</code>（对话数据 + 带 generation 标记的模板，token 级精确 mask）与 <code>completion_only_loss</code>（prompt-completion 格式数据，按"提示/补全"两段 mask，配合 <code>DataCollatorForCompletionOnlyLM</code> 可用 response 前缀定位边界）。前者的边界由模板作者声明，后者由 response 模板串匹配定位——第 9 节会讲到，后者有"前导空格导致的 tokenize 不一致"经典坑。第 7 节给出两者的完整配置示例。</p>
+    </div>
+    <p><strong>本节小结：</strong>优先用 tokenizer 的 assistant_masks 拿 token 级边界，把"训哪些轮"做成权重而非硬编码；模板缺少 generation 标记时要么补模板、要么退回 response 前缀匹配方案。</p>
+
+    <h2>6. 长序列 SFT 的显存细节：logits 才是大头</h2>
+    <p>很多团队把长序列 SFT 的显存瓶颈想成注意力，实际上现代实现里（FlashAttention 让注意力激活随序列长度线性增长），<strong>最大的单项激活是输出投影后的 logits</strong>：形状 \([B, T, V]\)，其中 \(V\) 是词表大小。做一个估算：Qwen2.5 词表 \(V \approx 15.2\) 万，单条 32k 序列的 bf16 logits 就要 \(32768 \times 152064 \times 2 \approx 9.9\) GB；交叉熵反向还要一份 fp32 梯度与 softmax 中间量，峰值接近 30 GB——这还只是 batch=1 的单条序列。下表给出不同序列长度的量级（按 \(V=152064\)、bf16 前向 / fp32 反向拷贝估算，随实现略有出入）：</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>序列长度 T</th><th>bf16 logits（前向）</th><th>CE 反向峰值（含 fp32 拷贝，估算）</th><th>常见后果</th></tr></thead>
+        <tbody>
+          <tr><td>4k</td><td>约 1.2 GB</td><td>约 3.7 GB</td><td>通常无感</td></tr>
+          <tr><td>16k</td><td>约 4.9 GB</td><td>约 15 GB</td><td>batch=1 已吃掉一张卡的大半</td></tr>
+          <tr><td>32k</td><td>约 9.9 GB</td><td>约 30 GB</td><td>不做优化基本训不动</td></tr>
+          <tr><td>64k</td><td>约 19.9 GB</td><td>约 60 GB</td><td>必须用融合/分块交叉熵</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 13-3：单条序列 logits 与交叉熵的显存占用估算（V=152064，bf16 权重；fp32 中间量按 2 倍 bf16 计）。整体显存账的系统性梳理见第 42 章</span>
+    </div>
+    <p>对策按性价比排序。<strong>第一，融合交叉熵（fused / chunked CE）</strong>：不一次性物化完整 logits，而是把序列切成块，逐块算"lm_head 投影 + 交叉熵 + 梯度"，显存从 \(O(T \cdot V)\) 降到 \(O(\mathrm{chunk} \cdot V)\)——Liger Kernel 的 <code>fused_linear_cross_entropy</code> 已被 TRL/LLaMA-Factory 以 <code>use_liger_kernel=True</code>（TRL）或 <code>enable_liger_kernel: true</code>（LLaMA-Factory）集成，长序列 SFT 基本必开。<strong>第二，梯度检查点（gradient checkpointing）</strong>：用重算换激活显存，对 logits 无效但能砍掉其余激活。<strong>第三，控制有效词表</strong>：如果任务只涉及中英混合语料，可用 <code>logit 裁剪</code>类技巧（只对出现过的 token 子集算 CE）——收益大但实现侵入性强，一般团队到不了这一步。<strong>第四，序列并行/上下文并行</strong>把单条序列切到多卡（见第 43 章），是 64k 以上场景的最终解法。</p>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：长序列 SFT 显存优化检查单</div>
+      <p>按顺序开：FlashAttention-2（注意力激活线性化）→ 梯度检查点 → 融合交叉熵（Liger）→ 8-bit 优化器或分页优化器（优化器状态，第 14 章 QLoRA 同款技巧）→ 序列并行。每开一项记录一次峰值显存与吞吐，别一次全开——融合 CE 与某些自定义注意力实现存在兼容性问题，出问题时无法定位是哪一项引入的。</p>
+    </div>
+    <p><strong>本节小结：</strong>长序列 SFT 的显存大头是 \([B,T,V]\) 的 logits 与 CE 中间量；分块融合 CE 是标配解法，注意力反而早已不是瓶颈。</p>
+
+    <h2>7. 训练框架对照：TRL SFTTrainer 与 LLaMA-Factory</h2>
+    <p>主流框架已把本章前几节的机制封装成参数，问题是参数名、默认值与适用条件各不相同。先看 TRL 的 <code>SFTConfig</code>（版本 0.19+ 的参数体系，旧版 <code>SFTTrainer</code> 的 <code>packing</code>/<code>max_seq_length</code> 参数已迁移进 Config）：</p>
+    <div class="code-wrap">
+      <span class="code-label">train_sft_trl.py</span>
+      <pre class="code"><code class="language-python">from datasets import load_dataset
+from trl import SFTTrainer, SFTConfig
+
+# 数据集为 HF 对话格式：{"messages": [{"role": ..., "content": ...}, ...]}
+train_ds = load_dataset("json", data_files="sft_multi_turn.jsonl", split="train")
+
+cfg = SFTConfig(
+    output_dir="out/qwen25-7b-sft",
+    # ---- 基础训练超参 ----
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=16,       # 等效 batch = 2*16 = 32 条
+    learning_rate=1e-5,                   # 7B 全参 SFT 的常用起点
+    num_train_epochs=3,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    bf16=True,
+    logging_steps=10,
+    # ---- 序列与 loss 关键参数 ----
+    max_length=4096,                      # 单条样本分词后截断长度
+    packing=True,                         # 开启序列拼接
+    packing_strategy="bfd",               # best-fit-decreasing：按长度装箱，
+                                          # 配合 FlashAttention-2 得到块对角注意力
+    assistant_only_loss=True,             # 只训 assistant 轮（token 级 mask）
+    # completion_only_loss=True,          # 仅 prompt-completion 数据用；与上一行二选一
+    # ---- 显存与效率 ----
+    gradient_checkpointing=True,
+    use_liger_kernel=True,                # 融合交叉熵，长序列必开
+    # ---- 模板 ----
+    # chat_template_path="my_template.jinja",  # 覆盖/注入模板（第 15 章）
+)
+trainer = SFTTrainer(
+    model="Qwen/Qwen2.5-7B-Instruct",
+    args=cfg,
+    train_dataset=train_ds,
+)
+trainer.train()</code></pre>
+    </div>
+    <div class="callout warn">
+      <div class="callout-title">⚠️ assistant_only_loss 的隐藏前提</div>
+      <p><code>assistant_only_loss=True</code> 依赖 tokenizer 内置模板中的 <code>{% generation %}</code> 标记：Qwen2.5 官方模板没有这个标记，直接开启会报错；Llama-3.1/3.2 系模板自带。两个选择：给模板补 generation 标记（第 15 章给出写法），或改用 <code>completion_only_loss</code>/手写 collator。另外注意 <code>packing</code> 与 <code>completion_only_loss</code> 组合时要确认当前 TRL 版本支持"packing + 逐样本 mask"（旧版本会静默退化为全序列训练）——升级框架后建议用第 9 节的审计手段复测一次。</p>
+    </div>
+    <p>LLaMA-Factory 把同样的机制放进 YAML，参数名不同但语义一一对应，特别是 mask 策略被显式拆成两个开关：</p>
+    <div class="code-wrap">
+      <span class="code-label">qwen25_sft.yaml（LLaMA-Factory）</span>
+      <pre class="code"><code class="language-yaml">### model
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full          # lora/qlora 见第 14 章
+
+### dataset 与模板
+dataset: my_sft_data           # dataset_info.json 里注册的数据集名
+template: qwen                 # 对话模板，必须与推理侧一致（第 15 章）
+cutoff_len: 4096               # 对应 TRL 的 max_length
+packing: true                  # 序列拼接
+neat_packing: true             # 块对角注意力 packing（防跨样本泄漏，务必开启）
+train_on_prompt: false         # true = 策略 B（user/system 也算 loss）
+mask_history: false            # true = 策略 C（只训最后一个 assistant 轮）
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 16
+learning_rate: 1.0e-5
+num_train_epochs: 3.0
+bf16: true
+gradient_checkpointing: true
+enable_liger_kernel: true      # 融合交叉熵
+warmup_ratio: 0.03
+lr_scheduler_type: cosine
+logging_steps: 10
+output_dir: saves/qwen25-7b-sft</code></pre>
+    </div>
+    <p>两个框架的参数对照如下，审读任何一个新框架的训练配置时，按这张表找齐"序列截断、packing、mask、显存"四组旋钮即可快速上手：</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>功能</th><th>TRL（SFTConfig）</th><th>LLaMA-Factory（YAML）</th><th>本章对应节</th></tr></thead>
+        <tbody>
+          <tr><td>单条截断长度</td><td><code>max_length</code></td><td><code>cutoff_len</code></td><td>第 2 节</td></tr>
+          <tr><td>序列拼接</td><td><code>packing=True</code></td><td><code>packing: true</code></td><td>第 4 节</td></tr>
+          <tr><td>块对角 packing</td><td><code>packing_strategy="bfd"</code></td><td><code>neat_packing: true</code></td><td>第 4 节</td></tr>
+          <tr><td>只训 response（对话数据）</td><td><code>assistant_only_loss=True</code></td><td>默认行为（<code>train_on_prompt: false</code>）</td><td>第 3、5 节</td></tr>
+          <tr><td>prompt 也训练</td><td>不设 assistant/completion loss</td><td><code>train_on_prompt: true</code></td><td>第 3 节策略 B</td></tr>
+          <tr><td>只训最后一轮</td><td>需自定义 collator/权重</td><td><code>mask_history: true</code></td><td>第 3 节策略 C</td></tr>
+          <tr><td>融合交叉熵</td><td><code>use_liger_kernel=True</code></td><td><code>enable_liger_kernel: true</code></td><td>第 6 节</td></tr>
+          <tr><td>对话模板注入</td><td><code>chat_template_path</code></td><td><code>template</code>（内置注册名）</td><td>第 15 章</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 13-4：TRL 与 LLaMA-Factory 的 SFT loss/packing 参数对照（参数名以各自 2024-2025 版本文档为准，升级后请复核）</span>
+    </div>
+    <p><strong>本节小结：</strong>框架参数只是本章机制的"命名层"——<code>packing</code> 对应第 4 节、<code>assistant_only_loss</code>/<code>train_on_prompt</code> 对应第 3 节、Liger 开关对应第 6 节；用机制理解参数，而不是背参数。</p>
+
+    <h2>8. 手写一个正确的 SFT Collator</h2>
+    <p>框架参数覆盖不了的定制需求（逐轮加权、混合数据源、特殊掩码规则）最终都要回到自己写 collator。下面是一个完整可用的多轮 SFT collator，涵盖本章所有要点：逐轮渲染求区间、assistant 区间进 labels、收尾 token 包含在训练范围内、padding 部分全部 -100、以及一个防 BPE 边界漂移的自检方法：</p>
+    <div class="code-wrap">
+      <span class="code-label">sft_collator.py — 完整手写 SFT Collator</span>
+      <pre class="code"><code class="language-python">import torch
+from typing import Any
+
+class MultiTurnSFTCollator:
+    """把 HF 对话格式的 messages 列表转成 input_ids / labels / attention_mask。
+
+    核心约定（与第 2 节一致）：
+    - labels 与 input_ids 同长同位，非训练位置填 -100；
+    - shift 交给模型的内部 loss，这里不做任何手动移位；
+    - assistant 轮的收尾 token（im_end/EOS 等）包含在训练区间内。
+    """
+
+    def __init__(self, tokenizer, max_length: int = 4096,
+                 last_turn_only: bool = False, turn_weights: list | None = None):
+        self.tok = tokenizer
+        self.max_length = max_length
+        self.last_turn_only = last_turn_only        # 策略 C：只训最后一轮
+        self.turn_weights = turn_weights            # 策略 C'：逐轮加权（可选）
+
+    def encode_example(self, messages: list[dict]) -&gt; dict:
+        # ---- 第一步：逐轮渲染，用"前缀 token 长度差"定位每轮的 token 区间 ----
+        ids: list[int] = []
+        spans: list[tuple[int, int]] = []           # 每轮的 (start, end)
+        prev_len = 0
+        for i in range(len(messages)):
+            partial_ids = self.tok.apply_chat_template(
+                messages[: i + 1],                  # 截止到本轮（含本轮全部内容）
+                tokenize=True,
+                add_special_tokens=False,           # 模板自带 BOS，防止双 BOS（第 15 章）
+            )
+            new_seg = partial_ids[prev_len:]        # 本轮新增 token（含模板标签）
+            start = len(ids)
+            ids.extend(new_seg)
+            if messages[i]["role"] == "assistant":
+                spans.append((start, len(ids)))     # assistant 轮整段（含收尾 token）
+            prev_len = len(partial_ids)
+        # 截断保护：从尾部截，保证最后的回答轮完整
+        if len(ids) &gt; self.max_length:
+            overflow = len(ids) - self.max_length
+            ids = ids[overflow:]
+            spans = [(
+                max(0, s - overflow), max(0, e - overflow)
+            ) for s, e in spans]
+            spans = [sp for sp in spans if sp[1] &gt; sp[0]]
+        if not spans:
+            raise ValueError("截断后没有任何 assistant 区间，检查 max_length 或数据")
+        return {"input_ids": ids, "spans": spans}
+
+    def verify(self, messages: list[dict]) -&gt; None:
+        """自检：整段重 tokenize 应与逐轮拼接一致（防 BPE 边界漂移）。
+        不一致说明模板边界处存在跨 token 合并，需要改用整段渲染+字符偏移定位。"""
+        whole = self.tok.apply_chat_template(messages, tokenize=True,
+                                             add_special_tokens=False)
+        piece = self.encode_example(messages)["input_ids"]
+        assert whole == piece, "逐轮 tokenize 与整段 tokenize 不一致，边界有合并漂移"
+
+    def __call__(self, batch: list[list[dict]]) -&gt; dict[str, torch.Tensor]:
+        feats = [self.encode_example(m) for m in batch]
+        maxlen = max(len(f["input_ids"]) for f in feats)
+        pad_id = self.tok.pad_token_id or self.tok.eos_token_id
+        b = len(feats)
+        input_ids  = torch.full((b, maxlen), pad_id, dtype=torch.long)
+        labels     = torch.full((b, maxlen), -100, dtype=torch.long)
+        attn_mask  = torch.zeros((b, maxlen), dtype=torch.long)
+        for i, f in enumerate(feats):
+            n = len(f["input_ids"])
+            ids_t = torch.tensor(f["input_ids"], dtype=torch.long)
+            input_ids[i, :n] = ids_t
+            attn_mask[i, :n] = 1
+            spans = f["spans"][-1:] if self.last_turn_only else f["spans"]
+            for j, (s, e) in enumerate(spans):
+                w = 1.0
+                if self.turn_weights is not None:      # 逐轮加权：labels 存
+                    w = self.turn_weights[j]           # 真值，权重交给 loss 侧
+                labels[i, s:e] = ids_t[s:e]            # 同位存放，含 im_end
+        # 注意：逐轮加权需要自定义 loss（reduction="none" 后乘权重再平均），
+        # 上面的 labels 构造只覆盖 0/1 mask；加权版请返回 spans 交给训练循环。
+        return {"input_ids": input_ids, "labels": labels, "attention_mask": attn_mask}
+
+# 用法：
+# collator = MultiTurnSFTCollator(tok, max_length=4096)
+# collator.verify(messages)                      # 先自检
+# loader = DataLoader(ds, batch_size=4, collate_fn=collator)</code></pre>
+    </div>
+    <p>这段代码有三个值得咀嚼的设计。<strong>第一，"逐轮渲染求差"定位区间</strong>：让模板引擎自己决定每轮边界在哪，collator 不 hardcode 任何模板字符串，换模型只换 tokenizer；代价是逐轮调用模板有开销，且依赖"整段 tokenize == 逐段拼接"，所以配了一个 <code>verify</code> 自检——一旦断言失败（BPE 在边界处发生跨轮合并），就要退回"整段渲染 + 用 decode 长度反查区间"的更稳实现。<strong>第二，labels 与 input_ids 同位</strong>：呼应第 2 节，这里绝不 shift。<strong>第三，padding 全 -100 且 pad_token 有兜底</strong>：很多基座模型没有 pad_token，用 eos 顶替时务必确认 labels 的 padding 位已被 -100 覆盖，否则模型会学"EOS 之后继续输出 EOS"。</p>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：把 collator 当作可测试的纯函数</div>
+      <p>collator 是整个 SFT 管线里最适合单元测试的部件：给它 3~5 条构造样本（含超长截断、单轮、多轮、空 system），断言 labels 的非 -100 区间 decode 回来恰好等于 assistant 内容 + 收尾 token。把这组测试放进 CI，框架升级、模板更换时跑一遍，能拦住本章第 9 节里一半的 bug。</p>
+    </div>
+    <p><strong>本节小结：</strong>手写 collator 的正确性 = 逐轮渲染定位区间 + 同位 labels + padding 全 mask + 边界自检；写完先测，再进训练。</p>
+
+    <h2>9. 常见 Bug 清单：那些"loss 正常下降但模型变笨"的原因</h2>
+    <p>最后把本章散落的坑收拢成一张排查表。这些 bug 的共同点是<strong>静默</strong>：不报错、loss 可以下降、粗看评测也能过，但对比消融时分数差一截。排查的通用方法论是"把 batch 解码出来看"：取一个 batch，<code>tokenizer.decode(labels[labels != -100])</code> 打印，肉眼确认"训练的内容"到底是不是你以为的内容；再打印 <code>decode(input_ids)</code> 与渲染文本逐字符 diff，确认特殊 token 没有被拆碎、BOS 没有重复。除此之外，从 loss 初值也能读出信息：第 1 步 loss 应接近 \(\ln |V|\)（15 万词表约 11.9），明显偏低说明 mask 失效或数据泄漏，明显偏高说明标签错位。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Bug</th><th>典型症状</th><th>根因与修复</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>mask 错位：prompt 参与训练</td><td>模型爱复述问题；loss 偏低</td><td>区间定位差一位（换行/空格归属）；打印 decode(labels != -100) 对齐到字符级检查</td></tr>
+          <tr><td>2</td><td>shift 双重移位</td><td>监督目标整体错一格； perplexity 假性正常</td><td>HF 模型内部已 shift，外部再移一次即错；约定"labels 同位存放"（第 2 节）</td></tr>
+          <tr><td>3</td><td>特殊 token 未加入词表</td><td>decode 出现乱码碎片；模板边界失真</td><td>新 token 未 add_special_tokens / 未 resize embedding；见第 15 章注册流程</td></tr>
+          <tr><td>4</td><td>response 模板串 tokenize 不一致</td><td>completion_only_loss 整条样本无 loss 或全在训</td><td>单独 tokenize 模板串与上下文内 tokenize 结果不同（前导空格）；改用 token 级 mask 方案</td></tr>
+          <tr><td>5</td><td>EOS/im_end 未进训练目标</td><td>推理停不下来，复读到 max_tokens</td><td>收尾 token 被区间切割丢掉；确认 spans 覆盖收尾 token（图 13-2）</td></tr>
+          <tr><td>6</td><td>pad_token=eos 且 padding 未 mask</td><td>生成 EOS 后接着吐 EOS；序列长度虚高</td><td>labels 的 padding 位必须 -100；collator 全量填充为 -100</td></tr>
+          <tr><td>7</td><td>双 BOS</td><td>开头连续两个 BOS token；短文本效果劣化</td><td>apply_chat_template 已含 BOS 又传 add_special_tokens=True；统一用 add_special_tokens=False</td></tr>
+          <tr><td>8</td><td>朴素 packing 跨样本泄漏</td><td>多轮/长上下文评测悄悄下降</td><td>packing 未配块对角注意力；确认 bfd/varlen/neat_packing（第 4 节）</td></tr>
+          <tr><td>9</td><td>packing 后 position_ids 未重置</td><td>同上，且长文本困惑度异常</td><td>RoPE 位置跨样本累加；用 DataCollatorWithFlattening 类方案生成 position_ids</td></tr>
+          <tr><td>10</td><td>loss 口径混用比较</td><td>换实现后"loss 变差"误判</td><td>token 平均与样本平均不可直接比；同口径对比（第 4 节表 13-2）</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 13-5：SFT loss 实现十大静默 bug 清单。前 7 项都可用"解码 labels 逐字符检查 + loss 初值 sanity check"在 10 分钟内定位</span>
+    </div>
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：loss 初值是免费的体检报告</div>
+      <p>训练启动后的第 1 个 loss 值蕴含大量信息：\(\ln |V|\) 附近（15 万词表约 11.9）说明 mask 与对齐基本正常；显著偏低（比如 3~5）几乎必然意味着 prompt 参与训练、数据泄漏进训练集、或者 base 模型本身已在同类数据上训过；出现 nan/inf 先查学习率与 fp16 溢出再查数据。把"第 1 步 loss 落在合理区间"写成训练脚本的启动断言，是成本最低的护栏。</p>
+    </div>
+    <p><strong>本节小结：</strong>SFT 的实现 bug 都是静默的；排查三板斧——解码 labels 肉眼检查、loss 初值 sanity check、collator 单元测试——能覆盖绝大多数事故。</p>
+
+    <h2>10. 本章小结</h2>
+    <ul>
+      <li><strong>向量化 CE</strong>：错位对齐（logits[:-1] 对 labels[1:]）+ 摊平 + ignore_index=-100；HF 约定 labels 与 input_ids 同位存放、shift 在模型内部完成，手动 shift 是双重移位 bug 的根源。</li>
+      <li><strong>mask 策略</strong>：只训 response（默认）、全序列、只训最后一轮、system 不训各有场景；无论哪种，assistant 收尾 token 必须进训练目标，否则生成停不下来。</li>
+      <li><strong>packing</strong>：消灭 padding 的代价是两件配套工程——块对角注意力（FlashAttention varlen / cu_seqlens / position_ids 重置）与 loss 归一化口径的显式选择（token 平均 vs 样本平均）。</li>
+      <li><strong>assistant_masks</strong>：优先用 tokenizer 的 generation 标记机制拿 token 级边界，多轮控制做成逐轮权重；模板缺标记时补模板或退回前缀匹配。</li>
+      <li><strong>长序列显存</strong>：瓶颈是 \([B,T,V]\) 的 logits 与 CE 中间量（32k 单条峰值约 30 GB，估算），分块融合 CE（Liger）+ 梯度检查点是标配，64k 以上考虑序列并行。</li>
+      <li><strong>框架参数</strong>：TRL 与 LLaMA-Factory 的 packing/loss 参数一一对应（表 13-4）；用机制理解参数，警惕 <code>assistant_only_loss</code> 的模板前提与朴素 packing 的静默泄漏。</li>
+      <li><strong>排查三板斧</strong>：解码 labels 逐字符检查、第 1 步 loss ≈ \(\ln|V|\) 的 sanity check、collator 单元测试。</li>
+    </ul>
+    <p>本章解决"损失怎么算对"；下一章转向"算多少参数"——LoRA 家族用低秩增量把 70B 模型的全参微调装进单机八卡。之后第 15 章补齐本章反复引用的另一半：对话模板与特殊 token 如何决定 token 边界。</p>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：为什么 -100 能安全地充当"不参与训练"的标记？如果改用 0 会发生什么？</summary><p>词表 ID 永远是非负整数，-100 不可能是任何合法 token，因此 PyTorch 把它设为 cross_entropy 的默认 ignore_index：这些位置既不进入 loss 分子，也不进入平均的分母。若改用 0，它会被当作 ID 为 0 的真实 token（通常是 BOS/unk）参与训练，模型会被迫学习"在这些位置预测 0"，产生大量错误监督信号；除非显式传 ignore_index 并保证该值不与任何合法 ID 冲突，否则没有理由偏离 -100。</p></details>
+      <details><summary>问题 2：packing 打开、保持 token 级平均不变，为什么长样本的话语权会变大？给出两种修正思路。</summary><p>token 级平均的分母是"batch 内有效 token 总数"，梯度按 token 数分配：一条 8k token 的样本对这步梯度的贡献是 1k 样本的 8 倍。packing 让一行装下更多不同长度的样本，长度差异被混合在同一个分母里，加权效应更隐蔽。修正思路一：改用样本级平均——每条样本先对自身有效 token 求平均，再对样本求平均，实现上要保留样本维度做两次归约；思路二：保持 token 平均但对样本按长度重加权（如每 token 权重 1/|r_i|，等效样本平均），或在数据侧做长度分桶均衡。注意切换口径后学习率要重新搜索，且两种口径的 loss 值不可直接比较。</p></details>
+      <details><summary>问题 3：一个 15 万词表模型的 SFT，第 1 步 loss 只有 2.1。列出三个最可能的原因与验证方法。</summary><p>原因一：mask 失效、模型基本没有收到监督或 supervision 泄漏——验证：解码 labels[labels != -100]，确认非 -100 区域是否为空或与输入重复；原因二：训练数据与 base 模型的预训练/既有 SFT 数据高度重叠（模型已经会答）——验证：拿一批未训练过的留出样本看 loss 是否同样偏低，或对数据做去重检查；原因三：实现把 loss 算在了错误的范围上（例如把 ignore_index 错传、或对 logits 做了 softmax 后又过一次 CE）——验证：用第 2 节的独立实现 sft_loss 对同一 batch 复算 loss 比对数值。附带检查：确认不是优化器状态残留（断点续训读错了 checkpoint）。</p></details>
+      <details><summary>问题 4：写出一行"把 prompt 带进训练"的典型错误代码，并解释错在哪。</summary><p>典型错误（针对 HF 模型）：<code>labels = torch.roll(input_ids, shifts=-1, dims=-1); labels[:, -1] = -100</code> 之后再按"labels 与 prompt 对齐"的方式 mask——这里手动做了 shift，而 HF 模型内部还会再做一次 shift，等于双重移位：模型在位置 i 的预测被监督成 token i（而不是 i+1），整个条件分布错位一格。正确做法是 labels 与 input_ids 同位存放，仅在 assistant 区间写真值、其余写 -100，shift 完全交给模型内部的 loss。同理，自己在训练循环里手写 CE 时才需要 logits[:, :-1] 与 labels[:, 1:] 的显式对齐（第 2 节）。</p></details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Ouyang+, 2022]</span> Ouyang, L. et al. "Training language models to follow instructions with human feedback." <i>NeurIPS</i>, 2022. <span class="rid">arXiv:2203.02155</span></li>
+      <li><span class="rid">[Raffel+, 2020]</span> Raffel, C. et al. "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer." <i>JMLR</i>, 2020. <span class="rid">arXiv:1910.10683</span></li>
+      <li><span class="rid">[Longpre+, 2023]</span> Longpre, S. et al. "The Flan Collection: Designing Data and Methods for Effective Instruction Tuning." <i>ICML</i>, 2023. <span class="rid">arXiv:2301.13688</span></li>
+      <li><span class="rid">[Chung+, 2022]</span> Chung, H. W. et al. "Scaling Instruction-Finetuned Language Models." 2022. <span class="rid">arXiv:2210.11416</span></li>
+      <li><span class="rid">[Dao+, 2022]</span> Dao, T. et al. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." <i>NeurIPS</i>, 2022. <span class="rid">arXiv:2205.14135</span></li>
+      <li><span class="rid">[Dao, 2023]</span> Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." 2023. <span class="rid">arXiv:2307.08691</span></li>
+      <li><span class="rid">[Zhou+, 2023]</span> Zhou, C. et al. "LIMA: Less Is More for Alignment." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2305.11206</span></li>
+      <li><span class="rid">[Tunstall+, 2023]</span> Tunstall, L. et al. "Zephyr: Direct Distillation of LM Alignment." 2023. <span class="rid">arXiv:2305.18290</span></li>
+      <li><span class="rid">[Lambert+, 2024]</span> Lambert, N. et al. "Tülu 3: Pushing Frontiers in Open Language Model Post-Training." 2024. <span class="rid">arXiv:2411.15124</span></li>
+      <li><span class="rid">[Yang+, 2024]</span> Yang, A. et al. "Qwen2.5 Technical Report." 2024. <span class="rid">arXiv:2412.15115</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

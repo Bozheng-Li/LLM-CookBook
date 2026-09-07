@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 12 章 · SFT 基本原理 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 3 部分 · 监督微调 SFT</div>
+      <h1>第 12 章 · SFT 基本原理</h1>
+      <p class="chapter-lead">SFT 是绝大多数后训练项目的第一步，也是最容易"看起来在学、其实在背"的一步。本章给出 SFT 的数学定义、它与预训练的本质区别、它真正教得了模型的三类东西，并用决策树、损失掩码与 20 行代码把第一课讲透。</p>
+      <div class="chapter-meta">⏱ 预计学习 75 分钟 ｜ 难度 ★★☆☆☆ ｜ 先修：第 4 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. SFT 的任务定义：条件语言建模与最大似然</h2>
+    <p><span class="term">监督微调（Supervised Fine-Tuning, SFT）</span>的任务形式异常简单：给定一批"上下文 \( x \)、回答 \( y \)"成对的样本（来自第 8 章的指令数据），在预训练好的自回归语言模型上继续训练，最大化给定 \( x \) 时生成 \( y \) 的似然。由于模型是自回归的（第 3 章），联合概率按链式法则分解为逐 token 的条件概率：</p>
+    \[ p_\theta(y \mid x) = \prod_{t=1}^{|y|} p_\theta(y_t \mid x, y_{&lt;t}) \]
+    <p>最大似然估计（MLE）等价于最小化负对数似然，也就是大家熟悉的交叉熵：</p>
+    \[ \mathcal{L}_{\mathrm{SFT}}(\theta) = -\,\mathbb{E}_{(x,y)\sim\mathcal{D}}\left[\sum_{t=1}^{|y|} \log p_\theta(y_t \mid x, y_{&lt;t})\right] \]
+    <p>直觉读法：SFT 把"回答的每个 token"当作一个分类标签（类别数 = 词表大小），在基座模型之上做有监督的分类拟合。它与预训练在数学形式上的差别只有两处——条件 \( x \) 的存在与损失作用的 token 范围，其余全部同构。这也解释了为什么 SFT 代码与预训练代码几乎可以共用：同样的前向、同样的交叉熵，只是数据与超参换了世界。实际训练里，\( (x, y) \) 由第 8 章的 messages 格式经对话模板展开成一条 token 序列（模板细节见第 15 章），模板引入的特殊 token 与角色标记是否计入损失，由损失掩码决定——这是第 6 节的主题。</p>
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：teacher forcing 与训练-推理错位</div>
+      <p>上式在训练时有个隐含设定：预测 \( y_t \) 用的是<strong>真实的</strong> \( y_{&lt;t} \)（teacher forcing），而不是模型自己此前的生成。这保证了训练的并行性与稳定性，但引入了训练-推理错位：推理时模型面对的是自己生成的、可能有瑕疵的前缀。SFT 不处理这个错位（部分后训练方法如第 24 章的在线方法在显式处理它），但你要知道它存在——SFT 模型在长回答后段"越写越飘"，一部分根源就在这里。</p>
+    </div>
+    <p><strong>本节小结：</strong>SFT = 条件语言建模上的最大似然/交叉熵，与预训练同构，差别只在条件 x、损失范围与数据分布；训练用 teacher forcing，存在训练-推理错位但 SFT 不管它。</p>
+
+    <h2>2. 与预训练的本质区别：不只是"数据不一样"</h2>
+    <p>把 SFT 理解成"小号的预训练"是新手最常见的错误框架，它会在超参数与预期管理两个地方立刻翻车。两者的区别分三层。<strong>第一层是数据分布</strong>：预训练语料是网络、书籍、代码的混合体，监督信号是"下一 token"（自监督）；SFT 数据是"指令-回答"对，回答本身就是标签（监督信号），且数据量小 4~5 个数量级——预训练动辄 10 万亿 token，SFT 全量通常在千万到百亿 token 之间（1 万~100 万条 × 平均数百 token）。<strong>第二层是损失作用范围</strong>：预训练对序列每个 token 计损失；SFT 通常只对回答 token 计损失（第 6 节），模型被"监督"的密度骤降。<strong>第三层是优化量级</strong>：总更新步数少 3~4 个数量级，超参数因此整体缩水一个身位，见表 12-1。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>维度</th><th>预训练</th><th>SFT</th></tr></thead>
+        <tbody>
+          <tr><td>数据形态</td><td>网络/书籍/代码文档，自监督"下一 token"</td><td>指令-回答对（messages + 模板），回答即标签</td></tr>
+          <tr><td>数据量</td><td>1~15 万亿 token</td><td>约 1 万~100 万条，千万~百亿 token</td></tr>
+          <tr><td>损失范围</td><td>全部 token</td><td>通常仅回答 token（掩码，第 6 节）</td></tr>
+          <tr><td>学习率（全参）</td><td>1e-4 ~ 3e-4</td><td>1e-5 ~ 2e-5（LoRA 可回到 1e-4 量级）</td></tr>
+          <tr><td>Epoch</td><td>约 1 遍（重复收益见第 10 章）</td><td>1~4 遍（精选数据可重复）</td></tr>
+          <tr><td>全局 batch</td><td>百万~千万 token 级</td><td>数十~百余条序列（数万~数十万 token）</td></tr>
+          <tr><td>训练时长</td><td>周级，千卡集群</td><td>小时~天级，单机到几十卡</td></tr>
+          <tr><td>验证方式</td><td>loss / 困惑度即可靠</td><td>评测集 + 人工抽检（loss 不可靠，第 9 节）</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 12-1：预训练与 SFT 的量级差异（数值为常见工程区间；算力与显存的估算方法见第 42 章）</span>
+    </div>
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：把预训练超参直接抄给 SFT</div>
+      <p>最典型的是学习率：预训练用 1e-4~3e-4，是因为模型要从零学习全部统计结构；SFT 时模型已收敛在一个好盆地里，用大学习率等于把它连根拔起——表现为训练 loss 疯狂下降后评测全崩（灾难性遗忘的加速版，第 16 章）。全参 SFT 的学习率从 1e-5 附近起调；warmup 也从预训练的数千步缩短到总步数的 1~3%。另一个隐蔽错误是照抄长 epoch：SFT 数据量小，2~3 个 epoch 后往往开始背模板，宁可早停加换数据。</p>
+    </div>
+    <p><strong>本节小结：</strong>预训练与 SFT 的区别有三层——数据分布（自监督海量 vs 监督小量）、损失范围（全 token vs 回答 token）、优化量级（学习率与 epoch 各小一到两个数量级）；照抄预训练超参是 SFT 最经典的翻车方式。</p>
+
+    <h2>3. SFT 到底在教什么：格式对齐、知识注入与行为塑形</h2>
+    <p>把"教什么"拆开，才能预判 SFT 的成功与失败。SFT 的教学效果按三类分档，可靠度依次递减。</p>
+    <p><strong>（1）格式对齐：最可靠。</strong>对话轮转、角色切换、按指令要求的结构输出（JSON、表格、分点）、中英文风格——这些是"表达层"的行为，SFT 一两千条就能立起来。LIMA 的"浅层对齐假说"（第 7 章）给出理论支撑：模型的知识在预训练已经齐了，SFT 教的是"在什么刺激下调出哪个能力子分布"，而调用的外部接口就是格式。<strong>（2）行为塑形：部分可靠。</strong>语气、详略倾向、拒答模式、引用习惯，SFT 能快速塑形，但一致性有限——深层的价值判断与安全边界，要靠偏好与安全训练（第 32 章）用成百上千倍的对比信号去固化。<strong>（3）知识注入：最不可靠。</strong>指望几万条 SFT 样本把新知识"写进"模型，是常见的需求错位：一两遍 epoch、小学习率的训练动态，根本不足以把长尾事实可靠地写入权重，模型学到的多半是"见过这道题"的表面记忆，还会诱发编造。知识更新应该走继续预训练（第 17 章）或外挂检索（RAG），SFT 只负责教"如何使用知识回答"。</p>
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：用 SFT 硬灌知识，付出的是可靠性的代价</div>
+      <p>把领域文档做成几百条问答对硬塞进 SFT，是"领域适配"需求最常见的错误解法。已证实的失败模式：答案背下来了但换一种问法就失效（泛化失败）；相邻知识被挤压（灾难性遗忘，第 16 章）；模型学会"自信地补全训练集里没有的细节"（幻觉加剧）。正确的分层做法：知识进继续预训练或 RAG，SFT 数据只保留"教模型使用与表达知识"的任务形态——这也正是第 17 章与第 12 章的分界线。</p>
+    </div>
+    <p>历史上第一个把三类教学分开的系统设计是 InstructGPT（第 18 章的全景主角），它的三阶段数据分工至今仍是教科书级的参考，见表 12-3：SFT 阶段数据最少（约 1.3 万条人工示范），却为后面两个阶段打下行为地基——SFT 教"怎么回答"，奖励模型教"哪种回答更好"，PPO 教"持续产生更好的回答"。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>阶段</th><th>数据量</th><th>数据形式</th><th>教学目标</th></tr></thead>
+        <tbody>
+          <tr><td>SFT</td><td>约 13K</td><td>标注员手写的示范回答（提示词-回答对）</td><td>建立对话格式与基本行为</td></tr>
+          <tr><td>RM</td><td>约 33K</td><td>标注员对 4~9 个回答的排序比较</td><td>训练奖励模型</td></tr>
+          <tr><td>PPO</td><td>约 31K</td><td>提示词（回答由模型在线生成）</td><td>强化学习持续优化</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 12-3：InstructGPT 三阶段的数据量与分工（Ouyang et al., 2022, arXiv:2203.02155）——SFT 数据最少，却是行为地基</span>
+    </div>
+    <p><strong>本节小结：</strong>SFT 的三类教学内容可靠度递减——格式对齐最可靠、行为塑形部分可靠、知识注入最不可靠；知识问题交给继续预训练与 RAG，SFT 管表达与使用。</p>
+
+    <h2>4. 指令遵循的 in-context 学习视角</h2>
+    <p>要理解 SFT 为什么"几条数据就能教会指令"，最好的透镜是 <span class="term">in-context 学习（In-Context Learning, ICL）</span>。GPT-3 已经证明（Brown et al., 2020, arXiv:2005.14165）：无需更新任何参数，只要在提示里放几个任务示例，模型就能跟着做——"读示例、识别任务、执行任务"的能力在预训练中已经存在。问题在于这种能力是<strong>脆弱的</strong>：依赖示例的摆放方式，zero-shot 时的表现远不如 few-shot。</p>
+    <p>指令微调（SFT 的多任务形态）做的正是把这种 ICL 能力"参数化"：FLAN 用 62 个数据集、1,836 个任务的多任务指令微调，把 137B 模型的 zero-shot 表现大幅提升，在多个任务上首次超过 GPT-3 的 few-shot（Wei et al., 2021, arXiv:2109.01652）；FLAN Collection 后续把多任务、多模板、多思维链的混合配方系统化（Longpre et al., 2023, arXiv:2301.13688）。从此视角看，SFT 样本本质上是"把 few-shot 示例烧进参数"：训练后模型不再依赖提示中的示例，zero-shot 直接执行指令。</p>
+    <p>这个视角给出两条实用推论。<strong>其一，任务识别是多任务 SFT 的第一性收益</strong>：模型先学会"这是什么类型的任务"，才会触发对应的能力子分布——这就是第 8 章指令分类学配额的原理层解释，也是单任务 SFT 之后模型"变笨"的原理层解释（任务识别面收窄）。<strong>其二，弱基座可以借回 ICL</strong>：对小模型或小数据，在训练样本里前置 1~2 个任务示例（示例-回答结构），相当于用 ICL 的形式辅助参数化过程；FLAN Collection 的 multi-task mixture 里就有这类设计。反之，强基座 + 高质量指令数据时，示例前置的收益可以忽略，别为它浪费上下文长度。</p>
+    <p><strong>本节小结：</strong>SFT 把 ICL 能力从"依赖提示示例"变成"参数化直达"——FLAN 的多任务指令微调证明了这条路；任务识别是多任务 SFT 的第一性收益，也解释了配额设计的必要性。</p>
+
+    <h2>5. 全参微调 vs 参数高效微调：一条决策树</h2>
+    <p>开工前最后一个架构决策：改动模型的全部权重（全参微调），还是只挂一小部分可训练参数（参数高效微调，Parameter-Efficient Fine-Tuning, PEFT）？决策因素有四个：显存预算（能否放下优化器状态）、数据规模与质量（数据越多越值得全参）、迭代频率（配方是否还会大改）、以及能力切换需求（是否要在同一基座上维护多套行为）。图 12-1 给出可直接执行的决策树，表 12-2 给出量级对比。</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 370" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="全参微调与参数高效微调决策树">
+        <defs><marker id="arrow12a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">全参还是高效：SFT 训练方案决策树</text>
+        <rect x="260" y="36" width="200" height="44" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="360" y="56" text-anchor="middle" font-size="14" fill="#1e3a8a">起点：基座模型</text>
+        <text x="360" y="74" text-anchor="middle" font-size="14" fill="#1e3a8a">+ 一份 SFT 数据集</text>
+        <rect x="225" y="108" width="270" height="52" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="360" y="128" text-anchor="middle" font-size="14" fill="#92400e">判定 1：全参微调显存可行吗？</text>
+        <text x="360" y="148" text-anchor="middle" font-size="14" fill="#92400e">（估算法见第 42 章）</text>
+        <rect x="225" y="200" width="270" height="52" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="360" y="220" text-anchor="middle" font-size="14" fill="#92400e">判定 2：数据多、配方稳定吗？</text>
+        <text x="360" y="240" text-anchor="middle" font-size="14" fill="#92400e">（≥ 数万条且不再大改）</text>
+        <rect x="15" y="290" width="210" height="64" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="120" y="312" text-anchor="middle" font-size="14" fill="#065f46">LoRA / QLoRA（第 14 章）</text>
+        <text x="120" y="330" text-anchor="middle" font-size="14" fill="#065f46">数千条小数据 · 频繁迭代</text>
+        <text x="120" y="348" text-anchor="middle" font-size="14" fill="#065f46">多套行为热切换</text>
+        <rect x="255" y="290" width="210" height="64" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="360" y="312" text-anchor="middle" font-size="14" fill="#1e3a8a">全参微调</text>
+        <text x="360" y="330" text-anchor="middle" font-size="14" fill="#1e3a8a">数据充足 · 配方稳定</text>
+        <text x="360" y="348" text-anchor="middle" font-size="14" fill="#1e3a8a">追求能力上限</text>
+        <rect x="495" y="290" width="210" height="64" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="600" y="312" text-anchor="middle" font-size="14" fill="#5b21b6">两步走（推荐默认）</text>
+        <text x="600" y="330" text-anchor="middle" font-size="14" fill="#5b21b6">LoRA 打样调数据配方</text>
+        <text x="600" y="348" text-anchor="middle" font-size="14" fill="#5b21b6">定稿后全参收尾</text>
+        <path d="M360 82 L 360 106" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow12a)"/>
+        <path d="M240 160 L 100 288" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow12a)"/>
+        <text x="120" y="205" text-anchor="middle" font-size="14" fill="#1e293b">否（预算紧/单卡）</text>
+        <path d="M360 162 L 360 198" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow12a)"/>
+        <text x="392" y="184" text-anchor="middle" font-size="14" fill="#1e293b">是</text>
+        <path d="M285 252 L 165 288" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow12a)"/>
+        <text x="185" y="272" text-anchor="middle" font-size="14" fill="#1e293b">小数据/频繁迭代</text>
+        <path d="M360 252 L 360 288" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow12a)"/>
+        <text x="404" y="272" text-anchor="middle" font-size="14" fill="#1e293b">大数据/稳定</text>
+        <path d="M435 252 L 555 288" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow12a)"/>
+        <text x="530" y="272" text-anchor="middle" font-size="14" fill="#1e293b">不确定/两步走</text>
+        <text x="360" y="370" text-anchor="middle" font-size="14" fill="#1e293b">经验法则：预算有限从 QLoRA 起步；不确定就走两步走，LoRA 的结论大多可迁移到全参</text>
+      </svg>
+      <figcaption>图 12-1：全参微调与 PEFT 的决策树——四个决策因素是显存、数据规模、迭代频率与能力切换需求（作者自绘）</figcaption>
+    </figure>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>方案</th><th>显存（7B 经验量级）</th><th>可训参数</th><th>典型场景</th></tr></thead>
+        <tbody>
+          <tr><td>全参微调</td><td>约 60~80GB+（bf16 权重+梯度+AdamW 状态，多卡）</td><td>100%</td><td>数据 ≥ 数万条、配方稳定、追求上限</td></tr>
+          <tr><td>LoRA</td><td>底座 bf16 约 14GB + 微量增量 → 单卡 24GB 可行</td><td>约 0.1~1%</td><td>数千~数万条、频繁迭代、多套行为切换</td></tr>
+          <tr><td>QLoRA</td><td>4-bit 底座约 5~8GB → 消费级单卡可行</td><td>约 0.1~1%</td><td>预算紧张、快速验证、LoRA 超参搜索</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 12-2：三种训练方案的显存与适用场景（7B 模型经验量级；精确估算见第 42 章，LoRA/QLoRA 细节见第 14 章）</span>
+    </div>
+    <p>两个补充判断。<strong>其一</strong>，LoRA 与全参在数千到数万条数据的 SFT 上效果差距通常不大（第 14 章给出机理与例外），差距随数据量与领域偏移增大而拉大——所以"两步走"是理性默认：LoRA 阶段把数据与配方的错误都犯完（每轮成本是全参的几分之一），全参只做最后定型。<strong>其二</strong>，决策树不是宿命：显存不够可以靠梯度检查点、DeepSpeed/FSDP 分片（第 43 章）换空间，PEFT 的结论也可以随时升级为全参——方案之间是迁移关系，不是互斥关系。</p>
+    <p><strong>本节小结：</strong>默认路径是"LoRA 打样 → 全参收尾"；显存、数据规模、迭代频率、能力切换四个因素决定站点，方案之间可迁移。</p>
+
+    <h2>6. 损失掩码：prompt 为什么不算 loss</h2>
+    <p>图 12-2 画出 SFT 训练样本的结构：一条经模板展开的序列，被切成三段——提示段（system + user + 模板标记）、生成起始符、回答段（assistant 正文 + 结束符）。<strong>损失掩码（loss mask）</strong>规定：只有回答段计入交叉熵，提示段对应位置的标签置为 -100（PyTorch 交叉熵忽略该值）。</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="损失掩码示意">
+        <text x="360" y="28" text-anchor="middle" font-size="16" fill="#1e293b">损失掩码：只对 assistant 正文计算交叉熵</text>
+        <rect x="20" y="70" width="230" height="64" rx="10" fill="#fef2f7" stroke="#ef4444" stroke-width="2"/>
+        <text x="135" y="96" text-anchor="middle" font-size="14" fill="#881337">system + user（含模板标记）</text>
+        <text x="135" y="118" text-anchor="middle" font-size="14" fill="#881337">label = -100，不计 loss</text>
+        <rect x="262" y="70" width="95" height="64" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="309" y="96" text-anchor="middle" font-size="14" fill="#92400e">生成起始符</text>
+        <text x="309" y="118" text-anchor="middle" font-size="14" fill="#92400e">（模板 token）</text>
+        <rect x="369" y="70" width="230" height="64" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="484" y="96" text-anchor="middle" font-size="14" fill="#065f46">assistant 正文 token</text>
+        <text x="484" y="118" text-anchor="middle" font-size="14" fill="#065f46">逐 token 计入 loss</text>
+        <rect x="611" y="70" width="89" height="64" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="655" y="96" text-anchor="middle" font-size="14" fill="#92400e">结束符</text>
+        <text x="655" y="118" text-anchor="middle" font-size="14" fill="#92400e">计入 loss</text>
+        <rect x="20" y="176" width="16" height="16" fill="#fef2f7" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="44" y="189" font-size="14" fill="#1e293b">提示与模板：不学——推理时它们是给定条件，学了等于练"抢话"</text>
+        <rect x="20" y="200" width="16" height="16" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="44" y="213" font-size="14" fill="#1e293b">起始符与结束符：是否计入随框架实现而异，逐 token 剖析见第 13 章</text>
+        <rect x="20" y="224" width="16" height="16" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="44" y="237" font-size="14" fill="#1e293b">assistant 正文：计入 loss；多轮对话每一轮的正文都要算（逐轮掩码）</text>
+      </svg>
+      <figcaption>图 12-2：损失掩码示意——提示段被屏蔽，损失只落在回答段（作者自绘；逐 token 实现与边界细节见第 13 章）</figcaption>
+    </figure>
+    <p>为什么这样做？三个理由，按重要性排序。<strong>（1）分布匹配</strong>：推理时提示词是用户给定的、已知的条件，模型永远不需要"生成提示词"，训练它预测提示 token 是在优化一个推理时不存在的任务。<strong>（2）避免学会抢话与过拟合模板</strong>：若对提示段计 loss，模型会花容量去背"用户通常怎么说话"与你的模板格式，数据一多直接表现为模板记忆（第 9 节的现象）。<strong>（3）信用分配</strong>：把梯度预算集中在真正要学的行为上——回答 token 只占序列的一小半，屏蔽提示相当于让每条数据的学习信号密度翻倍。多轮对话还要更进一步：每一轮 assistant 正文都要计入损失（逐轮掩码），而不只是最后一轮。</p>
+    <div class="code-wrap">
+      <span class="code-label">build_mask.py</span>
+      <pre class="code"><code class="language-python">"""构造带损失掩码的训练样本：prompt 部分 label = -100（不计 loss）
+注意：不同模型的模板 token 布局不同，先打印 apply_chat_template 的输出确认边界。
+"""
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+messages = [
+    {"role": "user", "content": "用一句话解释什么是过拟合。"},
+    {"role": "assistant",
+     "content": "过拟合是模型记住了训练集的噪声、在新数据上泛化变差的现象。"},
+]
+
+# 前缀：到“该轮 assistant 正文开始”为止；全文：完整对话
+prompt = tok.apply_chat_template(messages[:-1], tokenize=False,
+                                 add_generation_prompt=True)
+full = tok.apply_chat_template(messages, tokenize=False)
+p_ids = tok(prompt, add_special_tokens=False).input_ids
+f_ids = tok(full, add_special_tokens=False).input_ids
+labels = [-100] * len(p_ids) + f_ids[len(p_ids):]   # 前缀全部掩码
+assert len(labels) == len(f_ids), "前缀截断不等价时需回退到逐轮拼接（第 13 章）"
+print(tok.convert_ids_to_tokens(f_ids[len(p_ids):][:6]))  # 目测掩码边界！</code></pre>
+    </div>
+    <p>这段代码的最后一行是最重要的工程习惯：<strong>掩码边界必须目测</strong>。它依赖一个假设——"分词器对 前缀+后缀 的切分等于 前缀切分 + 后缀切分"，多数 BPE 分词器在拼接边界会破例（相邻 token 合并）。边界错一两个 token，loss 就开始教错误内容。彻底的解法（逐轮拼接、token 级对齐、packing 的跨样本掩码）在第 13 章展开，本节只需记住概念与理由。</p>
+    <p><strong>本节小结：</strong>损失掩码把梯度集中在回答 token——分布匹配、防抢话、信用分配三条理由；掩码边界必须逐样本目测，完整实现细节留给第 13 章。</p>
+
+    <h2>7. 训练目标变体与多任务混合</h2>
+    <p>标准 SFT 目标之外，工程上有三个常用的"变体旋钮"。<strong>（1）损失范围</strong>：completion-only（本节默认）vs 全序列——全序列让模型同时学习"用户怎么问"，仅在续写类或对话补全类产品里有意义，通用助手一律用前者。<strong>（2）多轮逐轮加权</strong>：多轮对话中给靠后轮次更高（或相等）权重，控制"最后一轮最重要"的归纳偏置。<strong>（3）课程与混合</strong>：难度课程（第 11 章的难度阶梯）控制样本呈现顺序，多任务混合控制"学什么"的配比。前两个旋钮的实现都在第 13 章，这里展开第三个。</p>
+    <p>多任务混合的证据与配比逻辑：FLAN Collection 系统对比了任务混合、模板多样性与思维链增强的收益（arXiv:2301.13688），Tulu 3 的 SFT 混合体（93.9 万条、多源配比、全程去污染）是现代开源配方的代表（arXiv:2411.15124）。对单团队最有用的结论是：<strong>纯目标任务 SFT 会让任务外能力系统性回退</strong>（任务识别面收窄，第 4 节；遗忘机制第 16 章），而"目标任务 30~50% + 通用任务保底"的混合配比能以很小的任务内代价换回通用性。混合的实现不复杂，难点在配比数据从哪来——第 10 章第 7 节的配比方法论（小模型消融定案）直接适用。</p>
+    <div class="code-wrap">
+      <span class="code-label">mix_sampler.py</span>
+      <pre class="code"><code class="language-python">"""多任务混合采样器：按配比分层抽样，配比写进配置而不是散落在代码里"""
+import json
+import random
+
+MIX = {                       # 配比即文档：来源 → 占比（总和 1.0）
+    "domain_target": 0.40,    # 目标域任务（第 8 章分类学配额在此生效）
+    "general_chat":  0.25,    # 通用对话保底，防任务识别面收窄
+    "code_math":     0.15,    # 结构化能力
+    "if_constraints":0.10,    # 可验证约束指令（IFEval 风格，第 8 章）
+    "safety_refusal":0.10,    # 拒答与安全初步（深层边界交给第 32 章）
+}
+
+def build_mix(pool: dict, weights: dict, total: int = 20000) -&gt; list:
+    picked = []
+    for src, w in weights.items():
+        k = min(int(total * w), len(pool[src]))     # 不足配额时全取，并应记告警
+        picked += random.sample(pool[src], k)
+    random.shuffle(picked)                          # 打乱避免来源聚集（课程另议）
+    return picked
+
+if __name__ == "__main__":
+    pool = {s: [json.loads(l) for l in open(f"{s}.jsonl", encoding="utf-8")]
+            for s in MIX}
+    data = build_mix(pool, MIX)
+    print(f"混合集 {len(data)} 条；各来源占比：")
+    for s, w in MIX.items():
+        print(f"  {s:16s} 目标 {w:.0%} → 实际计入了 {min(int(20000*w), len(pool[s]))} 条")</code></pre>
+    </div>
+    <p><strong>本节小结：</strong>SFT 目标的三个变体旋钮——损失范围、多轮加权、任务混合；混合配比"目标域 30~50% + 通用保底"是对抗能力回退的默认解，配比数据来源用第 10 章的方法论定案。</p>
+
+    <h2>8. SFT 的能力边界：为什么难教出"新的推理能力"</h2>
+    <p>本节是 SFT 的天花板说明书，也是第 26 章的预告片。SFT 是行为克隆：它的最优解是"让模型分布逼近示范分布"，因此<strong>示范里没有的策略，SFT 教不出来</strong>。推理能力的核心成分——尝试多步搜索、自我验证、回溯纠错——恰恰是"过程不可见"的能力：你只能把一条成功的推理链写给模型看（CoT 蒸馏，第 30 章），却无法通过更多同质示范让模型学会"在卡住时换路"。两条研究证据把边界画得更清楚。其一，"SFT 记忆、RL 泛化"：在分布偏移与泛化测试上，SFT 倾向于复现示范中的模式，RL 训练的行为更稳定（Chu et al., 2025, arXiv:2501.17161）。其二，pass@k 视角：RL 微调主要改变的是基座"已有潜力"的可激发性——把 pass@k 曲线整体上移到接近大 k 时的水平，而 SFT 的示范集本身构成上界（Yue et al., 2025, arXiv:2504.13837）。</p>
+    <p>这组结论经常被误读成"SFT 教不了推理"，需要精确化。<strong>SFT 能教的</strong>：输出推理的格式（把思考写出来）、常用推理路线的套路（分类讨论、列方程、自检步骤）、以及把基座已会的子技能组织成链——R1 系列的蒸馏模型（第 30 章）证明，强教师的长链示范确实能把可激发的推理"搬运"到小模型，但上限是教师的输出分布（DeepSeek-R1, arXiv:2501.12948）。<strong>SFT 教不了的</strong>：超越示范集的搜索广度、以及在示范没有覆盖的状态下自主纠错——这些要靠可验证奖励下的强化学习去探索（RLVR，第 26 章）。</p>
+    <p>给"想用 SFT 提升推理"的人两条务实建议。<strong>（1）先做能力盘点再做数据</strong>：拿基座在目标题库上做 pass@k（k 取 8~16），"pass@8 高但 pass@1 低"说明潜力在、可激发性差——SFT 整理格式与路线收益很大；"pass@8 也低"说明潜力不足——先扩数据难度或换基座，纯 SFT 无解。<strong>（2）示范多样性与正确性优先于数量</strong>：按第 11 章的验证器回路造"路线多样的正确解"，比堆同质示范有效得多；错误示范哪怕少量，也会被行为克隆如实学走。</p>
+    <p><strong>本节小结：</strong>SFT 是行为克隆——示范决定上界：它能教推理的格式、路线与组织，教不了超越示范的搜索与纠错；用 pass@k 盘点基座潜力再决定 SFT 还是 RLVR。</p>
+
+    <h2>9. SFT 实验观察：loss 下降 ≠ 质量提升</h2>
+    <p>预训练时代"看 loss 办事"的习惯，到 SFT 阶段必须改掉。三个反复出现的观察。<strong>（1）训练 loss 一路下降，评测分数先升后降</strong>：两三个 epoch 后模型开始背模板与特定回答，训练损失继续改善只是记忆的证据，通用评测开始回退——这与第 2 节"小数据短训练"的量级判断一致。<strong>（2）holdout loss 与质量脱钩</strong>：验证集 loss 低只说明模型分布贴近验证集文本，而"有用性、事实性、指令跟随"这些真正的目标，与困惑度的相关性在 SFT 阶段变得很弱——毕竟你优化的目标（匹配示范分布）与产品目标（对用户有用）本来就不是同一个东西。<strong>（3）loss 平台期 ≠ 学习停止</strong>：格式习得发生在最初几百步（loss 急降），之后的平台期里模型仍在缓慢改变行为风格——只盯 loss 会误以为训练无效，其实变化都发生在评测里。</p>
+    <p>所以 SFT 的验证体系要重建，三条原则。<strong>其一，验证集与目标使用分布一致</strong>：从真实用户提问（脱敏后）抽 holdout，而不是从训练数据同源管道再切一块——后者只会测出"拟合训练分布的程度"。<strong>其二，验证集与训练集去重</strong>：第 10 章的污染检测反过来用在自己身上——训练集与验证集 8-gram 去重后再看指标，否则指标会被近重复样本抬高。<strong>其三，早停靠评测不靠 loss</strong>：每个 checkpoint 跑小型评测组（IFEval 之类可程序化的指标 + 20~50 条人工抽检），评测曲线的拐点才是早停点。</p>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：SFT 验证集的"三件套"配置</div>
+      <p>一套够用的 SFT 验证配置：真实提问 holdout 500~1000 条（人工抽检用）+ IFEval（指令跟随，第 8 章）+ 目标领域小型评测 200 条 + 上一版模型的回归集（防修复变成破坏）。所有评测与训练集做过污染检查。每次实验只动一个变量（数据、超参、模板），并把结果写回实验记录——SFT 的进步来自"数据配方的迭代"，没有可比的评测组，迭代就是盲飞。</p>
+    </div>
+    <p><strong>本节小结：</strong>SFT 阶段 loss 与质量脱钩是常态——验证靠"真实分布 holdout + 可程序化评测 + 人工抽检"三件套，早停点定在评测曲线的拐点而不是 loss 的最低点。</p>
+
+    <h2>10. 最小可行 SFT：Trainer 20 行版</h2>
+    <p>收尾给出能跑通全流程的最小实现：HuggingFace transformers 的 Trainer，20 行量级。它刻意保持朴素——没有 packing、没有逐轮掩码、没有 LoRA——为的是让每个概念（第 6 节的掩码、第 7 节的混合、第 15 章的模板）在后续章节加进来时你能看清"多了什么"。</p>
+    <div class="code-wrap">
+      <span class="code-label">sft_mini.py</span>
+      <pre class="code"><code class="language-python">"""最小可行 SFT：transformers Trainer 20 行版
+生产项目建议换 TRL SFTTrainer（第 13 章）；此处保留一切显式，便于理解机制。
+依赖：pip install transformers datasets accelerate
+"""
+from datasets import load_dataset
+from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                          Trainer, TrainingArguments)
+
+MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+tok = AutoTokenizer.from_pretrained(MODEL)
+tok.pad_token = tok.eos_token                      # causal LM 常用做法：用 eos 补齐
+model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype="bfloat16")
+
+ds = load_dataset("json", data_files="sft_clean.jsonl", split="train")
+def encode(ex):                                    # 每条样本：messages → ids + labels
+    ids = tok(tok.apply_chat_template(ex["messages"], tokenize=False),
+              truncation=True, max_length=2048)
+    ids["labels"] = list(ids["input_ids"])         # 简化：全序列计 loss；掩码见第 13 章
+    return ids
+ds = ds.map(encode, remove_columns=ds.column_names)
+
+args = TrainingArguments(
+    "ckpt-sft-mini", per_device_train_batch_size=4, gradient_accumulation_steps=8,
+    learning_rate=1e-5, num_train_epochs=2, warmup_ratio=0.03,
+    lr_scheduler_type="cosine", bf16=True, logging_steps=10, save_strategy="epoch")
+Trainer(model=model, args=args, train_dataset=ds).train()</code></pre>
+    </div>
+    <p>三处注释值得展开。<strong>（1）学习率 1e-5</strong>：来自表 12-1 的全参区间，1.5B 小模型可上探到 2e-5。<strong>（2）labels 全序列</strong>：这是刻意留的教学缺口——本版会学"抢话"，把第 6 节的掩码接进来是留给你改动 this file 的第一个练习，标准实现见第 13 章。<strong>（3）save_strategy="epoch"</strong>：每个 epoch 存 checkpoint，配合第 9 节的评测组选早停点，而不是默认拿最后一个。跑通之后，向生产级的升级路径是固定的：TRL SFTTrainer + 逐轮掩码（第 13 章）→ LoRA/QLoRA（第 14 章）→ 模板对齐检查（第 15 章）→ 配比与防遗忘（第 16 章）。</p>
+    <p><strong>本节小结：</strong>20 行 Trainer 版把 SFT 的骨架降到最少——数据映射、超参、循环；它留下的三个教学缺口（掩码、PEFT、模板）正是第 13~15 章的内容。</p>
+
+    <h2>11. 本章小结</h2>
+    <ul>
+      <li><strong>任务定义</strong>：SFT = 条件语言建模上的最大似然/交叉熵，逐 token 分类拟合回答；与预训练同构，差别只在条件 x、损失范围与数据分布；训练用 teacher forcing，存在训练-推理错位。</li>
+      <li><strong>与预训练的区别</strong>：数据分布（自监督海量 vs 监督小量）、损失范围（全 token vs 回答 token）、优化量级（学习率 1e-5 量级、epoch 1~4）；照抄预训练超参是经典翻车点。</li>
+      <li><strong>SFT 教什么</strong>：格式对齐最可靠、行为塑形部分可靠、知识注入最不可靠；知识交给继续预训练（第 17 章）与 RAG，硬灌知识会换来泛化失败、遗忘与幻觉。</li>
+      <li><strong>ICL 视角</strong>：SFT 把"读示例执行任务"参数化（FLAN 证据），任务识别是多任务 SFT 的第一性收益；弱基座可借示例前置辅助。</li>
+      <li><strong>方案选型</strong>：默认"LoRA 打样 → 全参收尾"；显存、数据规模、迭代频率、能力切换四因素定站点（第 14 章展开 PEFT）。</li>
+      <li><strong>损失掩码</strong>：提示段 label=-100，三条理由是分布匹配、防抢话、信用分配；多轮对话逐轮掩码；掩码边界必须逐样本目测（细节第 13 章）。</li>
+      <li><strong>目标变体</strong>：completion-only 为默认；多任务混合"目标域 30~50% + 通用保底"是对抗能力回退的默认解。</li>
+      <li><strong>能力边界</strong>：SFT 是行为克隆，示范决定上界——能教推理的格式与路线，教不了超越示范的搜索与纠错；用 pass@k 盘点潜力，潜力不足时走向 RLVR（第 26 章）。</li>
+      <li><strong>实验观察</strong>：loss 下降不等于质量提升；验证靠"真实分布 holdout + 可程序化评测 + 人工抽检"三件套，早停看评测拐点。</li>
+      <li><strong>最小实现</strong>：20 行 Trainer 版打通骨架，生产升级路径 = TRL + 掩码（13 章）→ LoRA（14 章）→ 模板（15 章）→ 配比防遗忘（16 章）。</li>
+    </ul>
+    <p>下一章把 SFT 最容易踩坑的部分一次讲透：<a href="13-sft-implementation.html">第 13 章 · SFT 损失实现细节</a>——逐轮掩码、packing、模板 token 归属与多轮权重，全是本章留下的"引而不发"。</p>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：为什么全参 SFT 的学习率要比预训练小一到两个数量级？如果照抄预训练学习率会发生什么？</summary>
+        <p>预训练时模型从随机初始化学习全部统计结构，需要大步长快速下降；SFT 时模型已收敛在一个好的解盆地里，任务只是小幅调整行为分布。大学习率会把模型推出预训练盆地：表现为训练 loss 快速下降（模型迅速拟合新分布）但预训练能力大面积丢失、评测全面回退——这是灾难性遗忘的加速版。经验区间：全参 1e-5~2e-5 起调，warmup 缩短到总步数的 1~3%，配合余弦衰减；LoRA 因为只训练低秩增量，可以用回 1e-4 量级。</p>
+      </details>
+      <details><summary>问题 2：为什么 prompt 部分不计 loss？如果图省事对全序列计 loss，具体会学到什么坏东西？</summary>
+        <p>三条理由：推理时提示词是给定条件，预测它优化的是不存在的任务（分布匹配）；对提示计 loss 让模型花容量学"用户怎么说话"与模板格式（抢话与模板记忆）；梯度预算应集中在要学的行为上（信用分配）。全序列计 loss 的具体后果：模型学会在 assistant 轮次后自己续写 user 消息（抢话）、回答开头模仿用户口吻、对特定模板 token 过拟合——换一套对话模板（第 15 章）后行为明显退化，因为模型记住的是模板而不是行为。</p>
+      </details>
+      <details><summary>问题 3：为什么说 SFT 很难教会模型"新的推理能力"？给出判断"该用 SFT 还是该用 RLVR"的可操作方法。</summary>
+        <p>SFT 是行为克隆，最优解是逼近示范分布——示范里没有的多步搜索、自我验证与回溯策略，SFT 无法造出来；RL 训练的行为在分布偏移下更稳（arXiv:2501.17161），pass@k 分析显示 RL 主要提升基座已有潜力的可激发性，而 SFT 的示范集本身构成上界（arXiv:2504.13837）。可操作方法：拿基座在目标题库上跑 pass@k（k=8~16）。pass@8 高而 pass@1 低 → 潜力在、可激发性差，SFT 整理格式与推理路线收益大；pass@8 也低 → 潜力不足，纯 SFT 无解，要么提升数据难度与教师质量（蒸馏路径，第 30 章），要么上可验证奖励的 RL（第 26 章）。</p>
+      </details>
+      <details><summary>问题 4：训练 loss 正常下降、验证集 loss 也在下降，但人工评测变差。列出三个可能原因与对应的验证动作。</summary>
+        <p>原因一：验证集与训练分布同源——holdout 只测了"拟合训练分布的程度"，与产品目标脱钩；验证动作：用真实用户提问重建 holdout，并确认与训练集做过去重（第 10 章污染检测反向使用）。原因二：过拟合模板与风格——训练两三个 epoch 后开始背模板；验证动作：对比各 epoch checkpoint 的人工抽检与 IFEval，找评测拐点早停，并检查回答长度与风格是否向训练集收敛。原因三：多任务回退——目标域数据占比过高挤占通用能力；验证动作：分层评测（通用对话、代码、数学、拒答）定位回退面，按第 7 节调整混合配比，必要时重跑小模型消融。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Ouyang+, 2022]</span> Ouyang, L. et al. "Training language models to follow instructions with human feedback." <i>NeurIPS</i>, 2022. <span class="rid">arXiv:2203.02155</span></li>
+      <li><span class="rid">[Brown+, 2020]</span> Brown, T. et al. "Language Models are Few-Shot Learners." <i>NeurIPS</i>, 2020. <span class="rid">arXiv:2005.14165</span></li>
+      <li><span class="rid">[Wei+, 2021]</span> Wei, J. et al. "Finetuned Language Models Are Zero-Shot Learners." <i>ICLR</i>, 2022. <span class="rid">arXiv:2109.01652</span></li>
+      <li><span class="rid">[Longpre+, 2023]</span> Longpre, S. et al. "The FLAN Collection: Designing Data and Methods for Effective Instruction Tuning." <i>ICML</i>, 2023. <span class="rid">arXiv:2301.13688</span></li>
+      <li><span class="rid">[Zhou+, 2023]</span> Zhou, C. et al. "LIMA: Less Is More for Alignment." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2305.11206</span></li>
+      <li><span class="rid">[Hu+, 2022]</span> Hu, E. et al. "LoRA: Low-Rank Adaptation of Large Language Models." <i>ICLR</i>, 2022. <span class="rid">arXiv:2106.09685</span></li>
+      <li><span class="rid">[Dettmers+, 2023]</span> Dettmers, T. et al. "QLoRA: Efficient Finetuning of Quantized LLMs." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2305.14314</span></li>
+      <li><span class="rid">[Chu+, 2025]</span> Chu, T. et al. "SFT Memorizes, RL Generalizes: A Comparative Study of Foundation Model Post-training." <i>ICML</i>, 2025. <span class="rid">arXiv:2501.17161</span></li>
+      <li><span class="rid">[Yue+, 2025]</span> Yue, Y. et al. "Does Reinforcement Learning Really Incentivize Reasoning Capacity in LLMs Beyond the Base Model?" 2025. <span class="rid">arXiv:2504.13837</span></li>
+      <li><span class="rid">[DeepSeek-AI, 2025]</span> DeepSeek-AI. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." 2025. <span class="rid">arXiv:2501.12948</span></li>
+      <li><span class="rid">[Lambert+, 2024]</span> Lambert, N. et al. "Tulu 3: Pushing Frontiers in Open Language Model Post-Training." 2024. <span class="rid">arXiv:2411.15124</span></li>
+      <li><span class="rid">[Zhou+, 2023b]</span> Zhou, J. et al. "Instruction-Following Evaluation for Large Language Models." 2023. <span class="rid">arXiv:2311.07911</span></li>
+      <li><span class="rid">[Muennighoff+, 2023]</span> Muennighoff, N. et al. "Scaling Data-Constrained Language Models." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2305.16264</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

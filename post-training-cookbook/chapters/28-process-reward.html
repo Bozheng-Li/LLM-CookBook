@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 28 章 · 过程奖励模型与搜索 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 5 部分 · 推理增强后训练</div>
+      <h1>第 28 章 · 过程奖励模型与搜索</h1>
+      <p class="chapter-lead">在复杂多步逻辑推演与高阶数理证明中，仅仅依据最终答案正确与否进行端到端打分的结果奖励模型（ORM），面临着极其严峻的信度分配模糊与假阳性“碰巧猜对”困境。过程奖励模型（PRM）通过为推理链中的每一个细粒度思维步骤提供独立的正确性概率评估，不仅重构了多步推理的信用分配机制，更使得推理早期的主动错误检测、分支动态剪枝以及测试时树搜索引导成为可能。本章系统解构 PRM 的数学建模机理，深入分析从 PRM800K 人工过程监督到 Math-Shepherd 与 OmegaPRM 自动化合成数据流水线的演化历程，并全面呈现 PRM 与最佳优先重排（Best-of-N）、束搜索（Beam Search）及蒙特卡洛树搜索（MCTS）深度结合的工业级实现与工程避坑指南。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★★★ ｜ 先修：第 19 章、第 25 章、第 26 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 结果奖励模型（ORM）的局限与过程奖励模型（PRM）的提出</h2>
+    <p>在大语言模型强化学习与评估体系的早期阶段，以 InstructGPT 为代表的后训练流水线普遍依赖<span class="term">结果监督奖励模型（Outcome-supervised Reward Model, ORM）</span>。ORM 的数学形式极其直接：输入完整的提示词 \( x \) 和模型生成的完整解题轨迹 \( y = (s_1, s_2, \dots, s_K) \)，ORM 模型直接输出一个标量值 \( R_{\mathrm{ORM}}(x, y) \in [0, 1] \)。这种奖励形式在开放式对话、文本摘要与通用偏好对齐中表现良好，但在逻辑推导、算法竞赛与数学证明等严谨多步任务中，却暴露出根本性的理论缺陷与实践瓶颈。</p>
+
+    <h3>1.1 信用分配危机与假阳性陷阱</h3>
+    <p>在涉及数十步连续递推的高难度推理任务中，ORM 存在两大难以克服的核心矛盾：</p>
+    <ul>
+      <li><strong>信度分配难题（Credit Assignment Problem）</strong>：假设一条包含 15 个步骤的推理轨迹中，模型在第 2 步发生了一处符号推导笔误，但从第 3 步到第 15 步的逻辑推演均严格遵循了前述错误假定，最终由于前置错误导致最终答案不正确。ORM 只能在轨迹终点赋予全局 0 分（或极低的分值）。策略网络在进行梯度反向传播时，完全无法分辨究竟是哪一个步骤造成了溃败，从而导致后 13 步中展现出的高级代数技巧被一并抹杀。反之，若整条链条全部正确，ORM 赋予的 1 分也无法明确告诉模型究竟哪一步是打破僵局的关键洞察（Key Breakthrough）。</li>
+      <li><strong>假阳性与作弊解答（False Positives & Luckiness）</strong>：在初等代数与数值计算中，经常出现模型在前半部分推导出现一处负号错误，而在后半部分又由于另一种算术失误偶发性地抵消了前一次错误，最终竟“碰巧”输出了与标准答案完全吻合的数值。ORM 面对这种由荒谬逻辑堆砌而成的解答会毫不犹豫地赋予满分，这直接诱导强化学习策略网络固化错误的伪规则，严重恶化模型的泛化逻辑能力。</li>
+      <li><strong>缺乏早停与在线剪枝机制</strong>：在测试时计算（Test-time Compute）扩展中，若使用 ORM 作为验证器（Verifier），系统必须等待生成器完整生成数千甚至上万个 Token 的长思维链，才能由 ORM 进行后验打分。这意味着大量宝贵的 GPU 推理显存与解码算力被持续虚掷在早已不可逆的错误分支上，搜索效率极低。</li>
+    </ul>
+
+    <h3>1.2 过程监督奖励模型（PRM）的形式化定义</h3>
+    <p>为了解决 ORM 的深层缺陷，学术界与工业界提出了<span class="term">过程监督奖励模型（Process-supervised Reward Model, PRM）</span>。PRM 的核心理念是：<strong>对长推理链中的每一个思维步骤执行细粒度的即时评估</strong>。设提示词为 \( x \)，解题过程被自然切分为 \( K \) 个离散步骤序列 \( (s_1, s_2, \dots, s_K) \)。PRM 评估的是在给定问题上下文与前 \( k-1 \) 个历史步骤的条件下，当前第 \( k \) 个动作步骤 \( s_k \) 的局部正确性概率：</p>
+
+    \[ r_k = \mathrm{PRM}(s_k \mid x, s_1, s_2, \dots, s_{k-1}) = P(\mathrm{Step\ } k \text{ is correct and constructive} \mid x, s_{\le k-1}) \]
+
+    <p>通过输出步进式的概率向量 \( (r_1, r_2, \dots, r_K) \)，PRM 不仅赋予了评估系统透明的可解释性（清楚指出推理链在第几步发生脱轨），更为现代搜索算法提供了精准的启发式引导函数（Heuristic Function）。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>对比维度</th>
+            <th>结果奖励模型（ORM）</th>
+            <th>过程奖励模型（PRM）</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>打分粒度</strong></td>
+            <td>整条解题文本对应一个全局标量（Coarse-grained）</td>
+            <td>每个逻辑推导步骤对应一个局部概率（Step-level fine-grained）</td>
+          </tr>
+          <tr>
+            <td><strong>错误定位能力</strong></td>
+            <td>无定位能力，属于端到端黑盒判据</td>
+            <td>精准定位推理链上的第一处错误步骤（First Error Step）</td>
+          </tr>
+          <tr>
+            <td><strong>假阳性抵御</strong></td>
+            <td>极易被逻辑荒谬但答案巧合的解答所蒙骗</td>
+            <td>在第一处错误发生时即断崖式判负，具备极强鲁棒性</td>
+          </tr>
+          <tr>
+            <td><strong>搜索算法契合度</strong></td>
+            <td>仅能用于生成结束后的候选采样重排（Best-of-N）</td>
+            <td>原生适配步进式束搜索（Beam Search）与 MCTS 动态剪枝</td>
+          </tr>
+          <tr>
+            <td><strong>数据构建难度</strong></td>
+            <td>极低：规则判卷或比对 ground truth 答案即可自动化生成</td>
+            <td>极高：人工逐步核查成本极其昂贵，依赖复杂树搜索合成</td>
+          </tr>
+          <tr>
+            <td><strong>训练计算开销</strong></td>
+            <td>低：序列级损失反向传播</td>
+            <td>中/高：长序列中包含多个步骤掩码与多点分类损失计算</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 28-1：结果奖励模型（ORM）与过程奖励模型（PRM）的技术特质多维对照</span>
+    </div>
+
+    <h2>2. PRM 标注难题与数据演化：从 PRM800K 到自动化合成流水线</h2>
+    <p>虽然 PRM 在理论上拥有绝对优势，但其核心痛点在于监督数据的获取极其困难。如何低成本、高质量、大规模地为每一个推理步骤打上准确的标签，是推动过程奖励模型走向工业实用的关键命题。</p>
+
+    <h3>2.1 Lightman et al. PRM800K：人工过程监督的经典里程碑</h3>
+    <p>2023 年，OpenAI 团队在论文 <i>Let's Verify Step by Step</i>（Lightman et al.）中发布了轰动业界的 PRM800K 数据集。该数据集包含针对 MATH 竞赛题目的 80 万个人工细粒度步骤标注。OpenAI 制定了严格的人工标注协议，标注者针对每一个思维步骤打出以下三类互斥标签之一：</p>
+    <ul>
+      <li><strong>积极步骤（Positive, <code>+1</code>）</strong>：当前推导步骤完全正确，并且对于解决该问题提供了积极、有价值的推进。</li>
+      <li><strong>中性步骤（Neutral, <code>0</code>）</strong>：该步骤在数学上是正确的，但没有带来实质性的逻辑推进（例如单纯重抄题干已知条件，或进行毫无意义的代数恒等重写）。</li>
+      <li><strong>消极步骤（Negative, <code>-1</code>）</strong>：该步骤包含了代数计算错误、逻辑推论错误或引入了矛盾的假设，导致整条推理链走向失败。</li>
+    </ul>
+    <p>实验结果表明，在相同的 MATH 评测集上，由 PRM800K 训练的过程奖励模型在引导 Best-of-N 搜索时，其解题准确率显著超越了参数规模相当甚至更大的 ORM 模型。然而，PRM800K 的代价极其高昂：标注 80 万个步骤耗费了大量具有专业数学背景的高校人员数千小时的人工劳作，且完全无法随着题库的扩张实现自适应扩展。这促使研究界迫切寻求自动化合成方案。</p>
+
+    <h3>2.2 自动化过程合成：Math-Shepherd 思想</h3>
+    <p>为了摆脱人工标注的算力与人力桎梏，Wang 等人（2023）提出了 Math-Shepherd 自动化标注流水线。其核心直觉非常巧妙：<strong>通过后向蒙特卡洛采样来反推中间步骤的潜力和质量</strong>。对于策略模型生成的一个中间状态序列 \( (x, s_1, s_2, \dots, s_k) \)，Math-Shepherd 并不依赖人工阅读，而是直接调用生成器从状态 \( s_k \) 开始，继续独立采样展开 \( N \) 条完整的后续推理轨迹直至最终答案。若在这 \( N \) 条展开轨迹中，有相当比例的轨迹能够算出正确答案，则表明步骤 \( s_k \) 将系统置于一个高可解性的状态空间中；若无论后续如何展开，所有轨迹最终全部失败，则有极大概率说明步骤 \( s_k \) 已经引入了不可逆转的致命错误。</p>
+
+    <h3>2.3 蒙特卡洛树搜索与二分查找合成：OmegaPRM</h3>
+    <p>Math-Shepherd 的朴素展开虽然摆脱了人工，但采样算力开销巨大。DeepSeek 团队在 2024 年提出的 OmegaPRM 进一步将蒙特卡洛树搜索（MCTS）与高效的二分搜索（Binary Search）算法结合，极大革新了合成过程奖励数据的效率与精度。</p>
+
+    <figure class="figure">
+      <img src="../assets/figs/omegaprm.png" alt="OmegaPRM 蒙特卡洛树搜索与二分查找定位错误步骤">
+      <figcaption>图 28-1：OmegaPRM 基于树搜索与二分查找高效定位长思维链第一错误步骤的流水线（来源：Luo et al., DeepSeek-AI, 2024, arXiv:2406.06592）</figcaption>
+    </figure>
+
+    <p>在一条长达数十步的错误解答中，往往只有一步是真正的转折点。OmegaPRM 采用二分查找逻辑：首先在推理链的中间步骤 \( k = \lfloor K/2 \rfloor \) 处进行蒙特卡洛多次 Rollout。如果后续展开能够命中正确答案，说明当前步骤及前半部分是完全正确的，真正的逻辑漏洞必然潜藏在后半段；反之，若后续展开全部失败，则说明前半段中已经出现了致命缺陷。通过将线性单步探测转变为 \( O(\log K) \) 复杂度的二分收敛，OmegaPRM 以极高的算力利用率精准定位出每条链条中的“第一错误步骤”（First Erroneous Step），并以此为基准快速构建出百万级高精度正负步骤样本对。</p>
+
+    <h2>3. 过程奖励模型的网络架构与训练目标</h2>
+    <p>在实际工程落地中，PRM 通常采用与生成器底模相同体系结构的因果语言模型（Causal LM）。然而，其打分头与训练损失函数有别于传统的自回归下一词预测任务。</p>
+
+    <h3>3.1 分词器改造与步骤标识符（Step Delimiter）</h3>
+    <p>为了让模型明确感知每一个步骤的终结点，通常在分词器中引入一个专用的特殊步骤标记（例如 <code>&lt;|step_end|&gt;</code>），或者直接利用双换行符 <code>\n\n</code> 作为边界。在 Transformer 的前向传播中，PRM 仅提取每一个 <code>&lt;|step_end|&gt;</code> 位置上的隐藏状态向量 \( \mathbf{h}_k \in \mathbb{R}^d \)，通过线性分类头映射为一个二元分类或三元分类的 Logits。</p>
+
+    \[ z_k = \mathbf{w}^\top \mathbf{h}_k + b \]
+    \[ \hat{p}_k = \sigma(z_k) = \frac{1}{1 + e^{-z_k}} \]
+
+    <h3>3.2 掩码多步骤交叉熵损失函数</h3>
+    <p>在训练 PRM 时，一个长样本序列内包含多个步骤，但并非所有 Token 都需要计算奖励损失。必须设计专门的掩码机制（Step-level Masking），仅在步骤结束位置处计算真实标签 \( y_k \in \{0, 1\} \) 的二元交叉熵（Binary Cross-Entropy, BCE）损失。以下是 PRM 训练损失的核心数学表达：</p>
+
+    \[ \mathcal{L}_{\mathrm{PRM}}(\theta) = -\frac{1}{\sum_{i} M_i} \sum_{i=1}^T M_i \left[ y_i \log \sigma(\mathbf{w}^\top \mathbf{h}_i(\theta)) + (1 - y_i) \log (1 - \sigma(\mathbf{w}^\top \mathbf{h}_i(\theta))) \right] \]
+
+    <p>其中，\( M_i \in \{0, 1\} \) 是布尔掩码指示变量，当且仅当第 \( i \) 个 Token 为某一步骤的终结符时，\( M_i = 1 \)，其余位置均为 0。以下是基于 PyTorch 的工业级 PRM 损失模块实现代码。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">prm_loss_module.py</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Dict
+
+class PRMStepLoss(nn.Module):
+    """
+    用于过程奖励模型（PRM）的多步骤掩码二元交叉熵损失函数
+    仅在特定步骤标记符（如 &lt;|step_end|&gt;）处回传梯度
+    """
+    def __init__(self, pos_weight: float = 1.0, label_smoothing: float = 0.05):
+        super().__init__()
+        self.pos_weight = torch.tensor([pos_weight])
+        self.label_smoothing = label_smoothing
+
+    def forward(
+        self,
+        step_logits: torch.Tensor,       # [Batch_Size, Seq_Len] 步骤打分头输出
+        labels: torch.Tensor,            # [Batch_Size, Seq_Len] 浮点标签 (0.0 表示错误, 1.0 表示正确)
+        step_mask: torch.Tensor          # [Batch_Size, Seq_Len] 布尔掩码 (仅步骤终结符处为 True)
+    ) -> Dict[str, torch.Tensor]:
+        """
+        计算掩码位置处的加权二元交叉熵损失
+        """
+        # 展平以便统一索引
+        flat_logits = step_logits.view(-1)
+        flat_labels = labels.view(-1)
+        flat_mask = step_mask.view(-1).bool()
+
+        # 仅筛选出具有有效步骤标注的 Token
+        active_logits = flat_logits[flat_mask]
+        active_labels = flat_labels[flat_mask]
+
+        if active_logits.numel() == 0:
+            return {
+                "loss": torch.tensor(0.0, device=step_logits.device, requires_grad=True),
+                "active_steps": torch.tensor(0)
+            }
+
+        # 标签平滑软化
+        if self.label_smoothing &gt; 0:
+            active_labels = active_labels * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+
+        device = step_logits.device
+        bce_loss = F.binary_cross_entropy_with_logits(
+            active_logits,
+            active_labels,
+            pos_weight=self.pos_weight.to(device),
+            reduction="mean"
+        )
+
+        # 计算预测准确率用于监控指标
+        preds = (torch.sigmoid(active_logits) &gt; 0.5).float()
+        acc = (preds == (active_labels &gt; 0.5).float()).float().mean()
+
+        return {
+            "loss": bce_loss,
+            "accuracy": acc,
+            "active_steps": torch.tensor(active_logits.numel())
+        }</code></pre>
+    </div>
+
+    <h2>4. 搜索算法与大语言模型结合全景</h2>
+    <p>当训练获得高精度的 PRM 后，它将作为环境中的即时启发式评估器（Heuristic Evaluator），与语言模型生成策略 \( \pi_\theta \) 协同工作。测试时计算扩展（Test-time Compute Scaling）的核心，正是利用各种搜索算法在巨大的推理拓扑空间中进行高效的探索与利用。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PRM 引导的树搜索四大核心阶段">
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+        </defs>
+
+        <!-- Root Question Node -->
+        <rect x="20" y="110" width="100" height="60" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="70" y="135" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e3a8a">根节点</text>
+        <text x="70" y="155" text-anchor="middle" font-size="11" fill="#3b82f6">问题 Prompt x</text>
+
+        <!-- Step 1 Branches -->
+        <path d="M120 130 L 190 60" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)"/>
+        <path d="M120 140 L 190 140" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)"/>
+        <path d="M120 150 L 190 220" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <!-- Level 1 Nodes -->
+        <rect x="195" y="30" width="120" height="55" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="255" y="52" text-anchor="middle" font-size="12" font-weight="bold" fill="#065f46">步骤 1: 展开代数</text>
+        <text x="255" y="72" text-anchor="middle" font-size="11" fill="#059669">PRM 得分: 0.95 (保留)</text>
+
+        <rect x="195" y="112" width="120" height="55" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="2"/>
+        <text x="255" y="134" text-anchor="middle" font-size="12" font-weight="bold" fill="#991b1b">步骤 1: 错误求导</text>
+        <text x="255" y="154" text-anchor="middle" font-size="11" fill="#ef4444">PRM 得分: 0.12 (剪枝!)</text>
+
+        <rect x="195" y="195" width="120" height="55" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="255" y="217" text-anchor="middle" font-size="12" font-weight="bold" fill="#92400e">步骤 1: 设未知数</text>
+        <text x="255" y="237" text-anchor="middle" font-size="11" fill="#d97706">PRM 得分: 0.81 (备选)</text>
+
+        <!-- Step 2 Branches from Green Node -->
+        <path d="M315 57 L 380 40" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+        <path d="M315 65 L 380 90" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+
+        <rect x="385" y="15" width="125" height="50" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="447" y="36" text-anchor="middle" font-size="11" font-weight="bold" fill="#065f46">步骤 2: 因式分解</text>
+        <text x="447" y="54" text-anchor="middle" font-size="10" fill="#059669">PRM: 0.98 (高置信)</text>
+
+        <rect x="385" y="75" width="125" height="50" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="447" y="96" text-anchor="middle" font-size="11" fill="#1e3a8a">步骤 2: 换元法</text>
+        <text x="447" y="114" text-anchor="middle" font-size="10" fill="#3b82f6">PRM: 0.72</text>
+
+        <!-- Final Solution Path -->
+        <path d="M510 40 L 575 40" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+
+        <rect x="580" y="15" width="125" height="110" rx="8" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="642" y="40" text-anchor="middle" font-size="12" font-weight="bold" fill="#5b21b6">最终答案判定</text>
+        <text x="642" y="65" text-anchor="middle" font-size="11" fill="#6d28d9">累计路径置信度:</text>
+        <text x="642" y="85" text-anchor="middle" font-size="13" font-weight="bold" fill="#10b981">0.95 × 0.98 = 0.931</text>
+        <text x="642" y="108" text-anchor="middle" font-size="11" fill="#475569">多数投票加权确认</text>
+      </svg>
+      <figcaption>图 28-2：基于 PRM 的步骤级动态剪枝与蒙特卡洛状态扩展拓扑图</figcaption>
+    </figure>
+
+    <h3>4.1 最佳优先重排（Best-of-N with PRM Scoring）</h3>
+    <p>在 Best-of-N 架构中，系统通过高温采样独立生成 \( N \) 条完整的解答候选。PRM 对每条候选轨迹中的各个步骤给出置信度 \( (r_1, r_2, \dots, r_K) \)。由于不同轨迹的步骤数量往往不同，如何将这一向量聚合为标量分值决定了重排的优劣：</p>
+    <ul>
+      <li><strong>最低值瓶颈（Minimum Aggregation / Bottleneck）</strong>：\( S_{\mathrm{min}} = \min_{k=1}^K r_k \)。该策略基于逻辑链条的“木桶原理”——只要推理过程中出现哪怕一处低分，整个解答的置信度便由这一瓶颈所决定。在工程实践中，Minimum 聚合表现出最强的抗长度偏差能力。</li>
+      <li><strong>几何平均聚合（Geometric Mean）</strong>：\( S_{\mathrm{geom}} = \left(\prod_{k=1}^K r_k\right)^{1/K} \)。消除了步骤长度带来的指数级自然衰减，兼顾了所有步骤的平均质量。</li>
+      <li><strong>乘积聚合（Product Aggregation）</strong>：\( S_{\mathrm{prod}} = \prod_{k=1}^K r_k \)。假设各步骤独立正确。然而在序列较长时，连乘会导致数值迅速下溢，并严重惩罚更长但推导详尽的优质解答。</li>
+    </ul>
+
+    <h3>4.2 步进式束搜索（Step-level Beam Search）</h3>
+    <p>不同于 Best-of-N 的事后筛选，束搜索在每一步推理展开时即刻介入。假设当前的束宽（Beam Width）为 \( B \)。在当前时间步，每个存活的推导前缀独立生成 \( M \) 个候选的后续推导步骤，共产生 \( B \times M \) 个候选状态分支。PRM 对这些分支的新增步骤打分，计算累计路径价值，仅保留得分最高的前 \( B \) 个分支进入下一轮，其余分支直接被剪枝销毁。这种方式避免了算力在错误分支上的空转消耗。</p>
+
+    <h3>4.3 蒙特卡洛树搜索（MCTS）的深度融合</h3>
+    <p>束搜索是一种贪心启发式搜索，若在早期步骤中 PRM 偶发给出了错误的打分，可能会导致全局最优解被过早剪枝。为了实现更具探索深度的求解，学术界全面引入了蒙特卡洛树搜索（MCTS）。在 MCTS 框架中：</p>
+    <ul>
+      <li><strong>树状态（State）</strong>：由题干及至今为止生成的所有步骤字符串构成的状态节点 \( S \)。</li>
+      <li><strong>动作（Action）</strong>：由生成模型输出的一个新的候选推导步骤 \( A \)。</li>
+      <li><strong>先验概率（Prior）</strong>：由生成器模型在生成当前步骤时的对数概率归一化得到 \( P(A \mid S) \)。</li>
+      <li><strong>价值更新（Value Update）</strong>：结合 PRM 的单步判定与终局最终答案验证反馈，通过 PUCT 公式进行探索与利用平衡选择。</li>
+    </ul>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>搜索算法范式</th>
+            <th>探索机制与拓扑</th>
+            <th>推理算力消耗（FLOPS）</th>
+            <th>核心优势</th>
+            <th>主要局限</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Best-of-N 独立采样</strong></td>
+            <td>完全并行采样 N 条完整解答，事后重排</td>
+            <td>\( O(N \cdot L) \)</td>
+            <td>工程部署极其简单，无状态交互，高度契合批处理</td>
+            <td>中间推导无法共享 KV 缓存，错误分支无法提前终止</td>
+          </tr>
+          <tr>
+            <td><strong>步进式束搜索（Beam Search）</strong></td>
+            <td>按步骤分层前推，每步保留 Top-B 最优前缀</td>
+            <td>\( O(B \cdot M \cdot K) \)</td>
+            <td>步骤级动态剪枝，早期拦截错误，GPU 内存复用率高</td>
+            <td>容易陷入局部贪心陷阱，难以回溯推翻先前的错误前缀</td>
+          </tr>
+          <tr>
+            <td><strong>蒙特卡洛树搜索（MCTS）</strong></td>
+            <td>基于 PUCT 准则在树状图中非对称动态展开</td>
+            <td>\( O(\mathrm{Simulations} \cdot L) \)</td>
+            <td>兼顾探索与利用，支持自适应回溯与非线性多路对比</td>
+            <td>工程调度极其复杂，树节点 KV 缓存碎片化严重，并发利用率低</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 28-2：大语言模型三大主流测试时搜索算法的核心特质与系统开销对比</span>
+    </div>
+
+    <h2>5. PRM 驱动的步骤打分与 Best-of-N 加权重排实战</h2>
+    <p>下面给出一个完整可运行的生产级 Python 模块，演示如何加载轻量级 PRM 模型，对多步推理样本切分步骤、计算逐步置信度，并基于 Minimum 瓶颈聚合与加权多数投票算法（Weighted Majority Voting）实现答案重排。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">prm_scorer_and_ranker.py</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from typing import List, Dict, Any, Tuple
+from collections import defaultdict
+import numpy as np
+
+class StepLevelPRMScorer:
+    """基于双换行符切分的工业级 PRM 步骤打分与重排引擎"""
+    def __init__(self, model_name_or_path: str, device: str = "cuda"):
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path, 
+            torch_dtype=torch.bfloat16,
+            device_map=self.device
+        )
+        self.model.eval()
+        
+        # 提取用于标识打分正负的特殊 token id（在实际开源 PRM 如 Qwen2.5-Math-PRM 中常用 '+' 与 '-'）
+        self.pos_token_id = self.tokenizer.encode("+")[-1]
+        self.neg_token_id = self.tokenizer.encode("-")[-1]
+
+    def split_steps(self, reasoning_text: str) -> List[str]:
+        """将长思维链文本拆分为离散步骤列表"""
+        raw_steps = [s.strip() for s in reasoning_text.split("\n\n") if len(s.strip()) &gt; 0]
+        steps = []
+        for s in raw_steps:
+            cleaned = s.replace("&lt;think&gt;", "").replace("&lt;/think&gt;", "").strip()
+            if cleaned:
+                steps.append(cleaned)
+        return steps
+
+    @torch.no_grad()
+    def score_single_step(self, prompt: str, history_steps: List[str], current_step: str) -> float:
+        """评估单个推导步骤在历史上下文条件下的置信概率"""
+        prefix = f"Problem: {prompt}\n\n"
+        for i, step in enumerate(history_steps):
+            prefix += f"Step {i+1}: {step}\n\n"
+        
+        step_input = prefix + f"Step {len(history_steps)+1}: {current_step} Evaluator:"
+        inputs = self.tokenizer(step_input, return_tensors="pt").to(self.device)
+        
+        logits = self.model(**inputs).logits[:, -1, :]
+        pos_logit = logits[0, self.pos_token_id]
+        neg_logit = logits[0, self.neg_token_id]
+        
+        # 对正负 logit 进行 softmax 归一化
+        probs = F.softmax(torch.stack([neg_logit, pos_logit]), dim=0)
+        return probs[1].item()
+
+    def evaluate_solution(self, prompt: str, solution_text: str) -> Dict[str, Any]:
+        """逐步骤评测完整解题轨迹并输出各项聚合指标"""
+        steps = self.split_steps(solution_text)
+        step_scores = []
+        history = []
+        
+        for step in steps:
+            score = self.score_single_step(prompt, history, step)
+            step_scores.append(score)
+            history.append(step)
+            
+        min_score = min(step_scores) if step_scores else 0.0
+        geom_mean = float(np.exp(np.mean(np.log(np.array(step_scores) + 1e-8)))) if step_scores else 0.0
+        
+        return {
+            "num_steps": len(steps),
+            "step_scores": step_scores,
+            "min_score": min_score,
+            "geometric_mean": geom_mean,
+            "first_failing_step": next((i for i, s in enumerate(step_scores) if s &lt; 0.5), None)
+        }
+
+    def weighted_majority_vote(
+        self,
+        prompt: str,
+        candidates: List[Dict[str, str]],
+        agg_method: str = "min"
+    ) -> Tuple[str, float, List[Dict[str, Any]]]:
+        """
+        利用 PRM 置信度加权执行多数投票（Weighted Majority Voting）
+        每个 candidate 包含 'reasoning' 与 'extracted_answer'
+        """
+        eval_records = []
+        vote_table = defaultdict(float)
+        
+        for idx, cand in enumerate(candidates):
+            eval_res = self.evaluate_solution(prompt, cand["reasoning"])
+            weight = eval_res["min_score"] if agg_method == "min" else eval_res["geometric_mean"]
+            
+            ans = cand["extracted_answer"]
+            vote_table[ans] += weight
+            eval_records.append({
+                "cand_id": idx,
+                "answer": ans,
+                "weight": weight,
+                "eval": eval_res
+            })
+            
+        # 找出加权投票总分最高的最终答案
+        best_answer = max(vote_table.items(), key=lambda x: x[1])[0]
+        return best_answer, vote_table[best_answer], eval_records</code></pre>
+    </div>
+
+    <h2>6. 过程奖励引导的轻量级 MCTS 搜索骨架实现</h2>
+    <p>为了让读者直观理解如何将 PRM 嵌入经典的树搜索算法中，以下展示了一个轻量级的 MCTS 搜索骨架代码。该实现展现了树节点在选择、扩展、评估与反向回溯过程中的状态转移与 PRM 启发值融合逻辑。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">mcts_prm_search.py</span>
+      <pre class="code"><code class="language-python">import math
+from typing import List, Optional, Dict
+
+class MCTSNode:
+    """MCTS 树节点，记录推导步骤前缀与树统计指标"""
+    def __init__(self, step_text: str, parent: Optional['MCTSNode'] = None, prior_prob: float = 1.0):
+        self.step_text = step_text
+        self.parent = parent
+        self.children: List['MCTSNode'] = []
+        self.visit_count = 0
+        self.total_value = 0.0
+        self.prior_prob = prior_prob
+        self.is_terminal = False
+
+    @property
+    def q_value(self) -> float:
+        """平均累加价值"""
+        return self.total_value / self.visit_count if self.visit_count &gt; 0 else 0.0
+
+    def select_child_puct(self, c_puct: float = 1.414) -> 'MCTSNode':
+        """基于 PUCT 准则在子节点中进行探索与利用平衡选择"""
+        best_score = -float('inf')
+        best_child = None
+        
+        total_parent_visits = max(1, self.visit_count)
+        
+        for child in self.children:
+            u_score = c_puct * child.prior_prob * (math.sqrt(total_parent_visits) / (1 + child.visit_count))
+            puct_score = child.q_value + u_score
+            
+            if puct_score &gt; best_score:
+                best_score = puct_score
+                best_child = child
+                
+        return best_child
+
+class MCTSReasoningSearcher:
+    """结合 PRM 的多步推理蒙特卡洛树搜索器伪代码骨架"""
+    def __init__(self, prm_scorer: StepLevelPRMScorer, max_simulations: int = 20):
+        self.prm_scorer = prm_scorer
+        self.max_simulations = max_simulations
+
+    def search(self, prompt: str, initial_root: MCTSNode) -> str:
+        """执行指定轮次的 MCTS 模拟搜索并返回最优解题路径"""
+        for _ in range(self.max_simulations):
+            node = initial_root
+            search_path = [node]
+
+            # 1. Selection（向下选择至叶子节点）
+            while node.children and not node.is_terminal:
+                node = node.select_child_puct()
+                search_path.append(node)
+
+            # 2. Evaluation（调用 PRM 评估当前叶子步骤的单步置信度）
+            history_steps = [n.step_text for n in search_path[1:-1]]
+            current_step = node.step_text
+            step_reward = self.prm_scorer.score_single_step(prompt, history_steps, current_step)
+
+            # 3. Backpropagation（向上回溯更新路径上所有节点的访问次数与价值）
+            for ancestor in search_path:
+                ancestor.visit_count += 1
+                ancestor.total_value += step_reward
+
+        # 搜索结束后，顺着访问量最大的子节点路径提取最优解答步骤
+        best_path = []
+        curr = initial_root
+        while curr.children:
+            curr = max(curr.children, key=lambda c: c.visit_count)
+            best_path.append(curr.step_text)
+            
+        return "\n\n".join(best_path)</code></pre>
+    </div>
+
+    <h2>7. PRM 落地中的常见工程陷阱与失效对策</h2>
+    <p>尽管过程奖励模型在逻辑上极为优美，但在真实生产环境中，由于模型对推理状态分布的极端敏感性，常面临两大致命缺陷：</p>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 陷阱一：过程奖励黑客（Step-level Reward Hacking）</div>
+      <p>当直接将 PRM 的步骤奖励作为强化学习（RL）策略梯度的即时反馈时，生成模型会快速演化出“步骤填充作弊”：它会疯狂生成大量微小、绝对正确但毫无信息量的恒等变换（例如将一个已求得的代数式反复乘以 1、反复重述题目条件）。PRM 对这些微步骤每一步都会打出 0.9 以上的高分，最终模型以极长的废话步骤骗取极高奖赏，却再也无法推进到终局解答。<br>
+      <strong>防御手段</strong>：绝不能单纯依赖 PRM。必须采用“ORM 终局验证 + PRM 步骤正则”的联合奖励机制，仅当最终答案正确时才赋予全额过程奖励，并对无推进的冗余步骤施加长度递减惩罚。</p>
+    </div>
+
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 陷阱二：误差级联累积与长链误杀（Compounding False Negatives）</div>
+      <p>在涉及 20 个步骤的超长推导中，即便 PRM 拥有高达 98% 的单步极高准确率，其整条长链不被任何一步误判的概率也仅为 \( 0.98^{20} \approx 66.7\% \)。高达三分之一的正确长解会被 PRM 的偶发失误判定为不可行。为了防止长链被无情截断，在设计搜索算法时，应采用平滑阈值（如允许 1 次轻度低于阈值）或使用几何平均聚合代替脆弱的连乘积。</p>
+    </div>
+
+    <h2>8. 本章小结</h2>
+    <ul>
+      <li>结果奖励模型（ORM）因信度分配模糊与假阳性作弊漏洞，无法满足深层多步推理的优化需求；过程奖励模型（PRM）通过逐步骤提供置信度评估，为细粒度错误检测与测试时搜索提供了可解释的数学基础。</li>
+      <li>PRM 标注范式从早期昂贵的人工逐步审查（PRM800K）成功跃迁至基于蒙特卡洛展开（Math-Shepherd）与二分搜索树采样（OmegaPRM）的纯算法全自动合成。</li>
+      <li>在测试时计算扩展中，PRM 原生支持 Best-of-N 加权多数投票、步进式束搜索（Beam Search）以及蒙特卡洛树搜索（MCTS），能够在早期阶段精准剪枝，大幅降低算力空转消耗。</li>
+      <li>防范步骤冗余骗分（Reward Hacking）与级联误杀（Error Compounding）是保障 PRM 系统稳健运行的核心工程底线。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：在评估长思维链的全局置信度时，为什么最低值瓶颈（\( \min_k r_k \)）通常优于连乘积（\( \prod_k r_k \)）？</summary>
+        <p><strong>答案</strong>：因为每个步骤的概率分值 \( r_k \le 1 \)，连乘积在长序列上具有天然的指数衰减效应。即便一条 25 步的高难度证明每一步都近乎完美（如每步 0.95），其连乘积也仅剩 \( 0.95^{25} \approx 0.277 \)；而一条仅有 2 步但逻辑粗糙的解答（每步 0.7）其连乘积却高达 0.49。这会导致连乘积系统性歧视复杂长推导。Minimum 瓶颈聚合以链条中最薄弱的一环为准，消除了长度带来的数值惩罚，与“严谨数学证明只要一处不成立则全盘不成立”的客观规律完全一致。</p>
+      </details>
+      <details>
+        <summary>问题 2：OmegaPRM 是如何通过二分搜索算法大幅降低合成过程奖励数据的算力开销的？</summary>
+        <p><strong>答案</strong>：对于一条最终答案错误的推理链，传统方法需要对其中的每个步骤依次进行蒙特卡洛展开以寻找转折点，时间复杂度为 \( O(K \cdot N) \)。OmegaPRM 假设错误步骤前后的可解性状态存在单调突变，直接在中间步 \( K/2 \) 处进行并发展开采样：若能求出正确答案，说明错误潜藏在后半段；若全部失败，则说明前半段已出错。通过将线性单步探测转变为 \( O(\log K) \) 的对数收敛，极大降低了无意义的下游展开算力。</p>
+      </details>
+      <details>
+        <summary>问题 3：为什么不能在强化学习中将 PRM 单步得分作为唯一的即时奖励信号？</summary>
+        <p><strong>答案</strong>：因为这会引发严重的步骤填充式奖励黑客（Reward Hacking）。策略网络会学会放弃寻找最终解，而是不断输出毫无实质进展的废话但数学上恒成立的简单变式（如反复重述题干或简单加减恒等变形），以持续刷取 PRM 的正向单步分。必须将 PRM 与最终答案的准确率校验（ORM 或规则判卷）严格绑定，仅在最终答案正确时才赋予全额正向反馈。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Lightman et al., 2023]</span> Lightman, H. et al. "Let's Verify Step by Step." <i>ICLR</i>, 2024. <span class="rid">arXiv:2305.20050</span></li>
+      <li><span class="rid">[Luo et al., 2024]</span> Luo, L. et al. "OmegaPRM: Sub-Goal Oriented Process Reward Modeling via Monte Carlo Tree Search." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2406.06592</span></li>
+      <li><span class="rid">[Wang et al., 2023]</span> Wang, P. et al. "Math-Shepherd: Verify and Reinforce LLMs Step-by-step without Human Annotations." <i>ACL</i>, 2024. <span class="rid">arXiv:2312.08935</span></li>
+      <li><span class="rid">[Uesato et al., 2022]</span> Uesato, J. et al. "Solving math word problems with process- and outcome-based feedback." <i>arXiv preprint</i>, 2022. <span class="rid">arXiv:2211.14275</span></li>
+      <li><span class="rid">[Cobbe et al., 2021]</span> Cobbe, K. et al. "Training Verifiers to Solve Math Word Problems." <i>arXiv preprint</i>, 2021. <span class="rid">arXiv:2110.14168</span></li>
+      <li><span class="rid">[Yao et al., 2023]</span> Yao, S. et al. "Tree of Thoughts: Deliberate Problem Solving with Large Language Models." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2305.10601</span></li>
+      <li><span class="rid">[Silver et al., 2016]</span> Silver, D. et al. "Mastering the game of Go with deep neural networks and tree search." <i>Nature</i>, 2016.</li>
+      <li><span class="rid">[Snell et al., 2024]</span> Snell, C. et al. "Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2408.03314</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

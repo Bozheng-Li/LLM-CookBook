@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 48 章 · 模型融合 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 9 部分 · 前沿专题</div>
+      <h1>第 48 章 · 模型融合（Model Merging）</h1>
+      <p class="chapter-lead">如果我们可以像算术运算一样相加、相减甚至插值多个大语言模型的参数，会发生什么？模型融合（Model Merging）打破了“必须耗费昂贵算力重新训练才能融合能力”的传统范式，利用权重空间的几何特性与线性模式连接，在零额外训练数据与零推理延迟的前提下，将多个独立微调的领域模型无缝拼接为复合多能模型。本章系统解构模型融合的损失景观理论、主流融合算子（Task Arithmetic、SLERP、Fisher 加权、TIES-Merging 与 DARE）、后训练能力组合方案，并结合 MergeKit 与 PyTorch 提供工业级融合落地实战。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★★☆ ｜ 先修：第 12 章、第 14 章、第 22 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 权重空间的炼金术：为什么模型可以被合并？</h2>
+    <p>在大模型后训练领域，一个长期存在的工程困境是：<strong>“多任务全量微调”的计算开销与数据冲突</strong>。当我们希望一个基座大模型既精通 Python 编程、又具备出色的中文文案写作能力、同时还保持顶级的数学推导水平与严格的安全对齐防线时，最直觉的做法是将所有领域的数据汇集在一起进行多任务联合微调（Multi-Task SFT）或连续强化学习。然而，联合训练不仅面临跨领域梯度互冲（Negative Transfer / Gradient Conflict）与灾难性遗忘，还需要调动数百乃至上千张 GPU 重新训练数天甚至数周。</p>
+    <p>能否跳过昂贵的反向传播，直接对多个在不同任务上分别微调好的模型权重执行“参数合并”？这种看似违背深度学习非线性黑盒直觉的技术，被称为 <span class="term">模型融合（Model Merging）</span>。令人惊叹的是，在当今千亿级参数的大模型生态中，多个微调模型的直接权重相加或加权平均，常常不仅没有使模型瘫痪崩溃，反而能在各个任务上展现出媲美甚至超越独立微调专家的综合表现。</p>
+
+    <div class="callout note">
+      <div class="callout-title">📘 核心直觉：权重空间为什么具有线性可组合性？</div>
+      <p>深度神经网络的损失曲面（Loss Landscape）是高度非凸、崎岖不平且充斥着局部极小值的。如果随意将两个从随机高斯分布分别初始化训练出的神经网络权重取算术平均，所得模型在几乎所有任务上的损失都会剧烈飙升至天文数字。模型融合能够生效的<strong>唯一决定性前提</strong>在于：<strong>所有参与融合的模型都必须源自同一个预训练基座（Shared Pretrained Initialization）</strong>。</p>
+    </div>
+
+    <h3>1.1 线性模式连接（Linear Mode Connectivity, LMC）</h3>
+    <p>深度学习理论中的 <span class="term">线性模式连接（Linear Mode Connectivity, LMC）</span> 假说指出：在满足特定初始化条件时，神经网络在参数空间中收敛到的两个不同极小值点 \(\theta_A\) 与 \(\theta_B\) 之间，存在一条低损失的连通路径。更严格地，当这条路径是一条连接两点的欧几里得直线段时，我们称其满足严格的线性模式连接：</p>
+    \[ \forall \alpha \in [0, 1], \quad \mathcal{L}((1 - \alpha)\theta_A + \alpha \theta_B) \le (1 - \alpha)\mathcal{L}(\theta_A) + \alpha \mathcal{L}(\theta_B) + \epsilon \]
+    <p>式中 \(\epsilon\) 表示路径上的损失障碍（Loss Barrier）。如果 \(\epsilon \approx 0\)，说明从模型 A 到模型 B 的直线插值过程中完全没有越过高耸的损失山峰，二者处于同一平缓的凸状低损失盆地（Flat Convex Basin）内。</p>
+    <p>Nagarajan 等人与 Frankle 等人的实证研究表明：从完全不同的随机初始化点出发训练得到的两个模型，由于置换对称性（Permutation Symmetry）的存在，中间隔着极高的能量壁垒（\(\epsilon \gg 0\)）；然而，<strong>只要两个模型微调前使用的是同一个预训练检查点 \(\theta_0\)，后训练的微调过程本质上只是在该预训练吸引子（Attractor Basin）附近进行微小的局部切空间漂移</strong>。由于微调移动的距离相较于整个高维权重空间的半径极其微小，不同微调模型几乎始终停留在此单峰盆地内部，这构成了模型融合最坚实的几何与优化理论地基。</p>
+
+    <!-- 自绘 SVG：权重空间中单峰盆地与线性模式连接示意图 -->
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="权重空间损失景观与线性模式连接示意图">
+        <defs>
+          <marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="arrow-emerald" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+          <marker id="arrow-purple" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#8b5cf6"/>
+          </marker>
+          <linearGradient id="basin-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#eff6ff" stop-opacity="0.8"/>
+            <stop offset="100%" stop-color="#dbeafe" stop-opacity="0.2"/>
+          </linearGradient>
+        </defs>
+
+        <text x="360" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#1e293b">权重空间损失景观（Loss Landscape）与线性模式连接（LMC）机制</text>
+
+        <!-- 左侧：非共享初始化（隔着高能损失障碍） -->
+        <g transform="translate(30, 45)">
+          <rect x="0" y="0" width="310" height="215" rx="10" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+          <text x="155" y="25" text-anchor="middle" font-size="14" font-weight="bold" fill="#991b1b">非共享初始化（独立训练）</text>
+          
+          <!-- 损失等高线/山峰示意曲线 -->
+          <path d="M 30 150 Q 80 60 155 170 Q 230 60 280 150" fill="none" stroke="#ef4444" stroke-width="2" stroke-dasharray="4,4"/>
+          <!-- 山峰高阻隔 -->
+          <path d="M 120 180 Q 155 90 190 180 Z" fill="#fee2e2" stroke="#dc2626" stroke-width="1.5"/>
+          <text x="155" y="140" text-anchor="middle" font-size="11" fill="#b91c1c" font-weight="bold">损失高阻隔</text>
+          <text x="155" y="155" text-anchor="middle" font-size="10" fill="#b91c1c">ε ≫ 0 (坍塌)</text>
+
+          <!-- 极值点 A 和 B -->
+          <circle cx="50" cy="155" r="7" fill="#ef4444"/>
+          <text x="50" y="180" text-anchor="middle" font-size="12" font-weight="bold" fill="#7f1d1d">模型 A</text>
+
+          <circle cx="260" cy="155" r="7" fill="#ef4444"/>
+          <text x="260" y="180" text-anchor="middle" font-size="12" font-weight="bold" fill="#7f1d1d">模型 B</text>
+
+          <!-- 连线穿过山峰 -->
+          <line x1="50" y1="155" x2="260" y2="155" stroke="#991b1b" stroke-width="2" stroke-dasharray="3,3"/>
+          <circle cx="155" cy="155" r="5" fill="#991b1b"/>
+          <text x="155" y="172" text-anchor="middle" font-size="11" fill="#7f1d1d">直接算术平均 θ_avg</text>
+          <text x="155" y="202" text-anchor="middle" font-size="11" fill="#b91c1c">结论：参数置换错位，插值性能崩溃</text>
+        </g>
+
+        <!-- 右侧：共享预训练底座（处于同一单峰凹盆地） -->
+        <g transform="translate(380, 45)">
+          <rect x="0" y="0" width="310" height="215" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+          <text x="155" y="25" text-anchor="middle" font-size="14" font-weight="bold" fill="#065f46">共享预训练基座 θ₀（后训练融合）</text>
+
+          <!-- 平坦低损失盆地等高线 -->
+          <ellipse cx="155" cy="130" rx="130" ry="65" fill="url(#basin-grad)" stroke="#10b981" stroke-width="1.5"/>
+          <ellipse cx="155" cy="130" rx="90" ry="42" fill="#d1fae5" stroke="#059669" stroke-width="1.2"/>
+          <text x="155" y="85" text-anchor="middle" font-size="10" fill="#047857">平缓低损失吸引子盆地（Flat Valley）</text>
+
+          <!-- 预训练底座 θ0 -->
+          <circle cx="155" cy="145" r="6" fill="#1e3a8a"/>
+          <text x="155" y="165" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">基座 θ₀</text>
+
+          <!-- 微调模型 A (代码专家) 与 任务向量 tau_A -->
+          <circle cx="75" cy="115" r="6" fill="#2563eb"/>
+          <text x="75" y="105" text-anchor="middle" font-size="12" font-weight="bold" fill="#1d4ed8">模型 θ_A</text>
+          <line x1="155" y1="145" x2="81" y2="118" stroke="#2563eb" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+
+          <!-- 微调模型 B (数学专家) 与 任务向量 tau_B -->
+          <circle cx="235" cy="115" r="6" fill="#8b5cf6"/>
+          <text x="235" y="105" text-anchor="middle" font-size="12" font-weight="bold" fill="#6d28d9">模型 θ_B</text>
+          <line x1="155" y1="145" x2="229" y2="118" stroke="#8b5cf6" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+
+          <!-- 连线：LMC 低损失线段与融合点 -->
+          <line x1="75" y1="115" x2="235" y2="115" stroke="#10b981" stroke-width="2.5"/>
+          <circle cx="155" cy="115" r="6" fill="#10b981"/>
+          <text x="155" y="110" text-anchor="middle" font-size="12" font-weight="bold" fill="#065f46">融合模型 θ_merge</text>
+          <text x="155" y="202" text-anchor="middle" font-size="11" fill="#047857">结论：直线路径无障碍 (ε≈0)，双重能力叠加</text>
+        </g>
+      </svg>
+      <figcaption>图 48-1：权重空间中独立随机初始化（左）与共享预训练底座（右）在损失景观与线性模式连接上的本质差异</figcaption>
+    </figure>
+
+    <p><strong>本节小结：</strong>预训练阶段赋予了模型一个通用的底层语义坐标系；随后的 SFT 或偏好微调只是在局部切平面上施加位移向量。只要微调没有破坏基础表征流形，这些切向量在很大程度上是相互兼容的。</p>
+
+    <h2>2. 任务向量与几何插值：从线性平均到 Task Arithmetic</h2>
+    <p>理解了线性模式连接后，我们将问题形式化为数学操作。本节探讨基础融合算法：朴素加权平均、球面线性插值（SLERP）以及革命性的任务算术（Task Arithmetic）。</p>
+
+    <h3>2.1 任务向量（Task Vector）数学定义</h3>
+    <p>设 \(\theta_0 \in \mathbb{R}^d\) 为共享的预训练基座模型参数（参数维度 \(d\) 通常为数十亿至数千亿）。在特定任务 \(t\)（例如代码指令、安全对齐、法律问答）上微调后得到模型参数 \(\theta_t\)。Ilharco 等人（2022）提出了著名的 <span class="term">任务向量（Task Vector）</span> 概念：</p>
+    \[ \tau_t = \theta_t - \theta_0 \]
+    <p>任务向量 \(\tau_t\) 刻画了为了适应该任务，模型参数需要发生改变的高维位移方向与步长。直观而言，\(\tau_t\) 提炼了模型在后训练中获取的新知识增量，剔除了底座原有的共性表征。</p>
+
+    <h3>2.2 任务算术（Task Arithmetic）的代数运算</h3>
+    <p>既然 \(\tau_t\) 是参数空间中的向量，那么向量空间的标准代数运算（加法、数乘、减法）就具备了清晰的语义解释：</p>
+    <ul>
+      <li><strong>多任务技能叠加（Addition / Multi-Task Merging）：</strong>将针对不同任务独立训练的多个任务向量加权相加，与基座模型复合：
+        \[ \theta_{\mathrm{merge}} = \theta_0 + \lambda \sum_{i=1}^M \alpha_i \tau_i = \theta_0 + \lambda \sum_{i=1}^M \alpha_i (\theta_i - \theta_0) \]
+        其中 \(\alpha_i\) 为各任务重要性权重，\(\lambda\) 为全局融合缩放系数。模型在不需要联合微调的情况下同时获得 \(M\) 个专家的特长。</li>
+      <li><strong>负向知识剔除与任务相减（Subtraction / Unlearning）：</strong>若某模型 \(\theta_{\mathrm{toxic}}\) 具有极强的攻击性、偏见或毒性生成倾向，我们可以定义有害任务向量 \(\tau_{\mathrm{toxic}} = \theta_{\mathrm{toxic}} - \theta_0\)，并在目标模型中反向扣除：
+        \[ \theta_{\mathrm{clean}} = \theta_{\mathrm{target}} - \gamma \tau_{\mathrm{toxic}} \]
+        这一运算能够精准抑制特定领域的有害能力，成为机器遗忘（Machine Unlearning）的高效捷径。</li>
+      <li><strong>类比推理（Analogy）：</strong>类似词向量运算（King - Man + Woman = Queen），模型层面也可以进行能力迁移：\(\theta_{\mathrm{new}} = \theta_0 + \tau_{\mathrm{code\_python}} + (\tau_{\mathrm{rust\_annotated}} - \tau_{\mathrm{c\_annotated}})\)。</li>
+    </ul>
+
+    <h3>2.3 球面线性插值（SLERP）</h3>
+    <p>当我们要融合的模型数量恰好为 2 个（例如：一个经过高质量大尺度 SFT 的指令模型 \(\theta_1\)，和一个经过严格 DPO 安全对齐的模型 \(\theta_2\)）时，传统的线性插值（Linear Interpolation, LERP）存在一个内在几何缺陷：<strong>高维球体中，线性插值点的模长会发生向心塌陷</strong>。</p>
+    <p>高维参数空间具有极强的各向异性（Anisotropy）和超球面特性。当向量维度 \(d \sim 10^{10}\) 时，两个微调向量主要分布在超球面壳层上。若沿欧氏直线插值 \(\theta_{\mathrm{lerp}} = (1-\alpha)\theta_1 + \alpha \theta_2\)，当 \(\alpha = 0.5\) 且两向量正交时，中间点的欧式模长会剧烈缩短为原来的 \(\frac{\sqrt{2}}{2} \approx 0.707\)。这会导致神经网络隐藏层激活方差失真、输出 Logits 范围收缩、以及温度采样紊乱。</p>
+    <p><span class="term">球面线性插值（Spherical Linear Interpolation, SLERP）</span> 解决了这一几何失真问题。SLERP 沿着单位超球面上的测地线（大圆弧）进行匀速角度插值，严格保持向量模长的平滑过渡：</p>
+    \[ \Omega = \arccos\left(\frac{\theta_1 \cdot \theta_2}{\|\theta_1\| \|\theta_2\|}\right) \]
+    \[ \theta_{\mathrm{slerp}}(\alpha) = \frac{\sin((1 - \alpha)\Omega)}{\sin \Omega} \theta_1 + \frac{\sin(\alpha \Omega)}{\sin \Omega} \theta_2 \]
+    <p>当两个向量几乎平行（\(\Omega \to 0\)）时，分母趋于零，数值计算自动平滑退化为标准线性 LERP。SLERP 在开源社区模型合并竞赛（如 Open LLM Leaderboard）中被广泛用作打磨最后性能的利器。</p>
+
+    <!-- 自绘 SVG：高维权重空间任务向量与 SLERP 几何示意图 -->
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="任务算术与 SLERP 几何示意图">
+        <defs>
+          <marker id="arrow-m" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="arrow-g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+          <marker id="arrow-o" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#f59e0b"/>
+          </marker>
+        </defs>
+
+        <text x="360" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#1e293b">高维参数空间中 Task Vectors 与 SLERP 超球面几何投影</text>
+
+        <!-- 左侧：Task Arithmetic 任务向量加减几何 -->
+        <g transform="translate(30, 45)">
+          <rect x="0" y="0" width="310" height="215" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+          <text x="155" y="25" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a">任务向量代数相加 (Task Arithmetic)</text>
+
+          <!-- 坐标系与基座 θ0 -->
+          <circle cx="60" cy="170" r="7" fill="#1e293b"/>
+          <text x="45" y="190" font-size="13" font-weight="bold" fill="#1e293b">θ₀ (Base)</text>
+
+          <!-- 向量 tau_1 (代码模型) -->
+          <line x1="60" y1="170" x2="190" y2="170" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow-m)"/>
+          <text x="125" y="162" font-size="12" fill="#2563eb" font-weight="bold">τ₁ (Code)</text>
+
+          <!-- 向量 tau_2 (数学模型) -->
+          <line x1="60" y1="170" x2="60" y2="60" stroke="#10b981" stroke-width="2.5" marker-end="url(#arrow-g)"/>
+          <text x="68" y="115" font-size="12" fill="#10b981" font-weight="bold">τ₂ (Math)</text>
+
+          <!-- 平行四边形法则：合力向量 -->
+          <line x1="190" y1="170" x2="190" y2="60" stroke="#94a3b8" stroke-dasharray="3,3" stroke-width="1.5"/>
+          <line x1="60" y1="60" x2="190" y2="60" stroke="#94a3b8" stroke-dasharray="3,3" stroke-width="1.5"/>
+          
+          <line x1="60" y1="170" x2="185" y2="65" stroke="#f59e0b" stroke-width="3" marker-end="url(#arrow-o)"/>
+          <circle cx="190" cy="60" r="7" fill="#f59e0b"/>
+          <text x="210" y="55" font-size="12" font-weight="bold" fill="#b45309">θ_merge = θ₀ + λ(τ₁ + τ₂)</text>
+
+          <text x="155" y="202" text-anchor="middle" font-size="11" fill="#64748b">物理直觉：各任务切向量合成，多能力同体</text>
+        </g>
+
+        <!-- 右侧：SLERP 与 LERP 的超球面测地线差异 -->
+        <g transform="translate(380, 45)">
+          <rect x="0" y="0" width="310" height="215" rx="10" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+          <text x="155" y="25" text-anchor="middle" font-size="14" font-weight="bold" fill="#047857">SLERP 测地线 vs LERP 模长塌陷</text>
+
+          <!-- 超球面弧线 -->
+          <path d="M 50 170 A 150 150 0 0 1 250 170" fill="none" stroke="#64748b" stroke-width="1.5" stroke-dasharray="2,2"/>
+          <text x="155" y="65" text-anchor="middle" font-size="11" fill="#94a3b8">高维单位超球面 S^(d-1)</text>
+
+          <!-- 两个模型端点 -->
+          <circle cx="50" cy="170" r="7" fill="#2563eb"/>
+          <text x="50" y="195" text-anchor="middle" font-size="12" font-weight="bold" fill="#2563eb">θ₁</text>
+
+          <circle cx="250" cy="170" r="7" fill="#8b5cf6"/>
+          <text x="250" y="195" text-anchor="middle" font-size="12" font-weight="bold" fill="#8b5cf6">θ₂</text>
+
+          <!-- LERP 直线弦与模长坍塌 -->
+          <line x1="50" y1="170" x2="250" y2="170" stroke="#ef4444" stroke-width="2" stroke-dasharray="4,4"/>
+          <circle cx="150" cy="170" r="5" fill="#ef4444"/>
+          <text x="150" y="190" text-anchor="middle" font-size="11" fill="#b91c1c" font-weight="bold">LERP 中点 (模长坍塌 ||θ|| 偏小)</text>
+
+          <!-- SLERP 弧线测地线插值 -->
+          <path d="M 50 170 Q 150 100 250 170" fill="none" stroke="#10b981" stroke-width="3"/>
+          <circle cx="150" cy="120" r="6" fill="#10b981"/>
+          <text x="150" y="110" text-anchor="middle" font-size="11" font-weight="bold" fill="#065f46">SLERP 测地线插值 (模长恒定)</text>
+
+          <text x="155" y="202" text-anchor="middle" font-size="11" fill="#047857">保持神经元激活范数，杜绝温度偏移</text>
+        </g>
+      </svg>
+      <figcaption>图 48-2：高维权重空间中的几何图景：任务向量代数叠加（左）与 SLERP 避免模长塌陷的测地线插值（右）</figcaption>
+    </figure>
+
+    <p><strong>本节小结：</strong>简单线性加权假设各参数完全同分布且互相独立，在高维空间极易导致模长收缩；SLERP 从球面几何视角修复了二元插值的范数失真。</p>
+
+    <h2>3. 高阶去噪与冲突消除：Fisher、TIES-Merging 与 DARE</h2>
+    <p>当融合参与者超过两个、或者各模型微调的数据分布存在显著差异时，直接相加任务向量会遭遇严重挫折：<strong>参数冲突（Parameter Interference）与信噪比崩溃</strong>。本节将拆解现代融合工程的核心去噪算法：Fisher 加权、TIES-Merging 和 DARE。</p>
+
+    <h3>3.1 权重冲突与符号干扰（Interference and Sign Conflict）</h3>
+    <p>研究表明，当两个模型分别进行微调时，虽然绝大部分参数更新幅度极小（充斥着训练噪声），但有部分高敏感度关键参数在两个任务中的更新方向完全相反。例如：</p>
+    <ul>
+      <li>对于神经元权重 \(W_{i,j}\)，编程任务要求其增大更新：\(\tau_{1, (i,j)} = +0.8\)；</li>
+      <li>而创意文学写作任务要求其减小更新：\(\tau_{2, (i,j)} = -0.7\)。</li>
+    </ul>
+    <p>如果简单相加：\(\tau_{1} + \tau_{2} = +0.1\)，这两个任务在该参数上的梯度互相抵消。更糟糕的是，成千上万个微弱更新方向随机叠加，导致背景噪声被无谓放大，淹没了真正的关键信号。这种现象被称为 <span class="term">符号干扰（Sign Conflict）与冗余噪声泛滥</span>。</p>
+
+    <h3>3.2 Fisher 加权合并（Fisher Merging）</h3>
+    <p>并非所有参数的重要性都是均等的。Matena 与 Raffel（2022）引入了 <span class="term">Fisher 信息矩阵（Fisher Information Matrix, FIM）</span> 作为参数重要性加权系数。对于模型 \(\theta_k\)，其对角 Fisher 值为：</p>
+    \[ F_{k, (i)} = \mathbb{E}_{x \sim \mathcal{D}_k} \left[ \left( \frac{\partial \log p_{\theta_k}(x)}{\partial \theta_{k, (i)}} \right)^2 \right] \]
+    <p>\(F_{k, (i)}\) 直观反映了参数 \(i\) 的微小扰动对模型预测概率分布产生的曲率影响。Fisher 合并公式为：</p>
+    \[ \theta_{\mathrm{fisher}, (i)} = \frac{\sum_{k=1}^M F_{k, (i)} \theta_{k, (i)}}{\sum_{k=1}^M F_{k, (i)}} \]
+    <p>如果参数 \(i\) 在数学模型上具有巨大的 Fisher 曲率，而在代码模型上几乎平坦，则融合后该参数由数学模型主导。虽然 Fisher 合并理论完备，但为数十亿参数计算并存储经验 Fisher 对角阵需要额外的前向反向传播，显存与工程代价较高。</p>
+
+    <h3>3.3 TIES-Merging（Task Vectors + Trimming + Electing + Scaling）</h3>
+    <p>Yadav 等人（NeurIPS 2023）提出了极具实用价值的 <span class="term">TIES-Merging</span> 算法，在无需重新计算梯度的前提下，纯粹依靠代数规则系统性解决干扰。该算法由三个环环相扣的步骤组成：</p>
+    <ol>
+      <li><strong>修剪（Trimming）：</strong>对于每个任务向量 \(\tau_k\)，仅保留绝对值最大的前 \(p\%\)（例如 \(p=20\%\)）的最重要参数，将其余 \(80\%\) 视作微调噪声直接置零：
+        \[ \hat{\tau}_k = \mathrm{Trim}(\tau_k, p) \]
+      </li>
+      <li><strong>符号选举（Electing Signs）：</strong>对所有参与融合的模型在特定参数坐标上的更新符号进行全局多数表决（Majority Vote）。确定一个全局多数符号向量 \(\gamma \in \{-1, +1\}^d\)：
+        \[ \gamma_{(j)} = \mathrm{sgn}\left( \sum_{k=1}^M \hat{\tau}_{k, (j)} \right) \]
+        若某个模型在位置 \(j\) 上的更新符号与全局多数符号相反（即冲突背离），则直接将该模型的该参数置零剔除！</li>
+      <li><strong>融合与重缩放（Disjoint Merge & Scaling）：</strong>仅对保留下来的同符号参数取平均，并乘以全局缩放系数 \(\lambda\)：
+        \[ \tau_{\mathrm{ties}, (j)} = \lambda \cdot \frac{1}{|K_j|} \sum_{k \in K_j} \hat{\tau}_{k, (j)} \]
+        其中 \(K_j = \{k \mid \mathrm{sgn}(\hat{\tau}_{k, (j)}) = \gamma_{(j)}\}\)。</li>
+    </ol>
+
+    <h3>3.4 DARE（Drop And REscale）：极简即极致的随机稀疏</h3>
+    <p>Yu 等人（ICLR 2024）提出了令人惊叹的 <span class="term">DARE（Drop And REscale）</span> 算法。作者发现，完全不需要复杂的显著性排序与多数表决，<strong>只要以极高概率（高达 90%~99%）随机将任务向量的参数置零，再按留存比例放大，就能近乎奇迹般地消除冲突</strong>！</p>
+    <p>DARE 的数学原理源自蒙特卡洛无偏估计与伯努利掩码：</p>
+    \[ m_j \sim \mathrm{Bernoulli}(1 - p) \]
+    \[ \tilde{\tau}_{k, (j)} = m_j \cdot \frac{\tau_{k, (j)}}{1 - p} \]
+    <p>其中 \(p \in (0, 1)\) 是丢弃率（Drop Rate，常设为 0.9）。由于除以了保留概率 \(1 - p\)，掩码操作后的任务向量数学期望严格保持不变：</p>
+    \[ \mathbb{E}[\tilde{\tau}_{k, (j)}] = (1 - p) \cdot \frac{\tau_{k, (j)}}{1 - p} + p \cdot 0 = \tau_{k, (j)} \]
+    <p>当多个独立模型的任务向量被随机稀疏化至 10% 甚至 5% 之后，它们在绝大多数参数坐标上的更新相互正交错开（同时在同一坐标非零的概率仅为 \((1-p)^2 \sim 0.01\)），参数冲突与相消现象被自然化解于无形。DARE 与 TIES 结合（DARE-TIES）是目前开源社区公认能力最强悍、鲁棒性最好的融合配方之一。</p>
+
+    <!-- 表 48-1：主流融合算法全方位技术对比 -->
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>算法名称</th>
+            <th>核心理论假设</th>
+            <th>是否需额外数据</th>
+            <th>抗冲突机制</th>
+            <th>推荐丢弃/稀疏率</th>
+            <th>典型适用场景</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Linear Averaging</strong></td>
+            <td>参数独立、凸单峰盆地</td>
+            <td>否</td>
+            <td>无（易发生相互抵消）</td>
+            <td>不适用</td>
+            <td>同架构同任务同分布微调的集成</td>
+          </tr>
+          <tr>
+            <td><strong>SLERP</strong></td>
+            <td>超球面测地线分布</td>
+            <td>否</td>
+            <td>几何模长自适应补偿</td>
+            <td>不适用</td>
+            <td><strong>严格限 2 个模型</strong>（如 SFT 与 DPO 对齐底座）</td>
+          </tr>
+          <tr>
+            <td><strong>Fisher Merging</strong></td>
+            <td>二阶泰勒展开、黎曼曲率</td>
+            <td><strong>是</strong>（需前向数据）</td>
+            <td>按曲率灵敏度加权</td>
+            <td>不适用</td>
+            <td>对关键任务敏感度有严苛要求的控制</td>
+          </tr>
+          <tr>
+            <td><strong>Task Arithmetic</strong></td>
+            <td>局部切空间平坦向量加法</td>
+            <td>否</td>
+            <td>无（简单线性相加）</td>
+            <td>不适用</td>
+            <td>快速能力增减、去偏与特定技能注入</td>
+          </tr>
+          <tr>
+            <td><strong>TIES-Merging</strong></td>
+            <td>低幅值为噪声、多数符号正确</td>
+            <td>否</td>
+            <td>Top-k 剪枝 + 符号多数表决</td>
+            <td>剪枝 70%~80%</td>
+            <td><strong>3 个以上多领域模型</strong>跨领域专家混合</td>
+          </tr>
+          <tr>
+            <td><strong>DARE-TIES</strong></td>
+            <td>蒙特卡洛无偏重缩放、正交解耦</td>
+            <td>否</td>
+            <td>随机伯努利丢弃 + 符号选举</td>
+            <td>丢弃 90%~95%</td>
+            <td><strong>工业界通用推荐首选</strong>，兼顾多样性与极值性能</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption">表 48-1：主流模型融合算法全维度横向对比</span>
+    </div>
+
+    <p><strong>本节小结：</strong>高维参数更新不仅包含核心信号，更充斥着各向异性噪声；TIES 与 DARE 通过结构化剪除与随机正交化，将不同模型的碰撞概率压低至极限。</p>
+
+    <h2>4. 后训练中的模型融合核心应用范式</h2>
+    <p>在实际大模型研发管线中，模型融合绝非仅仅是打榜刷分的技巧，它已经成为后训练流程中不可或缺的生产力组件。本节提炼工业界后训练中的三大核心融合落地范式。</p>
+
+    <h3>4.1 范式一：SFT 模型与偏好对齐（DPO/PPO）模型的正交融合</h3>
+    <p>在第 18 章与第 22 章中我们深入探讨过“对齐税（Alignment Tax）”现象：经过高强度 RLHF 或 DPO 对齐后的模型，其安全性和拒绝率显著提高，但在复杂代码生成、逻辑推理和文学创意上的表现往往会发生回退（表现为模型输出风格保守、句式刻板、数学推理链长度缩短）。</p>
+    <p>通过模型融合可以完美破除这一二元对立：</p>
+    <ul>
+      <li>独立训练一个以追求极致能力上限为目标的 <strong>SFT 模型 \(\theta_{\mathrm{sft}}\)</strong>（使用包含海量多轮复杂指令、代码、逻辑题的高质量数据，甚至容忍轻微的不安全性）；</li>
+      <li>独立训练一个以强化安全拒绝、价值对齐与诚实回答为目标的 <strong>对齐模型 \(\theta_{\mathrm{align}}\)</strong>（使用 DPO 或 PPO 专注于安全边界优化）；</li>
+      <li>利用 SLERP 或 DARE-TIES，以 \(\alpha \approx 0.6 \sim 0.7\) 的比例对二者进行融合：
+        \[ \theta_{\mathrm{final}} = \mathrm{SLERP}(\theta_{\mathrm{sft}}, \theta_{\mathrm{align}}, \alpha=0.35) \]
+      </li>
+    </ul>
+    <p>实验证明，融合后的模型能够在完全继承 \(\theta_{\mathrm{sft}}\) 强大解题能力的同时，严格遵循 \(\theta_{\mathrm{align}}\) 的安全拒答准则，以近乎零成本的代价消除了绝大部分对齐税。</p>
+
+    <h3>4.2 范式二：跨领域专家融合（Polymath Merging）</h3>
+    <p>当需要交付一个横跨医疗、金融、代码、多语言的全功能工业模型时，联合训练面临数据配比黑洞：不同领域数据的质量差异、语言词表频率差异以及收敛速度差异极难权衡。现代范式采用“分而治之，合流归一”：</p>
+    <ol>
+      <li>由四个专项小组基于统一基座分别产出：\(\theta_{\mathrm{code}}\)、\(\theta_{\mathrm{math}}\)、\(\theta_{\mathrm{med}}\)、\(\theta_{\mathrm{fin}}\)；</li>
+      <li>通过 DARE 算法对每个专家模型提取稀疏任务向量：\(\tilde{\tau}_{\mathrm{code}}, \tilde{\tau}_{\mathrm{math}}, \tilde{\tau}_{\mathrm{med}}, \tilde{\tau}_{\mathrm{fin}}\)；</li>
+      <li>执行 TIES 符号选举合成：在金融和医疗问答上保持专业严谨，在写代码时调用编程专家的突触连接，且最终模型体积完全不变（仍为原本参数量）。</li>
+    </ol>
+
+    <h3>4.3 范式三：Frankenmerge 与 Upcycling（跨层重叠与 MoE 升级）</h3>
+    <p>除了同构模型的横向加权，社区还衍生出了两种激进的纵向与拓扑融合玩法：</p>
+    <ul>
+      <li><strong>Frankenmerge（缝合拼接）：</strong>将两个不同微调模型的不同 Transformer 层交叉串联。例如将 32 层的 Llama 模型重叠拼接为 48 层或 56 层的深层模型（Pass-through merge），通过复用底层通用语言层与高层特异推理层，实现参数量级的物理扩展。</li>
+      <li><strong>MoE 升级融合（Merge-to-MoE / Upcycling）：</strong>将多个稠密（Dense）专家模型的前馈神经网络（FFN）作为混合专家（MoE）的 Expert 分支，新增一个随机初始化的门控路由网络（Gating Router），只需耗费极少量的微调步数训练路由，即可零门槛构建千亿级 MoE 架构。</li>
+    </ul>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：融合超参数的敏感度排序</div>
+      <p>在实际工程中，参数重要性排序通常为：<strong>丢弃率（Drop Rate \(p\)） > 符号表决保留率 > 全局缩放因子（Scaling \(\lambda\)） > 任务间相对权重（\(\alpha_i\)）</strong>。当模型出现乱码或严重幻觉时，优先调大 DARE 的丢弃率（例如由 0.8 提升至 0.95），通常能立竿见影地压制噪声。</p>
+    </div>
+
+    <h2>5. 工业级模型融合实战：MergeKit 与 PyTorch 核心实现</h2>
+    <p>在工业界，<a href="https://github.com/arcee-ai/mergekit" target="_blank">MergeKit</a> 是事实上的模型融合标准工具链。它原生支持 out-of-core 计算、分块张量加载、跨设备并行以及 DARE、TIES、SLERP、Frankenmerge 等数十种融合模式。本节将展示规范的 MergeKit YAML 配置以及底层的 PyTorch 纯算法实现。</p>
+
+    <h3>5.1 MergeKit 工业级 YAML 编排</h3>
+    <p>以下为一个标准的 MergeKit 配置文件，展示了如何使用 <code>dare_ties</code> 算法将代码专用模型、数学推理模型以及安全指令对齐模型融合为多能模型：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">dare_ties_merge.yaml</span>
+      <pre class="code"><code class="language-yaml"># MergeKit 生产级 DARE-TIES 融合配置规范
+models:
+  - model: meta-llama/Llama-3-8B-Instruct
+    # 基础模型，不计入任务向量微调偏移，仅作为基准与底座
+    parameters:
+      weight: 0.2
+  - model: cognitivecomputations/dolphin-2.9-llama3-8b
+    # 高质量通用无审查/强指令遵循专家
+    parameters:
+      weight: 0.35
+      density: 0.53   # 对应 TIES trimming: 保留 53% 最强幅值参数
+  - model: WizardLM/WizardMath-7B-V1.1
+    # 复杂数学推导与推理专家
+    parameters:
+      weight: 0.25
+      density: 0.50
+  - model: defog/sqlcoder-7b-2
+    # 结构化代码与 SQL 生成专家
+    parameters:
+      weight: 0.20
+      density: 0.45
+
+merge_method: dare_ties
+base_model: meta-llama/Llama-3-8B-Instruct
+parameters:
+  int8_mask: true     # 显存优化：将掩码量化为 int8 存储，节省 CPU RAM
+  normalize: true     # 权重自适应归一化
+  rescale: true       # DARE 核心：除以保留概率保持无偏数学期望
+dtype: bfloat16       # 融合精度：全流程采用 bfloat16 防溢出</code></pre>
+    </div>
+
+    <p>执行该配置时，仅需在拥有至少 32GB 内存（无需强力 GPU，纯 CPU 亦可完成）的机器上运行一行 MergeKit 命令行即可：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">merge_runner.sh</span>
+      <pre class="code"><code class="language-bash">#!/usr/bin/env bash
+# 安装生产级 mergekit 依赖
+pip install mergekit --upgrade
+
+# 运行显存优化的分块模型融合
+mergekit-yaml \
+    dare_ties_merge.yaml \
+    ./merged-llama3-ultra-8b \
+    --cuda \
+    --low-cpu-memory \
+    --out-shard-size 4B \
+    --copy-tokenizer \
+    --lazy-unpickle</code></pre>
+    </div>
+
+    <h3>5.2 核心算法 PyTorch 原生实现：Task Arithmetic 与 DARE-TIES</h3>
+    <p>为了透彻理解其背后的张量操作，我们脱离高阶封装，用原生 PyTorch 实现完整的 DARE-TIES 融合算子。代码严格包含张量掩码、无偏重缩放、符号多数表决与安全融合：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">task_merging_ops.py</span>
+      <pre class="code"><code class="language-python">import torch
+from typing import List, Dict
+
+def dare_mask_and_rescale(task_vector: torch.Tensor, drop_rate: float = 0.9) -> torch.Tensor:
+    """
+    DARE (Drop And REscale) 核心算子实现
+    :param task_vector: 任务向量 (theta_task - theta_base)
+    :param drop_rate: 丢弃率 p (0.0 < drop_rate < 1.0)
+    :return: 稀疏化且保持数学期望一致的无偏任务向量
+    """
+    if drop_rate <= 0.0:
+        return task_vector
+    assert 0.0 < drop_rate < 1.0, "drop_rate 必须在 (0, 1) 区间内"
+    
+    keep_prob = 1.0 - drop_rate
+    # 生成伯努利保留掩码: 1 代表保留，0 代表丢弃
+    mask = torch.bernoulli(torch.full_like(task_vector, keep_prob))
+    # 伯努利随机丢弃 + 乘以 1/keep_prob 进行幅值无偏重缩放
+    scaled_vector = (task_vector * mask) / keep_prob
+    return scaled_vector
+
+def ties_sign_election(task_vectors: List[torch.Tensor]) -> torch.Tensor:
+    """
+    TIES 符号多数表决算子
+    :param task_vectors: 各微调模型经过 DARE 处理后的任务向量列表 [V_1, V_2, ..., V_M]
+    :return: 多数表决确定的全局符号向量 (-1 或 +1)
+    """
+    # 堆叠为高维张量 [M, ...]
+    stacked = torch.stack(task_vectors, dim=0)
+    # 对所有模型在各维度的幅值进行全局求和
+    total_sign_mass = torch.sum(stacked, dim=0)
+    # 多数符号: >0 为 +1，<0 为 -1，等于 0 默认为 1
+    elected_sign = torch.sign(total_sign_mass)
+    elected_sign[elected_sign == 0] = 1.0
+    return elected_sign
+
+def merge_dare_ties(
+    base_state_dict: Dict[str, torch.Tensor],
+    task_state_dicts: List[Dict[str, torch.Tensor]],
+    weights: List[float],
+    drop_rate: float = 0.9,
+    global_scale: float = 1.0
+) -> Dict[str, torch.Tensor]:
+    """
+    完备的 DARE-TIES 模型状态字典融合流水线
+    :param base_state_dict: 预训练底座权重字典
+    :param task_state_dicts: 各专家微调模型权重字典列表
+    :param weights: 各专家的加权系数列表 (长度等于 task_state_dicts)
+    :param drop_rate: DARE 随机稀疏丢弃率
+    :param global_scale: 融合任务向量全局缩放步长 lambda
+    :return: 融合完成的目标模型 state_dict
+    """
+    merged_dict = {}
+    num_models = len(task_state_dicts)
+    weights_tensor = torch.tensor(weights, dtype=torch.float32)
+    weights_tensor = weights_tensor / weights_tensor.sum() # 归一化
+
+    for key in base_state_dict.keys():
+        base_param = base_state_dict[key].clone().to(torch.float32)
+        
+        # 对于分类头、位置编码或形状不一致的非线性参数，直接保留底座参数
+        is_linear_param = any(t in key for t in ["weight", "bias"]) and base_param.dim() >= 1
+        if not is_linear_param:
+            merged_dict[key] = base_state_dict[key]
+            continue
+            
+        # 1. 计算各模型的独立任务向量: tau_i = theta_i - theta_0
+        task_vectors = []
+        for i in range(num_models):
+            param_i = task_state_dicts[i][key].to(torch.float32)
+            tau_i = param_i - base_param
+            # 2. 执行 DARE 随机丢弃与幅值重缩放
+            tau_dared = dare_mask_and_rescale(tau_i, drop_rate=drop_rate)
+            task_vectors.append(tau_dared)
+            
+        # 3. 执行 TIES 符号多数选举
+        elected_sign = ties_sign_election(task_vectors)
+        
+        # 4. 符号过滤与冲突消解: 滤除与大势符号相反的叛逆参数
+        filtered_vectors = []
+        for i in range(num_models):
+            tau = task_vectors[i]
+            # 保留同号项，异号项置零
+            aligned_mask = (torch.sign(tau) == elected_sign)
+            tau_filtered = tau * aligned_mask.to(tau.dtype)
+            filtered_vectors.append(tau_filtered * weights_tensor[i])
+            
+        # 5. 加权合力与基座重构: theta_merge = theta_0 + lambda * sum(filtered_tau)
+        combined_tau = torch.stack(filtered_vectors, dim=0).sum(dim=0)
+        final_param = base_param + global_scale * combined_tau
+        
+        # 转换回原始数据精度 (如 bfloat16)
+        merged_dict[key] = final_param.to(base_state_dict[key].dtype)
+        
+    return merged_dict</code></pre>
+    </div>
+
+    <h3>5.3 自动化融合网格搜索与超参数扫描脚本</h3>
+    <p>融合质量对超参数（尤其是全局缩放 \(\lambda\) 与丢弃率 \(p\)）极为敏感。在工程落地时，我们通常在小批量黄金验证集（如 200 条包含代码、推理、安全的数据集）上执行快速自动化网格扫描：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">merge_grid_search.py</span>
+      <pre class="code"><code class="language-python">import itertools
+import yaml
+import subprocess
+from pathlib import Path
+
+def run_merge_evaluation(yaml_path: str, eval_script: str) -> float:
+    """调用 MergeKit 执行融合并执行快速评测，返回综合基准评分"""
+    output_dir = f"./tmp_merge_output"
+    cmd = f"mergekit-yaml {yaml_path} {output_dir} --cuda --low-cpu-memory"
+    subprocess.run(cmd, shell=True, check=True)
+    
+    # 执行下游快速跑分 (如 lm-eval 最小子集)
+    eval_cmd = f"python {eval_script} --model_path {output_dir}"
+    result = subprocess.check_output(eval_cmd, shell=True).decode('utf-8')
+    score = float(result.strip().split()[-1]) # 提取综合准确率指标
+    return score
+
+def grid_search_merging_params():
+    drop_rates = [0.85, 0.90, 0.95]
+    scaling_factors = [0.7, 1.0, 1.3]
+    best_score = -1.0
+    best_config = None
+
+    for dr, scale in itertools.product(drop_rates, scaling_factors):
+        print(f"[*] 扫描超参数组合: DropRate={dr}, GlobalScale={scale}")
+        cfg = {
+            "merge_method": "dare_ties",
+            "base_model": "base_checkpoint",
+            "models": [
+                {"model": "model_code", "parameters": {"weight": 0.5, "density": 1.0 - dr}},
+                {"model": "model_math", "parameters": {"weight": 0.5, "density": 1.0 - dr}}
+            ],
+            "parameters": {"rescale": True, "int8_mask": True, "scale": scale}
+        }
+        
+        cfg_file = f"temp_cfg_{dr}_{scale}.yaml"
+        with open(cfg_file, "w") as f:
+            yaml.dump(cfg, f)
+            
+        score = run_merge_evaluation(cfg_file, "fast_eval.py")
+        print(f"--> 得分: {score:.4f}")
+        
+        if score > best_score:
+            best_score = score
+            best_config = (dr, scale)
+
+    print(f"[+] 最优融合配比: DropRate={best_config[0]}, Scale={best_config[1]} (综合得分: {best_score:.4f})")
+
+if __name__ == "__main__":
+    # 模拟启动网格搜索
+    print("模型融合自动化调优管线准备就绪。")</code></pre>
+    </div>
+
+    <p><strong>本节小结：</strong>MergeKit 屏蔽了复杂的底座分块加载与显存开销；理解 DARE-TIES 的无偏掩码与符号选举算子，是构建稳健自动化融合流的核心工程功底。</p>
+
+    <h2>6. 融合缺陷、干涉机制与工程避坑指南</h2>
+    <p>尽管模型融合在绝大多数公开基准测试中表现惊艳，但它绝非毫无副作用的“免费午餐”。若缺乏对高维权重交互机制的敬畏，工程团队极易掉入破坏性陷阱。</p>
+
+    <h3>6.1 权重抵消与幻觉激增</h3>
+    <p>最隐蔽的融合缺陷在于<strong>“平均化导致的自信度丧失（Loss of Model Confidence）”</strong>。当两个对同一专业名词持有不同释义模式的模型被平均后，融合模型在该位置的 Logits 分布平坦化，熵显著增高。反映在生成表现上，模型在短文本基准测试中准确率极高，但在长文本续写与多轮推理时极易陷入语无伦次的循环幻觉或事实捏造。</p>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 严重红线：绝对禁止跨分词器（Tokenizer）直接融合权重</div>
+      <p>模型融合最常见也是最致命的新手错误是：试图融合两个基于不同 Tokenizer 预训练或微调过的模型（例如试图将原生 LLaMA-2-7B 与修改了词表扩展的中文版 LLaMA-2-Chinese-7B 直接相加）。由于两者的 Embedding 矩阵与最后 lm_head 分类头各行对应的词表 Token ID 发生了乱序错位，直接融合将彻底摧毁神经语言表征，输出 100% 的乱码垃圾字符！</p>
+    </div>
+
+    <!-- 表 48-2：模型融合常见异常、根因与排查对策 -->
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>异常现象</th>
+            <th>底层物理根因</th>
+            <th>工程排查与对策</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>生成全量乱码或死循环重复</strong></td>
+            <td>Tokenizer 词表 ID 错位，或 Embedding / lm_head 权重被错误加权破损</td>
+            <td>检查词表哈希一致性；在 MergeKit 中使用 <code>copy-tokenizer</code> 并冻结 head 权重</td>
+          </tr>
+          <tr>
+            <td><strong>单一任务能力剧烈倒退（如数学崩塌）</strong></td>
+            <td>该领域的关键微调参数被其他通用任务的多数符号选举误杀（负转移）</td>
+            <td>增加该任务的专属 weight；调小 DARE 丢弃率；关闭全局符号表决改用 SLERP</td>
+          </tr>
+          <tr>
+            <td><strong>输出严重冗长、语气怪异、标点堆砌</strong></td>
+            <td>多个对话模板（Chat Templates）的系统级特殊 Token 权重冲突</td>
+            <td>确保只继承基准模型的特殊 Token 嵌入，重置 EOS/BOS 标识符</td>
+          </tr>
+          <tr>
+            <td><strong>模型推理速度骤降 50%</strong></td>
+            <td>使用了错误配置的 Frankenmerge，层数意外被拼接扩充导致物理计算量翻倍</td>
+            <td>核查目标模型 <code>config.json</code> 中的 <code>num_hidden_layers</code>，确保拓扑未失控膨胀</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption">表 48-2：模型融合典型工程灾难与现场处置方案</span>
+    </div>
+
+    <p><strong>本节小结：</strong>模型融合能够跨越数据的藩篱，但越不过架构与词表的鸿沟。严格的词表对齐校验与微调基底一致性验证，是模型融合工程的生命线。</p>
+
+    <h2>7. 本章小结</h2>
+    <ul>
+      <li><strong>理论基石：</strong>模型融合之所以成立，是因为共享预训练底座将不同任务的微调限制在同一个平坦凹盆地中，满足线性模式连接（LMC），微调位移可被视作局部切空间的任务向量（Task Vector）。</li>
+      <li><strong>核心算法谱系：</strong>简单线性平均存在模长萎缩与噪声放大的致命缺陷；SLERP 在超球面上维持测地线几何范数；TIES-Merging 通过剪枝、多数符号选举消除抵消；DARE 则以极简的高概率随机置零和无偏重缩放实现惊人的正交去噪。</li>
+      <li><strong>工程生产力：</strong>模型融合是破解“对齐税”与“多任务联合训练梯度冲突”的高性价比解药。借助 MergeKit 编排，只需消费级算力与数分钟 CPU 运算，即可零门槛组合出多领域复合专家大模型。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：为什么直接将从不同随机种子独立预训练出的两个 Transformer 模型取权重算术平均会导致性能彻底崩溃？</summary>
+        <p><strong>答案解析：</strong>因为深度神经网络具有高度的置换对称性（Permutation Symmetry）。即使两个模型学到了相似的表征，隐藏层各神经元（或注意力头）的排列索引也是完全随机的。直接按对应索引相加，等于将神经元 A 的权重与功能完全不同的神经元 B 混杂相加；更重要的是，非共享初始化的两个模型之间隔着高耸的能量壁垒（\(\epsilon \gg 0\)），不具备线性模式连接条件，直接插值必然落入极高损失的山峦区域。</p>
+      </details>
+      <details>
+        <summary>问题 2：在 SLERP 算法中，为什么比欧几里得线性插值（LERP）更适合用于对齐模型与 SFT 模型的二元融合？</summary>
+        <p><strong>答案解析：</strong>高维欧几里得线性插值会导致向量模长向原点塌陷（在中间点模长最小缩减至约 0.707）。在语言模型中，隐藏层权重模长直接决定了激活值的方差和 Logits 的绝对尺度。模长收缩会使得输出概率分布趋于平缓（相当于人为增大了生成温度），引发输出确定性下降与文本幻觉。SLERP 沿着单位超球面的大圆弧执行角度匀速插值，全程严格保持向量模长平滑稳定，杜绝了激活方差失真。</p>
+      </details>
+      <details>
+        <summary>问题 3：DARE 算法中以 90% 的极高概率将参数随机置零，为什么不仅不会损害性能，反而能提升多模型融合的效果？请从数学期望与冲突概率两个角度解答。</summary>
+        <p><strong>答案解析：</strong>① 数学期望层面：DARE 对保留下来的参数除以了保留概率 \(1-p\)（即乘上 \(\frac{1}{0.1} = 10\)），根据伯努利随机变量期望性质，被变换后的任务向量数学期望严格等于原始任务向量，因此属于无偏估计；② 冲突概率层面：当两个独立任务向量均被稀疏化至 10% 后，它们在同一参数坐标上同时非零的碰撞概率骤降至 \(10\% \times 10\% = 1\%\)。绝大多数坐标上的更新完全相互正交错开，从根源上消除了符号互冲、梯度抵消与背景噪声干扰。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Ilharco+, 2022]</span> Ilharco, G. et al. "Editing models with task arithmetic." <i>ICLR</i>, 2023. <a href="https://arxiv.org/abs/2212.04089" target="_blank">arXiv:2212.04089</a></li>
+      <li><span class="rid">[Yadav+, 2023]</span> Yadav, P. et al. "Resolving Interference When Merging Models." <i>NeurIPS</i>, 2023. <a href="https://arxiv.org/abs/2306.01708" target="_blank">arXiv:2306.01708</a></li>
+      <li><span class="rid">[Yu+, 2024]</span> Yu, L. et al. "DARE: Language Models are Super Mario: Absorbing Abilities from Homologous Models as a Free Lunch." <i>ICLR</i>, 2024. <a href="https://arxiv.org/abs/2311.03099" target="_blank">arXiv:2311.03099</a></li>
+      <li><span class="rid">[Matena+, 2022]</span> Matena, M., & Raffel, C. "Merging Models with Fisher-Weighted Averaging." <i>NeurIPS</i>, 2022. <a href="https://arxiv.org/abs/2111.09832" target="_blank">arXiv:2111.09832</a></li>
+      <li><span class="rid">[Frankle+, 2020]</span> Frankle, J. et al. "Linear Mode Connectivity and the Lottery Ticket Hypothesis." <i>ICML</i>, 2020. <a href="https://arxiv.org/abs/1912.05671" target="_blank">arXiv:1912.05671</a></li>
+      <li><span class="rid">[Entezari+, 2022]</span> Entezari, R. et al. "The Role of Permutation Invariance in Linear Mode Connectivity of Neural Networks." <i>ICLR</i>, 2022. <a href="https://arxiv.org/abs/2110.06296" target="_blank">arXiv:2110.06296</a></li>
+      <li><span class="rid">[Goddard+, 2024]</span> Goddard, C. et al. "Arcee's MergeKit: A Toolkit for Merging Large Language Models." <i>arXiv preprint</i>, 2024. <a href="https://arxiv.org/abs/2403.13257" target="_blank">arXiv:2403.13257</a></li>
+      <li><span class="rid">[Ainsworth+, 2023]</span> Ainsworth, S. K. et al. "Git Re-Basin: Merging Models modulo Permutation Symmetries." <i>ICLR</i>, 2023. <a href="https://arxiv.org/abs/2209.04836" target="_blank">arXiv:2209.04836</a></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

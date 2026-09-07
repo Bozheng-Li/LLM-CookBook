@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 3 章 · Transformer 与语言模型基础回顾 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 1 部分 · 理论基础</div>
+      <h1>第 3 章 · Transformer 与语言模型基础回顾</h1>
+      <p class="chapter-lead">后训练的一切操作——SFT 的交叉熵、RLHF 的 log 概率比、DPO 的偏移量——都作用在同一个对象上：一个 decoder-only Transformer 语言模型。本章从语言模型的概率定义出发，把 tokenization、注意力、位置编码、归一化、KV cache 这些"地基"按后训练工程师最需要的视角重新过一遍，为全书后续章节扫清概念障碍。</p>
+      <div class="chapter-meta">⏱ 预计学习 90 分钟 ｜ 难度 ★★★☆☆ ｜ 先修：深度学习基本概念（反向传播、交叉熵、卷积/全连接网络）</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 为什么要为"后训练"重新复习 Transformer</h2>
+    <p>大多数工程师第一次学 Transformer，是从预训练或者 NLP 课程的视角进入的：关注的是"它为什么能替代 RNN""长距离依赖怎么解决"。但在后训练的语境下，你面对的问题完全不同：你要在冻结或微调一个已经训练好的 7B~70B 模型时，准确说出"我的损失函数作用在哪几个张量上""为什么 PPO 需要同时跑四个模型""为什么把上下文从 4k 扩到 32k 显存会爆"。这些问题的答案，全部埋在架构的细节里。</p>
+    <p>具体来说，后训练工程师对 Transformer 的依赖集中在四个点上。<strong>第一，log 概率是后训练的"通用货币"</strong>：SFT 的损失是 <span class="term">Next-Token Prediction</span> 的负对数似然，PPO 的比率 \(r(\theta)\) 是新旧策略的 log 概率差，DPO 的目标里是策略与参考模型的 log 概率比——这些都要求你精确知道"log 概率是怎么算出来的"（第 10 节的前向数据流）。<strong>第二，token 是计费与对齐的基本单位</strong>：显存、算力、数据量、奖励分配，全部以 token 计（第 3 节与第 9 节）。<strong>第三，KV cache 决定推理与 RL rollout 的成本结构</strong>：后训练的瓶颈往往不是训练前向，而是采样生成（第 9 节，详见第 45 章）。<strong>第四，架构同质化</strong>：LLaMA/Qwen/Mistral 系模型几乎是同一套配方（RoPE + RMSNorm + SwiGLU + GQA），记住一张参数表就能覆盖 90% 的开源模型（第 8 节）。</p>
+    <p>本章不重复教科书式的逐层推导，而是按"后训练视角"重新组织这些知识。先给一张总览图（图 3-1）：一个 token 从整数 ID 一路走到 logits 的完整前向数据流——这是后训练里每一次"取 log 概率"的物理路径，本章后面各节就是沿着这张图逐站展开的。如果你对原始论文已经烂熟，可以快速扫过第 4~6 节，把时间留给第 8~10 节；如果你刚入门，建议按顺序读完，并在读到每个组件时问自己一个问题：它如果我改了，后训练的哪些环节会跟着变？</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="一个 token 从输入到 logits 的前向数据流">
+        <defs><marker id="arrow3z" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">前向数据流：一个 token 从输入到 logits</text>
+        <rect x="14" y="46" width="104" height="60" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="66" y="70" text-anchor="middle" font-size="14" fill="#1e3a8a">token id</text>
+        <text x="66" y="92" text-anchor="middle" font-size="13" fill="#475569">15496</text>
+        <rect x="130" y="46" width="104" height="60" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="182" y="70" text-anchor="middle" font-size="14" fill="#1e3a8a">Embedding</text>
+        <text x="182" y="92" text-anchor="middle" font-size="13" fill="#475569">查表 → d 维</text>
+        <rect x="246" y="46" width="130" height="60" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="311" y="70" text-anchor="middle" font-size="14" fill="#5b21b6">Block × L 层</text>
+        <text x="311" y="92" text-anchor="middle" font-size="13" fill="#475569">注意力 + FFN</text>
+        <rect x="388" y="46" width="104" height="60" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="440" y="70" text-anchor="middle" font-size="14" fill="#5b21b6">final LN</text>
+        <text x="440" y="92" text-anchor="middle" font-size="13" fill="#475569">RMSNorm</text>
+        <rect x="504" y="46" width="100" height="60" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="554" y="70" text-anchor="middle" font-size="14" fill="#92400e">lm_head</text>
+        <text x="554" y="92" text-anchor="middle" font-size="13" fill="#475569">d × |V| 矩阵乘</text>
+        <rect x="616" y="46" width="94" height="60" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="663" y="70" text-anchor="middle" font-size="14" fill="#065f46">logits</text>
+        <text x="663" y="92" text-anchor="middle" font-size="13" fill="#475569">→ softmax 采样</text>
+        <line x1="118" y1="76" x2="130" y2="76" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow3z)"/>
+        <line x1="234" y1="76" x2="246" y2="76" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow3z)"/>
+        <line x1="376" y1="76" x2="388" y2="76" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow3z)"/>
+        <line x1="492" y1="76" x2="504" y2="76" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow3z)"/>
+        <line x1="604" y1="76" x2="616" y2="76" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow3z)"/>
+        <rect x="40" y="150" width="640" height="190" rx="14" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="360" y="176" text-anchor="middle" font-size="15" fill="#1e293b">Block 内部放大（LLaMA 式，Pre-LN）</text>
+        <rect x="60" y="196" width="76" height="52" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="98" y="218" text-anchor="middle" font-size="13" fill="#1e3a8a">输入 x</text>
+        <text x="98" y="236" text-anchor="middle" font-size="12" fill="#475569">(B,T,d)</text>
+        <rect x="150" y="196" width="76" height="52" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="188" y="218" text-anchor="middle" font-size="13" fill="#1e3a8a">RMSNorm</text>
+        <text x="188" y="236" text-anchor="middle" font-size="12" fill="#475569">子层前</text>
+        <rect x="240" y="196" width="86" height="52" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="283" y="218" text-anchor="middle" font-size="13" fill="#065f46">因果自注意力</text>
+        <text x="283" y="236" text-anchor="middle" font-size="12" fill="#475569">QKV + RoPE + mask</text>
+        <rect x="340" y="196" width="72" height="52" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="376" y="218" text-anchor="middle" font-size="13" fill="#92400e">残差 ⊕</text>
+        <text x="376" y="236" text-anchor="middle" font-size="12" fill="#475569">x + attn</text>
+        <rect x="426" y="196" width="76" height="52" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="464" y="218" text-anchor="middle" font-size="13" fill="#1e3a8a">RMSNorm</text>
+        <text x="464" y="236" text-anchor="middle" font-size="12" fill="#475569">子层前</text>
+        <rect x="516" y="196" width="82" height="52" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="557" y="218" text-anchor="middle" font-size="13" fill="#065f46">SwiGLU FFN</text>
+        <text x="557" y="236" text-anchor="middle" font-size="12" fill="#475569">门控 MLP</text>
+        <rect x="612" y="196" width="52" height="52" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="638" y="218" text-anchor="middle" font-size="13" fill="#92400e">残差 ⊕</text>
+        <text x="638" y="236" text-anchor="middle" font-size="12" fill="#475569">输出</text>
+        <line x1="136" y1="222" x2="150" y2="222" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow3z)"/>
+        <line x1="226" y1="222" x2="240" y2="222" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow3z)"/>
+        <line x1="326" y1="222" x2="340" y2="222" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow3z)"/>
+        <line x1="412" y1="222" x2="426" y2="222" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow3z)"/>
+        <line x1="502" y1="222" x2="516" y2="222" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow3z)"/>
+        <line x1="598" y1="222" x2="612" y2="222" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow3z)"/>
+        <path d="M 638 248 C 638 310, 98 310, 98 248" fill="none" stroke="#8b5cf6" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow3z)"/>
+        <text x="360" y="322" text-anchor="middle" font-size="13" fill="#5b21b6">重复 L 层（每层权重独立），取最后位置 h_T → lm_head 得下一个 token 的分布</text>
+      </svg>
+      <figcaption>图 3-1：一个 token 从输入到 logits 的前向数据流：Embedding 查表 → L 个 Pre-LN Block（RMSNorm → 因果自注意力 → 残差 → RMSNorm → SwiGLU FFN → 残差）→ final LN → lm_head → softmax。后训练取 log 概率走的就是这条路径（作者自绘）</figcaption>
+    </figure>
+    <p><strong>本节小结：</strong>后训练的所有算法都构建在语言模型的前向计算之上，本章的目标是把"会用 API 调模型"升级为"知道每个张量从哪来、到哪里去"。</p>
+
+    <h2>2. 语言模型的概率定义：链式分解与自回归</h2>
+    <p>一个自回归语言模型（Autoregressive Language Model）对一段长度为 \(T\) 的 token 序列 \(x = (x_1, x_2, \dots, x_T)\) 建模。根据概率的链式分解（chain rule），任意序列的联合概率都可以写成一系列条件概率的乘积：</p>
+    \[ p_\theta(x) = \prod_{t=1}^{T} p_\theta(x_t \mid x_1, x_2, \dots, x_{t-1}) = \prod_{t=1}^{T} p_\theta(x_t \mid x_{&lt;t}) \]
+    <p>这个分解在数学上是恒等式，不依赖任何模型假设；语言模型做的唯一一件事，是用一个神经网络 \(p_\theta\) 去逼近其中每一个条件分布。训练目标是极大似然估计（Maximum Likelihood Estimation, MLE），等价于最小化数据分布与模型分布之间的交叉熵：</p>
+    \[ \mathcal{L}_{\mathrm{LM}}(\theta) = -\sum_{i} \sum_{t=1}^{T_i} \log p_\theta\!\left(x_t^{(i)} \,\middle|\, x_{&lt;t}^{(i)}\right) \]
+    <p>这里有三件事值得停下来想清楚，因为它们贯穿全书。<strong>其一，"生成"就是"采样"</strong>：模型在推理时逐 token 地从 \(p_\theta(x_t \mid x_{&lt;t})\) 中采样、拼回前缀、再采下一个——所谓自回归生成，就是把这个条件分布链走完，直到输出终止符。第 6 章会把这个过程精确地建模为一个马尔可夫决策过程。<strong>其二，SFT 与预训练的损失函数形式完全相同</strong>，区别只在数据分布：预训练最小化互联网文本的负对数似然，SFT 最小化"指令—回答"对中回答部分的负对数似然（只对回答 token 计算 loss，实现细节见第 13 章）。理解了这一点，你就明白 SFT 不是什么新算法，只是换了一个数据分布上的 MLE。<strong>其三，后训练的 RL 方法也构建在同一个条件分布之上</strong>：策略 \(\pi_\theta(a \mid s)\) 中的"动作概率"，在 LLM 语境下就是 \(p_\theta(y_t \mid x, y_{&lt;t})\)——RLHF 并没有引入新的模型结构，只是换了优化目标（第 5、6 章）。</p>
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：条件概率 vs 联合概率打分</div>
+      <p>BERT 类模型学的是双向的、去噪式的表示（第 4 章），它输出的分数不是"给定前缀生成下一个 token"的合法概率，因此不能直接做自回归生成，也不能直接套用策略梯度类方法。这就是为什么本书后训练部分的工作对象几乎全是 decoder-only 的因果语言模型：只有它给出的是规范的、逐 token 条件分布，"采样一条完整回答"与"计算该回答的 log 概率"才是同一个模型的两种用法。第 22 章的 DPO 推导正是同时用到了这两种用法。</p>
+    </div>
+    <p><strong>本节小结：</strong>语言模型 = 条件分布链的参数化；预训练、SFT、RLHF 共用同一个前向计算，差异只在损失函数与数据分布。</p>
+
+    <h2>3. Tokenization：BPE、SentencePiece 与词表大小的权衡</h2>
+    <p>神经网络不能直接处理字符串，文本必须先切分成 token 并映射为整数 ID。现代 LLM 几乎全部使用子词（subword）分词，主流方案有两种。<strong>字节对编码（Byte-Pair Encoding, BPE）</strong>从字符级词表出发，反复合并语料中最高频的相邻符号对，直到达到目标词表大小；GPT-2、LLaMA、Mistral 采用它的字节级变体（byte-level BPE），保证任何字节序列都能编码、没有 OOV。<strong>SentencePiece</strong>（Kudo &amp; Richardson, 2018）是一个把"原始文本→token 序列"整体视为无损耗管线的库，内置 BPE 与 Unigram 两种算法，并把空格当作普通字符处理（用 ▁ 表示），对中日韩等无空格语言和混合语料更友好；Qwen、Gemma 系采用它或等价的实现。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>方案</th><th>代表模型</th><th>算法核心</th><th>对中文的典型表现</th></tr></thead>
+        <tbody>
+          <tr><td>Byte-level BPE</td><td>GPT-2 / LLaMA-2 / Mistral</td><td>高频相邻对反复合并</td><td>常见汉字约 1~2 token，生僻字可能退化到 UTF-8 字节级（1 字 3 token）</td></tr>
+          <tr><td>SentencePiece (BPE)</td><td>LLaMA-3 / Gemma</td><td>同上，空格视为普通字符</td><td>LLaMA-3 词表扩到 128k 后中文压缩率明显改善</td></tr>
+          <tr><td>SentencePiece (Unigram)</td><td>Qwen / T5 系</td><td>从大候选集出发按概率剪枝</td><td>Qwen2.5 词表约 15.2 万，常见中文词多为 1 token</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 3-1：主流子词分词方案对比（压缩率为工程经验值，随语料领域波动）</span>
+    </div>
+    <p>词表大小是Tokenizer 设计中最关键的旋钮，它同时牵动三笔账。<strong>算力账</strong>：词表越大，同样一段文本被切成的 token 越少，预训练与推理的每字计算量越低——中文在 3.2 万词表下平均 1 个汉字占 1.5~2 token，在 15 万词表下常见词接近 1 token，等价于"同样的模型算力多读了 30%~50% 的中文内容"。<strong>显存账</strong>：embedding 与输出投影 lm_head 的参数量与词表成正比，128k 词表 × 4096 维的 lm_head 在 bf16 下约 1.0 GB，128k 词表 × 16384 维（405B 模型）则超过 4 GB；此外 lm_head 的 logits 计算与词表softmax在大 batch 下是显著的开销项。<strong>效果账</strong>：词表过小会过度切碎文本、拉长序列、拖累长距离建模；过大则低频 token 训练不充分（每个 token 需要足够的出现次数才能学到合理的 embedding），并加剧 embedding 层的参数浪费。实践上，多语模型的主流选择在 10 万~25 万之间。</p>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：为后训练准备特殊 token</div>
+      <p>后训练阶段你会频繁与特殊 token 打交道：对话模板的轮次分隔符（第 15 章）、填充符、EOS。它们必须在 tokenizer 的词表中<strong>预注册</strong>（作为 special token，且保证不被 BPE 拆开）。如果你在 SFT 阶段才临时往词表里加 token，新增的 embedding 是随机初始化的，需要额外的训练技巧才能收敛；更稳妥的做法是选型时就确认 base 模型自带的特殊 token 是否够用。另外，统计你业务语料的压缩率（tokens/字符）是估算训练与推理成本的第一步，第 42 章的算力预算全靠它。</p>
+    </div>
+    <p>下面的代码展示如何用 <span class="term">HuggingFace tokenizers</span> 库从零训练一个 byte-level BPE 分词器，整个过程与 GPT-2/LLaMA 的做法同构：</p>
+    <div class="code-wrap">
+      <span class="code-label">train_bpe_tokenizer.py</span>
+      <pre class="code"><code class="language-python">from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+
+# 用 byte-level BPE 训练一个 3.2 万词表的分词器（流程与 GPT-2/LLaMA 相同）
+tokenizer = Tokenizer(models.BPE(unk_token=None))          # 字节级兜底，无需 unk
+tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+tokenizer.decoder = decoders.ByteLevel()
+trainer = trainers.BpeTrainer(
+    vocab_size=32000,            # 词表上限：权衡算力/显存/低频 token 学习
+    min_frequency=2,             # 低于 2 次的合并不采纳
+    special_tokens=["&lt;|begin_of_text|&gt;", "&lt;|end_of_text|&gt;", "&lt;|pad|&gt;"],
+)
+tokenizer.train(["corpus_zh_en.txt"], trainer)
+tokenizer.save("bpe_32k.json")
+
+enc = tokenizer.encode("大模型后训练实战：Post-Training Cookbook")
+print(enc.tokens)          # 形如 ['大', '模型', '后', '训练', '实战', '：', 'Post', ...]
+print(len(enc.ids))        # token 数：压缩率直接决定训练成本与上下文余量
+print(tokenizer.encode("鿾").ids)   # 生僻字会退到 UTF-8 字节级表示，保证无损</code></pre>
+    </div>
+    <p><strong>本节小结：</strong>BPE/SentencePiece 用子词在"词表大小、序列长度、无损编码"之间做权衡；对后训练工程师，重点是压缩率决定成本、特殊 token 必须提前注册。</p>
+
+    <h2>4. 自注意力：QKV 的直觉、公式、多头与因果掩码</h2>
+    <p>自注意力（self-attention）解决的问题是：序列中每个 token 需要从其他 token 处收集信息，且"该看谁"取决于内容本身。它把每个位置的向量 \(x\) 通过三个投影矩阵映射成三种角色：<strong>查询（Query）</strong>表示"我在找什么"，<strong>键（Key）</strong>表示"我这里有什么可以被发现"，<strong>值（Value）</strong>表示"匹配上之后我实际给你的信息"。可以类比为一次软性的哈希检索：用 Q 在所有 K 中做相似度匹配，再按匹配度对 V 加权求和。</p>
+    <p>缩放点积注意力的公式为：</p>
+    \[ \mathrm{Attention}(Q, K, V) = \mathrm{softmax}\!\left( \frac{Q K^\top}{\sqrt{d_k}} + M \right) V \]
+    <p>其中 \(d_k\) 是每个头的键向量维度，\(M\) 是掩码矩阵（下一页详述）。为什么除以 \(\sqrt{d_k}\)？假设 \(q, k\) 的分量是均值 0、方差 1 的独立随机变量，则点积 \(q \cdot k = \sum_{i=1}^{d_k} q_i k_i\) 的方差为 \(d_k\)——维度越高，点积的数值越分散，softmax 会进入饱和区（一个分量接近 1、其余接近 0），梯度消失。除以 \(\sqrt{d_k}\) 把点积方差归一回 1，这是让深栈注意力可训练的关键小技巧。</p>
+    <p><strong>多头机制（multi-head）</strong>把 \(d_{\mathrm{model}}\) 维空间切成 \(h\) 个子空间，每个头在 \(d_k = d_{\mathrm{model}}/h\) 的子空间里独立做注意力，最后拼接并经输出矩阵 \(W_O\) 混合。直觉是：一个头只能表达一种"关注模式"（比如"主语找谓语"或"代词找先行词"），多头让模型在不同子空间并行维护多套模式。顺带一提，现代模型普遍用<strong>分组查询注意力（Grouped-Query Attention, GQA）</strong>让多个查询头共享一组键值头（LLaMA-2-70B 用 64 个 Q 头配 8 个 KV 头），KV 头数减少直接把 KV cache 压缩数倍（第 9 节），是"几乎不掉点、大幅省推理显存"的免费午餐（Ainslie et al., 2023, arXiv:2305.13245）。</p>
+    <p><strong>因果掩码（causal mask）</strong>是 decoder-only 架构的灵魂。在 softmax 之前，把所有 \(j &gt; i\) 位置（未来 token）的注意力分数置为 \(-\infty\)：</p>
+    \[ M_{ij} = \begin{cases} 0, &amp; j \le i \\ -\infty, &amp; j &gt; i \end{cases} \]
+    <p>这样位置 \(i\) 的表示只依赖 \(x_{\le i}\)，整条序列的一次前向就能并行地给出所有 \(T\) 个"预测下一个 token"的条件分布——这正是预训练能在万亿 token 上高效并行的原因：训练时对 \(T\) 个位置的监督信号一次算完，且不需要等真实的"未来"。反过来，<strong>推理时的自回归生成无法并行</strong>：你必须先算出 \(y_t\) 才能算 \(y_{t+1}\)，这就是 KV cache（第 9 节）要解决的问题。训练并行、生成串行，这个不对称性是理解 LLM 推理成本与 RL rollout 瓶颈的起点。</p>
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：训练与推理的掩码不一致是 SFT 事故高发区</div>
+      <p>把"指令 + 回答"拼接成一条序列做 SFT 时，回答部分的标签要把输入整体左移一位（loss 只落在回答 token 上），同时因果掩码必须覆盖包括指令在内的整条序列——常见的两个 bug 是：标签没有 shift（模型在学"复制输入"）或回答部分误用了双向注意力（训练-推理不一致，上线后行为诡异）。第 13 章会给出逐行核对清单。</p>
+    </div>
+    <p>注意力计算本身是 \(O(T^2 d)\) 的显存与算力开销，标准实现要物化 \(T \times T\) 的注意力矩阵。FlashAttention（Dao et al., 2022, arXiv:2205.14135）通过分块计算与在线 softmax 把显存降到 \(O(T)\)、速度提升数倍，且是<strong>精确</strong>注意力而非近似——如今所有主流训练框架都默认启用它，长上下文工程（第 44 章）建立在这之上。</p>
+    <p><strong>本节小结：</strong>注意力 = 内容寻址的加权检索，\(1/\sqrt{d_k}\) 稳住 softmax，多头并行多套关注模式，因果掩码让训练并行而生成串行。</p>
+
+    <h2>5. 位置编码：从正弦编码到 RoPE</h2>
+    <p>注意力本身是置换等变的——打乱输入 token 顺序，输出集合不变，位置信息必须显式注入。第一代方案来自原论文的<strong>正弦位置编码（sinusoidal encoding）</strong>：对位置 \(pos\)、维度对 \(2i\)，用一组不同频率的三角函数生成固定的加性编码：</p>
+    \[ \mathrm{PE}(pos, 2i) = \sin\!\left(\frac{pos}{10000^{2i/d}}\right), \qquad \mathrm{PE}(pos, 2i+1) = \cos\!\left(\frac{pos}{10000^{2i/d}}\right) \]
+    <p>低维度用高频率（分辨相邻位置），高维度用低频率（编码远距离），形成类似二进制进尺的多尺度"时钟"。GPT-2 一系改用可学习的绝对位置编码，效果相当，但两者共同的问题是：<strong>编码与绝对位置绑定，外推到训练长度之外会急剧失效</strong>。</p>
+    <p>现代开源模型（LLaMA、Qwen、Mistral、DeepSeek 等）几乎统一采用<strong>旋转位置编码（Rotary Position Embedding, RoPE）</strong>（Su et al., 2021, arXiv:2104.09864）。它的核心思想是：不再给 token 加位置向量，而是在注意力计算内部，把每个头的 \(q, k\) 向量按其所在位置旋转一个与位置成正比的角度。以二维分量对 \((q_1, q_2)\) 为例，位置 \(m\) 处的旋转为：</p>
+    \[ R(m\theta)\,q = \begin{pmatrix} q_1 \cos m\theta_1 - q_2 \sin m\theta_1 \\ q_1 \sin m\theta_1 + q_2 \cos m\theta_1 \end{pmatrix}, \qquad \theta_i = 10000^{-2i/d} \]
+    <p>高维情形是把向量切成 \(d/2\) 个二维对、每对用不同频率 \(\theta_i\) 旋转。RoPE 的魔法在于内积的性质：位置 \(m\) 的 \(q\) 与位置 \(n\) 的 \(k\) 旋转后做点积，结果只依赖<strong>相对距离</strong> \(m - n\)：</p>
+    \[ \langle R(m\theta)\,q,\; R(n\theta)\,k \rangle = \langle q, R((m-n)\theta)\,k \rangle \]
+    <p>证明只需一行：二维旋转矩阵满足 \(R(\alpha)^\top R(\beta) = R(\beta - \alpha)\)，代入即得。这个"注意力分数只看相对位置"的性质让 RoPE 天然适配语言建模，同时旋转不改变向量模长，不引入额外的数值不稳定。理解 RoPE 的第二个理由是工程性的：<strong>长上下文扩展的主流方法全是围绕 RoPE 展开的</strong>——位置插值（Position Interpolation, arXiv:2309.17074）把位置 \(m\) 压缩到 \(m/L\)，YaRN（arXiv:2309.00071）按频率分组做非均匀插值，LLaMA-3.1 与 Qwen2.5 的 128k 上下文都是"RoPE 插值 + 少量长文本继续预训练"的产物。当你在后训练里做长上下文适配（第 17 章），改的就是这组频率参数。</p>
+    <p>此外还有一条相对位置的支线：ALiBi（Press et al., 2021, arXiv:2108.12409）不给 token 加编码，而是给注意力分数加一个随距离线性衰减的静态偏置，以外推能力见长，在 BLOOM 等模型中使用。选型时知道它的存在即可，新项目默认跟 RoPE。</p>
+    <p><strong>本节小结：</strong>位置编码解决"注意力不知道顺序"的问题；RoPE 用"按位置旋转 \(q,k\)"实现相对位置感知，且是长上下文扩展技术的主要落点。</p>
+
+    <h2>6. FFN、残差与归一化：Pre-LN vs Post-LN</h2>
+    <p>一个 Transformer 块 = 注意力子层 + 前馈网络（Feed-Forward Network, FFN）子层，各自包一条残差连接与一个归一化。FFN 是逐位置的 两层 MLP，负责"把注意力汇总来的信息做非线性变换与知识存取"：</p>
+    \[ \mathrm{FFN}(x) = W_2\, \sigma(W_1 x) \]
+    <p>中间层维度通常是 \(4d\)。现代模型几乎都把激活函数换成了 <strong>SwiGLU</strong>（Shazeer, 2020, arXiv:2002.05202）——门控线性单元与 SiLU 激活的组合 \(\mathrm{SwiGLU}(x) = W_2(\mathrm{SiLU}(W_1 x) \odot W_3 x)\)。它多了一个投影矩阵，为了保持参数量不变，中间维度从 \(4d\) 缩到约 \(\frac{8}{3}d\)：LLaMA-7B 的 \(d=4096\)、FFN 中间维 11008，正是这个比例的取整。参数量的经验估算也值得背下来：一个 \(L\) 层、宽度 \(d\) 的 dense 模型（忽略 embedding），总参数约 \(N \approx 12 L d^2\)——看到"70B、80 层、8192 宽"你就能心算验证（\(12 \times 80 \times 8192^2 \approx 6.4 \times 10^{10}\)，加上 embedding 后约 6.9e10，吻合）。</p>
+    <p><strong>残差连接</strong>给梯度提供一条无衰减的恒等通路，使百层网络可训练；<strong>归一化</strong>稳定各层激活的尺度。这里有一个后训练工程师必须知道的历史转折：归一化放在残差分支的<strong>哪里</strong>，显著影响训练稳定性。原始 Transformer 是 <strong>Post-LN</strong>：\(x \leftarrow \mathrm{LN}(x + \mathrm{Sublayer}(x))\)，归一化在残差相加之后；GPT-2 之后的主流是 <strong>Pre-LN</strong>：\(x \leftarrow x + \mathrm{Sublayer}(\mathrm{LN}(x))\)，归一化在子层输入之前。Xiong et al.（2020, arXiv:2002.04745）从理论上解释了原因：Post-LN 中越深的层梯度越要经过多个 LN 的雅可比，梯度随深度衰减、必须靠小心翼翼的学习率预热；Pre-LN 的残差主路上没有 LN，梯度可以"无阻尼"地直达浅层，深层网络不再需要预热。代价是 Pre-LN 让残差主路的范数随深度膨胀，因此要在栈顶补一个<strong>最终 LayerNorm（final LN）</strong>——LLaMA 代码里的 <code>norm</code> 层就是它，删掉它模型输出尺度会随深度漂移、SFT 直接训崩。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>维度</th><th>Post-LN（原始 Transformer）</th><th>Pre-LN（GPT-2/LLaMA/Qwen）</th></tr></thead>
+        <tbody>
+          <tr><td>归一化位置</td><td>残差相加之后：\(x \leftarrow \mathrm{LN}(x + f(x))\)</td><td>子层输入前：\(x \leftarrow x + f(\mathrm{LN}(x))\)</td></tr>
+          <tr><td>深层梯度行为</td><td>随深度衰减，需学习率预热</td><td>残差主路无阻尼，深层可稳定训练</td></tr>
+          <tr><td>是否需要 final LN</td><td>不需要</td><td>需要（栈顶补一个，稳定输出尺度）</td></tr>
+          <tr><td>常见归一化算子</td><td>LayerNorm（去均值 + 缩放）</td><td>RMSNorm（只缩放，去均值省略）</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 3-2：Pre-LN 与 Post-LN 对比。现代模型在 Pre-LN 基础上把 LayerNorm 换成 RMSNorm（Zhang &amp; Sennrich, 2019, arXiv:1910.07467），少一次均值统计，快且几乎不掉点</span>
+    </div>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：改架构前先看归一化与残差</div>
+      <p>做继续预训练或架构魔改（换归一化、加层、改 FFN）时，Pre-LN 的 final LN 与残差通路是绝不能破坏的两条"生命线"；全量微调时的学习率应比预训练小 1~2 个数量级（如 1e-5 → 1e-6 量级，第 16 章），一个重要原因就是微调不能扰乱 Pre-LN 体系已经平衡好的激活尺度。</p>
+    </div>
+    <p><strong>本节小结：</strong>FFN（SwiGLU）负责知识变换，残差保梯度通路，Pre-LN + RMSNorm + final LN 是现代模型的稳定标配；估算参数量用 \(N \approx 12Ld^2\)。</p>
+
+    <h2>7. Decoder-only 架构为何胜出</h2>
+    <p>2018~2020 年，生成式 LLM 存在三条第线：encoder-decoder（T5，arXiv:1910.10683）、decoder-only（GPT 系）、prefix-LM（UL2 等）。到今天，指令与对话模型几乎清一色是 decoder-only。这个胜负不是偶然，而是四个工程约束共同作用的结果。</p>
+    <p><strong>第一，训练目标与数据利用率。</strong>decoder-only 的因果掩码让序列中每个位置都携带监督信号：\(T\) 个 token 产生 \(T\) 个 next-token 损失项，数据效率极高。encoder-decoder 的 span corruption 只在被破坏的片段上有损失，同等算力下"每 token 学到的东西"更少；且它需要"构造输入-目标对"的数据预处理，在万亿级噪声语料上这一步既昂贵又引入人为设计。<strong>第二，扩展性（scaling friendliness）。</strong>decoder-only 结构最简单：一个栈、一种掩码、一种数据格式，没有 encoder/decoder 的超参切分，几乎不需要调结构就能一路扩到千亿参数——缩放定律（第 4 章）实验全部在这一族模型上完成，形成正反馈。<strong>第三，推理与工程效率。</strong>自回归生成天然匹配 KV cache（第 9 节）；decoder-only 无需维护两套权重与交叉注意力，部署、量化、投机解码（speculative decoding）的工具链都为它优化。<strong>第四，涌现的少样本能力。</strong>GPT-3（arXiv:2005.14165）展示了纯因果 LM + 足够规模就能出现上下文学习（in-context learning），而当时的多任务 encoder-decoder 路线（T0、FLAN 早期版本）需要显式的多任务数据混合才能逼近类似能力。ICL 让"同一个 base 模型 + 不同提示词"服务无数任务，这条路径的生态位被 decoder-only 占住了。</p>
+    <p>需要保留的批判性视角是：encoder-decoder 并没有输在"表达力"上，在小数据、强监督的翻译/摘要任务上它至今仍有优势；prefix-LM 的注意力掩码也已被证明在长上下文上有理论吸引力。decoder-only 的胜出更像是"在互联网规模无监督数据的约束下，最简单、数据利用率最高、最易扩展的那个设计赢了"——是工程选择，不是数学必然。</p>
+    <p><strong>本节小结：</strong>decoder-only 胜出的四根支柱：每 token 监督信号密度最高、结构最简单最易扩展、推理工程效率最高、规模驱动的 ICL 能力。</p>
+
+    <h2>8. 主流开源模型的架构参数盘点</h2>
+    <p>好消息是：你已经掌握了理解现代开源模型所需的全部组件。当前主流模型几乎是同一张"配方卡"：<strong>decoder-only + RoPE + RMSNorm（Pre-LN）+ SwiGLU FFN + GQA + 无偏置项</strong>。差异只在超参数：层数、宽度、头数、KV 头数、词表、上下文长度。表 3-3 给出常用开源 base 模型的关键配置（以各模型 HuggingFace config 为准，版本更新可能微调）。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>模型</th><th>层数 L</th><th>注意力头（Q/KV）</th><th>隐藏维 d</th><th>上下文</th><th>词表</th><th>位置编码</th></tr></thead>
+        <tbody>
+          <tr><td>LLaMA-2-7B</td><td>32</td><td>32 / 32（MHA）</td><td>4096</td><td>4096</td><td>32000</td><td>RoPE</td></tr>
+          <tr><td>LLaMA-2-70B</td><td>80</td><td>64 / 8（GQA）</td><td>8192</td><td>4096</td><td>32000</td><td>RoPE</td></tr>
+          <tr><td>LLaMA-3-8B</td><td>32</td><td>32 / 8（GQA）</td><td>4096</td><td>8192</td><td>128256</td><td>RoPE</td></tr>
+          <tr><td>LLaMA-3.1-405B</td><td>126</td><td>128 / 8（GQA）</td><td>16384</td><td>131072</td><td>128256</td><td>RoPE（长上下文缩放）</td></tr>
+          <tr><td>Qwen2.5-7B</td><td>28</td><td>28 / 4（GQA）</td><td>3584</td><td>32768</td><td>152064</td><td>RoPE</td></tr>
+          <tr><td>Qwen2.5-72B</td><td>80</td><td>64 / 8（GQA）</td><td>8192</td><td>32768</td><td>152064</td><td>RoPE</td></tr>
+          <tr><td>Mistral-7B（v0.1）</td><td>32</td><td>32 / 8（GQA）</td><td>4096</td><td>8192（滑窗 4096）</td><td>32000</td><td>RoPE</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 3-3：主流开源 decoder-only 模型架构参数对比（数据来自各模型技术报告与官方 config：LLaMA arXiv:2302.13971、Qwen2.5、Mistral 7B）</span>
+    </div>
+    <p>这张表值得用三个视角来读。<strong>视角一：头维恒定。</strong>注意每个头维度几乎都是 128（4096/32、8192/64、16384/128），这是行业收敛的经验值，与注意力效率、张量核形状匹配有关。<strong>视角二：GQA 的普及轨迹。</strong>LLaMA-2-7B 还是朴素 MHA，7B 以上普遍配 8 个 KV 头；Qwen2.5-7B 甚至用 4 个 KV 头把推理显存进一步压缩——越新的模型对推理成本的敏感度越高。<strong>视角三：上下文的跨越。</strong>从 LLaMA-2 的 4k 到 LLaMA-3.1 的 128k，三年间 32 倍，靠的是 RoPE 缩放 + 长文本数据 + 高效注意力（第 44 章）的组合拳，而不是架构革命。选 base 模型做后训练时，这张表决定了你的显存预算（第 42 章）、上下文上限与 KV cache 成本（下一节）。</p>
+    <figure class="figure">
+      <img src="../assets/figs/transformer-arch.png" alt="Transformer 架构图">
+      <figcaption>图 3-2：原始 Transformer 架构：左侧 encoder 与右侧 decoder 堆叠。现代 decoder-only LLM 只保留右半边的 masked 多头注意力栈，并把 LayerNorm 移到子层输入前（Pre-LN）（来源：Vaswani et al., 2017, arXiv:1706.03762）</figcaption>
+    </figure>
+    <p><strong>本节小结：</strong>开源 LLM 架构高度同质（RoPE + RMSNorm + SwiGLU + GQA），选型差异集中在 L/d/头数/词表/上下文五个超参；记住 \(N \approx 12Ld^2\) 与"头维 128"即可快速校验任何新模型。</p>
+
+    <h2>9. KV cache 与推理成本初步</h2>
+    <p>自回归生成的朴素做法是：每生成一个 token，就把<strong>整条</strong>前缀重新前向一遍。这意味着生成 \(T\) 个 token 需要 \(O(T^2)\) 次注意力计算和 \(T\) 次完整前向——大量计算浪费在重复计算历史 token 的 K、V 上。观察注意力的因果性可以消除这个浪费：位置 \(i\) 的 K、V 只依赖 \(x_{\le i}\)，<strong>历史 token 的 K、V 永远不会变</strong>。于是把每一层每个头的 K、V 缓存下来（这就是 <span class="term">KV cache</span>），每步只前向最新的一个 token：</p>
+    \[ M_{\mathrm{KV}} = 2 \times L \times H_{kv} \times d_{head} \times s \times b \;\; \text{字节} \]
+    <p>其中因子 2 对应 K 和 V，\(L\) 是层数，\(H_{kv}\) 是 KV 头数（GQA 下远小于查询头数），\(d_{head}\) 头维度，\(s\) 序列长度，\(b\) 批大小（bf16 每元素 2 字节）。拿 LLaMA-3-8B 代入：\(2 \times 32 \times 8 \times 128 = 131072\) 字节/token，即每生成 1 个 token 累积 128 KB 的缓存；8k 上下文就是每条序列 1 GB。对比 LLaMA-2-7B 的 MHA（\(H_{kv}=32\)）：512 KB/token、8k 上下文 4 GB——GQA 用不到 1% 的质量代价把推理显存压到四分之一。</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="KV cache 显存随上下文长度增长对比">
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">KV cache 显存：MHA vs GQA（每条序列，bf16）</text>
+        <line x1="80" y1="270" x2="680" y2="270" stroke="#1e293b" stroke-width="1.5"/>
+        <line x1="80" y1="270" x2="80" y2="50" stroke="#1e293b" stroke-width="1.5"/>
+        <text x="70" y="275" text-anchor="end" font-size="13" fill="#475569">0</text>
+        <text x="70" y="215" text-anchor="end" font-size="13" fill="#475569">4GB</text>
+        <text x="70" y="160" text-anchor="end" font-size="13" fill="#475569">8GB</text>
+        <text x="70" y="105" text-anchor="end" font-size="13" fill="#475569">12GB</text>
+        <text x="70" y="55" text-anchor="end" font-size="13" fill="#475569">16GB</text>
+        <line x1="80" y1="215" x2="680" y2="215" stroke="#e2e8f0" stroke-width="1"/>
+        <line x1="80" y1="160" x2="680" y2="160" stroke="#e2e8f0" stroke-width="1"/>
+        <line x1="80" y1="105" x2="680" y2="105" stroke="#e2e8f0" stroke-width="1"/>
+        <line x1="80" y1="55" x2="680" y2="55" stroke="#e2e8f0" stroke-width="1"/>
+        <polyline points="170,259 260,237 350,193 440,105 530,55" fill="none" stroke="#ef4444" stroke-width="3"/>
+        <polyline points="170,264 260,259 350,248 440,226 530,182" fill="none" stroke="#2563eb" stroke-width="3"/>
+        <circle cx="530" cy="55" r="5" fill="#ef4444"/>
+        <circle cx="530" cy="182" r="5" fill="#2563eb"/>
+        <text x="545" y="50" font-size="14" fill="#881337">MHA 512KB/token（LLaMA-2-7B）</text>
+        <text x="545" y="192" font-size="14" fill="#1e3a8a">GQA 128KB/token（LLaMA-3-8B）</text>
+        <text x="170" y="290" text-anchor="middle" font-size="13" fill="#475569">2k</text>
+        <text x="260" y="290" text-anchor="middle" font-size="13" fill="#475569">4k</text>
+        <text x="350" y="290" text-anchor="middle" font-size="13" fill="#475569">8k</text>
+        <text x="440" y="290" text-anchor="middle" font-size="13" fill="#475569">16k</text>
+        <text x="530" y="290" text-anchor="middle" font-size="13" fill="#475569">32k</text>
+        <text x="360" y="312" text-anchor="middle" font-size="14" fill="#475569">上下文长度（token）</text>
+        <rect x="560" y="210" width="118" height="52" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="619" y="231" text-anchor="middle" font-size="13" fill="#92400e">32k 时两者相差</text>
+        <text x="619" y="251" text-anchor="middle" font-size="14" fill="#92400e">12 GB / 序列</text>
+      </svg>
+      <figcaption>图 3-3：KV cache 显存随上下文长度线性增长；MHA（红）与 GQA（蓝）在 32k 上下文下相差 12 GB/序列。这是 GQA 成为主流的决定性原因（作者自绘，按第 9 节公式计算）</figcaption>
+    </figure>
+    <p>为什么后训练工程师要关心这个？因为 <strong>RLHF/RLVR 训练的瓶颈恰恰在生成端</strong>。PPO 或 GRPO 的每个训练迭代，都要用当前策略对每个 prompt 采样一条或多条完整回答（rollout），生成几百个 token；采样阶段受制于自回归串行 + KV cache 读写，GPU 利用率远低于训练阶段。当 batch 变大、上下文变长，KV cache 会吃掉本可用于并发的显存——vLLM 的 PagedAttention（Kwon et al., 2023, arXiv:2309.06180）用分页管理把碎片压到最低，已成为 RL rollout 基础设施的标配（第 45 章）。一句话记住推理端的两本账：<strong>算力账</strong>随生成步数线性增长（每步一次单 token 前向），<strong>显存账</strong>随上下文线性增长（KV cache 累积）——训练是 6ND 的稠密矩阵乘（第 42 章），推理是访存受限的解码循环，两者的优化逻辑完全不同。</p>
+    <p><strong>本节小结：</strong>KV cache 用空间换时间，把生成从"每步全量重算"变成"每步单 token 前向"；其显存 \( \propto L \times H_{kv} \times d_{head} \times s\)，GQA 与分页管理是控制它的两大手段，也是 RL rollout 成本的核心变量。</p>
+
+    <h2>10. 动手：极简 attention 与带 cache 的生成循环</h2>
+    <p>理论到此为止，本节用两个"能跑的最小实现"把前面的概念钉死。第一个是从零实现的因果多头注意力，去掉 dropout、bias、flash kernel 等工程件，只保留 QKV、缩放点积、因果掩码、多头四条主线——建议你逐行对着第 4 节的公式读：</p>
+    <div class="code-wrap">
+      <span class="code-label">minimal_attention.py</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MinimalCausalAttention(nn.Module):
+    """极简因果自注意力：省略 dropout/bias，突出 QKV 与因果掩码主线"""
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads            # 头维度 d_k，行业惯例取 128
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.wk = nn.Linear(d_model, d_model, bias=False)
+        self.wv = nn.Linear(d_model, d_model, bias=False)
+        self.wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        # 1) 线性投影出 Q/K/V，并按头拆分：(B, T, D) -&gt; (B, h, T, d_head)
+        q = self.wq(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.wk(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.wv(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        # 2) 缩放点积：除以 sqrt(d_k) 稳住 softmax，防止高维点积饱和
+        att = (q @ k.transpose(-2, -1)) / (self.d_head ** 0.5)
+        # 3) 因果掩码：位置 i 只允许关注 j &lt;= i 的键，未来位置置 -inf
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1)
+        att = att.masked_fill(mask, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        # 4) 按 V 加权求和，合并多头，输出投影
+        out = (att @ v).transpose(1, 2).reshape(B, T, D)
+        return self.wo(out)
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    x = torch.randn(2, 16, 512)                     # batch=2, 序列长=16, d_model=512
+    block = MinimalCausalAttention(d_model=512, n_heads=4)
+    out = block(x)
+    print(out.shape)                                # torch.Size([2, 16, 512])
+    assert torch.isfinite(out).all()</code></pre>
+    </div>
+    <p>第二个实现是带 KV cache 的生成循环，对应第 9 节的两本账：预填充（prefill）阶段一次性处理完整提示词，解码（decode）阶段每步只喂最后一个 token、复用历史 K/V。真实引擎（vLLM、SGLang）在此基础上叠加分页与连续批处理，但数据流与此一致：</p>
+    <div class="code-wrap">
+      <span class="code-label">kv_cache_generate.py</span>
+      <pre class="code"><code class="language-python">import torch
+
+@torch.no_grad()
+def generate_with_kv_cache(model, input_ids, max_new_tokens=64, temperature=0.8):
+    """带 KV cache 的自回归生成（简化示意：假设 model.forward 返回 (logits, past_kv)）"""
+    past = None
+    tokens = input_ids
+    for step in range(max_new_tokens):
+        if past is None:
+            # 预填充：一次性前向整个提示词，产生全部位置的 K/V
+            logits, past = model(tokens, past_key_values=None)
+        else:
+            # 解码：只前向最新 1 个 token，历史 K/V 从 cache 读取并追加
+            logits, past = model(tokens[:, -1:], past_key_values=past)
+        logits = logits[:, -1, :] / max(temperature, 1e-5)   # 温度控制分布尖锐度
+        probs = torch.softmax(logits, dim=-1)
+        next_tok = torch.multinomial(probs, num_samples=1)
+        tokens = torch.cat([tokens, next_tok], dim=1)
+        if next_tok.item() == model.config.eos_token_id:     # 终止符结束本次生成
+            break
+    return tokens
+
+# 用法示例（伪流程）：
+# model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", torch_dtype=torch.bfloat16)
+# ids = tokenizer("解释什么是过拟合", return_tensors="pt").input_ids
+# out = generate_with_kv_cache(model, ids, max_new_tokens=256)</code></pre>
+    </div>
+    <div class="callout note">
+      <div class="callout-title">📘 与后训练的连接点</div>
+      <p>这段循环在 RLHF 里每天要被调用数十亿次：PPO/GRPO 的 rollout 就是把它包在推理引擎里、对成千上万个 prompt 并发执行。rollout 产生的回答再被策略模型与参考模型各算一遍 log 概率（第 6 章）、被奖励模型打分（第 19 章）。理解"生成贵、验证相对便宜"，就理解了为什么 GRPO 要在同一 prompt 上采一组回答共享成本（第 25 章），为什么离线类方法 DPO 有工程吸引力（第 22 章）。</p>
+    </div>
+    <p><strong>本节小结：</strong>70 行代码就能实现因果注意力与 KV cache 生成；这两个最小实现是理解 SFT 标签移位（第 13 章）、RL rollout 成本（第 45 章）与推理引擎优化的共同起点。</p>
+
+    <h2>11. 本章小结</h2>
+    <ul>
+      <li><strong>概率定义</strong>：语言模型是对条件分布链 \(p_\theta(x_t \mid x_{&lt;t})\) 的参数化；预训练、SFT、RL 共用同一个前向计算，差异只在数据与损失。</li>
+      <li><strong>Tokenization</strong>：BPE/SentencePiece 在词表大小、序列长度与低频 token 学习之间权衡；压缩率直接决定算力账，特殊 token 必须预注册。</li>
+      <li><strong>注意力</strong>：QKV 是内容寻址的软检索，\(1/\sqrt{d_k}\) 防饱和，多头并行多套关注模式，因果掩码让训练并行、生成串行——这个不对称性贯穿全书。</li>
+      <li><strong>位置编码</strong>：RoPE 通过按位置旋转 \(q,k\) 实现相对位置感知，是长上下文扩展（PI/YaRN）的支点。</li>
+      <li><strong>架构标配</strong>：decoder-only + Pre-LN RMSNorm + SwiGLU + GQA + 无偏置；参数量心算 \(N \approx 12Ld^2\)，final LN 不能删。</li>
+      <li><strong>KV cache</strong>：显存 \(= 2 L H_{kv} d_{head} s b\) 字节（bf16），LLaMA-3-8B 为 128 KB/token；GQA 与 PagedAttention 控制 RL rollout 的最大成本项。</li>
+    </ul>
+    <p>下一章我们沿数据方向继续：这些架构被灌入什么样的预训练数据、遵循什么缩放定律、具备哪些 base 模型能力与缺陷——它们划定了后训练的起点与天花板。</p>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：因果掩码为什么能让训练并行、却不能让生成并行？</summary><p>训练时，整条序列的所有位置都已给定，因果掩码保证位置 \(i\) 的条件分布 \(p(x_i \mid x_{&lt;i})\) 只依赖历史，因此一次前向可以同时算出全部 \(T\) 个位置的 next-token 概率，监督信号并行兑现。生成时，"未来"尚未存在：第 \(t\) 步的输入依赖第 \(t-1\) 步采样出的 token，形成了数据依赖链，只能串行；KV cache 缓解的是每步的重复计算（不必重算历史 K/V），但无法消除步与步之间的串行依赖。</p></details>
+      <details><summary>问题 2：把词表从 3.2 万扩到 15 万，分别对算力、显存、模型质量有什么影响？</summary><p>算力：同样的中文文本被切成更少的 token，前向/反向次数减少，等于同算力多读数据（对中文常见 30%~50% 的压缩收益）。显存：embedding 与 lm_head 参数量与词表成正比，15.2 万词表 × 4096 维的 lm_head 在 bf16 下约 1.2 GB，且 logits 与 softmax 的激活开销同步上涨。质量：低频 token 出现次数变少、embedding 学习不充分，若语料量不足可能损害整体效果；但合理的扩词表能减少过度切碎，改善长距离建模。三笔账一起算，多语模型主流选择在 10 万~25 万词表。</p></details>
+      <details><summary>问题 3：Pre-LN 架构为什么必须在栈顶放一个 final LayerNorm？删掉会发生什么？</summary><p>Pre-LN 中归一化在残差分支内部，残差主路本身不做归一化，因此表示的范数会随深度逐层累加膨胀（大约每层累加一个子层输出）。final LN 在输出前把尺度重新归一，稳定 logits 的量纲。删掉它，模型输出尺度随深度漂移，logits 数值异常，SFT 的损失会剧烈震荡甚至发散；对已预训练好的模型做微调时改动它尤其致命。</p></details>
+      <details><summary>问题 4：计算 LLaMA-3-8B 在 32768 上下文、batch=8 时的 KV cache 总显存（bf16，GQA 8 个 KV 头）。</summary><p>每 token：\(2 \times L \times H_{kv} \times d_{head} = 2 \times 32 \times 8 \times 128 = 131072\) 字节 = 128 KB。32k 上下文单条序列：128 KB × 32768 = 4 GB。batch=8：32 GB。这还只是 KV cache，不含权重（8B 模型 bf16 约 16 GB）与激活——这就是长上下文 RL rollout 必须依赖 GQA、分页与量化的原因。</p></details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Vaswani+, 2017]</span> Vaswani, A. et al. "Attention Is All You Need." <i>NeurIPS</i>, 2017. <span class="rid">arXiv:1706.03762</span></li>
+      <li><span class="rid">[Brown+, 2020]</span> Brown, T. et al. "Language Models are Few-Shot Learners." <i>NeurIPS</i>, 2020. <span class="rid">arXiv:2005.14165</span></li>
+      <li><span class="rid">[Su+, 2021]</span> Su, J. et al. "RoFormer: Enhanced Transformer with Rotary Position Embedding." 2021. <span class="rid">arXiv:2104.09864</span></li>
+      <li><span class="rid">[Press+, 2021]</span> Press, O., Smith, N., Lewis, M. "Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation." 2021. <span class="rid">arXiv:2108.12409</span></li>
+      <li><span class="rid">[Zhang &amp; Sennrich, 2019]</span> Zhang, B., Sennrich, R. "Root Mean Square Layer Normalization." <i>NeurIPS</i>, 2019. <span class="rid">arXiv:1910.07467</span></li>
+      <li><span class="rid">[Xiong+, 2020]</span> Xiong, R. et al. "On Layer Normalization in the Transformer Architecture." <i>ICML</i>, 2020. <span class="rid">arXiv:2002.04745</span></li>
+      <li><span class="rid">[Shazeer, 2020]</span> Shazeer, N. "GLU Variants Improve Transformer." 2020. <span class="rid">arXiv:2002.05202</span></li>
+      <li><span class="rid">[Kudo &amp; Richardson, 2018]</span> Kudo, T., Richardson, J. "SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing." <i>EMNLP</i>, 2018. <span class="rid">arXiv:1808.06226</span></li>
+      <li><span class="rid">[Touvron+, 2023]</span> Touvron, H. et al. "LLaMA: Open and Efficient Foundation Language Models." 2023. <span class="rid">arXiv:2302.13971</span></li>
+      <li><span class="rid">[Ainslie+, 2023]</span> Ainslie, J. et al. "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints." <i>EMNLP</i>, 2023. <span class="rid">arXiv:2305.13245</span></li>
+      <li><span class="rid">[Shazeer, 2019]</span> Shazeer, N. "Fast Transformer Decoding: One Write-Head is All You Need." 2019. <span class="rid">arXiv:1911.02150</span></li>
+      <li><span class="rid">[Dao+, 2022]</span> Dao, T. et al. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." <i>NeurIPS</i>, 2022. <span class="rid">arXiv:2205.14135</span></li>
+      <li><span class="rid">[Raffel+, 2020]</span> Raffel, C. et al. "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer." <i>JMLR</i>, 2020. <span class="rid">arXiv:1910.10683</span></li>
+      <li><span class="rid">[Kwon+, 2023]</span> Kwon, W. et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." <i>SOSP</i>, 2023. <span class="rid">arXiv:2309.06180</span></li>
+      <li><span class="rid">[Peng+, 2023]</span> Peng, B. et al. "YaRN: Efficient Context Window Extension of Large Language Models." 2023. <span class="rid">arXiv:2309.00071</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 15 章 · 对话模板与特殊 Token | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 3 部分 · 监督微调 SFT</div>
+      <h1>第 15 章 · 对话模板与特殊 Token</h1>
+      <p class="chapter-lead">对话模板把 messages 列表变成模型真正看到的 token 序列，它同时决定了 loss mask 的边界、生成停不停得下来、工具调用能不能被解析。本章拆解 ChatML、LLaMA-2/3、Qwen、Mistral、DeepSeek、Gemma 六种主流格式的渲染结果，讲清特殊 token 体系与 add_special_tokens 陷阱，给出自定义模板的完整注册流程与模板级调试代码——这些是后训练里最常被忽视、也最容易静默翻车的环节。</p>
+      <div class="chapter-meta">⏱ 预计学习 75 分钟 ｜ 难度 ★★☆☆☆ ｜ 先修：第 12 章、第 13 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 为什么 chat template 是后训练最常见的翻车点</h2>
+    <p>一个模型在预训练时从未见过"<code>&lt;|im_start|&gt;</code>"这样的轮次标记，它对"对话"的全部理解都来自 SFT 数据的呈现方式。<span class="term">对话模板（Chat Template）</span>就是这份呈现方式的代码化：一段 Jinja2 模板，把 <code>[{role, content}, ...]</code> 渲染成最终送入模型的纯文本。它之所以是翻车重灾区，源于三个结构性原因。<strong>第一，它静默地决定了一切下游行为</strong>：模板错一个字符，loss mask 的边界就整体漂移（第 13 章），生成时的停止条件就失效——而这一切不抛任何异常，loss 曲线照常下降。<strong>第二，训练侧与推理侧是两份独立配置</strong>：训练框架用一份模板渲染样本，线上服务（vLLM/TGI/自研引擎）用另一份（或 tokenizer 内置的）模板包 prompt，两边不一致时模型面对的是它从未学过的输入分布。<strong>第三，模板里的特殊 token 与 tokenizer、词表、embedding 三者强耦合</strong>：新 token 没注册进词表、注册了没扩 embedding、扩了 embedding 没训练，都是只看代码发现不了的坑。</p>
+    <p>与数据质量类问题（第 10 章）不同，模板错误的"修复成本"极低——通常就是改几行配置——但"发现成本"很高：它混在数据问题、超参问题、评测噪声里，团队常见的症状是"换了更好的数据反而没涨分"。因此本章的目标可以压缩成一句话：<strong>让模板成为你代码库里被测试覆盖的部分，而不是藏在配置里的玄学</strong>。先看一张全景图，把"一段 messages 如何一步步变成训练样本"装进脑子，后面每节都在展开这张图的一角：</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="messages 经模板拼接与掩码处理成为训练样本的全流程">
+        <defs><marker id="arrow15a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">一段对话的完整旅程：messages → 模板渲染 → tokenize → labels</text>
+        <!-- 阶段 1 -->
+        <rect x="16" y="44" width="150" height="120" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="91" y="66" text-anchor="middle" font-size="14" fill="#1e3a8a">① messages</text>
+        <rect x="30" y="78" width="122" height="22" rx="5" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="91" y="93" text-anchor="middle" font-size="12" fill="#92400e">system 内容</text>
+        <rect x="30" y="106" width="122" height="22" rx="5" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="91" y="121" text-anchor="middle" font-size="12" fill="#92400e">user 内容</text>
+        <rect x="30" y="134" width="122" height="22" rx="5" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="91" y="149" text-anchor="middle" font-size="12" fill="#065f46">assistant 内容</text>
+        <!-- 阶段 2 -->
+        <rect x="196" y="44" width="200" height="120" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="296" y="66" text-anchor="middle" font-size="14" fill="#5b21b6">② Jinja2 模板渲染</text>
+        <text x="212" y="90" font-size="12" fill="#475569">&lt;|im_start|&gt;user</text>
+        <text x="212" y="110" font-size="12" fill="#475569">解释过拟合&lt;|im_end|&gt;</text>
+        <text x="212" y="130" font-size="12" fill="#475569">&lt;|im_start|&gt;assistant</text>
+        <text x="212" y="150" font-size="12" fill="#64748b">（模板决定每个边界）</text>
+        <!-- 阶段 3 -->
+        <rect x="426" y="44" width="130" height="120" rx="10" fill="#f8fafc" stroke="#94a3b8" stroke-width="2"/>
+        <text x="491" y="66" text-anchor="middle" font-size="14" fill="#1e293b">③ tokenize</text>
+        <text x="440" y="92" font-size="12" fill="#475569">input_ids</text>
+        <text x="440" y="112" font-size="12" fill="#475569">assistant_masks</text>
+        <text x="440" y="132" font-size="12" fill="#475569">（generation 标记</text>
+        <text x="440" y="150" font-size="12" fill="#475569">→ token 级掩码）</text>
+        <!-- 阶段 4 -->
+        <rect x="586" y="44" width="120" height="120" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="646" y="66" text-anchor="middle" font-size="14" fill="#065f46">④ labels</text>
+        <text x="600" y="92" font-size="12" fill="#475569">绿区=真值</text>
+        <text x="600" y="112" font-size="12" fill="#475569">其余=-100</text>
+        <text x="600" y="132" font-size="12" fill="#475569">im_end 必须在</text>
+        <text x="600" y="150" font-size="12" fill="#475569">绿区里（学会停）</text>
+        <line x1="166" y1="104" x2="196" y2="104" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow15a)"/>
+        <line x1="396" y1="104" x2="426" y2="104" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow15a)"/>
+        <line x1="556" y1="104" x2="586" y2="104" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow15a)"/>
+        <!-- token 条带：边界与掩码的对应 -->
+        <text x="360" y="196" text-anchor="middle" font-size="14" fill="#1e293b">token 条带视角：模板 token 与掩码区间一一对应</text>
+        <rect x="40" y="212" width="120" height="34" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="100" y="234" text-anchor="middle" font-size="12" fill="#1e3a8a">im_start user</text>
+        <rect x="160" y="212" width="140" height="34" rx="5" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="230" y="234" text-anchor="middle" font-size="12" fill="#92400e">用户问题</text>
+        <rect x="300" y="212" width="70" height="34" rx="5" fill="#fecaca" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="335" y="234" text-anchor="middle" font-size="12" fill="#991b1b">im_end</text>
+        <rect x="370" y="212" width="130" height="34" rx="5" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="435" y="234" text-anchor="middle" font-size="12" fill="#1e3a8a">im_start assistant</text>
+        <rect x="500" y="212" width="120" height="34" rx="5" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="560" y="234" text-anchor="middle" font-size="12" fill="#065f46">回答内容</text>
+        <rect x="620" y="212" width="70" height="34" rx="5" fill="#fecaca" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="655" y="234" text-anchor="middle" font-size="12" fill="#991b1b">im_end</text>
+        <text x="40" y="272" font-size="13" fill="#334155">assistant_masks：</text>
+        <text x="190" y="272" font-size="13" fill="#64748b">0 …… 0 ｜ 0 …… 0 ｜ 1 …… 1 ｜ 1（最后一个 1 就是停止 token）</text>
+        <text x="40" y="296" font-size="13" fill="#334155">labels：</text>
+        <text x="190" y="296" font-size="13" fill="#64748b">-100 ……………… ｜ 真 值（含 im_end）｜ padding 区再填 -100</text>
+        <text x="360" y="330" text-anchor="middle" font-size="13" fill="#5b21b6">任何一格错位（多了空格、少了换行、im_end 归错区），掩码就整体漂移</text>
+      </svg>
+      <figcaption>图 15-1：对话数据从 messages 到 labels 的全流程：模板负责"把边界写进文本"，tokenize 把边界变成 token 位置，generation 标记把边界变成掩码区间，labels 把区间变成监督信号（作者自绘）</figcaption>
+    </figure>
+    <p><strong>本节小结：</strong>模板是"数据→训练→推理"三端共享的契约，它错了一切都静默地错；本章的落脚点是把契约显式化、可测试化。</p>
+
+    <h2>2. Jinja2 机制与 apply_chat_template：模板是怎么被执行的</h2>
+    <p>HF tokenizer 把模板存成 <code>tokenizer_config.json</code> 里的 <code>chat_template</code> 字符串（新版支持 <code>chat_template.jinja</code> 独立文件），调用 <code>apply_chat_template</code> 时用 Jinja2 引擎执行。你需要掌握的语法子集很小，但每个都有后训练含义：</p>
+    <div class="code-wrap">
+      <span class="code-label">template_basics.py — apply_chat_template 的关键用法</span>
+      <pre class="code"><code class="language-python">from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+messages = [
+    {"role": "system", "content": "你是一个严谨的助手。"},
+    {"role": "user", "content": "解释什么是过拟合。"},
+]
+
+# 1) 只渲染不 tokenize：调试时永远先看这个（用 repr 让换行/空格可见）
+text = tok.apply_chat_template(messages, tokenize=False)
+print(repr(text))
+# '&lt;|im_start|&gt;system\n你是一个严谨的助手。&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\n'
+# '解释什么是过拟合。&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n'
+
+# 2) add_generation_prompt=True：在末尾追加"assistant 头"，推理预填充用
+p = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+print(repr(p[-40:]))   # ……&lt;|im_start|&gt;assistant\n
+
+# 3) tokenize=True：模板自带 BOS 等特殊 token，内部按 add_special_tokens=False 处理
+ids = tok.apply_chat_template(messages, tokenize=True)
+# 危险写法（双 BOS 的来源）：先渲染文本，再用默认参数 encode
+# bad = tok(text).input_ids          # add_special_tokens=True 又加了一次 BOS！
+
+# 4) 训练侧：让模板作者声明的 assistant 边界变成 token 级掩码（第 13 章第 5 节）
+enc = tok.apply_chat_template(messages, return_dict=True,
+                              return_assistant_tokens_mask=True)</code></pre>
+    </div>
+    <p>模板语法里三个高频片段。<strong>其一，循环与条件</strong>：<code>{% for message in messages %}</code> 逐轮展开，<code>{% if loop.last %}</code> 之类判断用于"最后一轮是否追加生成提示"。<strong>其二，generation 标记</strong>：Jinja 的自定义块 <code>{% generation %}...{% endgeneration %}</code> 不产生任何文本输出，只在执行时记录"这段内容属于 assistant 生成"——<code>return_assistant_tokens_mask=True</code> 完全依赖它，没有这个标记的模板（如 Qwen2.5 官方模板）无法直接用 assistant_only_loss。<strong>其三，过滤器</strong>：<code>{{ content | trim }}</code> 之类用于规范化空格——空格归属是模板 bug 的最大来源之一，第 4 节展开。模板是<strong>可编程的契约</strong>：它不仅有格式含义，还直接决定掩码与停止行为。</p>
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：模板 ≠ 特殊 token</div>
+      <p>模板是"编排逻辑"（谁在前谁在后、换行放哪），特殊 token 是"被编排的物料"（im_start、im_end、eot_id……）。改模板不改 token 是格式调整；给模板引入词表里不存在的字符串，则要按第 6 节的注册流程走——两者的工程动作完全不同，混为一谈是"自定义模板翻车"的第一大来源。</p>
+    </div>
+    <p><strong>本节小结：</strong>apply_chat_template 的四个参数（tokenize、add_generation_prompt、add_special_tokens 的隐式行为、assistant mask）各管一件事；调试永远从 <code>tokenize=False + repr</code> 开始。</p>
+
+    <h2>3. 主流模板格式逐一拆解：六个家族的渲染结果</h2>
+    <p>下面把六个主流家族的同一段对话（一轮 user/assistant）渲染结果并排放在一起。看懂这六段，就能看懂开源生态 90% 的模型；注意<strong>换行属于模板的一部分</strong>，渲染结果里的 <code>\n</code> 都会被 tokenize：</p>
+    <div class="code-wrap">
+      <span class="code-label">render_all_formats.py（输出为各家族的真实渲染结果）</span>
+      <pre class="code"><code class="language-python"># system="你是一个助手"，user="解释过拟合"，assistant="过拟合是指……"
+
+# ── ChatML / Qwen（&lt;|im_start|&gt;role\n 内容 &lt;|im_end|&gt;\n）──────────────
+# &lt;|im_start|&gt;system
+# 你是一个助手&lt;|im_end|&gt;
+# &lt;|im_start|&gt;user
+# 解释过拟合&lt;|im_end|&gt;
+# &lt;|im_start|&gt;assistant
+# 过拟合是指……&lt;|im_end|&gt;
+
+# ── LLaMA-2（system 嵌入第一轮的 &lt;&lt;SYS&gt;&gt; 块）─────────────────────────
+# &lt;s&gt;[INST] &lt;&lt;SYS&gt;&gt;
+# 你是一个助手
+# &lt;&lt;/SYS&gt;&gt;
+#
+# 解释过拟合 [/INST] 过拟合是指……&lt;/s&gt;
+
+# ── LLaMA-3（header 三件套 + &lt;|eot_id|&gt;，官方模板另含日期截断行，示例从简）─
+# &lt;|begin_of_text|&gt;&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;
+#
+# 你是一个助手&lt;|eot_id|&gt;&lt;|start_header_id|&gt;user&lt;|end_header_id|&gt;
+#
+# 解释过拟合&lt;|eot_id|&gt;&lt;|start_header_id|&gt;assistant&lt;|end_header_id|&gt;
+#
+# 过拟合是指……&lt;|eot_id|&gt;
+
+# ── Mistral（无 system 角色；system 文本折叠进第一轮 user）───────────
+# &lt;s&gt;[INST] 你是一个助手\n\n解释过拟合 [/INST]过拟合是指……&lt;/s&gt;
+
+# ── DeepSeek（注意全角"｜"与"▁"是 token 的一部分，不是显示效果！）───
+# &lt;｜begin▁of▁sentence｜&gt;你是一个助手
+# User: 解释过拟合
+# &lt;｜Assistant｜&gt;过拟合是指……&lt;｜end▁of▁sentence｜&gt;
+
+# ── Gemma（角色只有 user/model；system 折叠进首轮 user）──────────────
+# &lt;bos&gt;&lt;start_of_turn&gt;user
+# 你是一个助手\n\n解释过拟合&lt;end_of_turn&gt;
+# &lt;start_of_turn&gt;model
+# 过拟合是指……&lt;end_of_turn&gt;</code></pre>
+    </div>
+    <p>六段结果里有五个对 loss mask 与推理行为有直接影响的差异点，逐个点名。<strong>第一，system 的去向</strong>：ChatML 与 LLaMA-3 有独立 system 轮；LLaMA-2 用 <code>&lt;&lt;SYS&gt;&gt;</code> 块嵌入首轮；Mistral 与 Gemma 根本没有 system 角色，system 文本被拼进第一轮 user——如果你按"有 system 轮"的假设构造多轮数据，在这两家上渲染结果会与预期不符。<strong>第二，停止 token 的身份</strong>：Qwen 停在 <code>&lt;|im_end|&gt;</code>，LLaMA-3 停在 <code>&lt;|eot_id|&gt;</code>（<code>&lt;|end_of_text|&gt;</code> 是文档级终止，不是轮级），LLaMA-2/Mistral 停在 <code>&lt;/s&gt;</code>，DeepSeek 停在 <code>&lt;｜end▁of▁sentence｜&gt;</code>。推理时 stop token 列表配错，是最常见的"复读机"事故。<strong>第三，BOS 的有无与位置</strong>：LLaMA-2/Mistral/Gemma 模板以 BOS 开头，Qwen 没有 BOS——把 Qwen 的处理习惯带到 LLaMA 上（或反之）就是双 BOS / 零 BOS 事故。<strong>第四，换行归属</strong>：ChatML 的 <code>&lt;|im_end|&gt;\n</code> 中，这个换行属于"当前轮的结尾"，训练时它在 assistant 区间内部还是外部，各实现有分歧（第 8 节）。<strong>第五，非 ASCII 特殊字符</strong>：DeepSeek 家族的 <code>｜</code> 与 <code>▁</code> 是字符串本身的一部分，手打模板用半角 <code>|</code> 替代后，特殊 token 匹配直接失效——这是抄 DeepSeek 模板的高频事故。</p>
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：照着"网上流传的格式"手写模板</div>
+      <p>社区教程里的模板常经过"美化"：删掉换行、把全角字符打成半角、漏掉 generation 标记。唯一可信的来源是 tokenizer 发布仓库里的 <code>tokenizer_config.json</code>（或 <code>chat_template.jinja</code>）。迁移模板时用第 9 节的对齐检查脚本，把自己渲染的 token 序列与官方渲染逐 token 比对，任何不一致都会现形。</p>
+    </div>
+    <p><strong>本节小结：</strong>六大家族的差异集中在 system 去向、停止 token、BOS 位置、换行归属、特殊字符五点；以官方 tokenizer 配置为唯一事实来源，别信二手模板。</p>
+
+    <h2>4. 特殊 token 体系与 add_special_tokens 陷阱</h2>
+    <p>特殊 token（Special Tokens）是"永远不该被 BPE 拆开、有独立 embedding、由模板或引擎直接放置"的 token。各家体系如下表，先建立索引再看陷阱：</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>家族</th><th>BOS</th><th>轮次/角色 token</th><th>轮级停止（EOS 语义）</th><th>system 支持</th><th>补充 token</th></tr></thead>
+        <tbody>
+          <tr><td>Qwen2.5（ChatML）</td><td>无</td><td>&lt;|im_start|&gt; + 角色名</td><td>&lt;|im_end|&gt;</td><td>独立轮</td><td>&lt;|endoftext|&gt;（pad/文档终止）</td></tr>
+          <tr><td>LLaMA-3</td><td>&lt;|begin_of_text|&gt;</td><td>&lt;|start_header_id|&gt;角色&lt;|end_header_id|&gt;\n\n</td><td>&lt;|eot_id|&gt;</td><td>独立轮</td><td>&lt;|end_of_text|&gt;、&lt;|finetune_right_pad_id|&gt;、&lt;|python_tag|&gt;</td></tr>
+          <tr><td>LLaMA-2</td><td>&lt;s&gt;</td><td>[INST] / [/INST]、&lt;&lt;SYS&gt;&gt;</td><td>&lt;/s&gt;</td><td>嵌首轮</td><td>[INST] 系为普通文本 token（可被拆）</td></tr>
+          <tr><td>Mistral</td><td>&lt;s&gt;</td><td>[INST] / [/INST]</td><td>&lt;/s&gt;</td><td>无（折叠）</td><td>v3+ 为工具调用扩展了 [TOOL_CALLS] 等</td></tr>
+          <tr><td>DeepSeek-V2/V3</td><td>&lt;｜begin▁of▁sentence｜&gt;</td><td>User: / &lt;｜Assistant｜&gt;</td><td>&lt;｜end▁of▁sentence｜&gt;</td><td>文本前缀</td><td>全角字符是 token 字面量的一部分</td></tr>
+          <tr><td>Gemma</td><td>&lt;bos&gt;</td><td>&lt;start_of_turn&gt;角色</td><td>&lt;end_of_turn&gt;</td><td>无（折叠）</td><td>&lt;eos&gt;（文档级）、&lt;pad&gt;（专用填充）</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 15-1：六个主流家族的特殊 token 体系（以各自官方 tokenizer 配置为准，版本演进可能增补）。注意"轮级停止"与"文档级终止"在很多家族是两个不同的 token</span>
+    </div>
+    <p>围绕这些 token 有三个高频陷阱。<strong>陷阱一：双 BOS。</strong><code>apply_chat_template(tokenize=True)</code> 内部已按 add_special_tokens=False 处理（模板自带 BOS）；如果你先渲染成文本、再用默认参数 <code>tok(text)</code> 编码，tokenizer 会再补一个 BOS。序列开头连续两个 BOS 在长对话上影响不大，但对短 prompt 的分布是实打实的偏移，社区里多次出现 vLLM/早期推理栈双 BOS 导致的效果劣化报告。<strong>陷阱二：轮级与文档级停止 token 混用。</strong>LLaMA-3 的 <code>&lt;|eot_id|&gt;</code>（轮级）与 <code>&lt;|end_of_text|&gt;</code>（文档级）、Gemma 的 <code>&lt;end_of_turn&gt;</code> 与 <code>&lt;eos&gt;</code> 都是成对出现的：SFT 标签里应训练的"停止"是轮级 token，推理引擎的 stop 参数也必须配轮级 token——配成文档级会导致多轮对话第一次回答就把整个会话终止，或相反地永不停止。<strong>陷阱三：模板字符串伪装成特殊 token。</strong>LLaMA-2 的 <code>[INST]</code>、Qwen 的 <code>&lt;tool_call&gt;</code> 等本质是<strong>普通文本</strong>（会被 BPE 正常拆分），它们不占用独立 embedding、也不保证 token 边界稳定。它们能用，但意味着"模板边界"与"token 边界"不重合——第 13 章讲的"逐轮渲染求区间"必须依赖 token 化后的真实边界，而不是字符串匹配。</p>
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：decode 后再 encode 不可逆</div>
+      <p>排查问题时很多人用 <code>tok.decode(ids)</code> 得到字符串、修改后重新 <code>tok(text)</code> 编码——这条"往返"不可逆：特殊 token 会被保留为字面文本，而普通文本的空格、前导符、跨词合并都可能变化。任何"改一个 token 再放回去"的操作都必须在 id 层面进行；字符串层面只能用于人眼检查。把 <code>tok(tok.decode(ids)).input_ids == ids</code> 的断言写进模板测试（第 9 节），往返不可逆会立刻现形。</p>
+    </div>
+    <p><strong>本节小结：</strong>特殊 token 的三大陷阱是双 BOS、轮级/文档级停止混用、文本标签冒充特殊 token；记住"模板边界 ≠ token 边界"，一切以 tokenize 后的 id 为准。</p>
+
+    <h2>5. 训练与推理必须一致：mismatch 事故的模式</h2>
+    <p>模板不一致事故在社区里反复出现，形态高度雷同，值得作为模式记住。先看机理：</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="训练与推理模板一致与不一致的对照">
+        <defs><marker id="arrow15b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#10b981"/></marker><marker id="arrow15c" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#ef4444"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">训练模板与推理模板：一致才有意义</text>
+        <!-- 上：一致 -->
+        <rect x="30" y="46" width="180" height="54" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="120" y="68" text-anchor="middle" font-size="14" fill="#065f46">训练：ChatML 模板</text>
+        <text x="120" y="88" text-anchor="middle" font-size="12" fill="#475569">im_start / im_end 边界</text>
+        <rect x="260" y="46" width="180" height="54" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="350" y="68" text-anchor="middle" font-size="14" fill="#065f46">推理：同一 ChatML</text>
+        <text x="350" y="88" text-anchor="middle" font-size="12" fill="#475569">stop = im_end</text>
+        <rect x="490" y="46" width="200" height="54" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="590" y="68" text-anchor="middle" font-size="14" fill="#1e3a8a">分布一致 → 正常回答</text>
+        <text x="590" y="88" text-anchor="middle" font-size="12" fill="#475569">在 im_end 处正确停止</text>
+        <line x1="210" y1="73" x2="260" y2="73" stroke="#10b981" stroke-width="2" marker-end="url(#arrow15b)"/>
+        <line x1="440" y1="73" x2="490" y2="73" stroke="#10b981" stroke-width="2" marker-end="url(#arrow15b)"/>
+        <!-- 下：不一致 -->
+        <rect x="30" y="150" width="180" height="54" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="120" y="172" text-anchor="middle" font-size="14" fill="#065f46">训练：ChatML 模板</text>
+        <text x="120" y="192" text-anchor="middle" font-size="12" fill="#475569">只见过 im_start 边界</text>
+        <rect x="260" y="150" width="180" height="54" rx="10" fill="#fef2f7" stroke="#ef4444" stroke-width="2"/>
+        <text x="350" y="172" text-anchor="middle" font-size="14" fill="#991b1b">推理：LLaMA-2 [INST]</text>
+        <text x="350" y="192" text-anchor="middle" font-size="12" fill="#991b1b">stop 列表也没对齐</text>
+        <rect x="490" y="150" width="200" height="54" rx="10" fill="#fef2f7" stroke="#ef4444" stroke-width="2"/>
+        <text x="590" y="172" text-anchor="middle" font-size="14" fill="#991b1b">分布错位 → 静默劣化</text>
+        <text x="590" y="192" text-anchor="middle" font-size="12" fill="#991b1b">复读 / 停不下来 / 乱码</text>
+        <line x1="210" y1="177" x2="260" y2="177" stroke="#ef4444" stroke-width="2" marker-end="url(#arrow15c)"/>
+        <line x1="440" y1="177" x2="490" y2="177" stroke="#ef4444" stroke-width="2" marker-end="url(#arrow15c)"/>
+        <text x="360" y="238" text-anchor="middle" font-size="13" fill="#5b21b6">模板错误不报错、loss 照常下降——只有把渲染文本打出来才看得见</text>
+      </svg>
+      <figcaption>图 15-2：训练-推理模板一致性对照。上下两条路径的唯一区别是推理侧模板；下路径的失败模式全部是"静默"的（作者自绘）</figcaption>
+    </figure>
+    <p>把社区事故归拢成三类模式。<strong>模式一：跨家族模板错配。</strong>训练用 ChatML、推理按 LLaMA-2 <code>[INST]</code> 包 prompt：模型没学过这种边界，表现为答非所问或复读；反向错配（LLaMA-2 训练、ChatML 推理）则表现为模型把 <code>&lt;|im_start|&gt;</code> 当普通文本续写。<strong>模式二：停止 token 三方不一致。</strong>SFT 标签里没训到轮级停止 token（第 13 章的 mask bug）、推理引擎 stop 列表又没配对，两件事叠加的典型症状是"永远说到 max_tokens 才停"。<strong>模式三：引擎默认模板兜底。</strong>自训模型的 tokenizer 没写 <code>chat_template</code> 字段时，部分推理栈回退到内置默认模板（如 ChatML），与你的训练格式无关——上线前必须用一份"prompt 录制"日志核对线上真实发给模型的字节。Zephyr 等开源模型的发布实践值得照抄：模型、tokenizer、模板、推荐推理配置（stop token、温度）作为一个整体发布，任何一侧单飞都是事故源（Tunstall et al., 2023）。另外提示格式本身对输出就有系统性影响，同一 prompt 换个格式分数能差出十几分（Sclar et al., 2024），模板错配相当于把这种敏感性推到极端。</p>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：把"模板一致性"写成发布检查单</div>
+      <p>模型发布/上线前过四项：① tokenizer_config 里 chat_template 存在且与训练渲染一致（diff 训练时保存的渲染样本）；② 推理引擎 stop 参数包含训练的轮级停止 token；③ 推理端 BOS 行为与训练一致（发送前打印最终请求文本）；④ 线上抽样一条真实请求，记录"模型实际收到的完整字符串"存档。四项都过，模板类事故基本绝迹。</p>
+    </div>
+    <p><strong>本节小结：</strong>mismatch 的三种模式——跨家族错配、停止 token 不一致、引擎兜底模板——共同点是静默；防御手段是发布检查单与线上 prompt 录制。</p>
+
+    <h2>6. 自定义模板的完整流程：注册、扩容、训练、保存</h2>
+    <p>当你需要新角色（如工具调用、思考过程）、或迁移到没有现成模板的自训模型时，要按固定顺序完成四件事，顺序错了每一步都会在后面爆雷。以"给 Qwen2.5 增加专用工具调用 token"为例：</p>
+    <div class="code-wrap">
+      <span class="code-label">add_custom_template.py — 特殊 token 注册到模板保存的完整流程</span>
+      <pre class="code"><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
+
+# ---- 第一步：注册特殊 token（进词表、保证不被 BPE 拆开）----
+tok = AutoTokenizer.from_pretrained(MODEL_ID)
+new_tokens = ["&lt;|tool_call_start|&gt;", "&lt;|tool_call_end|&gt;",
+              "&lt;|tool_output_start|&gt;", "&lt;|tool_output_end|&gt;"]
+num_added = tok.add_special_tokens(
+    {"additional_special_tokens": new_tokens})   # special=True：BPE 永不拆分
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID, torch_dtype=torch.bfloat16)
+
+# ---- 第二步：词表扩容（embedding 与 lm_head 同步 resize）----
+model.resize_token_embeddings(len(tok))          # Qwen2.5-7B 词嵌入与 lm_head 绑定，
+                                                 # resize 同时覆盖两者
+# ---- 第三步：新 embedding 用词表均值初始化，降低初期扰动 ----
+with torch.no_grad():
+    emb = model.get_input_embeddings().weight
+    mean_vec = emb[:-num_added].mean(dim=0)      # 旧词表的均值向量
+    emb[-num_added:] = mean_vec                  # 新增行从均值出发
+
+# ---- 第四步：注入 Jinja 模板并保存 ----
+tok.chat_template = """{%- for message in messages -%}
+{%- if message['role'] == 'user' -%}
+{{ '&lt;|im_start|&gt;user\\n' + message['content'] + '&lt;|im_end|&gt;\\n' }}
+{%- elif message['role'] == 'tool' -%}
+{{ '&lt;|im_start|&gt;tool\\n&lt;|tool_output_start|&gt;' + message['content']
+   + '&lt;|tool_output_end|&gt;&lt;|im_end|&gt;\\n' }}
+{%- elif message['role'] == 'assistant' -%}
+{{ '&lt;|im_start|&gt;assistant\\n' + message['content'] + '&lt;|im_end|&gt;\\n' }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{ '&lt;|im_start|&gt;assistant\\n' }}{%- endif -%}"""
+
+tok.save_pretrained("models/qwen25-tool")        # 模板与新 token 随 tokenizer 保存
+model.save_pretrained("models/qwen25-tool")      # 扩容后的权重整体保存
+
+# ---- SFT 侧的必做配套（否则新 token 学不会）----
+# 1) 训练数据中保证新 token 有足量出现次数（经验：每个新 token 数千次以上）
+# 2) LoRA：把 embed_tokens / lm_head 加进 target_modules，或全参训练
+# 3) 评测时检查新 token 的 embedding 范数与旧词表是否同量级（异常大=没训到）</code></pre>
+    </div>
+    <p>流程里有三个"顺序即正确性"的要点。<strong>第一，先注册再扩容</strong>：<code>resize_token_embeddings(len(tok))</code> 的目标尺寸由 tokenizer 决定，token 没注册就 resize 是白扩。<strong>第二，resize 必须在保存前、训练前</strong>：训练中途扩容会破坏优化器状态与已保存 checkpoint 的形状一致性。<strong>第三，新 token 的 embedding 初始化 + 训练保障缺一不可</strong>：均值初始化只解决"起点不离谱"，真正学到语义靠 SFT 数据里的出现次数与可训练的 embedding——只训 LoRA 不挂 embedding 层，新 token 永远是"均值向量"，模型对它的行为是随机的。</p>
+    <div class="callout note">
+      <div class="callout-title">📘 与第 13、14 章的连接</div>
+      <p>这个流程同时是前面两章的汇合点：新 token 注册后，第 13 章的 collator 逐轮渲染自然会把新 token 收进 assistant 区间（含 <code>&lt;|im_end|&gt;</code> 等收尾 token）；第 14 章的 LoRA 若选了"扩词表配置"，需要把 <code>embed_tokens/lm_head</code> 加进 target_modules（表 14-2 的第四行）。模板、词表、损失、参数效率四件事在这里咬合。</p>
+    </div>
+    <p><strong>本节小结：</strong>自定义模板四步固定顺序——注册 token、resize、初始化并训练 embedding、注入模板并保存；新 token 学不学得会取决于数据频次与 embedding 可训练性，不取决于模板本身。</p>
+
+    <h2>7. 工具调用与多模态模板：扩展格式的两个代表</h2>
+    <p>工具调用（Function Calling）与多模态是模板扩展最集中的两个场景，它们的共同本质是：<strong>在对话流里插入"非自然语言的结构化片段"，并让模板为这些片段安排专用的边界标记</strong>。先看 Qwen2.5 的工具调用渲染（其工具标签是普通文本，不是特殊 token）：</p>
+    <div class="code-wrap">
+      <span class="code-label">tool_call_template.py — 工具调用的模板编排</span>
+      <pre class="code"><code class="language-python">tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "查询城市天气",
+        "parameters": {"type": "object",
+                       "properties": {"city": {"type": "string"}},
+                       "required": ["city"]},
+    },
+}]
+messages = [
+    {"role": "user", "content": "北京现在多少度？"},
+    {"role": "assistant",
+     "content": "&lt;tool_call&gt;\n{\"name\": \"get_weather\", "
+                "\"arguments\": {\"city\": \"北京\"}}\n&lt;/tool_call&gt;"},
+    {"role": "tool", "content": "{\"temp_c\": 25}"},
+]
+text = tok.apply_chat_template(messages, tokenize=False, tools=tools)
+# Qwen2.5 渲染要点：
+# 1) tools 定义被序列化进 system 轮（&lt;tools&gt;...&lt;/tools&gt; JSON Schema 文本）
+# 2) assistant 的调用包在 &lt;tool_call&gt;...&lt;/tool_call&gt;（普通文本，可被 BPE 拆分）
+# 3) 工具返回值渲染为 user 方向的 &lt;tool_response&gt;...&lt;/tool_response&gt; 轮
+# 对照：LLaMA-3.1 走另一条路线——&lt;|python_tag|&gt; 等专用特殊 token + JSON 文本</code></pre>
+    </div>
+    <p>两条路线的取舍正好对应第 4 节的"特殊 token vs 文本标签"：Qwen 用文本标签，优点是不动词表、tokenizer 零改动，缺点是边界可能被 BPE 拆分、解析要靠字符串匹配；LLaMA-3.1 用专用特殊 token，边界稳定、便于引擎识别，代价是必须走第 6 节的注册-扩容-训练流程。<strong>训练工具调用模型时的模板纪律</strong>只有三条：assistant 生成的调用片段（含首尾标签）必须完整落在训练区间内；工具返回轮通常作为 user 方向输入、不参与训练；tools 定义进 system 区、默认不训练（除非你想让模型学会"读工具说明书"）。多模态模板是同构的扩展：视觉 token 以占位符形式进入文本流——LLaVA 系用 <code>&lt;image&gt;</code> 占位，Qwen-VL 用 <code>&lt;|vision_start|&gt;&lt;|image_pad|&gt;...&lt;|vision_end|&gt;</code>，其中 <code>&lt;|image_pad|&gt;</code> 的<strong>重复次数等于视觉编码器输出的 patch 数</strong>，由 processor 在运行时动态填充。多模态后训练的完整话题在第 50 章展开，这里只需记住：占位符的个数与位置都是模板契约的一部分，错了就是静默的对齐失败。</p>
+    <p><strong>本节小结：</strong>工具/多模态模板 = 结构化片段 + 专用边界标记；文本标签省钱但边界不稳，特殊 token 稳定但要走注册流程；工具调用训练的纪律是"调用片段全训、返回与工具书不训"。</p>
+
+    <h2>8. 模板与 loss mask 的联动：边界归属规则</h2>
+    <p>第 13 章已经讲了 mask 的机制，本章补上它的模板侧语义：<strong>mask 区间由模板的边界 token 决定，而边界 token 的"归属"有一套需要明确的规则</strong>。用 ChatML 逐个部件过一遍：assistant 轮渲染为 <code>&lt;|im_start|&gt;assistant\n{content}&lt;|im_end|&gt;\n</code>，其中每个部件的归属是——<code>&lt;|im_start|&gt;assistant\n</code> 属于<strong>输入侧</strong>（它是"生成提示"的一部分，推理时由 add_generation_prompt 提供，训练时必须被 mask）；<code>content</code> 属于<strong>输出侧</strong>（训练）；<code>&lt;|im_end|&gt;</code> 属于<strong>输出侧</strong>（必须训练，它是"学会停止"的载体）；紧跟其后的 <code>\n</code> 属于<strong>输入侧</strong>（它是下一轮开始的前奏，模型不需要学着生成它）。这套归属规则的效果：训练目标与推理分布完全对齐——推理时模型拿到的正是"提示 + 自己已生成的内容"，它要学的只有"给定提示生成内容与停止"。</p>
+    <p>规则落实到 <code>assistant_masks</code>/<code>generation</code> 标记时有一个已知的不精确性：generation 块通常按"content + 收尾 token"划界，尾随 <code>\n</code> 的归属在不同模板里写法不一，个别模板会把换行划进训练区。这属于可容忍的噪声（一两个 token 的偏差），但<strong>收尾 token 本身被划出训练区就是事故</strong>（第 13 章表 13-5 第 5 条）。给一张归属速查表，写模板/审模板时对照：</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>模板部件（ChatML 例）</th><th>归属</th><th>训练？</th><th>原因</th></tr></thead>
+        <tbody>
+          <tr><td>&lt;|im_start|&gt;role\n</td><td>输入侧（生成提示）</td><td>否</td><td>推理时由 add_generation_prompt 提供，模型不必学</td></tr>
+          <tr><td>assistant 的 content</td><td>输出侧</td><td>是</td><td>唯一真正的生成目标</td></tr>
+          <tr><td>&lt;|im_end|&gt; / &lt;|eot_id|&gt; / &lt;/s&gt;</td><td>输出侧</td><td>必须</td><td>"学会停止"的唯一载体；漏训即复读</td></tr>
+          <tr><td>im_end 之后的 \n</td><td>输入侧</td><td>否（推荐）</td><td>属于下一轮前奏；个别模板划入训练区，属可容忍噪声</td></tr>
+          <tr><td>user/system 的全部内容</td><td>输入侧</td><td>按第 13 章策略 A/B/D 决定</td><td>与模板无关，是独立的策略选择</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 15-2：ChatML 各模板部件的 loss 归属速查。其他家族规则同构：把 im_start/role 换成 header 三件套（LLaMA-3）或 [INST]（LLaMA-2/Mistral）即可</span>
+    </div>
+    <p><strong>本节小结：</strong>mask 的模板侧语义 = 边界 token 的归属规则：提示进 mask、内容与停止 token 进训练、轮间空隙归输入；用归属表审查任何模板的 generation 划界。</p>
+
+    <h2>9. 调试技巧：渲染检查与 token 级对齐脚本</h2>
+    <p>模板问题只能"看见"才能修，调试的核心是把 token 序列变成可肉眼检查的东西。下面是一份可直接进 CI 的对齐检查脚本，覆盖本章所有陷阱：</p>
+    <div class="code-wrap">
+      <span class="code-label">check_template.py — 模板对齐检查（可进 CI）</span>
+      <pre class="code"><code class="language-python">def check_template(tok, messages: list[dict]) -&gt; None:
+    """对一段样本做四层检查；任何一层失败都说明模板或用法有问题。"""
+    # ---- 检查 1：渲染文本（repr 让 \n、空格、全角字符全部可见）----
+    text = tok.apply_chat_template(messages, tokenize=False)
+    print("渲染文本：", repr(text))
+
+    # ---- 检查 2：token 层（BOS 计数、特殊 token 是否被拆碎）----
+    ids = tok.apply_chat_template(messages, tokenize=True, add_special_tokens=False)
+    if tok.bos_token_id is not None:
+        n_bos = sum(1 for i in ids if i == tok.bos_token_id)
+        assert n_bos == 1, f"BOS 出现 {n_bos} 次（预期 1）：双 BOS 或零 BOS"
+    for sp in tok.additional_special_tokens or []:
+        # 特殊 token 的 id 序列长度应为 1；被拆成多段说明注册失效
+        assert len(tok(sp, add_special_tokens=False).input_ids) == 1, \
+            f"特殊 token {sp} 被 BPE 拆开，检查 add_special_tokens 注册"
+
+    # ---- 检查 3：逐轮区间与解码回读（区间内容应等于 assistant 内容+停止 token）----
+    prev, spans = 0, []
+    for i in range(len(messages)):
+        part = tok.apply_chat_template(messages[: i + 1],
+                                       tokenize=True, add_special_tokens=False)
+        if messages[i]["role"] == "assistant":
+            spans.append((prev, len(part)))
+        prev = len(part)
+    for s, e in spans:
+        print("训练区间 decode：", repr(tok.decode(ids[s:e])))
+        # 断言：区间内必须包含轮级停止 token
+        assert tok.eos_token_id in ids[s:e], "停止 token 不在训练区间内！"
+
+    # ---- 检查 4：往返可逆性（decode→encode 不应改变序列）----
+    round_trip = tok(tok.decode(ids), add_special_tokens=False).input_ids
+    assert round_trip == ids, "decode→encode 不可逆：存在合并/拆分漂移"
+
+# 典型调用：
+# check_template(tok, [{"role": "user", "content": "你好"},
+#                      {"role": "assistant", "content": "你好，有什么可以帮你？"}])</code></pre>
+    </div>
+    <p>四层检查各管一类事故：检查 1 抓空格/换行/全角字符问题（人眼看 repr），检查 2 抓双 BOS 与特殊 token 拆分，检查 3 抓 mask 边界与停止 token 归属（第 13 章的逐轮渲染法在这里复用），检查 4 抓"字符串层面改数据"的隐患。实践中再补两个习惯：<strong>其一，把训练时真实送入模型的首个 batch 完整 dump 到磁盘</strong>（<code>decode(input_ids)</code> 与 <code>labels != -100</code> 的区间），训练启动后第一件事核对它——很多模板问题在 step 0 就能发现，而不是训练完评测时。<strong>其二，为每个新模板写 5 条固定样本的快照测试</strong>：单轮、多轮、带 system、带工具调用、超长截断，渲染结果与基线 diff，模板升级时任何变化都逃不掉。</p>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：把推理请求也纳入同一套检查</div>
+      <p>训练侧的检查脚本稍加改造就能检查推理侧：把推理引擎最终发送的 prompt 字符串（多数引擎有 debug/echo 开关，或从服务日志抓）走一遍检查 1、2、4，再断言"stop 参数包含轮级停止 token 的字符串形式"。训练与推理共用一份模板测试用例，是保证图 15-2 上路径的唯一机制化手段。</p>
+    </div>
+    <p><strong>本节小结：</strong>模板调试 = 渲染 repr + token 断言 + 区间回读 + 往返可逆四层检查；配 batch dump 与快照测试，模板问题从"上线后炸"变成"CI 里拦"。</p>
+
+    <h2>10. 本章小结</h2>
+    <ul>
+      <li><strong>模板的地位</strong>：它是训练、推理、词表三方共享的契约；错误全部静默，唯一防御是把模板纳入测试与发布检查单。</li>
+      <li><strong>机制</strong>：apply_chat_template 的四个关键参数（tokenize=False 调试、add_generation_prompt、隐式 add_special_tokens=False、assistant mask）各司其职；generation 标记是模板与 loss mask 的接口。</li>
+      <li><strong>六大家族</strong>：ChatML/LLaMA-2/LLaMA-3/Qwen/Mistral/DeepSeek/Gemma 的差异集中在 system 去向、停止 token、BOS、换行归属、特殊字符五点；以官方 tokenizer 配置为唯一事实来源。</li>
+      <li><strong>特殊 token 三陷阱</strong>：双 BOS、轮级/文档级停止混用、文本标签冒充特殊 token；一切以 tokenize 后的 id 为准。</li>
+      <li><strong>一致性</strong>：mismatch 三模式（跨家族错配、停止 token 不一致、引擎兜底模板）靠发布四项检查单与线上 prompt 录制防御。</li>
+      <li><strong>自定义流程</strong>：注册 token → resize embedding → 均值初始化并确保 embedding 可训练 → 注入模板保存；新 token 的学习靠数据频次，不靠模板。</li>
+      <li><strong>扩展格式</strong>：工具调用与多模态 = 结构化片段 + 专用边界；调用片段全训、工具书与返回轮不训。</li>
+      <li><strong>调试</strong>：四层检查脚本（repr 渲染、token 断言、区间回读、往返可逆）+ 首 batch dump + 模板快照测试。</li>
+    </ul>
+    <p>至此第 3 部分的"机制三部曲"完整：第 12 章讲 SFT 的数学与数据，第 13 章讲损失的实现细节，本章补齐 token 边界与模板契约，第 14 章解决了训多少参数的问题。接下来第 16 章回到"炼丹"层面：SFT 的实践法则、灾难性遗忘的诊断与缓解。</p>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：Qwen（ChatML）与 LLaMA-3 在"停止 token"上的关键区别是什么？各需要配置推理 stop 参数为哪些 token？</summary><p>关键区别是"轮级停止"与"文档级终止"的分离程度。Qwen 的轮级停止就是 &lt;|im_end|&gt;（&lt;|endoftext|&gt; 主要作文档终止/填充），推理 stop 配 &lt;|im_end|&gt; 即可，SFT 标签里训练的也是它。LLaMA-3 明确分成两个：&lt;|eot_id|&gt; 是轮级（end of turn），&lt;|end_of_text|&gt; 是文档级——多轮对话推理应 stop 在 &lt;|eot_id|&gt;，若错配成 &lt;|end_of_text|&gt;，模型可能在整个文档层面结束（对话提前终止）或不触发停止条件而复读到上限。SFT 侧同理：标签里的"停止"必须与推理 stop 使用同一个轮级 token。</p></details>
+      <details><summary>问题 2：写出"双 BOS"的一种产生方式，以及它为什么在短 prompt 上危害更大。</summary><p>典型产生方式：先 apply_chat_template(tokenize=False) 渲染成文本，再用 tok(text) 默认参数编码——tokenizer 又追加了一次 BOS，而模板开头已经有一个 &lt;s&gt;/&lt;bos&gt;/&lt;|begin_of_text|&gt;。危害与长度的关系：BOS 在预训练/对齐中承担"序列起点"的角色，开头连续两个 BOS 对分布是一个固定偏移；对话很长时这个偏移被稀释，但短 prompt（几个到几十个 token）中它占比显著，条件分布整体偏离训练所见，短问答质量最先劣化。防御：统一使用 apply_chat_template(tokenize=True)，或在自渲染路径显式传 add_special_tokens=False。</p></details>
+      <details><summary>问题 3：为什么"只在模板里写上新 token 字符串"是不够的？完整说清一个新特殊 token 从注册到被正确生成要经过哪些环节。</summary><p>模板字符串要成为模型能生成、tokenizer 不拆分的 token，需要四个环节协同：① 注册——tokenizer.add_special_tokens({"additional_special_tokens": [...]})，使其成为独立词条、BPE 永不拆分；② 扩容——model.resize_token_embeddings(len(tok))，让 embedding 与 lm_head（未绑定时两者都要）长出对应行；③ 初始化与训练——新行随机初始化，先用旧词表均值初始化降低起点扰动，再通过 SFT 数据让新 token 有数千次以上出现，且 embedding（LoRA 场景为 embed_tokens/lm_head）可训练；④ 模板与保存——chat_template 引用该 token，save_pretrained 整体落盘。缺任何一环的症状分别是：BPE 拆碎边界、embedding 越界错误、模型对该 token 行为随机、他人加载时模板丢失。</p></details>
+      <details><summary>问题 4：训练侧一切模板正确，但上线后模型复读不停。列出至少三个与模板相关的排查点。</summary><p>排查点一：推理引擎的 stop 列表——是否包含训练的轮级停止 token（如 &lt;|im_end|&gt;/&lt;|eot_id|&gt;），还是配了文档级或干脆没配；排查点二：引擎使用的 chat_template——tokenizer_config 里缺模板时部分引擎回退内置默认模板，与训练格式错配（用请求日志/echo 核对实际发送字节）；排查点三：SFT 数据的收尾 token 是否真的在训练区间——某些 mask 实现把 im_end 之前的换行/之后的空格切错，导致模型从未学过"何时停"（即使训练侧"看起来"正确，也要用检查 3 的区间回读验证）；排查点四：add_generation_prompt 的使用——推理请求没有追加生成提示时，模型面对的输入与训练分布不同，可能直接续写用户内容或复读。四项都能用第 9 节的检查脚本在分钟级定位。</p></details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Touvron+, 2023]</span> Touvron, H. et al. "Llama 2: Open Foundation and Fine-Tuned Chat Models." 2023. <span class="rid">arXiv:2307.09288</span></li>
+      <li><span class="rid">[Grattafiori+, 2024]</span> Grattafiori, A. et al. "The Llama 3 Herd of Models." 2024. <span class="rid">arXiv:2407.21783</span></li>
+      <li><span class="rid">[Bai+, 2023]</span> Bai, J. et al. "Qwen Technical Report." 2023. <span class="rid">arXiv:2309.16609</span></li>
+      <li><span class="rid">[Yang+, 2024]</span> Yang, A. et al. "Qwen2.5 Technical Report." 2024. <span class="rid">arXiv:2412.15115</span></li>
+      <li><span class="rid">[Jiang+, 2023]</span> Jiang, A. Q. et al. "Mistral 7B." 2023. <span class="rid">arXiv:2310.06825</span></li>
+      <li><span class="rid">[Bi+, 2024]</span> Bi, X. et al. "DeepSeek LLM: Scaling Open-Source Language Models with Longtermism." 2024. <span class="rid">arXiv:2401.02954</span></li>
+      <li><span class="rid">[Gemma Team, 2024]</span> Gemma Team. "Gemma: Open Models Based on Gemini Research and Technology." 2024. <span class="rid">arXiv:2403.08295</span></li>
+      <li><span class="rid">[Tunstall+, 2023]</span> Tunstall, L. et al. "Zephyr: Direct Distillation of LM Alignment." 2023. <span class="rid">arXiv:2305.18290</span></li>
+      <li><span class="rid">[Sclar+, 2024]</span> Sclar, M. et al. "Quantifying Language Models' Sensitivity to Spurious Features in Prompt Design." <i>ICLR</i>, 2024. <span class="rid">arXiv:2310.11324</span></li>
+      <li><span class="rid">[Schick+, 2023]</span> Schick, T. et al. "Toolformer: Language Models Can Teach Themselves to Use Tools." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2302.04761</span></li>
+      <li><span class="rid">[Lambert+, 2024]</span> Lambert, N. et al. "Tülu 3: Pushing Frontiers in Open Language Model Post-Training." 2024. <span class="rid">arXiv:2411.15124</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

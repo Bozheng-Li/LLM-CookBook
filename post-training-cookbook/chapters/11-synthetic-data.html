@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 11 章 · 合成数据与 RLAIF 数据化 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 2 部分 · 后训练数据工程</div>
+      <h1>第 11 章 · 合成数据与 RLAIF 数据化</h1>
+      <p class="chapter-lead">合成数据已是后训练数据的主要增量来源，但收益与风险同样真实。本章从模型坍塌讲到三大生成范式，从 RLAIF、judge 偏差、蒸馏合规讲到数据飞轮，并给出验证器回路合成推理数据的完整代码与质量评估方法。</p>
+      <div class="chapter-meta">⏱ 预计学习 90 分钟 ｜ 难度 ★★★☆☆ ｜ 先修：第 8 章、第 9 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 合成数据的合法性：收益、风险与模型坍塌</h2>
+    <p>第 8 章已经给了合成数据的经济账（Self-Instruct 用约 600 美元生成 5 万条指令），这里补上反面：合成数据有两个层面的"合法性"要过审。<strong>许可层面</strong>：用什么模型生成、生成物能不能商用，取决于教师模型的使用条款与数据许可证，第 5 节专门讨论。<strong>分布层面</strong>：递归使用合成数据会触发 <span class="term">模型坍塌（model collapse）</span>——这是合成数据最重要的科学风险，必须先讲清楚。</p>
+    <p>Shumailov 等人发表于 Nature 的工作（"AI models collapse when trained on recursively generated data"，2024；arXiv:2305.17493）证明了坍塌机制：用模型自己生成的数据训练模型、再迭代下去，分布的<strong>尾部会逐代丢失</strong>——高频模式被反复强化，低频但重要的内容（罕见表达、少数群体语言、冷门知识）被逐代稀释，最终模型输出退化为上一代模型的"回声"。论文的高斯示例最直观：每次用采出的样本重新拟合分布，方差逐代缩小，几代之后分布收缩成一个尖峰；LLM 实验同样观察到递归若干代后输出多样性的系统性衰减。</p>
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：坍塌的前提是"替换"，不是"增广"</div>
+      <p>Gerstgrasser 等人（arXiv:2404.01413）把坍塌实验重新拆解后得到一个关键区分：<strong>替换式</strong>训练（每代用新合成数据替换旧数据）会坍塌；<strong>累积式</strong>训练（真实数据始终保留、合成数据不断累加）在实验中不发生坍塌——真实数据把分布锚住了。工程结论：合成数据做"增量增广"，不做"代际替换"；混合体中真实数据打底（经验上不低于一半），并保留采样温度与多样本采样（n&gt;1）的多样性来源。把这条纪律写进数据卡片，比事后补救便宜得多。</p>
+    </div>
+    <p>由此得到合成数据在混合体中的合理定位：真实数据（用户日志、专家标注、开源精选）负责分布的"底盘"，合成数据负责"定向增量"——补覆盖度缺口、补难度阶梯、制造可验证的训练信号。第 10 章第 7 节"来源轴"配比中合成数据的份额，应当由这一定位决定，而不是"能生成多少就塞多少"。</p>
+    <p><strong>本节小结：</strong>合成数据过两道合法性审查——许可（第 5 节）与分布（模型坍塌）；防坍塌的纪律是"累积不替换、真实打底、合成做定向增量"。</p>
+
+    <h2>2. 合成数据生成三大范式</h2>
+    <p>第 8 章把 Self-Instruct、Evol-Instruct、Magpie 当作独立方法逐一拆解，本章把它们收纳进一个更抽象的框架：<strong>所有合成数据管线都可以归入三种范式</strong>，区别只在于"数据从哪来、质量靠什么保证"。图 11-1 是三条路径的对照。</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 310" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="合成数据三大生成范式">
+        <defs><marker id="arrow11a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">合成数据三大生成范式：同一个目标，三种获取路径</text>
+        <rect x="10" y="44" width="700" height="74" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <rect x="18" y="53" width="118" height="56" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="77" y="72" text-anchor="middle" font-size="14" fill="#1e3a8a">范式 A</text>
+        <text x="77" y="90" text-anchor="middle" font-size="14" fill="#1e3a8a">self-instruct 式</text>
+        <text x="77" y="106" text-anchor="middle" font-size="14" fill="#1e3a8a">种子驱动</text>
+        <rect x="155" y="53" width="118" height="56" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="214" y="72" text-anchor="middle" font-size="14" fill="#1e3a8a">种子任务池</text>
+        <text x="214" y="90" text-anchor="middle" font-size="14" fill="#1e3a8a">人工 175 条起步</text>
+        <rect x="288" y="53" width="118" height="56" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="347" y="72" text-anchor="middle" font-size="14" fill="#1e3a8a">模型滚雪球</text>
+        <text x="347" y="90" text-anchor="middle" font-size="14" fill="#1e3a8a">6+2 采样循环</text>
+        <rect x="421" y="53" width="118" height="56" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="480" y="72" text-anchor="middle" font-size="14" fill="#1e3a8a">相似度过滤</text>
+        <text x="480" y="90" text-anchor="middle" font-size="14" fill="#1e3a8a">去重 + judge</text>
+        <rect x="554" y="53" width="118" height="56" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="613" y="72" text-anchor="middle" font-size="14" fill="#1e3a8a">指令-回答对</text>
+        <text x="613" y="90" text-anchor="middle" font-size="14" fill="#1e3a8a">入库（第 10 章）</text>
+        <rect x="10" y="126" width="700" height="74" rx="12" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <rect x="18" y="135" width="118" height="56" rx="8" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="77" y="154" text-anchor="middle" font-size="14" fill="#92400e">范式 B</text>
+        <text x="77" y="172" text-anchor="middle" font-size="14" fill="#92400e">逆向翻译式</text>
+        <text x="77" y="188" text-anchor="middle" font-size="14" fill="#92400e">文档驱动</text>
+        <rect x="155" y="135" width="118" height="56" rx="8" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="214" y="154" text-anchor="middle" font-size="14" fill="#92400e">高质量文档</text>
+        <text x="214" y="172" text-anchor="middle" font-size="14" fill="#92400e">网页/书/代码</text>
+        <rect x="288" y="135" width="118" height="56" rx="8" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="347" y="154" text-anchor="middle" font-size="14" fill="#92400e">反推指令</text>
+        <text x="347" y="172" text-anchor="middle" font-size="14" fill="#92400e">什么任务产生它</text>
+        <rect x="421" y="135" width="118" height="56" rx="8" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="480" y="154" text-anchor="middle" font-size="14" fill="#92400e">成对与过滤</text>
+        <text x="480" y="172" text-anchor="middle" font-size="14" fill="#92400e">一致性打分</text>
+        <rect x="554" y="135" width="118" height="56" rx="8" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="613" y="154" text-anchor="middle" font-size="14" fill="#92400e">(指令, 文档)</text>
+        <text x="613" y="172" text-anchor="middle" font-size="14" fill="#92400e">回答天然自包含</text>
+        <rect x="10" y="208" width="700" height="74" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <rect x="18" y="217" width="118" height="56" rx="8" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="77" y="236" text-anchor="middle" font-size="14" fill="#065f46">范式 C</text>
+        <text x="77" y="254" text-anchor="middle" font-size="14" fill="#065f46">验证器回路式</text>
+        <text x="77" y="270" text-anchor="middle" font-size="14" fill="#065f46">可验证驱动</text>
+        <rect x="155" y="217" width="118" height="56" rx="8" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="214" y="236" text-anchor="middle" font-size="14" fill="#065f46">种子题目</text>
+        <text x="214" y="254" text-anchor="middle" font-size="14" fill="#065f46">带金标答案</text>
+        <rect x="288" y="217" width="118" height="56" rx="8" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="347" y="236" text-anchor="middle" font-size="14" fill="#065f46">生成 k 个解答</text>
+        <text x="347" y="254" text-anchor="middle" font-size="14" fill="#065f46">高温多样采样</text>
+        <rect x="421" y="217" width="118" height="56" rx="8" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="480" y="236" text-anchor="middle" font-size="14" fill="#065f46">验证器判定</text>
+        <text x="480" y="254" text-anchor="middle" font-size="14" fill="#065f46">答案/测试通过</text>
+        <rect x="554" y="217" width="118" height="56" rx="8" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="613" y="236" text-anchor="middle" font-size="14" fill="#065f46">正确解入库</text>
+        <text x="613" y="254" text-anchor="middle" font-size="14" fill="#065f46">错误解可回流</text>
+        <path d="M138 81 L 153 81" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M275 81 L 286 81" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M408 81 L 419 81" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M541 81 L 552 81" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M138 163 L 153 163" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M275 163 L 286 163" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M408 163 L 419 163" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M541 163 L 552 163" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M138 245 L 153 245" stroke="#10b981" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M275 245 L 286 245" stroke="#10b981" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M408 245 L 419 245" stroke="#10b981" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <path d="M541 245 L 552 245" stroke="#10b981" stroke-width="2" marker-end="url(#arrow11a)"/>
+        <text x="360" y="300" text-anchor="middle" font-size="14" fill="#1e293b">范式 C 的错误解不要扔：批评-修正可构造自纠轨迹，正确-错误可构造偏好对（第 7、9 节）</text>
+      </svg>
+      <figcaption>图 11-1：合成数据三大生成范式——种子驱动、文档驱动、可验证驱动（作者自绘；范式 A 的方法细节见第 8 章）</figcaption>
+    </figure>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>范式</th><th>输入</th><th>产出</th><th>质量保障</th><th>代表工作</th><th>失效场景</th></tr></thead>
+        <tbody>
+          <tr><td>A：self-instruct 式</td><td>少量种子任务</td><td>指令-回答对</td><td>相似度去重 + judge 打分</td><td>Self-Instruct、Evol-Instruct、Magpie（第 8 章）</td><td>多样性坍缩、难度漂移；答案无真值</td></tr>
+          <tr><td>B：逆向翻译式</td><td>高质量文档语料</td><td>(反推指令, 原文档) 对</td><td>指令-内容一致性打分</td><td>Instruction Backtranslation（Li et al., 2023, arXiv:2308.06259）</td><td>指令与内容错位；文档质量是天花板</td></tr>
+          <tr><td>C：验证器回路式</td><td>带金标答案/可测试的题目</td><td>筛过的解答、偏好对、自纠轨迹</td><td>执行/答案验证器（硬判据）</td><td>STaR、RFT（见第 2.3 节）</td><td>只适用可验证领域；验证器漏洞即数据漏洞</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 11-1：三大生成范式对比——差异的本质是"质量信号的强度"：A 靠打分器，B 靠一致性，C 靠硬验证</span>
+    </div>
+    <p>范式 B 值得多说两句。<span class="term">指令回译（Instruction Backtranslation）</span>（Li et al., 2023, arXiv:2308.06259）的流程：对一批高质量网络文档，让模型反推"什么样的指令会自然产生这篇回答"，组成 (指令, 文档) 对；再对每对做指令-内容一致性打分，只留高分对训练，并可迭代第二轮。它的独特优势是<strong>回答端的质量由真实文档保证</strong>（不是模型编的），避免了范式 A"答案无真值"的软肋；代价是指令端是猜的，错位样本要靠打分器拦截。RAG 产品的"文档→问答对"合成也是同一范式，是生产中最常用的数据合成形态之一。</p>
+    <p><strong>本节小结：</strong>三大范式的分野在质量信号强度——A 靠打分器、B 靠文档锚定、C 靠硬验证；选范式先看你的领域有没有可验证的判据，有则优先 C。</p>
+
+    <h2>3. RLAIF 与 AI 反馈：数据视角</h2>
+    <p>第 9 章讲偏好数据时，"谁来当裁判"的答案还是人类标注员与 LLM 打分器。本节把后者推到极致：当 AI 反馈成为偏好数据的主要来源，就进入了 <span class="term">RLAIF（Reinforcement Learning from AI Feedback）</span>的地界。机制细节（宪法起草、批评-改写、RL 阶段）留给第 33 章，这里只取数据视角的三个要点。</p>
+    <p><strong>（1）宪法就是可审计的标注规范。</strong>Constitutional AI（Bai et al., 2022, arXiv:2212.08073）先用一组书面原则（宪法）让模型批评并改写自己的输出，构成 SFT 数据；再让模型基于原则对两个输出做比较，构成偏好对训练奖励模型。数据视角的本质变化：<strong>标注规范从"人脑里的共识"变成"写得下来的条款"</strong>——宪法可以直接进入代码库做版本管理，改一条原则就能定向改变数据分布，这是人类标注做不到的迭代速度。</p>
+    <p><strong>（2）成本从人时变成 token。</strong>Anthropic 在 CAI 论文中报告了 RL-CAI 阶段完全不用人类偏好标注的做法；Lee 等人的 RLAIF 实验（arXiv:2309.00267）进一步证明：在摘要任务上，AI 反馈训练的模型与人类反馈训练的模型偏好度相当，且即使 AI 标注器较小、提示词较简陋，RLAIF 与 RLHF 的差距也不显著——AI 反馈的性价比在多数场景下碾压人工，前提是你接受它的偏差（下一节）。</p>
+    <p><strong>（3）AI 反馈不是免费的真理。</strong>RLAIF 的偏好数据继承 judge 的一切偏差：长度偏好、位置偏好、自我偏好。而且因为生成-打分用的是同一个（或同一族）模型，这些偏差会<strong>系统地</strong>进入偏好对，让模型学到"人类喜欢长答案"这种伪规律。所以 RLAIF 管线的标准配置是：judge 与生成模型异构、成对比较交换位置、保留一个人工金标子集持续校准（第 9 章的偏差审计在这里全部适用）。</p>
+    <p><strong>本节小结：</strong>RLAIF 的数据学意义是把标注规范变成可版本管理的宪法、把标注成本降到 token 级；但它把 judge 偏差也变成了数据的一部分，校准手段不可省略。</p>
+
+    <h2>4. LLM-as-annotator 的偏差与校准</h2>
+    <p>第 9 章给过偏差清单与审计动作，本节从"标注器"角度系统化：把 LLM 当标注员用，它在替你定义"什么是好数据"，而它的定义有四个已知缺口，每个都有对应的校准手段，见表 11-2。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>偏差</th><th>机制</th><th>检测方法</th><th>校准手段</th></tr></thead>
+        <tbody>
+          <tr><td>位置偏差</td><td>成对比较时系统性偏爱首个位置（MT-Bench 论文实测显著）</td><td>交换 A/B 位置重评，统计结论翻转率</td><td>双位置都评；仅取一致对，不一致对进人工仲裁</td></tr>
+          <tr><td>长度偏差</td><td>同等质量下偏爱更长、更面面俱到的回答</td><td>统计 chosen/rejected 长度差分布</td><td>长度分桶内比较；judge 提示词显式声明"不以长度加分"</td></tr>
+          <tr><td>自我偏好</td><td>偏爱自己（或同族模型）生成的回答，即使质量无差（Panickssery et al., 2024, arXiv:2404.13076）</td><td>把 judge 自家的输出与其他模型输出成对送评，看胜率</td><td>judge 与生成模型异构；judge 评测前做匿名化改写</td></tr>
+          <tr><td>格式偏好</td><td>偏爱 Markdown 排版、分点、加粗等"看起来专业"的表面特征</td><td>统计 chosen/rejected 的 Markdown 符号数差</td><td>在评测集中混入"内容好但朴素"的金标样本校准阈值</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 11-2：LLM 标注器的四类系统性偏差与校准手段（检测与缓解均应在数据管线中自动化）</span>
+    </div>
+    <p>三个补充判断。<strong>其一</strong>，偏差校准的前提是有"金标"：抽几百条让人工独立标注，持续统计 judge 与人类的一致率（第 8 章的 kappa 思想同样适用）；没有金标子集的 AI 标注管线，等于没有校验的仪表。<strong>其二</strong>，位置偏差的"双评 + 一致才用"会砍掉相当比例的样本（翻转率常见在 10~25% 区间，取决于任务），预算要按"生成量 × 2 次评审 × 留存率"估算。<strong>其三</strong>，温度与提示词对偏差的影响不亚于换模型：评审用温度 0、结构化 JSON 输出、明确的评分维度定义，能把同一模型的偏差压掉一截——先用满这些免费手段，再谈换更强的 judge。</p>
+    <p><strong>本节小结：</strong>位置、长度、自我、格式四类偏差是 LLM 标注器的出厂配置；"双位置评审 + 异构 judge + 金标校准 + 结构化输出"是标准校准四件套。</p>
+
+    <h2>5. 模仿 vs 蒸馏：从强模型"借数据"的许可与效果</h2>
+    <p>从强模型借数据是最快的起量方式，但"借"有两条完全不同的路，风险 profile 也完全不同。<strong>模仿（imitation）</strong>：黑盒场景下拿强模型的文本输出直接当训练数据（典型：把 GPT-4 的回答喂给开源模型）。<strong>蒸馏（distillation）</strong>：白盒场景下传递 logits 或特征等软信息，或如第 30 章那样蒸馏推理链。本节聚焦数据视角的模仿，白盒蒸馏在第 30 章展开。</p>
+    <h3>5.1 许可：一票否决项</h3>
+    <p>主流闭黑盒厂商的使用条款明确限制"用输出训练竞争模型"，OpenAI 的使用政策即包含此类条款。这意味着：<strong>把闭源模型输出用作商业训练数据，合规上不是灰色地带，而是要先过法务的问题</strong>；数据来源的审计链条（哪个模型、什么条款、什么时间）要写进数据卡片。开源教师模型（如 Qwen、Llama 系列的 Instruct 版）输出用于训练通常更宽松，但仍要逐条核对其许可证（第 7 章的许可证清单复用）。纯研究用途的边界同样要书面确认。</p>
+    <h3>5.2 效果：模仿学腔调，蒸馏学解释</h3>
+    <p>Gudibande 等人的系统分析（arXiv:2305.15717）给纯模仿泼了冷水：一系列模仿模型在风格上像强模型，事实性反而下降——模仿数据教的是"分布的表面"。但同一时期 Orca（Mukherjee et al., 2023, arXiv:2306.02707）给出了正面证据：它从 ChatGPT 与 GPT-4 采集约 500 万 + 100 万条<strong>带完整解释轨迹</strong>的回答（explanation tuning，覆盖 FLAN 系列的多样任务并做了系统化的任务缩放与采样），Orca-13B 在多项基准上大幅超过 Vicuna-13B，部分基准追平 ChatGPT。两者差在哪里？不在"用了谁的输出"，而在数据形态：<strong>解释轨迹让数据携带推理过程而不只是结论，多任务缩放让覆盖度跟得上，系统化采样与过滤压住了噪声</strong>。Orca 2（Mitra et al., 2023, arXiv:2311.11045）进一步把重心从"模仿答案"移到"教小模型选择推理策略"，延续了这一路线。</p>
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：把许可问题当成"反正查不到"</div>
+      <p>模型输出中携带教师模型特征是可检测的（风格指纹、逐字复现），商用后面临的下架与诉讼风险真实存在；开源许可的传染性条款（如某些非商用许可）同样会在融资与并购尽调时爆雷。两条纪律：数据卡片记录每个数据来源的模型、条款、许可证版本；商用混合体中，闭源输出派生数据单独标记、可整体摘除——一旦条款变化或收到投诉，能在一小时内把这部分数据从训练集中剥离重建。</p>
+    </div>
+    <p><strong>本节小结：</strong>模仿数据的成败在数据形态而非教师身份——解释轨迹 + 任务覆盖 + 系统过滤是 Orca 三件套；许可是独立于效果的一票否决项，来源可剥离是商用底线。</p>
+
+    <h2>6. 教师-学生数据增强：rephrase、paraphrase 与难度阶梯</h2>
+    <p>范式之外还有一类高频操作：不新增任务，只对已有样本做<strong>受控变换</strong>。三种基本算子覆盖绝大多数需求：<strong>（1）rephrase</strong>——指令的同义改写，答案不变，扩充指令分布的覆盖面；<strong>（2）paraphrase</strong>——回答的风格改写（书面↔口语、详尽↔简洁），同一语义的多种表达让模型不把"某种文风"当成正确性信号；<strong>（3）难度阶梯</strong>——沿 Evol-Instruct 的深度算子把简单任务推进为多约束、多步推理任务（第 8 章 4 节已详），为小模型造"够得着的难"。</p>
+    <p>受控变换的核心约束是<strong>语义等价</strong>：改写后答案必须仍然正确、约束仍然满足。工程上用"带通过滤"实现——改写后与原指令的嵌入相似度落在区间 [下限, 上限] 才保留：低于下限说明改写漂移了语义（教错信号），高于上限说明改写太保守（等于没改，浪费配额）。注意这层增强与模型坍塌的关系：纯改写是分布收缩操作，靠它无法扩展模型能力；每一批改写数据都应混入由新素材（新 persona、新文档、新约束）驱动的"新信息"样本，让增广同时是增广（呼应第 1 节的累积式纪律）。</p>
+    <div class="code-wrap">
+      <span class="code-label">paraphrase_augment.py</span>
+      <pre class="code"><code class="language-python">"""教师-学生改写增强：1 条指令扩成 N 条语义等价变体（带通过滤）
+依赖：pip install openai sentence-transformers
+"""
+import json
+import numpy as np
+from openai import OpenAI
+from sentence_transformers import SentenceTransformer
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+enc = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+
+REWRITE_PROMPT = """请把下面的指令改写成 {n} 个语义等价但表述不同的变体：
+- 保持任务目标、约束条件与难度完全不变
+- 改变句式、视角或措辞（如陈述句↔疑问句、书面↔口语）
+- 逐行输出，不要编号，不要解释
+原指令：{inst}"""
+
+def augment(item: dict, n: int = 4, lo: float = 0.75, hi: float = 0.95) -&gt; list:
+    """带通过滤：sim&lt;lo = 语义漂移，sim&gt;hi = 冗余改写，都丢弃"""
+    base = enc.encode([item["instruction"]], normalize_embeddings=True)[0]
+    resp = client.completions.create(
+        model="Qwen/Qwen2.5-7B-Instruct",
+        prompt=REWRITE_PROMPT.format(n=n, inst=item["instruction"]),
+        max_tokens=512, temperature=0.8)
+    variants = [l.strip() for l in resp.choices[0].text.split("\n") if len(l.strip()) &gt; 8]
+    vecs = enc.encode(variants, normalize_embeddings=True)
+    sims = vecs @ base
+    out = []
+    for v, s in zip(variants, sims):
+        if lo &lt;= float(s) &lt;= hi:                    # 带通：保语义、去冗余
+            out.append({"instruction": v,
+                        "output": item["output"],    # 答案不变：语义等价假设
+                        "src": "paraphrase", "sim": round(float(s), 3)})
+    return out
+
+if __name__ == "__main__":
+    sample = {"instruction": "把这段话总结成三个要点：……", "output": "要点如下：……"}
+    for r in augment(sample):
+        print(r["sim"], r["instruction"][:40])       # 先小批量目测带通边界</code></pre>
+    </div>
+    <p>上线前必做一次带通边界的人工目测：lo~hi 取值因编码器而异（bge 系列对中文常见任务，0.75~0.95 是合理起点），边界附近各抽 20 条，确认"漂移的被拦住、同义的被放进"。另外，paraphrase 变体的输出虽然原文保留，但建议对长回答做一次一致性复查——改写指令后原回答可能包含对原措辞的指代（"如上所述"），这类样本要改写回答或丢弃。</p>
+    <p><strong>本节小结：</strong>rephrase 扩指令覆盖、paraphrase 去风格耦合、难度阶梯造"够得着的难"；带通过滤保语义等价，改写必须混入新信息才能扩展分布。</p>
+
+    <h2>7. 合成数学/代码数据与验证器：执行反馈</h2>
+    <p>数学与代码是合成数据的特殊福地：它们有<strong>硬验证器</strong>。代码可以跑单元测试、看返回码与超时（<span class="term">执行反馈（execution feedback）</span>）；数学可以抽最终答案与金标比对（正则抽取 + sympy 等价性检查）。有了硬判据，数据质量从"打分器说了算"变成"客观事实说了算"——这是范式 C 的根本优势，也是第 26 章 RLVR（可验证奖励的强化学习）的数据地基：同一个验证器，SFT 阶段用它筛数据，RL 阶段用它当奖励。</p>
+    <p>验证器回路的完整形态是"生成-验证-迭代"的奠基性工作 <span class="term">STaR</span>（Zelikman et al., 2022, arXiv:2203.14465）：对每道题采样推理链，保留答案正确的直接入库；答案错误但有提示后能改对的，也入库；再用扩充的数据集微调模型，进入下一轮——模型自己变强，能解出的题变多，数据池随之扩大。RFT（Yuan et al., 2023, arXiv:2308.01825）聚焦拒绝采样微调：对每题保留多条<strong>推理路线不同</strong>的正确解，证明同等数据量下解法多样性显著优于重复同一解法；MetaMath（Yu et al., 2023, arXiv:2309.12284）则从题面侧增强（答案反转、改写、增条件），两者合起来给出配方：<strong>题面增强 + 解法多样性 + 硬验证</strong>。代码侧同理，Self-Debug（Chen et al., 2023, arXiv:2304.05128）展示了让模型根据测试失败信息自我修正的价值——修正前后的 (错误代码, 修正过程, 正确代码) 轨迹本身就是珍贵的教学数据。</p>
+    <div class="code-wrap">
+      <span class="code-label">verify_code.py</span>
+      <pre class="code"><code class="language-python">"""代码数据的执行反馈验证器：单元测试 + 超时 + 返回码
+生产环境请把 subprocess 换成容器/沙箱执行（隔离网络与文件系统）！
+"""
+import os
+import subprocess
+import tempfile
+
+def verify_code(solution: str, tests: str, timeout: int = 10) -&gt; bool:
+    """把生成的解答与测试拼成脚本执行；退出码 0 = 通过"""
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
+                                     encoding="utf-8") as f:
+        f.write(solution + "\n\n" + tests)
+        path = f.name
+    try:
+        r = subprocess.run(["python", path], capture_output=True, timeout=timeout)
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:                # 死循环/超时也算失败
+        return False
+    finally:
+        os.unlink(path)
+
+TESTS = '''
+assert longest_common_prefix(["flower","flow","flight"]) == "fl"
+assert longest_common_prefix(["dog","racecar","car"]) == ""
+assert longest_common_prefix(["same","same"]) == "same"
+print("ALL PASSED")
+'''
+if __name__ == "__main__":
+    cand = '''
+def longest_common_prefix(strs):
+    if not strs:
+        return ""
+    prefix = min(strs, key=len)
+    for s in strs:
+        while not s.startswith(prefix):
+            prefix = prefix[:-1]
+    return prefix
+'''
+    print(verify_code(cand, TESTS))                  # True = 该样本可入库</code></pre>
+    </div>
+    <p><strong>本节小结：</strong>数学/代码数据的护城河是硬验证器——执行反馈与答案匹配把质量判定变成客观事实；STaR/RFT/MetaMath 给出的配方是题面增强、解法多样、错误回流，同一验证器将在第 26 章升级为 RL 奖励。</p>
+
+    <h2>8. 数据飞轮：把部署变成下一轮数据采集</h2>
+    <p>前七节讲的是"单轮"的数据生产，工程上真正的杠杆是把生产变成<strong>闭环</strong>：模型上线后产生的真实交互日志，是下一轮数据的最好原料。这个循环就是 <span class="term">数据飞轮（data flywheel）</span>——第 7 章数据全景图的"回流"环节展开成完整机制，见图 11-2。</p>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 350" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="数据飞轮闭环">
+        <defs><marker id="arrow11b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">数据飞轮：把每一次部署变成下一轮数据采集的开始</text>
+        <ellipse cx="360" cy="192" rx="190" ry="112" fill="none" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="6 6"/>
+        <rect x="278" y="49" width="164" height="58" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="360" y="70" text-anchor="middle" font-size="14" fill="#1e3a8a">① 上线与日志</text>
+        <text x="360" y="92" text-anchor="middle" font-size="14" fill="#1e3a8a">请求·回答·用户反馈沉淀</text>
+        <rect x="451" y="104" width="164" height="58" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="533" y="125" text-anchor="middle" font-size="14" fill="#92400e">② 挖掘 badcase</text>
+        <text x="533" y="147" text-anchor="middle" font-size="14" fill="#92400e">差评·失败会话检索聚类</text>
+        <rect x="451" y="222" width="164" height="58" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="533" y="243" text-anchor="middle" font-size="14" fill="#92400e">③ 分型与脱敏</text>
+        <text x="533" y="265" text-anchor="middle" font-size="14" fill="#92400e">错误类型库 · PII 清洗</text>
+        <rect x="278" y="273" width="164" height="58" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="360" y="294" text-anchor="middle" font-size="14" fill="#065f46">④ 定向合成与标注</text>
+        <text x="360" y="316" text-anchor="middle" font-size="14" fill="#065f46">badcase → 新样本（第 6/7 节）</text>
+        <rect x="105" y="222" width="164" height="58" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="187" y="243" text-anchor="middle" font-size="14" fill="#5b21b6">⑤ 训练与评测</text>
+        <text x="187" y="265" text-anchor="middle" font-size="14" fill="#5b21b6">SFT / DPO + 基准集</text>
+        <rect x="105" y="104" width="164" height="58" rx="10" fill="#fef2f7" stroke="#ef4444" stroke-width="2"/>
+        <text x="187" y="125" text-anchor="middle" font-size="14" fill="#881337">⑥ 清洗与去污染</text>
+        <text x="187" y="147" text-anchor="middle" font-size="14" fill="#881337">过第 10 章全流水线</text>
+        <path d="M444 78 Q 505 82 516 108" stroke="#2563eb" stroke-width="2" fill="none" marker-end="url(#arrow11b)"/>
+        <path d="M533 164 L 533 220" stroke="#2563eb" stroke-width="2" fill="none" marker-end="url(#arrow11b)"/>
+        <path d="M516 276 Q 505 302 444 302" stroke="#2563eb" stroke-width="2" fill="none" marker-end="url(#arrow11b)"/>
+        <path d="M276 302 Q 215 302 204 282" stroke="#2563eb" stroke-width="2" fill="none" marker-end="url(#arrow11b)"/>
+        <path d="M187 220 L 187 164" stroke="#2563eb" stroke-width="2" fill="none" marker-end="url(#arrow11b)"/>
+        <path d="M204 122 Q 215 96 276 80" stroke="#2563eb" stroke-width="2" fill="none" marker-end="url(#arrow11b)"/>
+        <text x="360" y="186" text-anchor="middle" font-size="16" fill="#1e293b">数据飞轮</text>
+        <text x="360" y="210" text-anchor="middle" font-size="14" fill="#1e293b">每步产物入库可审计，</text>
+        <text x="360" y="230" text-anchor="middle" font-size="14" fill="#1e293b">转速由 badcase 分型质量决定</text>
+      </svg>
+      <figcaption>图 11-2：数据飞轮六环闭环——部署日志 → badcase 挖掘 → 分型脱敏 → 定向合成 → 训练评测 → 清洗上线（作者自绘）</figcaption>
+    </figure>
+    <p>飞轮有四个工程要害。<strong>（1）badcase 分型先行</strong>：不是所有差评都值得回流，先把 badcase 聚成错误类型库（事实错误、格式违规、拒答过度、长依赖丢失……），类型频率决定合成配额——飞轮的转速取决于分型质量，不是日志总量。<strong>（2）脱敏前置</strong>：用户日志进训练管线之前必须完成 PII 清洗与授权核对（第 7 章），这条腿断了，飞轮越快越危险。<strong>（3）回流数据占比设上限</strong>：每轮混合体中回流修正数据控制在 20~30% 以内，超过后模型分布会向"最近一周的 badcase"倾斜，通用能力被挤占（灾难性遗忘的机制见第 16 章）。<strong>（4）每轮都过清洗线</strong>：回流数据与外部数据一视同仁，走第 10 章的八道工序——飞轮里最容易混入的恰是与评测集最像的数据（你的 badcase 集往往就是评测集的场景来源），去污染必须每轮重跑。</p>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：给飞轮装"刹车"指标</div>
+      <p>每轮上线前固定看三个刹车指标：回归集（上一版已修复 badcase 的重现率）必须保持通过；通用能力基线（IFEval、领域小评测）不得回退超过噪声带；badcase 类型库的分布漂移超过 20% 就停下补通用数据。飞轮的价值在"越转越准"，而不是"越转越快"——没有刹车的飞轮通常转三圈就把模型转偏。</p>
+    </div>
+    <p><strong>本节小结：</strong>数据飞轮六环——日志、挖掘、分型脱敏、定向合成、训练评测、清洗上线；转速由 badcase 分型质量决定，回流占比设上限、每轮重跑去污染、三个刹车指标防跑偏。</p>
+
+    <h2>9. 完整代码：验证器回路的合成推理数据</h2>
+    <p>把第 2 节范式 C 与第 7 节的验证器落成一条可直接运行的流水线：对每道带金标答案的题目，高温采样 k 个解答，抽取最终答案比对金标，正确解构造 SFT 数据（一题多解增强），正确-错误配对构造偏好数据。产出的 SFT 数据直接进第 12 章，偏好对直接进第 22 章 DPO。</p>
+    <div class="code-wrap">
+      <span class="code-label">synth_reasoning.py</span>
+      <pre class="code"><code class="language-python">"""验证器回路合成推理数据：生成 k 个解答 → 只留答案正确的 → 构造 SFT 与偏好数据
+前置：vllm serve Qwen/Qwen2.5-7B-Instruct --max-model-len 4096 ；pip install openai
+运行：python synth_reasoning.py --problems gsm8k_train.jsonl
+"""
+import argparse
+import json
+import random
+import re
+from concurrent.futures import ThreadPoolExecutor
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+MODEL = "Qwen/Qwen2.5-7B-Instruct"
+
+def extract_ans(text: str) -&gt; str:
+    """抽取最终答案：约定模型以“答案是 X”收尾，取末段数字并去千分位"""
+    m = re.findall(r"-?\d[\d,\.]*", text[-200:])
+    return m[-1].replace(",", "").rstrip(".") if m else ""
+
+def solve(problem: str, k: int = 8) -&gt; list:
+    """高温采样 k 个完整解答：多样性是后续筛选的原料（n&gt;1 即保持温度）"""
+    prompt = (problem + "\n请一步一步推理，最后用一行“答案是 X”收尾。")
+    resp = client.completions.create(
+        model=MODEL, prompt=prompt, n=k,
+        max_tokens=512, temperature=0.9, top_p=0.95)
+    return [c.text for c in resp.choices]
+
+def dedup_by_route(sols: list) -&gt; list:
+    """开头 40 字相同视为同一路线，保留一条：解法多样性优先于数量"""
+    seen, out = set(), []
+    for s in sols:
+        key = s.strip()[:40]
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out
+
+def synth_one(item: dict, k: int = 8, max_pairs: int = 2):
+    gold = extract_ans(item["answer"])               # GSM8K 的 answer 以 #### N 结尾
+    if not gold:
+        return [], []
+    sols = solve(item["question"], k)
+    correct = [s for s in sols if extract_ans(s) == gold]
+    wrong = [s for s in sols if extract_ans(s) != gold and len(s) &gt; 50]
+    # （1）SFT 数据：每条不同路线的正确解各成一条（RFT 思想：多样性换泛化）
+    sft = [{"instruction": item["question"], "output": s.strip(),
+            "src": "verifier_loop"} for s in dedup_by_route(correct)]
+    # （2）偏好数据：正确 vs 错误成对，上限 max_pairs 控制噪声
+    pref = []
+    if correct and wrong:
+        for _ in range(min(max_pairs, len(wrong))):
+            pref.append({"instruction": item["question"],
+                         "chosen": random.choice(correct).strip(),
+                         "rejected": random.choice(wrong).strip(),
+                         "src": "verifier_loop"})
+    return sft, pref
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--problems", default="gsm8k_train.jsonl")
+    ap.add_argument("--k", type=int, default=8)
+    ap.add_argument("--out-sft", default="sft_from_verifier.jsonl")
+    ap.add_argument("--out-pref", default="pref_from_verifier.jsonl")
+    args = ap.parse_args()
+    items = [json.loads(l) for l in open(args.problems, encoding="utf-8")]
+    with open(args.out_sft, "w", encoding="utf-8") as fs, \
+         open(args.out_pref, "w", encoding="utf-8") as fp, \
+         ThreadPoolExecutor(16) as ex:
+        for sft, pref in ex.map(lambda it: synth_one(it, args.k), items):
+            for r in sft:
+                fs.write(json.dumps(r, ensure_ascii=False) + "\n")
+            for r in pref:
+                fp.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"完成：{len(items)} 题 × k={args.k} → {args.out_sft} / {args.out_pref}")
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <p>五个设计决策值得抠。<strong>（1）k 的取舍</strong>：k=8~16 是常见起点——k 越大每题期望产出的正确解越多、错误解越多样，但成本线性增长；先用 32 题试跑，统计"至少一条正确"的题目比例（可解率），可解率低于 60% 说明模型对当前题库太弱，先换简单题再谈合成。<strong>（2）答案抽取是单点故障</strong>：正则抽取错一个，正确解被当错误解丢弃、错误解混进正确侧；上线前用 100 题人工核对抽取正确率，必要时给"答案是 X"加多条模板并取交集。<strong>（3）偏好对的信噪比</strong>：随机配对可能选中"错在笔误"的 rejected，与 chosen 差距太小，DPO 训不出梯度——预算允许时给 pair 加 judge 二次筛选（第 9 章的 margin 过滤），或只保留"错误类型可识别"的 pair。<strong>（4）错误解不白拿</strong>：除了做 rejected，错误解还可以走"批评-修正"构造自纠轨迹（第 7 节），教模型认错比教它不犯错便宜。<strong>（5）一题多解要去重</strong>：dedup_by_route 只按开头 40 字去重是初版，接入第 10 章的 MinHash 语义去重做全文级检查，防止换汤不换药的解法刷屏。</p>
+    <p><strong>本节小结：</strong>k 路采样、金标验证、按路线去重，一题产出多条 SFT 与少量偏好对；答案抽取正确率与 pair 信噪比是这条流水线的两个单点故障，先测再量产。</p>
+
+    <h2>10. 合成数据质量评估方法</h2>
+    <p>合成数据最危险的时刻是"看起来很多很好"，评估就是把这句话变成数字。按"样本 → 集合 → 分布 → 训练"四个层级组织，见表 11-3，其中训练级评估是唯一能直接回答"有没有用"的一层，前三层都是它的代理。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>层级</th><th>方法</th><th>指标 / 工具</th><th>拦截对象</th></tr></thead>
+        <tbody>
+          <tr><td>样本级 · 规则</td><td>长度、复读、语言检测（第 10 章规则四件套）</td><td>通过率；剔除原因分布</td><td>生成事故、模板垃圾</td></tr>
+          <tr><td>样本级 · 验证器</td><td>答案匹配、单元测试执行</td><td>通过率（按题目难度分层看）</td><td>错误数据、伪解答</td></tr>
+          <tr><td>样本级 · judge</td><td>LLM 多维打分 + 多模型投票一致性</td><td>与金标一致率；投票一致率</td><td>幻觉、隐性错误（验证器覆盖不到的）</td></tr>
+          <tr><td>集合级 · 多样性</td><td>嵌入聚类、任务类型配额达成率、n-gram 多样性</td><td>簇数量与簇熵；各配额达成率</td><td>多样性坍缩、近亲繁殖</td></tr>
+          <tr><td>分布级 · 保真</td><td>与真实数据对比长度/难度/类型分布</td><td>分位数差、分布偏移比例</td><td>分布偏移、风格单一化</td></tr>
+          <tr><td>训练级 · 消融</td><td>1~3B 小模型 proxy：混入 vs 不混入合成数据各训一轮</td><td>目标验证集 delta（含回归集）</td><td>整体有效性；负收益合成</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 11-3：合成数据质量评估四层六法——样本级拦坏样本，集合/分布级拦偏移，训练级定去留</span>
+    </div>
+    <p>三层落地建议。<strong>（1）训练级消融是金标准，也是唯一不可跳过的</strong>：合成数据的所有代理指标都可能出现"指标好、训练负收益"（例如 judge 偏好导致的冗长化，第 8 章的老问题在合成数据上更常见）；小模型 proxy 消融一轮的成本远低于全量试错。<strong>（2）多样性指标要盯"配额达成率"而不是均值</strong>：平均簇熵可能被大量长尾簇抬高，而目标任务类型的配额没完成——按第 8 章的分类学逐项对账。<strong>（3）评估与防泄漏联动</strong>：合成数据入库前过第 10 章的去污染检测（强模型容易背出公开评测原题），训练级消融的验证集必须与合成数据的来源素材隔离，否则 delta 是幻觉。</p>
+    <p><strong>本节小结：</strong>质量评估四层六法——规则与验证器拦坏样本，judge 补盲区，多样性与分布检查拦偏移，小模型消融训练级定去留；不可跳过的只有训练级。</p>
+
+    <h2>11. 本章小结</h2>
+    <ul>
+      <li><strong>合法性两道关</strong>：许可（教师条款、许可证、来源可剥离）与分布（模型坍塌）；防坍塌纪律是"累积不替换、真实打底、合成做定向增量"（arXiv:2305.17493、arXiv:2404.01413）。</li>
+      <li><strong>三大范式</strong>：self-instruct 式（种子驱动）、逆向翻译式（文档锚定回答质量）、验证器回路式（硬判据）；有可验证判据的领域优先范式 C。</li>
+      <li><strong>RLAIF 数据视角</strong>：宪法把标注规范变成可版本管理的条款，AI 反馈把成本降到 token 级（摘要任务上与 RLHF 相当，arXiv:2309.00267）；judge 偏差随之进入数据，校准不可省。</li>
+      <li><strong>LLM 标注器四偏差</strong>：位置、长度、自我、格式；校准四件套是双位置评审、异构 judge、金标子集、结构化输出。</li>
+      <li><strong>模仿 vs 蒸馏</strong>：纯模仿学腔调不学本事（arXiv:2305.15717），Orca 证明解释轨迹 + 任务覆盖 + 系统过滤才是蒸馏数据的正确形态（arXiv:2306.02707）；许可是独立的一票否决项。</li>
+      <li><strong>教师-学生增强</strong>：rephrase 扩覆盖、paraphrase 去风格耦合、难度阶梯造"够得着的难"；带通过滤保语义等价，纯改写是分布收缩，必须混入新信息。</li>
+      <li><strong>验证器回路</strong>：数学/代码的执行反馈把质量判定变成客观事实；STaR/RFT/MetaMath 配方 = 题面增强 + 解法多样 + 错误回流；同一验证器在第 26 章升级为 RLVR 奖励。</li>
+      <li><strong>数据飞轮</strong>：日志 → badcase 挖掘 → 分型脱敏 → 定向合成 → 训练评测 → 清洗上线；转速取决于分型质量，回流占比设上限、每轮重跑去污染、三个刹车指标防跑偏。</li>
+      <li><strong>质量评估</strong>：四层六法，训练级小模型消融是唯一不可跳过的一层；多样性别看均值看配额达成率。</li>
+    </ul>
+    <p>数据工程三部曲至此收官。下一部分进入训练本体：<a href="12-sft-fundamentals.html">第 12 章 · SFT 基本原理</a>——手里的数据终于要变成模型了，从最大似然目标、损失掩码到 SFT 真正教得了什么。</p>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：模型坍塌的机制是什么？"累积式"使用为什么能避免坍塌？对合成数据的配比有什么要求？</summary>
+        <p>机制：用模型自身生成的数据递归训练，每次都从当前分布采样再拟合，分布的尾部（低频但重要的内容）被逐代稀释，高频模式被强化，最终分布收缩、多样性系统性衰减（Shumailov et al., Nature 2024）。累积式避免坍塌的原因：真实数据始终保留在训练集中，把分布"锚"在原始流形上，合成数据只是叠加增量而非替换（Gerstgrasser et al., arXiv:2404.01413）。配比要求：真实数据打底（经验上不低于一半）、合成数据做定向增量、保留采样温度与多样本采样等多样性来源；每轮回流数据控制在 20~30% 以内，防止分布向近期 badcase 倾斜。</p>
+      </details>
+      <details><summary>问题 2：用 LLM judge 合成偏好数据时，位置偏差会怎样污染数据？给出完整的校准流程。</summary>
+        <p>成对比较时 judge 系统性偏爱首个位置：若合成管线固定把"模型 A 的回答"放在第一位，偏好标签会整体偏向 A，训练出的模型学到的是"像 A 的回答格式更好"这种伪规律，而非真实质量排序。校准流程：（1）同一对样本交换位置各评一次，只保留两次结论一致的对（通常损失 10~25% 样本，预算按此估算），不一致对进人工仲裁；（2）评审用温度 0、结构化 JSON 输出、明确的评分维度与"不以长度加分"声明；（3）judge 与被评模型异构，或对输出做匿名化改写，压制自我偏好；（4）保留 200~500 条人工金标，持续统计 judge 与人类的一致率，一致率低于 70% 先修 judge 再扩产。</p>
+      </details>
+      <details><summary>问题 3：同样是拿 GPT-4 的输出做训练数据，为什么 Gudibande 等人认为"模仿"无效，而 Orca 有效？差距在数据形态的哪三点？</summary>
+        <p>Gudibande 等人（arXiv:2305.15717）分析的是纯模仿数据：只有 (指令, GPT-4 回答) 对，模型学到的是 GPT-4 的表面风格（分点、谦辞、排版），事实能力不升反降——数据只携带"结论分布"，不携带"如何得到结论"。Orca（arXiv:2306.02707）的差异在三点：（1）<strong>解释轨迹</strong>——让教师输出完整推理过程（explanation tuning），数据携带从问题到答案的路径而非只有答案；（2）<strong>任务缩放与覆盖</strong>——基于 FLAN 系列多任务系统扩展，覆盖度跟得上能力需求；（3）<strong>系统化采样与过滤</strong>——控制采样策略并对数据做质量过滤，压住噪声。结论：决定效果的是数据形态，不是教师身份；同时注意许可问题独立于效果，闭源输出用于商用训练须先过法务。</p>
+      </details>
+      <details><summary>问题 4：验证器回路合成推理数据中，为什么"一题多解"要先按推理路线去重？如果某题 8 个解答全错，这题的数据就浪费了吗？</summary>
+        <p>不去重的"一题多解"会退化为同一解法的 8 个复制品：高温采样下模型常把同一路线换措辞输出若干遍，全量入库等于用 8 倍数据教同一个信号——不仅浪费训练配额，还会放大该解法的支配地位、挤压其他解法（分布偏移），这正是 RFT 强调解法多样性的原因。去重按"开头片段/嵌入相似度"识别同路线，每条路线保留一条。8 个全错的题不是浪费：错误解可以走两条路——（1）给模型提示（金标答案或关键步骤）后让它修正，"有提示后能改对"的轨迹按 STaR 协议入库；（2）批评-修正构造自纠轨迹，或与后续轮次生成的正确解配对成偏好数据。真正浪费的只有"连提示都救不回来"的题目，它们应该被标记为超纲，触发题库难度调整。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Shumailov+, 2024]</span> Shumailov, I. et al. "AI models collapse when trained on recursively generated data." <i>Nature</i>, 2024. <span class="rid">arXiv:2305.17493</span></li>
+      <li><span class="rid">[Gerstgrasser+, 2024]</span> Gerstgrasser, M. et al. "Is Model Collapse Inevitable? Breaking the Curse of Recursion by Accumulating Real and Synthetic Data." 2024. <span class="rid">arXiv:2404.01413</span></li>
+      <li><span class="rid">[Wang+, 2023]</span> Wang, Y. et al. "Self-Instruct: Aligning Language Models with Self-Generated Instructions." <i>ACL</i>, 2023. <span class="rid">arXiv:2212.10560</span></li>
+      <li><span class="rid">[Xu+, 2023]</span> Xu, C. et al. "WizardLM: Empowering Large Language Models to Follow Complex Instructions." 2023. <span class="rid">arXiv:2304.12244</span></li>
+      <li><span class="rid">[Xu+, 2024]</span> Xu, Z. et al. "Magpie: Alignment Data Synthesis from Scratch by Prompting Aligned LLMs with Nothing." <i>ICLR</i>, 2025. <span class="rid">arXiv:2406.08464</span></li>
+      <li><span class="rid">[Li+, 2024]</span> Li, X. et al. "Self-Alignment with Instruction Backtranslation." <i>ICLR</i>, 2024. <span class="rid">arXiv:2308.06259</span></li>
+      <li><span class="rid">[Zelikman+, 2022]</span> Zelikman, E. et al. "STaR: Bootstrapping Reasoning With Reasoning." <i>NeurIPS</i>, 2022. <span class="rid">arXiv:2203.14465</span></li>
+      <li><span class="rid">[Yuan+, 2023]</span> Yuan, Z. et al. "Scaling Relationship on Learning Mathematical Reasoning with Large Language Models." 2023. <span class="rid">arXiv:2308.01825</span></li>
+      <li><span class="rid">[Yu+, 2023]</span> Yu, L. et al. "MetaMath: Bootstrap Your Own Mathematical Questions for Large Language Models." <i>ICLR</i>, 2024. <span class="rid">arXiv:2309.12284</span></li>
+      <li><span class="rid">[Bai+, 2022]</span> Bai, Y. et al. "Constitutional AI: Harmlessness from AI Feedback." 2022. <span class="rid">arXiv:2212.08073</span></li>
+      <li><span class="rid">[Lee+, 2023]</span> Lee, H. et al. "RLAIF: Scaling Reinforcement Learning from Human Feedback with AI Feedback." <i>ICLR</i>, 2024. <span class="rid">arXiv:2309.00267</span></li>
+      <li><span class="rid">[Zheng+, 2023]</span> Zheng, L. et al. "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2306.05685</span></li>
+      <li><span class="rid">[Panickssery+, 2024]</span> Panickssery, A. et al. "LLM Evaluators Recognize and Favor Their Own Generations." <i>NeurIPS</i>, 2024. <span class="rid">arXiv:2404.13076</span></li>
+      <li><span class="rid">[Gudibande+, 2023]</span> Gudibande, A. et al. "The False Promise of Imitating Proprietary LLMs." <i>ICLR</i>, 2024. <span class="rid">arXiv:2305.15717</span></li>
+      <li><span class="rid">[Mukherjee+, 2023]</span> Mukherjee, S. et al. "Orca: Progressive Learning from Complex Explanation Traces of GPT-4." 2023. <span class="rid">arXiv:2306.02707</span></li>
+      <li><span class="rid">[Mitra+, 2023]</span> Mitra, A. et al. "Orca 2: Teaching Small Language Models How to Reason." 2023. <span class="rid">arXiv:2311.11045</span></li>
+      <li><span class="rid">[Chen+, 2023b]</span> Chen, X. et al. "Teaching Large Language Models to Self-Debug." <i>ICLR</i>, 2024. <span class="rid">arXiv:2304.05128</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

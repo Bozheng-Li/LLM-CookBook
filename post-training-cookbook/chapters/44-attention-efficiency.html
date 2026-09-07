@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 44 章 · 高效注意力与混合精度 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\(', '\)']], displayMath: [['\[', '\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 8 部分 · 训练工程</div>
+      <h1>第 44 章 · 高效注意力与混合精度</h1>
+      <p class="chapter-lead">自注意力机制的平方复杂度 \( O(N^2) \) 与高精度计算的高昂开销，是大模型向超长上下文与极速训练演进的双重阻碍。在现代后训练工程中，上下文窗口动辄从 4k 跃升至 32k、128k，传统注意力算子的中间显存分配与 HBM 访存墙会让硬件利用率彻底崩盘。本章深入底层硬件访存体系，全景拆解 FlashAttention-1/2/3 的核心机理——Tiling 切块技术、Online Softmax 流式重缩放与异步流水线设计；推导 FP32、FP16、BF16 与 FP8 的数值动态范围与下溢风险；解析混合精度 GradScaler 梯度缩放机制；并剖析基于 Triton 与 Liger Kernel 打造的跨算子融合内核（RMSNorm、SwiGLU 与 CrossEntropy）。</p>
+      <div class="chapter-meta">⏱ 预计学习 110 分钟 ｜ 难度 ★★★★☆ ｜ 先修：第 3 章、第 42 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 显存墙与算力墙：注意力算子的硬件物理瓶颈</h2>
+    <p>自 Vaswani 等人在 2017 年提出标准 Transformer 架构以来，<span class="term">缩放点积注意力（Scaled Dot-Product Attention）</span>构成了大语言模型的基石：</p>
+    \[ 	ext{Attention}(Q, K, V) = 	ext{Softmax}\left(rac{Q K^T}{\sqrt{d_k}}
+ight) V \]
+    <p>在算法理论层面，该公式优雅简洁。然而，当把这一公式翻译为物理硬件底层的执行流时，其显存与访存特征暴露出极其严苛的瓶颈。对于批次大小为 \( B \)、注意力头数为 \( H \)、序列长度为 \( N \)、头维度为 \( d \) 的张量计算：</p>
+    <ol>
+      <li><strong>计算复杂度为 \( O(N^2 d) \)</strong>：首先计算内积矩阵 \( S = Q K^T \in \mathbb{R}^{B 	imes H 	imes N 	imes N} \)，需要 \( 2 B H N^2 d \) 次浮点操作（FLOPs）；随后计算 \( P = 	ext{Softmax}(S) \)，再与 \( V \) 相乘 \( O = P V \)，又需要 \( 2 B H N^2 d \) 次 FLOPs。</li>
+      <li><strong>空间复杂度为 \( O(N^2) \)</strong>：在标准 PyTorch 实现中，中间注意力矩阵 \( S \) 与 Softmax 概率矩阵 \( P \) 必须作为中间激活值（Activations）完整物化（Materialize）并写入 GPU 的全局显存（High Bandwidth Memory, HBM）中，以便在反向传播时用于链式法则计算 \( 
+abla_Q, 
+abla_K, 
+abla_V \)。</li>
+    </ol>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 \( O(N^2) \) 显存膨胀灾难</div>
+      <p>以一个典型的长序列后训练任务为例：设 \( B=2, H=32, N=32768 \)（32k 上下文），数据类型为 FP16（2 字节）。仅单个 Transformer 层的注意力概率矩阵 \( P \) 所占用的 HBM 物理显存为：</p>
+      \[ M_P = B 	imes H 	imes N 	imes N 	imes 2 	ext{ 字节} = 2 	imes 32 	imes 32768^2 	imes 2 pprox 137.4 	imes 10^9 	ext{ 字节} pprox 128 	ext{ GB} \]
+      <p>这意味着：<strong>仅仅单个层、单个 Forward 产生的临时注意力矩阵，就瞬间撑爆了单张 80GB 的 A100 显卡！</strong>即便是将序列缩短至 8192，该矩阵依然占用整整 8 GB。若模型拥有 32 或 80 个层，全量缓存这些矩阵在物理上是完全不可行的。</p>
+    </div>
+
+    <h3>1.1 访存受限（Memory-Bound） vs 计算受限（Compute-Bound）</h3>
+    <p>更深层次的性能瓶颈在于 GPU 的微架构设计。现代加速卡（如 NVIDIA A100 SXM4）具备两层核心存储层级：</p>
+    <ul>
+      <li><strong>高带宽显存（HBM）</strong>：容量大（40GB/80GB），但带宽有限（A100 约为 2.0 TB/s，H100 约为 3.35 TB/s）。</li>
+      <li><strong>片上静态随机存储器（SRAM）</strong>：嵌入在每个流式多处理器（Streaming Multiprocessor, SM）内部，容量极其稀缺（A100 单 SM 仅 192 KB，单卡总计约 20 MB），但其读写带宽高达惊人的 <strong>19 TB/s</strong>（比 HBM 快整整近一个数量级），且访问延迟小于 1 纳秒。</li>
+    </ul>
+    <p>标准 PyTorch 的实现方式是典型的“算子孤岛”调用：首先启动一个 GEMM 内核计算 \( Q K^T \)，并将结果由片上 SRAM 写回到全局 HBM；紧接着启动一个 Softmax 内核从 HBM 重新读入该矩阵，计算归一化后再写回 HBM；随后再启动第三个 GEMM 内核从 HBM 读入概率矩阵与 \( V \) 相乘。由于 SRAM 到 HBM 的反复数据搬运，GPU 的 Tensor Core 算力大部分时间处于空闲等待状态，算子执行被困死在“访存墙”内。因此，<strong>打破 \( O(N^2) \) 显存瓶颈与消除 HBM 冗余访存，是现代高效注意力计算的核心宿命</strong>。</p>
+
+    <!-- 自绘 SVG：传统 Attention 与 FlashAttention 访存流转机制对比 -->
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 370" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="标准 Attention 与 FlashAttention 访存机制对比">
+        <defs>
+          <marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="arrow-green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+          <marker id="arrow-red" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#ef4444"/>
+          </marker>
+        </defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" font-weight="bold" fill="#1e293b">标准 PyTorch Attention 与 FlashAttention 底层访存对比</text>
+
+        <!-- 左侧：标准 Attention -->
+        <rect x="25" y="50" width="320" height="300" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+        <text x="185" y="75" text-anchor="middle" font-size="15" font-weight="bold" fill="#ef4444">标准 PyTorch Attention (访存瓶颈)</text>
+        
+        <!-- HBM 区域 -->
+        <rect x="45" y="95" width="280" height="65" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1.2"/>
+        <text x="55" y="115" font-size="13" font-weight="bold" fill="#991b1b">全局显存 (HBM, 2.0 TB/s)</text>
+        <text x="55" y="135" font-size="12" fill="#7f1d1d">写入巨型中间矩阵: S = QK^T [N, N] (O(N^2))</text>
+        <text x="55" y="150" font-size="12" fill="#7f1d1d">写入巨型概率矩阵: P = Softmax(S) [N, N]</text>
+
+        <!-- 读写箭头 -->
+        <path d="M120 160 L120 220" stroke="#ef4444" stroke-width="2" marker-end="url(#arrow-red)"/>
+        <path d="M160 220 L160 160" stroke="#ef4444" stroke-width="2" marker-end="url(#arrow-red)"/>
+        <path d="M220 160 L220 220" stroke="#ef4444" stroke-width="2" marker-end="url(#arrow-red)"/>
+        <path d="M260 220 L260 160" stroke="#ef4444" stroke-width="2" marker-end="url(#arrow-red)"/>
+
+        <!-- 片上 SRAM / SM -->
+        <rect x="45" y="225" width="280" height="85" rx="6" fill="#f1f5f9" stroke="#64748b" stroke-width="1.2"/>
+        <text x="55" y="245" font-size="13" font-weight="bold" fill="#334155">片上计算单元 (SRAM, 19 TB/s)</text>
+        <text x="55" y="265" font-size="12" fill="#475569">Kernel 1: Matmul(Q, K) -> 写出到 HBM</text>
+        <text x="55" y="282" font-size="12" fill="#475569">Kernel 2: Softmax(S) 从 HBM 读入并写回</text>
+        <text x="55" y="299" font-size="12" fill="#475569">Kernel 3: Matmul(P, V) 再次从 HBM 读入</text>
+        <text x="185" y="335" text-anchor="middle" font-size="12" font-weight="bold" fill="#ef4444">HBM 读写总量: O(N^2) 极易 OOM，计算单元严重空转</text>
+
+        <!-- 右侧：FlashAttention -->
+        <rect x="375" y="50" width="320" height="300" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+        <text x="535" y="75" text-anchor="middle" font-size="15" font-weight="bold" fill="#10b981">FlashAttention (SRAM 切块融合)</text>
+
+        <!-- HBM 区域 -->
+        <rect x="395" y="95" width="280" height="65" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="1.2"/>
+        <text x="405" y="115" font-size="13" font-weight="bold" fill="#065f46">全局显存 (HBM)</text>
+        <text x="405" y="135" font-size="12" fill="#047857">仅存放基础输入 Q, K, V 和最终输出 O</text>
+        <text x="405" y="150" font-size="12" font-weight="bold" fill="#059669">完全不物化 N×N 矩阵！显存开销 O(N)</text>
+
+        <!-- 读写切块箭头 -->
+        <path d="M470 160 L470 220" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+        <text x="475" y="195" font-size="11" fill="#065f46">拉取 Q_i, K_j, V_j</text>
+        <path d="M600 220 L600 160" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+        <text x="605" y="195" font-size="11" fill="#065f46">写回最终输出 O</text>
+
+        <!-- 片上 SRAM -->
+        <rect x="395" y="225" width="280" height="85" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.2"/>
+        <text x="405" y="245" font-size="13" font-weight="bold" fill="#1e40af">片上高速 SRAM (Tiling 切块循环)</text>
+        <text x="405" y="265" font-size="12" fill="#1e3a8a">分块计算 S_ij = Q_i K_j^T (常驻 SRAM)</text>
+        <text x="405" y="282" font-size="12" fill="#1e3a8a">利用 Online Softmax 动态更新局域统计量</text>
+        <text x="405" y="299" font-size="12" fill="#1e3a8a">增量累加 O_i += P_ij V_j，无需写出中间态</text>
+        <text x="535" y="335" text-anchor="middle" font-size="12" font-weight="bold" fill="#10b981">HBM 读写总量: O(N) 逼近硬件算力上限</text>
+      </svg>
+      <figcaption>图 44-1：标准 Attention 与 FlashAttention 在 GPU HBM 与片上 SRAM 间的访存流转对比</figcaption>
+    </figure>
+
+    <h2>2. FlashAttention 原理演进：从 V1 到 V3</h2>
+    <p>斯坦福大学的 Tri Dao 等人在 2022 年提出了 <span class="term">FlashAttention</span>，随后相继演进出 FlashAttention-2 与 FlashAttention-3。其核心目标是：<strong>利用 GPU 片上高速 SRAM 执行端到端融合计算，绝不在全局 HBM 中物化任何 \( N 	imes N \) 的注意力中间矩阵，使得整体算法的 HBM 访存复杂度从 \( O(N^2) \) 骤降至 \( O(N) \)</strong>。</p>
+
+    <h3>2.1 FlashAttention-1：Tiling 切块与 Online Softmax</h3>
+    <p>要在容量仅有几十 KB 到上百 KB 的 SRAM 中完成完整注意力的计算，最大的数学阻碍在于 <span class="term">Softmax</span> 算子的全局依赖性。标准 Softmax 计算公式为：</p>
+    \[ m = \max_{j} x_j, \quad l = \sum_{j} e^{x_j - m}, \quad 	ext{Softmax}(x)_i = rac{e^{x_i - m}}{l} \]
+    <p>为了保证数值下溢不发生，传统算法必须先遍历整行找到全局最大值 \( m \)，再遍历整行计算分母归一化因子 \( l \)。这意味着在算完所有列之前，单列的 Softmax 值根本无法确定！</p>
+    <p>FlashAttention 巧妙引入了 <span class="term">Online Softmax（在线流式 Softmax）</span> 算法。设向量 \( x \) 被划分为两个局部切块 \( x^{(1)} \) 和 \( x^{(2)} \)。我们在计算完第一块后，记录局部统计量：</p>
+    \[ m^{(1)} = \max_j x_j^{(1)}, \quad l^{(1)} = \sum_j e^{x_j^{(1)} - m^{(1)}} \]
+    <p>当处理第二个切块 \( x^{(2)} \) 时，局部最大值为 \( m^{(2)} \)。两块合并后的全局新最大值为：</p>
+    \[ m^{	ext{new}} = \max(m^{(1)}, m^{(2)}) \]
+    <p>关键的数学性质在于：<strong>旧的归一化分母 \( l^{(1)} \) 可以通过缩放因子 \( e^{m^{(1)} - m^{	ext{new}}} \) 进行精确修正！</strong>更新后的累积归一化因子为：</p>
+    \[ l^{	ext{new}} = e^{m^{(1)} - m^{	ext{new}}} l^{(1)} + e^{m^{(2)} - m^{	ext{new}}} l^{(2)} \]
+    <p>同理，对于前向输出累积向量 \( O \in \mathbb{R}^d \)，若前一个切块累加的输出为 \( O^{(1)} \)，当接入新切块计算出的局部结果 \( O^{(2)} \) 时，只需做如下重缩放修正即可完成增量更新：</p>
+    \[ O^{	ext{new}} = 	ext{diag}\left(e^{m^{(1)} - m^{	ext{new}}}
+ight) O^{(1)} + 	ext{diag}\left(e^{m^{(2)} - m^{	ext{new}}}
+ight) O^{(2)} \]
+    <p>最终归一化输出为 \( O = O^{	ext{new}} / l^{	ext{new}} \)。</p>
+
+    <div class="callout note">
+      <div class="callout-title">📘 反向传播的极致设计：重计算胜过访存</div>
+      <p>在反向传播中，传统方法需要使用之前保存在 HBM 中的 \( N 	imes N \) 概率矩阵 \( P \) 来计算梯度。FlashAttention 做出了一个违反直觉却符合现代硬件特性的工程抉择：<strong>在前向传播中完全不保存矩阵 \( P \)，仅保存轻量的标量统计量 \( (m, l) \in \mathbb{R}^N \)；在反向传播时，利用保存在 SRAM 的局部切块 \( Q_i, K_j \) 重新计算出对应的局部 \( S_{ij} \) 与 \( P_{ij} \)</strong>！</p>
+      <p>在现代 GPU 上，FLOPS 算力极其廉价，而 HBM 访存极度昂贵。用少量冗余的 Tensor Core GEMM 算力，换取彻底消除数十 GB 的 HBM 读写，使得反向传播的整体实际墙钟时间不降反升，速度大幅超越标准反向传播。</p>
+    </div>
+
+    <h3>2.2 FlashAttention-2：循环调优与 Warp 级并行优化</h3>
+    <p>FlashAttention-1 虽然解决了显存墙，但在算力利用率上仅达到了 A100 理论峰值的 30%~40%。2023 年发布的 FlashAttention-2 对底层算法流水线进行了深度重构：</p>
+    <ul>
+      <li><strong>外层与内层循环调转</strong>：在 V1 中，外层循环遍历 \( K, V \) 切块，内层循环遍历 \( Q \) 切块，导致在更新局部输出 \( O \) 时需要在不同内层步骤间频繁加锁或写回；V2 将外层循环改为遍历 \( Q \) 切块，内层循环遍历 \( K, V \) 切块。对于每个固定的 \( Q_i \)，它只由单个线程块（Thread Block）独占，所有的在线 Softmax 统计量与累积输出 \( O_i \) 完全锁定在单组片上寄存器中，直到处理完所有 \( K_j, V_j \) 后<strong>仅需执行一次最终写回 HBM</strong>，彻底消除了写冲突。</li>
+      <li><strong>非矩阵运算数量大幅消减</strong>：在 V1 中，Online Softmax 的重缩放操作包含大量对中间向量的缩放指令；V2 推导了等价变换，将除以 \( l_i \) 的归一化操作彻底推迟到所有切块遍历完毕后的最后一步，极大减少了寄存器非矩阵乘法的指令发射开销。</li>
+      <li><strong>针对 Causal Mask 的三角形切块优化</strong>：在因果自注意力（Causal Attention）中，由于只能看见前序 Token，注意力矩阵的上三角全为 0。V2 实现了自适应切块调度：直接跳过完全位于对角线上方的块；仅对被对角线穿过的块执行掩码计算；对完全位于对角线下方的块<strong>全速执行无掩码的密集 GEMM</strong>，使得因果注意力的速度相比普通双向注意力直接翻倍（速度提升近 2 倍）。</li>
+    </ul>
+
+    <h3>2.3 FlashAttention-3：针对 Hopper 架构的异步流水线与 FP8 原生加速</h3>
+    <p>随着 NVIDIA Hopper 架构（H100/H800）的推出，硬件引入了全新的 <span class="term">TMA（Tensor Memory Accelerator，张量内存加速器）</span> 与 <span class="term">WGMMA（Warp Group Matrix Multiply and Accumulate）</span> 指令集。FlashAttention-3 应运而生：</p>
+    <ul>
+      <li><strong>硬件级异步数据搬运（TMA）</strong>：传统 GPU 搬运数据需要线程执行通用加载指令并消耗寄存器。Hopper 的 TMA 是专门的片上硬件引擎，一条指令即可异步在 HBM 与共享内存（Shared Memory）之间搬运多维张量切片，完全不占用 SM 算力寄存器。</li>
+      <li><strong>Warp-Group 级软硬件协同交织</strong>：FlashAttention-3 采用了“生产者-消费者”解耦模型。一个特化的 Warp 专门充当生产者，利用 TMA 发射异步数据预取；其余三个 Warp 组成 Warp-Group，充当消费者全速执行 WGMMA GEMM 累乘。数据加载与矩阵计算在硬件层面完全实现 100% 重叠掩盖。</li>
+      <li><strong>FP8 低精度注意力原生支持</strong>：FlashAttention-3 深度支持 FP8 数据格式（E4M3 与 E5M2），在将注意力算子吞吐推向数 PFLOPS 极限的同时，结合自适应指数缩放避免了低精度下的下溢与精度崩塌。在 H100 GPU 上，FlashAttention-3 实现了高达 <strong>75%~80% 的理论峰值 FLOPS 利用率</strong>。</li>
+    </ul>
+
+    <p><strong>本节小结：</strong>FlashAttention 体系通过片上 Tiling、在线流式 Softmax 和硬件异步流水线，将注意力算子的空间开销压制为线性 \( O(N) \)，是支撑万级别长上下文训练不可或缺的基石。</p>
+
+    <h2>3. 混合精度全景：FP32、FP16、BF16 与 FP8 深度对比</h2>
+    <p>大模型工程从全精度单精度 FP32（32 位）向混合精度演进，其动力在于 Tensor Core 对低精度格式数十倍的算力增益以及对传输带宽的腰斩节约。然而，精度的缩减必然伴随动态数值范围（Dynamic Range）与精度分辨率（Precision）的妥协。</p>
+
+    <h3>3.1 浮点数内部比特结构解析</h3>
+    <p>IEEE 754 浮点数的表示由三部分组成：符号位（Sign）、指数位（Exponent）与尾数位（Mantissa/Fraction）：</p>
+    \[ x = (-1)^{	ext{sign}} 	imes 2^{	ext{exponent} - 	ext{bias}} 	imes \left(1 + rac{	ext{mantissa}}{2^M}
+ight) \]
+    <p>其中，<strong>指数位位数决定了数值的动态范围（即最大值与最小正非零值）</strong>，指数位越长，越不容易发生溢出（Overflow）或下溢（Underflow）；<strong>尾数位位数决定了数值的精度精度与分辨率</strong>，尾数位越长，数值精细度越高，相对舍入误差越小。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>浮点格式</th>
+            <th>总比特数</th>
+            <th>符号位 (S)</th>
+            <th>指数位 (E)</th>
+            <th>尾数位 (M)</th>
+            <th>指数偏置 (Bias)</th>
+            <th>绝对数值动态范围</th>
+            <th>机器精度 (\( \epsilon \))</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>FP32 (单精度)</strong></td>
+            <td>32 bits</td>
+            <td>1 bit</td>
+            <td>8 bits</td>
+            <td>23 bits</td>
+            <td>127</td>
+            <td>\( \sim 1.18 	imes 10^{-38} \) 到 \( 3.4 	imes 10^{38} \)</td>
+            <td>\( 2^{-23} pprox 1.19 	imes 10^{-7} \)</td>
+          </tr>
+          <tr>
+            <td><strong>FP16 (半精度)</strong></td>
+            <td>16 bits</td>
+            <td>1 bit</td>
+            <td>5 bits</td>
+            <td>10 bits</td>
+            <td>15</td>
+            <td>\( \sim 6.10 	imes 10^{-5} \) 到 \( 65504 \)</td>
+            <td>\( 2^{-10} pprox 9.77 	imes 10^{-4} \)</td>
+          </tr>
+          <tr>
+            <td><strong>BF16 (Brain Float)</strong></td>
+            <td>16 bits</td>
+            <td>1 bit</td>
+            <td><strong>8 bits</strong></td>
+            <td>7 bits</td>
+            <td>127</td>
+            <td>\( \sim 1.18 	imes 10^{-38} \) 到 \( 3.4 	imes 10^{38} \)</td>
+            <td>\( 2^{-7} pprox 7.81 	imes 10^{-3} \)</td>
+          </tr>
+          <tr>
+            <td><strong>FP8 (E4M3)</strong></td>
+            <td>8 bits</td>
+            <td>1 bit</td>
+            <td>4 bits</td>
+            <td>3 bits</td>
+            <td>7</td>
+            <td>\( \sim 1.95 	imes 10^{-3} \) 到 \( 448 \)</td>
+            <td>\( 2^{-3} = 0.125 \)</td>
+          </tr>
+          <tr>
+            <td><strong>FP8 (E5M2)</strong></td>
+            <td>8 bits</td>
+            <td>1 bit</td>
+            <td>5 bits</td>
+            <td>2 bits</td>
+            <td>15</td>
+            <td>\( \sim 6.10 	imes 10^{-5} \) 到 \( 57344 \)</td>
+            <td>\( 2^{-2} = 0.25 \)</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 44-1：大模型常用浮点数据格式的比特位分配与数值动态范围全面对比</span>
+    </div>
+
+    <h3>3.2 FP16 的数值脆弱性与动态损失缩放（GradScaler）</h3>
+    <p>观察上表可见，标准 FP16 的指数位仅有 5 位，其最大表示上限仅为 <strong>65504</strong>，最小正正规数为 \( 6.1 	imes 10^{-5} \)。在大模型反向传播过程中，梯度的绝对值通常极小（集中在 \( 10^{-5} \) 到 \( 10^{-8} \) 之间）。如果直接使用 FP16 存储梯度，大量微小梯度会直接落入低于 \( 6.1 	imes 10^{-5} \) 的非正规数甚至下溢区间，直接被硬件截断为绝对的 <code>0.0</code>，导致模型权重彻底停滞不更新！反之，在某些注意力内积稍微偏大时，\( e^x \) 又会迅速冲破 65504，导致 <code>Inf</code> 进而污染出满屏的 <code>NaN</code>。</p>
+    <p>为了拯救 FP16，混合精度框架引入了 <span class="term">动态损失缩放（Dynamic Loss Scaling / GradScaler）</span> 机制：</p>
+    <ol>
+      <li>在前向传播计算出损失 \( \mathcal{L} \) 后，先乘以一个极大的缩放因子 \( S \)（例如初始 \( S=65536 \)），得到缩放后损失 \( \mathcal{L}_{	ext{scaled}} = \mathcal{L} 	imes S \)；</li>
+      <li>在反向传播时，根据导数线性性质，计算出的梯度同样被放大了 \( S \) 倍：\( g_{	ext{scaled}} = g 	imes S \)。这使得微小的梯度整体向右推移进入 FP16 的安全可表示区间，避免了下溢为零；</li>
+      <li>在优化器调用 <code>step()</code> 更新参数之前，框架先对梯度执行反缩放（Unscale）：\( g = g_{	ext{scaled}} / S \)；</li>
+      <li><strong>动态探测机制</strong>：如果在未缩放梯度中检测到任何一个元素为 <code>NaN</code> 或 <code>Inf</code>，优化器会<strong>直接跳过本步参数更新</strong>，并将缩放因子缩小为一半（\( S \leftarrow S / 2 \)）；如果连续 \( M \) 个 Step（如 2000 步）均未出现溢出，则尝试放大缩放因子（\( S \leftarrow S 	imes 2 \)）。</li>
+    </ol>
+
+    <h3>3.3 为什么后训练无脑首选 BF16？</h3>
+    <p>尽管 GradScaler 解决了 FP16 的部分问题，但在大模型强化学习（PPO/GRPO）与长上下文 SFT 中，FP16 依然极其容易由于复杂的 Logits 差分或梯度尖峰遭遇持续跳步。而 <span class="term">BF16（Bfloat16）</span> 的出现彻底改写了游戏规则：</p>
+    <ul>
+      <li>BF16 拥有与单精度 FP32 <strong>完全相同的 8 位指数位</strong>，其动态数值范围与 FP32 完全等同（上限达 \( 3.4 	imes 10^{38} \)）；</li>
+      <li>BF16 在物理层面上<strong>几乎永远不会发生溢出或微小梯度下溢</strong>。在大模型训练中，<strong>使用 BF16 训练完全无需配置任何 Loss Scaler / GradScaler</strong>，彻底规避了因缩放因子抖动造成的训练震荡；</li>
+      <li>现代 Ampere、Hopper 与 Ada Lovelace 架构对 BF16 提供了原生的 Tensor Core 硬件乘加指令支持，计算速度与 FP16 严格相同。因此在现代工程实践中，<strong>只要硬件支持（A100/H100/RTX 3090/4090 及以上），必须毫无保留地将 BF16 作为后训练的默认精度</strong>。</li>
+    </ul>
+
+    <h3>3.4 FP8 训练前沿：E4M3 vs E5M2 组合拳</h3>
+    <p>在 Hopper 架构与 FP8 成为工业界热点后，大模型前向与反向开始探索 8 位浮点训练。由于 8 个比特的信息熵极度紧张，IEEE 针对不同阶段设计了两种互补格式：</p>
+    <ul>
+      <li><strong>E4M3（4位指数，3位尾数）</strong>：保留了相对较多的尾数位，具有更高的数据精度，但数值上限仅为 448。主要用于<strong>前向传播的激活值与权重矩阵相乘</strong>，因为经过归一化后的激活值与权重通常分布在 \([-10, 10]\) 之间，不易越界，更需要精度。</li>
+      <li><strong>E5M2（5位指数，2位尾数）</strong>：动态范围大（上限 57344），但精度仅有 2 位尾数。主要用于<strong>反向传播中梯度的回传与外积计算</strong>，因为梯度跨越的动态跨度极大，优先保住不溢出。</li>
+    </ul>
+
+    <h2>4. 融合内核实践：Triton 与 Liger Kernel</h2>
+    <p>在解决了注意力算子与精度的选型后，整个 Transformer 管道中剩下的<strong>元素级（Element-wise）与归一化算子</strong>成为了新的性能拖油瓶。现代模型（如 Llama 3、DeepSeek）普遍采用了 <span class="term">RMSNorm</span>、<span class="term">SwiGLU</span> 激活函数以及巨大的词表交叉熵损失 <span class="term">CrossEntropyLoss</span>。</p>
+
+    <h3>4.1 传统 PyTorch 实现的内存浪费</h3>
+    <p>以经典的 SwiGLU 激活函数为例：</p>
+    \[ 	ext{SwiGLU}(x) = (x W_{	ext{gate}} \cdot 	ext{sigmoid}(x W_{	ext{gate}})) \odot (x W_{	ext{up}}) \]
+    <p>在原生 PyTorch 中，这行代码由多个独立 Python 算子串行构成：先调用 <code>torch.sigmoid</code>，再调用 <code>torch.mul</code>，再调用逐元素乘法。每一个算子都会把几十吉字节的中间张量在 HBM 与片上之间写出再读入。若能在底层编写一个 CUDA/Triton 内核，<strong>把从 Sigmoid、逐元素乘到反向传播导数在一个片上 SRAM 循环中全部完成（Kernel Fusion）</strong>，不仅可以将内存占用降低数倍，还能大幅提升算力利用率。</p>
+
+    <h3>4.2 Liger Kernel：后训练全流程算子融合</h3>
+    <p>由 LinkedIn 开源的 <span class="term">Liger Kernel</span> 是近年来针对大语言模型后训练最具代表性的算子级优化库。它完全采用 OpenAI Triton 语言编写，旨在无缝替换 Hugging Face 默认的 Transformer 组件：</p>
+    <ul>
+      <li><strong>Fused Linear + CrossEntropyLoss</strong>：在后训练中，模型的词表大小往往高达 128k 乃至 150k。在最后的输出层，模型需要计算 \( 	ext{logits} = H \cdot W_{	ext{vocab}} \in \mathbb{R}^{B 	imes S 	imes V} \)。对于 \( B=4, S=4096, V=128000 \)，仅 Logits 张量就占用超过 <strong>4 GB</strong> 显存！Liger Kernel 将全连接投影与交叉熵损失融为一体，采用分块计算的方式，在寄存器中计算局域 Logits 并即时累加 Softmax 分母与 Loss，<strong>完全不物化整个巨大的 Logits 张量</strong>，直接将显存峰值降低 60%~80%，并带来 20% 以上的端到端提速。</li>
+      <li><strong>Fused RMSNorm</strong>：将均方根计算、标量逆开方与仿射变换融合为单次访存内核，并对反向传播的梯度链进行手写化简。</li>
+    </ul>
+
+    <h2>5. 基准测试与生产级工程代码</h2>
+    <p>接下来，我们提供完整的工程级基准测试与内核挂载代码，展示如何在真实项目中集成 FlashAttention-2 与 Triton 混合精度环境。</p>
+
+    <h3>5.1 算子级基准测试：标准 Attention vs FlashAttention-2</h3>
+    <p>以下 Python 脚本可直接运行，用于在本地 GPU 上精确测量序列长度从 1024 扩展至 16384 时，标准注意力与 FlashAttention-2 在显存峰值与延迟上的量化差异：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">benchmark_attention.py</span>
+      <pre class="code"><code class="language-python">import time
+import torch
+import torch.nn.functional as F
+
+def standard_attention(q, k, v):
+    """标准 PyTorch 缩放点积注意力实现（物化 N x N 矩阵）"""
+    scale = 1.0 / (q.shape[-1] ** 0.5)
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    probs = F.softmax(scores, dim=-1)
+    output = torch.matmul(probs, v)
+    return output
+
+def run_benchmark():
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    batch_size = 2
+    num_heads = 32
+    head_dim = 128
+    seq_lens = [1024, 2048, 4096, 8192, 16384]
+
+    print(f"{'SeqLen':<8} | {'PyTorch Std Time (ms)':<22} | {'FA-2 Time (ms)':<16} | {'Speedup':<8}")
+    print("-" * 60)
+
+    for s in seq_lens:
+        q = torch.randn(batch_size, num_heads, s, head_dim, dtype=torch.bfloat16, device=device)
+        k = torch.randn(batch_size, num_heads, s, head_dim, dtype=torch.bfloat16, device=device)
+        v = torch.randn(batch_size, num_heads, s, head_dim, dtype=torch.bfloat16, device=device)
+
+        # 1. 预热 GPU
+        for _ in range(5):
+            _ = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.cuda.synchronize()
+
+        # 2. 测量原生 PyTorch (关闭底层 FlashAttention 优化以模拟普通实现)
+        std_time = None
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            start = time.perf_counter()
+            for _ in range(20):
+                with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+                    _ = standard_attention(q, k, v)
+            torch.cuda.synchronize()
+            std_time = (time.perf_counter() - start) / 20 * 1000
+        except torch.cuda.OutOfMemoryError:
+            std_time = "OOM"
+            torch.cuda.empty_cache()
+
+        # 3. 测量 FlashAttention 内核 (通过 PyTorch 原生 SDP 后端调度)
+        torch.cuda.reset_peak_memory_stats()
+        start = time.perf_counter()
+        for _ in range(20):
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+                _ = F.scaled_dot_product_attention(q, k, v)
+        torch.cuda.synchronize()
+        fa_time = (time.perf_counter() - start) / 20 * 1000
+
+        speedup_str = f"{std_time / fa_time:.2f}x" if isinstance(std_time, float) else "Inf (OOM)"
+        std_str = f"{std_time:.2f}" if isinstance(std_time, float) else std_time
+        print(f"{s:<8} | {std_str:<22} | {fa_time:<16.2f} | {speedup_str:<8}")
+
+if __name__ == "__main__":
+    run_benchmark()</code></pre>
+    </div>
+
+    <h3>5.2 生产级混合精度训练配置代码</h3>
+    <p>以下 Python 代码展示了如何在标准的 Hugging Face 训练循环中，结合 <code>TrainingArguments</code>、FlashAttention-2 与全链路 BF16 精度完成最高效的训练管道装配：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">train_efficient_sft.py</span>
+      <pre class="code"><code class="language-python">import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+
+def launch_training():
+    model_id = "/models/llama-3-8b-base"
+    
+    # 1. 验证硬件是否原生支持 BF16
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError("当前硬件不支持 BF16，建议升级 Ampere 架构以上 GPU！")
+
+    # 2. 以 BF16 精度加载模型并显式挂载 FlashAttention-2
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",  # 启用底层 FlashAttention-2
+        device_map="auto",
+    )
+
+    # 3. 训练超参数与混合精度设定
+    training_args = TrainingArguments(
+        output_dir="./outputs",
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
+        learning_rate=2e-5,
+        bf16=True,                # 全局启用 BF16 混合精度
+        fp16=False,               # 关闭 FP16 及其 GradScaler
+        logging_steps=10,
+        save_strategy="steps",
+        save_steps=500,
+        gradient_checkpointing=True,  # 激活值梯度重计算
+        gradient_checkpointing_kwargs={"use_reentrant": False},  # 推荐使用 non-reentrant
+        optim="adamw_torch_fused",    # 启用 PyTorch 内部融合版 AdamW
+        max_grad_norm=1.0,
+    )
+
+    print("[INFO] 模型与高效注意力配置就绪，随时可启动微调。")
+
+if __name__ == "__main__":
+    launch_training()</code></pre>
+    </div>
+
+    <h3>5.3 Triton 手写融合算子实战：极速 SwiGLU 实现</h3>
+    <p>为了理解现代内核优化的本质，下述代码给出了一个极简可运行的 Triton 语言前向融合 SwiGLU 内核，展示如何将门控与激活完全限制在片上寄存器中：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">triton_swiglu.py</span>
+      <pre class="code"><code class="language-python">import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _swiglu_fwd_kernel(
+    gate_ptr, up_ptr, out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr
+):
+    """Triton 融合 SwiGLU 前向内核: out = (gate * sigmoid(gate)) * up"""
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    # 异步从全局显存载入分块
+    gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0)
+    up = tl.load(up_ptr + offsets, mask=mask, other=0.0)
+
+    # 片上完成 Sigmoid 与双重逐元素相乘，零中间态 HBM 写出
+    sig = tl.sigmoid(gate)
+    swish = gate * sig
+    out = swish * up
+
+    # 写回全局显存
+    tl.store(out_ptr + offsets, out, mask=mask)
+
+def triton_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """包装为 PyTorch 调用接口"""
+    out = torch.empty_like(gate)
+    n_elements = gate.numel()
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    _swiglu_fwd_kernel[grid](gate, up, out, n_elements, BLOCK_SIZE=1024)
+    return out</code></pre>
+    </div>
+
+    <h2>6. 常见陷阱与调试经验</h2>
+    <ul>
+      <li><strong>陷阱一：在支持 BF16 的现代 GPU 上盲目开启 FP16 导致 GradScaler 崩溃</strong>。
+      <br><em>现象分析</em>：训练刚开始几步，Loss 突然变为 <code>NaN</code>，控制台充斥着 <code>Loss scale reduced to ...</code> 的警告，随后优化器跳步，模型完全无法收敛。<br>
+      <em>根本原因</em>：FP16 动态范围仅到 65504，在后训练对齐阶段（特别是带有长度惩罚或长文本 Attention 时），梯度峰值极易越界。GradScaler 反复缩放最终下溢为 0。<br>
+      <em>急救方案</em>：在 Ampere/Hopper（A100/H100/4090）上，坚决将 <code>fp16=False</code> 并切换为 <code>bf16=True</code>。BF16 的 8 位指数与 FP32 相同，彻底免疫此类溢出。</li>
+
+      <li><strong>陷阱二：启用 FlashAttention 后，Padding Token 的掩码泄露或计算不一致</strong>。
+      <br><em>现象分析</em>：在做 SFT 微调时，使用了包含大量 Padding 的 Batch，开启 FlashAttention 后模型性能大幅劣于不开 FlashAttention。<br>
+      <em>根本原因</em>：标准 Attention 往往依赖传入形状为 <code>[B, 1, S, S]</code> 的 <code>attention_mask</code>，其中包含 <code>-inf</code> 填充。FlashAttention 内部为了极致速度，通常采用紧凑的序列拼接格式（Unpadding / VarLen），传入的是 <code>cu_seqlens</code> 累积序列长度张量。如果外层封装传递了错误的 Mask，会导致 FlashAttention 错误地将 Padding 计算在内或越界越权。<br>
+      <em>急救方案</em>：确保使用 Hugging Face 官方认证的 <code>attn_implementation="flash_attention_2"</code>，它在底层会自动处理 Padding 的解包与打包（Unpad &amp; Pad），保证掩码严格对齐。</li>
+
+      <li><strong>陷阱三：Gradient Checkpointing 与 FlashAttention 冲突导致显存不减反增</strong>。
+      <br><em>现象分析</em>：为了压榨显存同时开启了梯度重计算与 FlashAttention，发现前向速度变慢很多，显存没有明显下降。<br>
+      <em>根本原因</em>：PyTorch 传统的 <code>use_reentrant=True</code> 机制会破坏 FlashAttention 内核的张量生命周期钩子，导致部分重计算逻辑被重复调用。<br>
+      <em>急救方案</em>：务必传递 <code>gradient_checkpointing_kwargs={"use_reentrant": False}</code>，使用 PyTorch 2.x 原生的 non-reentrant 模式，两者可完美协同。</li>
+    </ul>
+
+    <h2>7. 本章小结</h2>
+    <ul>
+      <li><strong>注意力物理瓶颈</strong>：标准点积注意力的内存与时间复杂度为 \( O(N^2) \)，中间矩阵 \( S, P \) 在 HBM 全量物化导致访存受限并引发长文本显存崩溃。</li>
+      <li><strong>FlashAttention 核心机理</strong>：利用 GPU 高速 SRAM 执行 Tiling 分块计算；运用 Online Softmax 的动态重缩放性质消除全局同步；在反向传播中通过重计算替代巨额 HBM 访存，实现 \( O(N) \) 显存开销。</li>
+      <li><strong>版本演进脉络</strong>：V1 奠定切块与流式基础；V2 调转内外循环、消除写冲突并大幅优化因果掩码；V3 深度适配 Hopper 架构，引入 TMA 硬件异步数据搬运与 FP8 原生指令。</li>
+      <li><strong>浮点精度取舍</strong>：FP16 指数位短（5位），必须依赖 GradScaler 动态防溢出；BF16 继承 FP32 的 8 位指数位，完全杜绝下溢，是现代后训练的绝对首选；FP8 则在超大规模训练中借助 E4M3/E5M2 组合拳开拓算力新边疆。</li>
+      <li><strong>算子融合革命</strong>：借助 Triton 与 Liger Kernel 将 RMSNorm、SwiGLU 与 CrossEntropy 进行片上融合，消除中间张量访存，实现端到端吞吐与显存利用率的双重跃迁。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：在 FlashAttention 中，为什么在线流式 Softmax（Online Softmax）允许在不遍历完整个序列的情况下就开始计算部分 Attention 输出？</summary>
+        <p><strong>答案：</strong>因为 Softmax 的指数特性允许基于局部最大值进行“事后重缩放”。当算法先处理序列的第一个局部切块时，可以基于该切块的局部最大值 \( m^{(1)} \) 算出局部的未归一化输出向量；当算法遍历到后续切块发现更大的新最大值 \( m^{	ext{new}} \) 时，只需将之前已经累积的输出向量乘以一个标量缩放因子 \( e^{m^{(1)} - m^{	ext{new}}} \)，便能将其严格无损地调整至新最大值的基底上，同时累加新切块的局部贡献。遍历完所有切块后，再除以最终累计的分母归一化项 \( l^{	ext{new}} \)，在数学上与全局一次性计算的 Softmax 完全等价。</p>
+      </details>
+      <details>
+        <summary>问题 2：为什么在大模型训练中，BF16 相比 FP16 几乎彻底消除了对 GradScaler（损失缩放器）的依赖？</summary>
+        <p><strong>答案：</strong>FP16 只有 5 位指数位，其表示的数值上限是 65504，最小正正规数是 \( 6.1 	imes 10^{-5} \)。反向传播中大模型的梯度往往非常微小（例如 \( 10^{-6} \) 甚至更小），极易直接下溢截断为 0，因此 FP16 必须引入 GradScaler 将整个损失和梯度人为放大数万倍后再计算。而 BF16 拥有与单精度 FP32 完全相同的 8 位指数位，其动态表示范围高达 \( \sim 10^{-38} \) 到 \( 10^{38} \)，无论前向激活有多大、反向微小梯度有多小，都天然落在 BF16 的正规表示区间内，绝不会发生下溢或溢出，因此完全不需要任何外部缩放器动态干预。</p>
+      </details>
+      <details>
+        <summary>问题 3：Liger Kernel 在优化 Transformer 最后一层（Linear + CrossEntropyLoss）时，是如何做到降低 60% 以上显存峰值的？</summary>
+        <p><strong>答案：</strong>在标准实现中，隐藏状态 \( H \in \mathbb{R}^{B 	imes S 	imes D} \) 必须先通过全连接权重投影成一个巨大的 Logits 张量 \( \mathbb{R}^{B 	imes S 	imes V} \) 并写回 GPU 显存中，随后再调用 CrossEntropy 计算 Loss。当词表大小 \( V \) 达到 128k 时，这个中间 Logits 张量极其庞大。Liger Kernel 将两者通过 Triton 内核进行了片上融合，在计算时采用分块流式处理：每次只在片上 SRAM 中计算一小块 Token 对应的 Logits 分布，并在本地即时完成 Softmax 分母统计与对数损失累加，随后立即丢弃该块 Logits。整个训练过程中<strong>从不将整个完整的 Logits 张量物化写回到显存</strong>，从而彻底砍掉了这部分显存开销。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Dao+, 2022]</span> Dao, T., Fu, D. Y., Ermon, S., Rudra, A., &amp; Ré, C. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." <i>NeurIPS</i>, 2022. <span class="rid">arXiv:2205.14135</span></li>
+      <li><span class="rid">[Dao, 2023]</span> Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." <i>ICLR</i>, 2024. <span class="rid">arXiv:2307.08691</span></li>
+      <li><span class="rid">[Shah+, 2024]</span> Shah, J., Ganesh, A., Wan, S., Dao, T., et al. "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2407.08608</span></li>
+      <li><span class="rid">[Micikevicius+, 2017]</span> Micikevicius, P., Narang, S., Alben, J., Diamos, G., et al. "Mixed Precision Training." <i>ICLR</i>, 2018. <span class="rid">arXiv:1710.03740</span></li>
+      <li><span class="rid">[Kalamkar+, 2019]</span> Kalamkar, D., Mudigere, D., Mellempudi, N., et al. "A Study of BFLOAT16 for Deep Learning Training." <i>arXiv preprint</i>, 2019. <span class="rid">arXiv:1905.12322</span></li>
+      <li><span class="rid">[Micikevicius+, 2022]</span> Micikevicius, P., Stosic, M., Burgess, N., et al. "FP8 Formats for Deep Learning." <i>arXiv preprint</i>, 2022. <span class="rid">arXiv:2209.05433</span></li>
+      <li><span class="rid">[Tillet+, 2019]</span> Tillet, P., Kung, H. T., &amp; Cox, D. "Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations." <i>MAPL</i>, 2019.</li>
+      <li><span class="rid">[Hsu+, 2024]</span> Hsu, B. Y., et al. "Liger Kernel: Efficient Triton Kernels for LLM Training." <i>GitHub Repository</i>, 2024. <span class="rid">arXiv:2410.10989</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

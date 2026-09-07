@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 27 章 · R1 复现实战与配方 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 5 部分 · 推理增强后训练</div>
+      <h1>第 27 章 · R1 复现实战与配方</h1>
+      <p class="chapter-lead">DeepSeek-R1 的开源彻底打破了专有前沿推理模型的黑盒垄断，证明了纯强化学习（Pure RL）与极小规模冷启动数据在诱导长思维链自发涌现方面的颠覆性威力。本章系统解构 DeepSeek-R1 完整的四阶段后训练流水线，深入剖析 DeepSeek-R1-Zero 纯强化学习在探索过程中出现的语言混杂现象及其消解机制。在此基础上，我们将完整呈现规则奖励函数工程实现、面向 verl 与 Open-R1 框架的大规模 GRPO 启动脚本，以及长序列推理展开对分布式显存与负载均衡的系统级工程应对方案。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★★★ ｜ 先修：第 20 章、第 25 章、第 26 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. DeepSeek-R1 四阶段训练流水线全景解构</h2>
+    <p>在传统的基于人类反馈的强化学习（Reinforcement Learning from Human Feedback, RLHF）管线中，大语言模型的微调往往依赖数十万条高质量人类标注数据，以及极其脆弱的人类偏好奖励模型（Reward Model, RM）。然而，DeepSeek-R1 提出了一套环环相扣、以强化学习为核心驱动力的四阶段训练流水线（Four-stage Pipeline）。这套架构不仅彻底摆脱了神经奖励模型的奖励黑客（Reward Hacking）困境，更揭示了语言模型如何通过自主试错建立深层逻辑推理网络。</p>
+
+    <p>为了全面理解 R1 的成功基石，我们需要先剖析其前置探路实验——DeepSeek-R1-Zero。R1-Zero 在没有任何监督微调（SFT）的前提下，直接在基础底模（DeepSeek-V3-Base）上施加基于群体相对策略优化（Group Relative Policy Optimization, GRPO）算法的纯强化学习。实验发现，模型自发学会了耗费成千上万个 Token 进行思考、检验并纠正先前的错误，推理能力随着环境奖励的迭代呈现爆发式增长。然而，R1-Zero 也暴露了严重的排版混乱、中英文夹杂与低可读性问题。正是为了解决这些缺陷，完整的 DeepSeek-R1 工业级流水线应运而生。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DeepSeek-R1 四阶段训练流水线与数据流向">
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+        </defs>
+
+        <!-- Stage 1 -->
+        <rect x="20" y="30" width="150" height="90" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="95" y="55" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a">阶段一：冷启动 SFT</text>
+        <text x="95" y="78" text-anchor="middle" font-size="12" fill="#3b82f6">数千条优质长 CoT</text>
+        <text x="95" y="98" text-anchor="middle" font-size="11" fill="#64748b">可读性与结构初始化</text>
+
+        <!-- Arrow 1 to 2 -->
+        <path d="M170 75 L 195 75" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <!-- Stage 2 -->
+        <rect x="200" y="30" width="155" height="90" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="277" y="55" text-anchor="middle" font-size="14" font-weight="bold" fill="#065f46">阶段二：推理导向 RL</text>
+        <text x="277" y="78" text-anchor="middle" font-size="12" fill="#059669">大规模 GRPO 算法</text>
+        <text x="277" y="98" text-anchor="middle" font-size="11" fill="#64748b">规则准确率 + 格式约束</text>
+
+        <!-- Arrow 2 to 3 -->
+        <path d="M355 75 L 380 75" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <!-- Stage 3 -->
+        <rect x="385" y="30" width="155" height="90" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="462" y="55" text-anchor="middle" font-size="14" font-weight="bold" fill="#92400e">阶段三：拒识采样 SFT</text>
+        <text x="462" y="78" text-anchor="middle" font-size="12" fill="#d97706">60万推理 + 20万通用</text>
+        <text x="462" y="98" text-anchor="middle" font-size="11" fill="#64748b">多轮对话与通用能力恢复</text>
+
+        <!-- Arrow 3 to 4 -->
+        <path d="M540 75 L 565 75" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <!-- Stage 4 -->
+        <rect x="570" y="30" width="135" height="90" rx="8" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="637" y="55" text-anchor="middle" font-size="14" font-weight="bold" fill="#5b21b6">阶段四：全功能 RL</text>
+        <text x="637" y="78" text-anchor="middle" font-size="12" fill="#7c3aed">多目标奖励对齐</text>
+        <text x="637" y="98" text-anchor="middle" font-size="11" fill="#64748b">推理、事实性与人类偏好</text>
+
+        <!-- Bottom Distillation Loop -->
+        <rect x="200" y="160" width="340" height="85" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="2"/>
+        <text x="370" y="185" text-anchor="middle" font-size="14" font-weight="bold" fill="#991b1b">下游输出：长思考链知识蒸馏（Distillation）</text>
+        <text x="370" y="208" text-anchor="middle" font-size="12" fill="#b91c1c">生成 80 万精滤推理数据 → SFT 小参数模型（1.5B ~ 70B）</text>
+        <text x="370" y="228" text-anchor="middle" font-size="11" fill="#7f1d1d">超越直接小模型 RL 的算力投入产出比</text>
+
+        <!-- Flow line from Stage 4 to Distillation -->
+        <path d="M637 120 L 637 202 L 545 202" stroke="#ef4444" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#arrow)"/>
+      </svg>
+      <figcaption>图 27-1：DeepSeek-R1 四阶段完整后训练流水线与下游蒸馏全景流转图</figcaption>
+    </figure>
+
+    <h3>1.1 阶段一：冷启动监督微调（Cold-Start SFT）</h3>
+    <p>与 R1-Zero 从零直接进入强化学习不同，DeepSeek-R1 首先构建了一个数千条规模（数千至上万条）的高质量冷启动数据集。构建该数据集的核心目的并非教会基座模型庞杂的领域事实，而是赋予模型基础的格式遵守能力与良好的可读性。冷启动数据通常采用包含显式思维链标签的格式，例如：</p>
+    <pre><code>|special_token|&lt;think&gt;
+[详细且条理清晰的逐步推理过程，包括假设提出、步骤演算、自我反思与结论总结]
+&lt;/think&gt;
+[最终精炼准确的最终答案]</code></pre>
+    <p>通过仅数千条此类样本的微调，基座模型被迅速置于高可读性、格式规范的推理流形之上，有效避免了 R1-Zero 在早期探索阶段陷入杂乱无章的符号输出状态。</p>
+
+    <h3>1.2 阶段二：面向推理任务的大规模强化学习（Reasoning-oriented RL）</h3>
+    <p>在冷启动模型的基础上，训练流水线切入以长思维链激发为主目标的第二阶段。此阶段主要使用数学推理、算法编程、物理逻辑等具有确定性客观判据的任务。算法层面全面采用群体相对策略优化（GRPO），对于每个提示词 \( q \)，由策略网络生成一组候选轨迹 \( \{o_1, o_2, \dots, o_G\} \)，利用纯规则打分器计算归一化优势值进行更新。通过持续的多万步迭代，模型的平均输出长度从最初的数百 Token 迅速激增至上万 Token，自发演化出反复推导验证的深层推理策略。</p>
+
+    <h3>1.3 阶段三：拒识采样与通用能力融合微调（Rejection Sampling & General SFT）</h3>
+    <p>当第二阶段的推理强化学习收敛后，模型已经在高难度逻辑问题上展现出极高的求解率。然而，由于前期训练过度偏向于数理代码类任务，模型在泛化场景下的指令遵循能力、多轮对话连贯性、文科写作甚至语言表达自然度均遭受了不同程度的抑制。为了解决这种灾难性能力退化，阶段三执行了大规模的重采样与混合 SFT：</p>
+    <ul>
+      <li><strong>推理数据拒识采样（Rejection Sampling）</strong>：利用阶段二训练出的推理模型对海量数学与编程题进行并发采样生成，仅保留答案经过自动化验证通过的高质量长 CoT 样本，规模约为 60 万条。</li>
+      <li><strong>通用领域数据混合（General SFT）</strong>：混入约 20 万条涵盖创意写作、事实问答、多轮闲聊、摘要抽取与安全合规的通用精标数据。在通用数据中，对不需要深度思考的问题引导模型输出紧凑或无思维链的直接回答。</li>
+    </ul>
+
+    <h3>1.4 阶段四：全场景多目标强化学习（Whole-pipeline RL）</h3>
+    <p>最后一阶段旨在将模型彻底打磨为能够服务于广泛现实场景的综合智能助手。在这一阶段，不仅保留针对数学与编程任务的确定性规则奖励，同时引入针对通用指令遵循、回答风格偏好、事实准确性以及安全红线的人类偏好奖励模型（RM）。整个强化学习过程在全功能混合目标下展开，确保最终模型在保持超强推理深度的同时，具备与人类价值观高度对齐的交互体验。</p>
+
+    <figure class="figure">
+      <img src="../assets/figs/deepseek-r1.png" alt="DeepSeek-R1 训练管线对比">
+      <figcaption>图 27-2：DeepSeek-R1 官方论文中展示的端到端训练框架演化（来源：DeepSeek-AI, 2025, arXiv:2501.12948）</figcaption>
+    </figure>
+
+    <h2>2. DeepSeek-R1-Zero 的复现细节与语言混杂困境</h2>
+    <p>DeepSeek-R1-Zero 是整个推理研究中最具学术震撼力的实验。它向整个 AI 社区回答了一个根本性问题：<strong>在没有任何人类先验指导、没有任何有监督标注数据的情况下，仅仅凭借纯策略梯度的试错反馈，语言模型能否自发进化出高阶逻辑推理系统？</strong></p>
+
+    <h3>2.1 R1-Zero 的纯 RL 涌现机制</h3>
+    <p>在 R1-Zero 的复现中，直接加载未经任何指令微调的预训练基础模型（Base Model）。输入提示被封装在极简的系统模板中：</p>
+    <div class="code-wrap">
+      <span class="code-label">prompt_template.txt</span>
+      <pre class="code"><code class="language-plaintext">A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within &lt;think&gt; &lt;/think&gt; and &lt;answer&gt; &lt;/answer&gt; tags, respectively, i.e., &lt;think&gt; reasoning process here &lt;/think&gt; &lt;answer&gt; answer here &lt;/answer&gt;. User: {prompt} Assistant:</code></pre>
+    </div>
+    <p>当启动 GRPO 训练并持续推进到数百步后，监控曲线呈现出非常鲜明的特征：模型的输出 Token 长度与基准准确率之间展现出强烈的正相关演化。起初，模型仅尝试直接给出简短答案，命中率较低；然而，由于长距离推导能够偶发性地带来更高的准确率，策略梯度迅速对探索出中间推导路径的参数权重给予正向增强。伴随着训练的深入，模型不仅自发拉长思考链，更在无监督的情况下自发产生了著名的<span class="term">顿悟时刻（Aha Moment）</span>——模型在思维链内部输出诸如“Wait, let me rethink this...”、“Wait, this formula does not hold for negative values...”等自我质疑短语，推翻前面的推导重新建立逻辑分支。</p>
+
+    <h3>2.2 语言混杂（Language Mixing）现象剖析</h3>
+    <p>然而，在完全脱离人类语言偏好奖励的纯强化学习环境中，模型唯一的优化目标是最大化最终答案命中率与格式闭合奖励。这导致策略网络为了寻找全局熵最大或表征最高效的解空间，出现严重的<span class="term">语言混杂（Language Mixing）</span>。典型表现包括：</p>
+    <ul>
+      <li><strong>跨语言频繁震荡</strong>：即使用户的 Prompt 为纯中文，模型在 <code>&lt;think&gt;</code> 标签内却交替混杂英语、中文、伪代码甚至数学公式缩写，例如前一句话用中文分析题目已知条件，后一句话突然跳到英文推导行列式，紧接着又用中文总结结论。</li>
+      <li><strong>信息密度的病态漂移</strong>：在某些特定算术分支中，模型发现使用简略的英文介词或符号缩写能在有限的窗口内以更高的 Token 效率展开推演，导致输出的思维流虽然逻辑正确但人类完全无法舒适阅读。</li>
+      <li><strong>语法破损与乱码边缘探索</strong>：为追求快速达成规则答案，部分探索轨迹会出现无谓的字符重复或非规范标点。</li>
+    </ul>
+
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 语言混杂为什么是纯 RL 的必然产物？</div>
+      <p>从信息论与控制论视角来看，语言只是表征逻辑状态的载体。如果在奖励函数中只对最终结果的正确性进行二值判定（0 或 1），对于策略网络而言，所有能够引向正确答案的中间语言符号分布在效用上是完全等价的。人类自然语言的语法一致性与单语言纯净度对于数学解题本质上是一种“不必要的先验约束”。因此，只要没有施加强制的语言一致性正则惩罚或冷启动引导，纯强化学习必然自发走向跨语种词元自由组合的帕累托最优状态。</p>
+    </div>
+
+    <h2>3. 工业级奖励函数工程：准确率、格式与语言一致性</h2>
+    <p>在可验证奖励强化学习（RLVR）中，奖励函数的设计是决定训练成败的核心命门。任何轻微的逻辑漏洞都会被强大的策略网络以指数级速度捕捉，演变为灾难性的奖励黑客（Reward Hacking）。针对推理模型训练，工业界通常采用三位一体的复合规则奖励架构：<strong>规则准确率奖励（Rule-based Accuracy Reward）</strong>、<strong>格式一致性奖励（Format Consistency Reward）</strong>与<strong>语言一致性惩罚（Language Consistency Penalty）</strong>。</p>
+
+    \[ R_{\mathrm{total}} = R_{\mathrm{acc}} + \alpha \cdot R_{\mathrm{format}} - \beta \cdot P_{\mathrm{lang\_mix}} \]
+
+    <p>其中，\( \alpha \) 通常设定在 0.1 ~ 0.2 之间，确保格式信号能够引导模型建立基础交互协议，但绝不喧宾夺主掩盖真正的逻辑解题信号；\( \beta \) 设定为 0.1 ~ 0.15，对跨语言漂移进行有效抑制。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>奖励分量</th>
+            <th>判定逻辑与提取方式</th>
+            <th>取值范围</th>
+            <th>典型失效与黑客行为排查</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>准确率奖励（\( R_{\mathrm{acc}} \)）</strong></td>
+            <td>从 <code>&lt;answer&gt;</code> 中提取最终答案，经 SymPy 等价符号计算或单元测试判定</td>
+            <td>\( \{0.0, 1.0\} \) 或部分赋分</td>
+            <td>答案解析器写得过宽，导致模型在输出末尾穷举选项命中打分正则</td>
+          </tr>
+          <tr>
+            <td><strong>格式奖励（\( R_{\mathrm{format}} \)）</strong></td>
+            <td>严格检测 <code>&lt;think&gt;</code> 与 <code>&lt;answer&gt;</code> 成对闭合，且无前置或后置游离杂乱符号</td>
+            <td>\( \{0.0, 0.1, 0.2\} \)</td>
+            <td>模型为了刷满格式分，直接输出空的思考标签跳过深度计算</td>
+          </tr>
+          <tr>
+            <td><strong>语言一致性（\( P_{\mathrm{lang}} \)）</strong></td>
+            <td>基于 fastText / LangDetect 检测思考链中的主导语言是否与 Prompt 严格对齐</td>
+            <td>\( [0.0, 0.2] \) 连续惩罚</td>
+            <td>因包含标准数学公式变量（如 \( x, y, \sin, \cos \)）误判为英文比例过高</td>
+          </tr>
+          <tr>
+            <td><strong>长度调节项（可选）</strong></td>
+            <td>非线性阶段性长度惩罚或奖励，防止长尾死循环爆窗</td>
+            <td>\( [-0.5, 0.0] \)</td>
+            <td>过早施加长度惩罚导致模型主动阉割长思维链的自发展开</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 27-1：推理强化学习复合规则奖励体系设计与失效边界对照</span>
+    </div>
+
+    <p>在具体实现中，数学题目的答案提取与比对尤其充满陷阱。例如，LaTeX 格式下的分数 \( \frac{1}{2} \) 与浮点数 <code>0.5</code>，带根号的代数式化简形式，以及矩阵或集合的表示，均无法通过简易的字符串直接匹配（Exact String Match）。必须构建基于抽象语法树（AST）解析的符号比较器。以下是经过工业生产验证的奖励函数核心实现代码。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">reward_functions.py</span>
+      <pre class="code"><code class="language-python">import re
+import math
+from typing import Dict, Any, List, Optional
+import sympy
+from sympy.parsing.latex import parse_latex
+
+class R1RewardEngine:
+    """DeepSeek-R1 工业级复合规则奖励计算引擎"""
+    def __init__(self, format_weight: float = 0.15, lang_penalty_weight: float = 0.1):
+        self.format_weight = format_weight
+        self.lang_penalty_weight = lang_penalty_weight
+        # 预编译核心标签匹配正则
+        self.pattern_think = re.compile(r"&lt;think&gt;(.*?)&lt;/think&gt;", re.DOTALL)
+        self.pattern_answer = re.compile(r"&lt;answer&gt;(.*?)&lt;/answer&gt;", re.DOTALL)
+        self.pattern_cjk = re.compile(r"[\u4e00-\u9fff]")
+        self.pattern_latin = re.compile(r"[a-zA-Z]")
+
+    def extract_tags(self, text: str) -> Dict[str, Optional[str]]:
+        """从模型输出中抽取思考与最终答案内容"""
+        think_match = self.pattern_think.search(text)
+        answer_match = self.pattern_answer.search(text)
+        return {
+            "think": think_match.group(1).strip() if think_match else None,
+            "answer": answer_match.group(1).strip() if answer_match else None,
+            "has_valid_format": bool(think_match and answer_match)
+        }
+
+    def compute_format_reward(self, text: str, parsed: Dict[str, Optional[str]]) -> float:
+        """评估输出结构的完整性与标签合规性"""
+        if not parsed["has_valid_format"]:
+            return 0.0
+        
+        # 思考内容不可为空且必须具备最低有效长度（防止格式空转欺诈）
+        think_text = parsed["think"]
+        if len(think_text) &lt; 30:
+            return 0.02
+        
+        # 检查是否出现多余或嵌套的非法标签
+        total_open_think = text.count("&lt;think&gt;")
+        total_close_think = text.count("&lt;/think&gt;")
+        total_open_ans = text.count("&lt;answer&gt;")
+        total_close_ans = text.count("&lt;/answer&gt;")
+        
+        if total_open_think == 1 and total_close_think == 1 and \
+           total_open_ans == 1 and total_close_ans == 1:
+            return self.format_weight
+        return self.format_weight * 0.5
+
+    def compute_accuracy_reward(self, predicted_answer: Optional[str], ground_truth: str) -> float:
+        """使用 SymPy 符号代数系统比对数学客观题答案"""
+        if predicted_answer is None or len(predicted_answer) == 0:
+            return 0.0
+        
+        clean_pred = predicted_answer.strip().replace("$", "").replace(" ", "")
+        clean_gt = ground_truth.strip().replace("$", "").replace(" ", "")
+        
+        # 1. 简易字符串完全匹配快路径
+        if clean_pred == clean_gt:
+            return 1.0
+            
+        # 2. 符号代数解析等价性判定
+        try:
+            # 尝试通过 sympy 解析 LaTeX 表达式
+            expr_pred = parse_latex(clean_pred)
+            expr_gt = parse_latex(clean_gt)
+            # 简化差值是否恒等于零
+            diff = sympy.simplify(expr_pred - expr_gt)
+            if diff == 0:
+                return 1.0
+        except Exception:
+            pass
+
+        # 3. 浮点数极小容差回退比较
+        try:
+            val_pred = float(sympy.N(clean_pred))
+            val_gt = float(sympy.N(clean_gt))
+            if math.isclose(val_pred, val_gt, rel_tol=1e-4, abs_tol=1e-5):
+                return 1.0
+        except Exception:
+            pass
+
+        return 0.0
+
+    def compute_language_consistency_penalty(self, prompt: str, think_text: Optional[str]) -> float:
+        """惩罚思考链中违背提问语言的严重语言混杂"""
+        if not think_text:
+            return 0.0
+        
+        # 判定提问是否以中文为主
+        prompt_cjk_count = len(self.pattern_cjk.findall(prompt))
+        is_prompt_zh = prompt_cjk_count &gt; 5
+        
+        if is_prompt_zh:
+            # 计算思考链中英文单词与汉字的比例
+            think_cjk_count = len(self.pattern_cjk.findall(think_text))
+            think_latin_count = len(self.pattern_latin.findall(think_text))
+            
+            # 若提问为中文，但思考链中拉丁字母数量碾压汉字数（剔除公式符号常见影响）
+            if think_cjk_count + think_latin_count &gt; 0:
+                latin_ratio = think_latin_count / (think_cjk_count + think_latin_count + 1e-6)
+                if latin_ratio &gt; 0.75:
+                    return self.lang_penalty_weight
+        return 0.0
+
+    def evaluate_response(self, prompt: str, response: str, ground_truth: str) -> Dict[str, float]:
+        """批量调度综合得分计算"""
+        parsed = self.extract_tags(response)
+        r_acc = self.compute_accuracy_reward(parsed["answer"], ground_truth)
+        r_fmt = self.compute_format_reward(response, parsed)
+        p_lang = self.compute_language_consistency_penalty(prompt, parsed["think"])
+        
+        total = r_acc + r_fmt - p_lang
+        return {
+            "total_reward": max(0.0, total),
+            "accuracy_reward": r_acc,
+            "format_reward": r_fmt,
+            "language_penalty": p_lang
+        }</code></pre>
+    </div>
+
+    <h2>4. 基于 verl 框架的 R1-Zero / R1 完整复现配置</h2>
+    <p>在大规模强化学习工程落地上，字节跳动开源的 <span class="term">verl（Volcano Engine Reinforcement Learning for LLM）</span> 框架已成为复现 DeepSeek-R1 与 GRPO 算法的事实标准之一。verl 通过解耦执行器架构（Decoupled Actor-Critic Architecture）与高吞吐的 vLLM Rollout 引擎，完美支持万卡级别的长思维链异步训练。</p>
+
+    <h3>4.1 分布式拓扑与并行切分策略</h3>
+    <p>在长序列推理训练中，一个批次的 Rollout 序列长度往往从 1K 动态膨胀至 16K 或 32K。传统的纯张量并行（Tensor Parallelism, TP）在应对长上下文时，通信开销迅速吃满 NVLink 带宽。因此在 verl 中，标准的配置是采用 3D 并行混合调度：</p>
+    <ul>
+      <li><strong>Rollout 阶段</strong>：采用基于 vLLM 的张量并行（如 \( \mathrm{TP}=2 \) 或 \( \mathrm{TP}=4 \)），配合 PagedAttention 支撑动态并发采样。</li>
+      <li><strong>训练 Actor 优化阶段</strong>：切换至 FSDP（Fully Sharded Data Parallel）或 DeepSpeed ZeRO-3，同时开启序列并行（Sequence Parallelism, SP）或 FlashAttention-3 长序列分块计算。</li>
+    </ul>
+
+    <div class="code-wrap">
+      <span class="code-label">run_r1_zero_grpo.sh</span>
+      <pre class="code"><code class="language-bash">#!/usr/bin/env bash
+# 基于 8 x H100/H800 GPU 节点复现 R1-Zero 风格推理训练启动脚本
+set -xe
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export NCCL_DEBUG=WARN
+export PYTHONUNBUFFERED=1
+
+PROJECT_DIR="D:/llm-post-training-cookbook"
+OUTPUT_DIR="./checkpoints/r1-zero-qwen2.5-7b"
+DATA_DIR="./data/math_code_reasoning"
+
+python -m verl.trainer.main_ppo \
+    --data.train_files="${DATA_DIR}/train.parquet" \
+    --data.val_files="${DATA_DIR}/test.parquet" \
+    --data.prompt_key="prompt" \
+    --data.max_prompt_length=1024 \
+    --data.max_response_length=8192 \
+    --data.train_batch_size=128 \
+    --actor_rollout_ref.model.path="Qwen/Qwen2.5-Math-7B" \
+    --actor_rollout_ref.actor.strategy="fsdp" \
+    --actor_rollout_ref.actor.optim.lr=1e-6 \
+    --actor_rollout_ref.actor.optim.weight_decay=0.01 \
+    --actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    --actor_rollout_ref.actor.ppo_epochs=1 \
+    --actor_rollout_ref.actor.entropy_coeff=0.001 \
+    --actor_rollout_ref.actor.clip_ratio=0.2 \
+    --actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    --actor_rollout_ref.actor.fsdp_config.grad_offload=False \
+    --actor_rollout_ref.rollout.name="vllm" \
+    --actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    --actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    --actor_rollout_ref.rollout.n=8 \
+    --actor_rollout_ref.rollout.temperature=0.9 \
+    --actor_rollout_ref.rollout.top_p=0.95 \
+    --algorithm.adv_estimator="grpo" \
+    --algorithm.kl_ctrl.kl_coef=0.0 \
+    --reward_model.reward_manager="naive" \
+    --trainer.total_epochs=15 \
+    --trainer.logger="['wandb', 'console']" \
+    --trainer.project_name="r1-zero-reproduction" \
+    --trainer.experiment_name="qwen-7b-grpo-8k" \
+    --trainer.default_local_dir="${OUTPUT_DIR}"</code></pre>
+    </div>
+
+    <h3>4.2 超参数矩阵与关键调度法则</h3>
+    <p>在推理任务的强化学习训练中，超参数的选择与传统对话对齐（如 PPO-DPO 风格微调）有着截然不同的规律。表 27-2 列出了复现 7B 至 32B 规模模型时的推荐生产超参数。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>超参数（Hyperparameter）</th>
+            <th>推荐取值</th>
+            <th>物理含义与工程调优原则</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>组采样大小（Group Size, \( G \)）</strong></td>
+            <td>\( 8 \sim 16 \)</td>
+            <td>每个 Prompt 采样的候选数量。\( G \) 太小会导致组内优势值方差估计失效，太大会加剧显存压力。</td>
+          </tr>
+          <tr>
+            <td><strong>采样温度（Sampling Temperature）</strong></td>
+            <td>\( 0.8 \sim 1.0 \)</td>
+            <td>必须保持高探索度，促使模型能够尝试不同解题路径，切忌设为 0.2 以下的低温。</td>
+          </tr>
+          <tr>
+            <td><strong>学习率（Actor Learning Rate）</strong></td>
+            <td>\( 1 \times 10^{-6} \sim 3 \times 10^{-6} \)</td>
+            <td>由于使用纯策略梯度且序列极长，学习率过高会导致注意力权重瞬间崩溃。</td>
+          </tr>
+          <tr>
+            <td><strong>KL 散度系数（\( \beta_{\mathrm{kl}} \)）</strong></td>
+            <td>\( 0.0 \) 或极小值（\( 0.001 \)）</td>
+            <td>R1-Zero 核心特征是不设参考基线约束（\( \beta=0 \)），允许模型无限度偏离原基座。</td>
+          </tr>
+          <tr>
+            <td><strong>熵正则化系数（Entropy Coeff）</strong></td>
+            <td>\( 0.001 \sim 0.005 \)</td>
+            <td>在长序列展开过程中防止特定高频 Token（如反复输出点号）导致策略过早确定化坍缩。</td>
+          </tr>
+          <tr>
+            <td><strong>PPO 剪切阈值（Clip Ratio \( \epsilon \)）</strong></td>
+            <td>\( 0.1 \sim 0.2 \)</td>
+            <td>长序列累积的概率比值扰动极其剧烈，保守的剪切区间能有效保护梯度更新稳定性。</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 27-2：DeepSeek-R1-Zero / GRPO 核心训练超参数基线配置</span>
+    </div>
+
+    <h2>5. 长序列展开对系统基础设施的极致挑战与破局</h2>
+    <p>传统 RLHF 训练中，模型的回复长度通常截断在 1024 或 2048 Tokens。然而在推理增强后训练中，为了让模型完整展示自我修正与深层推演，生成上限往往被放宽至 8192、16384 乃至 32768 Tokens。这种长序列自回归展开对底层训练集群构成了毁灭性的系统级压力。</p>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 显存与负载的“长尾爆炸”危机</div>
+      <p>在标准批处理中，若同一个 Batch 内有 7 条轨迹在 1000 Token 内得出结论，而有 1 条轨迹由于陷入逻辑死循环展开到了 16000 Token，传统的 Static Padding 将导致整个 Batch 在张量维度上被强行填充至 16000。此时，前 7 条轨迹的无效填充占比高达 93.75%，大量的算力与显存带宽被白白耗费在与 <code>pad_token</code> 的无用矩阵乘法中，直接触发集群级显存溢出（OOM）。</p>
+    </div>
+
+    <h3>5.1 动态序列打包与分块变长注意力</h3>
+    <p>为了攻克长尾长度不均衡，现代推理训练引擎全面引入了基于 FlashAttention 的无填充序列打包（Unpadded Sequence Packing）。在这一架构下，所有候选轨迹在内存中被展平为一维连续张量，并利用 <code>cu_seqlens</code> 累积位移索引指针直接记录每条轨迹的真实起止位置。底层计算单元通过动态分块跳过一切无用 Padding 计算。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">packed_attention_loss.py</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn as nn
+from flash_attn import flash_attn_varlen_func
+
+class PackedGRPOLoss(nn.Module):
+    """支持变长一维扁平化长序列的 GRPO 损失计算模块"""
+    def __init__(self, clip_eps: float = 0.2):
+        super().__init__()
+        self.clip_eps = clip_eps
+
+    def forward(
+        self,
+        current_logps: torch.Tensor,      # [Total_Tokens]
+        old_logps: torch.Tensor,          # [Total_Tokens]
+        advantages: torch.Tensor,         # [Num_Sequences]
+        cu_seqlens: torch.Tensor          # [Num_Sequences + 1] 累加偏移指针
+    ) -> torch.Tensor:
+        """
+        计算变长打包序列下的策略梯度损失，杜绝无意义 Padding 显存开销
+        """
+        num_seqs = advantages.size(0)
+        # 将序列级优势标量广播映射到每个 token 级别
+        token_advantages = torch.zeros_like(current_logps)
+        
+        for i in range(num_seqs):
+            start_idx = cu_seqlens[i].item()
+            end_idx = cu_seqlens[i + 1].item()
+            token_advantages[start_idx:end_idx] = advantages[i]
+
+        # 计算重要性采样比率 ratio = pi_theta(a|s) / pi_old(a|s)
+        ratio = torch.exp(current_logps - old_logps)
+        surr1 = ratio * token_advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * token_advantages
+        
+        # PPO 剪切损失（取悲观下界）
+        policy_loss = -torch.min(surr1, surr2)
+        return policy_loss.mean()</code></pre>
+    </div>
+
+    <h3>5.2 异步解耦调度：Rollout 引擎与训练 Worker 的解聚</h3>
+    <p>传统的同步 RL 框架（如早期 DeepSpeed-Chat）中，GPU Worker 必须在执行推断采样与梯度反向传播之间来回切换上下文，导致 vLLM 的 KV Cache 必须频繁分配与释放。在大规模复现 R1 时，主流架构转向了彻底的异步流水线解耦（Disaggregated Scheduling）：</p>
+    <ul>
+      <li><strong>专用推理节点池（Inference Workers）</strong>：部署专门的 GPU 集群专职运行基于 vLLM / SGLang 的高并发 Rollout 采样，持续消费任务队列并向缓冲区回填带有规则奖励打分的样本轨迹。</li>
+      <li><strong>专用训练节点池（Training Workers）</strong>：部署大规模 FSDP / Megatron 算力节点专职执行参数更新。当训练端完成权重更新后，通过异步非阻塞梯度广播或高速权重同步协议（Weight Sync Protocol）将最新权重热更新至推理端。</li>
+    </ul>
+
+    <h2>6. 常见陷阱与调试急救手册</h2>
+    <p>在实际动手复现 DeepSeek-R1 或 R1-Zero 时，算法工程师通常会遇到若干极端疑难杂症。以下总结了高频故障现象及其根因排查指南：</p>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 现象一：奖励崩溃（Reward Collapse）与重复循环</div>
+      <p><strong>症状</strong>：模型训练到某个阶段后，输出的 Token 长度突然被强行拉满到预设的最大长度（如 8192），思维链中充斥着成千上万个连续的“....”或“Wait, let me recalculate...”，最终导致输出被硬截断，奖励全部归零。<br>
+      <strong>排查方案</strong>：1. 检查是否完全去除了长度惩罚且没有任何标点多样性熵约束；2. 在格式奖励中，严禁仅对标签闭合赋予过高固定分值；3. 引入轻微的重复惩罚或采用动态退火温度。</p>
+    </div>
+
+    <div class="callout note">
+      <div class="callout-title">📘 现象二：组内全零方差（All-Zero Advantage）</div>
+      <p><strong>症状</strong>：GRPO 的优势值监控面板长时间处于全零状态，梯度范数（Grad Norm）降为零，策略网络停止学习。<br>
+      <strong>排查方案</strong>：这是由于采样的题目难度过高，导致组内 \( G \) 个候选轨迹全部答错（奖励全为 0）；或者题目过简单，候选全部答对（奖励全为 1）。当组内所有采样奖励一致时，标准差为零，归一化优势值退化为 0。解决方案是实施<strong>难度感知的数据集动态过滤</strong>，确保训练集中题目的 Pass@1 处于 0.1 到 0.8 的有效梯度区间内。</p>
+    </div>
+
+    <h2>7. 本章小结</h2>
+    <ul>
+      <li>DeepSeek-R1 证明了纯策略强化学习结合群体相对策略优化（GRPO）能够使基础语言模型在零人类标注的条件下自主涌现出长思维链推演、自我修正与深度反思能力。</li>
+      <li>R1-Zero 展现了惊人的推演上限，但也伴随着不可控的语言混杂（中英跨语种频繁切换与排版退化）问题。完整的 R1 四阶段流水线通过极小规模的冷启动微调与后置全功能对齐，兼顾了顶级推理能力与人类可读性。</li>
+      <li>规则奖励函数的构建是可验证强化学习的命门，必须由高精度符号代数计算（如 SymPy AST 解析）驱动，并辅以格式约束与语言一致性惩罚，杜绝一切奖励黑客漏洞。</li>
+      <li>长序列自回归展开对底层基础设施提出了极高的并发挑战，必须借助一维无填充打包（Unpadded Packing）、动态分块注意力以及推训异步解耦架构，才能在长尾显存爆炸的极端工况下实现线性的扩展吞吐。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：DeepSeek-R1-Zero 为什么会出现严重的“语言混杂”现象？在工业流水线中是如何系统解决的？</summary>
+        <p><strong>答案</strong>：因为 R1-Zero 采用纯可验证奖励强化学习，环境仅根据最终答案的对错与标签格式赋予奖励，而未对思考链的自然语言流畅度或语种进行任何先验约束。对于优化目标而言，策略网络发现跨语言交替或利用特定英文词汇缩写能以更高的信息密度或更广的熵分布达成正确结论，因而自发收敛至跨语种混杂的局部最优。工业级 DeepSeek-R1 通过在阶段一引入数千条规范格式的高质量冷启动长 CoT 数据奠定初始流形，并在阶段四结合通用领域多目标对齐，辅以语言一致性惩罚项，彻底解决了混杂问题。</p>
+      </details>
+      <details>
+        <summary>问题 2：在 GRPO 训练中，为什么如果一个 Prompt 的所有 \( G \) 个候选输出全部答对或全部答错，会导致该 Prompt 对模型参数更新毫无贡献？</summary>
+        <p><strong>答案</strong>：GRPO 的优势值是通过计算组内样本奖励的相对标准化得到的，其公式为 \( A_i = \frac{R_i - \mathrm{mean}(\{R\})}{\mathrm{std}(\{R\}) + \epsilon} \)。当一个 Prompt 下的所有候选采样全部答对（奖励均为 1）或全部答错（奖励均为 0）时，所有样本的奖励值完全相同，分子 \( R_i - \mathrm{mean} \) 恒等于 0。因此所有候选的优势值均变为 0，梯度在点乘优势项后直接归零，无法为模型提供任何相对优劣的对比信号。</p>
+      </details>
+      <details>
+        <summary>问题 3：为什么在长思维链推理强化学习中，直接使用带有 Padding 的传统批处理会导致显存溢出（OOM），工业上通常采取什么技术突破该瓶颈？</summary>
+        <p><strong>答案</strong>：长推理链中各候选输出的长度存在严重的“长尾效应”（有的仅需 500 Token，有的展开到 16000 Token）。传统批处理按照当前 Batch 内的最长样本进行 Padding，导致大量短样本被强行填充上万个无意义的 Pad Token，产生海量无效显存与计算浪费。工业上采用基于 FlashAttention 的无填充序列展平（Unpadded Sequence Packing），将所有有效 Token 连续排列并通过位移指针 <code>cu_seqlens</code> 记录分界，在底层注意力计算中直接跳过 Padding 矩阵乘法。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[DeepSeek-AI, 2025]</span> DeepSeek-AI. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." <i>arXiv preprint</i>, 2025. <span class="rid">arXiv:2501.12948</span></li>
+      <li><span class="rid">[Shao et al., 2024]</span> Shao, Z. et al. "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2402.03300</span></li>
+      <li><span class="rid">[Schulman et al., 2017]</span> Schulman, J. et al. "Proximal Policy Optimization Algorithms." <i>arXiv preprint</i>, 2017. <span class="rid">arXiv:1707.06347</span></li>
+      <li><span class="rid">[Kwon et al., 2023]</span> Kwon, W. et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." <i>SOSP</i>, 2023. <span class="rid">arXiv:2309.06180</span></li>
+      <li><span class="rid">[Sheng et al., 2024]</span> Sheng, Y. et al. "HybridFlow: A Flexible and Efficient RLHF Framework." <i>EuroSys</i>, 2024. <span class="rid">arXiv:2409.19256</span></li>
+      <li><span class="rid">[Dao, 2023]</span> Dao, T. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." <i>ICLR</i>, 2024. <span class="rid">arXiv:2307.08691</span></li>
+      <li><span class="rid">[Lightman et al., 2023]</span> Lightman, H. et al. "Let's Verify Step by Step." <i>ICLR</i>, 2024. <span class="rid">arXiv:2305.20050</span></li>
+      <li><span class="rid">[OpenAI, 2024]</span> OpenAI. "Learning to Reason with LLMs." <i>OpenAI Technical Report</i>, 2024.</li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

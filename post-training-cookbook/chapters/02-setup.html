@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 2 章 · 环境搭建与工具全景 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 0 部分 · 导读与学习路径</div>
+      <h1>第 2 章 · 环境搭建与工具全景</h1>
+      <p class="chapter-lead">工欲善其事，必先利其器。本章给出后训练的硬件梯度表与"模型大小 × 方法"选卡矩阵，讲清 CUDA/PyTorch 的版本兼容逻辑，梳理核心工具栈的分类与选型，并用 conda 环境管理与版本锁定固化一套可复现的工程习惯。最后用 10 分钟在单卡上跑通第一个 SFT——这是全书所有实战的起点。</p>
+      <div class="chapter-meta">⏱ 预计学习 60 分钟 ｜ 难度 ★★☆☆☆ ｜ 先修：第 0 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 硬件梯度：从 RTX 4090 到 H100</h2>
+    <p>后训练对硬件的需求可以用一句话概括：<b>显存决定"能不能跑"，算力决定"跑多快"，互联决定"多卡扩不扩得动"。</b>显存是最刚性的约束——模型权重、梯度、优化器状态加激活值必须同时放得下；算力（以厂商标称的 bf16 张量峰值计：RTX 4090 约 165 TFLOPS，A100 80G 约 312 TFLOPS，H100 SXM 约 989 TFLOPS，均不含稀疏加速）决定迭代速度，只影响你的时间成本；而卡间互联（NVLink vs PCIe）影响张量并行与多卡 RL 的通信效率，在消费级多卡机器上经常成为隐性瓶颈。</p>
+    <p>先建立显存的量级直觉（详细推导见 <a href="42-training-flops-memory.html">第 42 章</a>）。混合精度 + AdamW 下，全量微调的常数为每个参数约 16 字节：bf16 权重 2 字节、bf16 梯度 2 字节、fp32 主权重 4 字节、一阶与二阶动量各 4 字节——即 <b>7B 模型全量微调在跑第一条数据之前，就需要约 112 GB 显存容纳权重、梯度与优化器状态</b>，再加激活值，2×A100-80G 起步并不夸张。而参数高效微调（Parameter-Efficient Fine-Tuning, PEFT）改写了游戏规则：LoRA（Low-Rank Adaptation）冻结原权重、只训练低秩适配器（第 14 章），显存主体是 bf16 基座（7B 约 14 GB）；QLoRA 把基座量化到 NF4（7B 约 3.5 GB），把 65B 模型的微调压进单张 48 GB 显卡（QLoRA 论文的原始实绩）。这张梯度差，就是你选卡的依据。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>档位</th><th>代表硬件</th><th>显存</th><th>互联</th><th>能完成的后训练任务</th><th>获取方式</th></tr></thead>
+        <tbody>
+          <tr><td>消费级单卡</td><td>RTX 4090 / 3090</td><td>24 GB</td><td>PCIe</td><td>QLoRA 至 70B；LoRA 与全量 SFT 至 8B；GRPO 至 3B；全部冒烟测试</td><td>个人购买、整机</td></tr>
+          <tr><td>消费级多卡</td><td>2–4 × RTX 4090</td><td>48–96 GB</td><td>PCIe（无 NVLink）</td><td>ZeRO-3 下 14B 全量 SFT；8B DPO；8B 以下推理 RL（需 vLLM 辅助）</td><td>实验室、小团队</td></tr>
+          <tr><td>专业卡工作站</td><td>2–8 × RTX A6000 / 6000 Ada</td><td>48 GB × N</td><td>PCIe</td><td>32B LoRA；8B RLHF 全家桶（PPO/GRPO + vLLM rollout）</td><td>机构采购</td></tr>
+          <tr><td>云端标准</td><td>A100 / A800 80G × 4–8</td><td>320–640 GB</td><td>NVLink</td><td>70B 全量 SFT（ZeRO-3）；32B DPO/PPO；R1 复现的小规模实验</td><td>按小时租用</td></tr>
+          <tr><td>云端旗舰</td><td>H100 / H800 × 8 起</td><td>640 GB+</td><td>NVLink/NVSwitch</td><td>70B RLHF/PPO 全流程；论文级推理 RL 复现</td><td>租用或云厂商预留</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 2-1：后训练硬件梯度表。Mac（M 系列统一内存）可跑 MLX/MPS 后端的 QLoRA 原型实验，但训练吞吐与生态（flash-attn、DeepSpeed）明显弱于 CUDA，不建议作为主力训练机。</span>
+    </div>
+
+    <p>把"模型大小 × 方法"摆成矩阵，选卡就变成查表。表中显存为工程经验估算值（按第 1 节的字节常数推算，含常用上下文长度下的激活余量），多卡方案默认配合 ZeRO 分片或 FSDP；"×"表示该组合在该档位不可行或极不经济。</p>
+
+    <p>再补两个容易被忽略的变量。<b>激活值随 batch 与上下文长度线性增长</b>：同样是 7B LoRA，4K 上下文的显存需求可能是 1K 上下文的三倍以上，因此选卡之前先明确你的典型序列长度；梯度检查点（gradient checkpointing）用约三成的额外计算时间换取大幅的激活显存节省，是单卡长序列任务的标配开关。<b>互联对 RL 后训练的影响远大于对 SFT 的影响</b>：RLHF 与 GRPO 的采样与训练在多个进程间来回搬运权重，PCIe 多卡机器上的权重同步可能占掉训练循环的相当一部分时间——这正是 verl、OpenRLHF 这类框架强调把 rollout 引擎与训练引擎混合编排、共址部署的原因（第 45 章）。实践建议：SFT 类任务可以放心选 PCIe 消费级多卡，RL 类任务则优先考虑带 NVLink 的云实例。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>模型规模</th><th>全量 SFT</th><th>LoRA</th><th>QLoRA</th><th>DPO（LoRA 化）</th><th>PPO / GRPO</th></tr></thead>
+        <tbody>
+          <tr><td>0.5–3B</td><td>单卡 24G</td><td>单卡 24G</td><td>单卡 16G</td><td>单卡 24G</td><td>单卡 24G（GRPO 可行）</td></tr>
+          <tr><td>7–8B</td><td>2×A100-80G（ZeRO-2）或 4×4090（ZeRO-3+offload）</td><td>单卡 24G</td><td>单卡 16G 起</td><td>2×4090 或 1×A100</td><td>4×A100（训练引擎 + vLLM 混合放置）</td></tr>
+          <tr><td>14–32B</td><td>4–8×A100</td><td>2×4090</td><td>单卡 24–48G</td><td>2×A100</td><td>8×A100（verl/OpenRLHF）</td></tr>
+          <tr><td>70B</td><td>16×A100/H100（ZeRO-3）</td><td>2×A100 或 8×4090</td><td>单卡 48G（QLoRA 论文实绩：65B/48G）</td><td>2×A100（QLoRA 化可更低）</td><td>多机 H100 集群</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 2-2：模型大小 × 训练方法的推荐配置矩阵（经验估算值）。RL 一列显存显著更高，因为策略、参考、奖励/评判模型与采样引擎共存；精确数字请用第 42 章的公式按你的序列长度重算。</span>
+    </div>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：先用小模型把流程跑通，再为效果换大模型</div>
+      <p>绝大多数流程性 bug（模板错位、数据格式错误、超参数量级错误）与大模型无关。正确姿势是：用 Qwen2.5-0.5B/1.5B 把数据 → 训练 → 评测闭环调通，再切到目标规模模型调效果。本章 10 分钟冒烟测试用的就是 0.5B——它能在任何 8 GB 以上显存的卡上运行。</p>
+    </div>
+
+    <p><em>小结：显存是刚性约束、算力是时间约束、互联是扩展约束；LoRA/QLoRA 把 70B 级微调压进单卡，而 RL 后训练始终比 SFT 贵一个档位。</em></p>
+
+    <h2>2. 软件栈：CUDA、PyTorch 与版本兼容</h2>
+    <p>新手最容易在这里耗掉一个晚上，所以先把逻辑讲透。NVIDIA 软件栈分两层：<b>驱动（driver）</b>是操作系统内核态的底层组件，必须与显卡匹配、由你安装或云镜像预装；<b>CUDA 运行时（runtime）</b>是用户态计算库。<b>关键事实：通过 pip 安装的官方 PyTorch wheel 自带完整的 CUDA 运行时，你不需要单独安装 CUDA Toolkit</b>——唯一的要求是驱动版本足够新。CUDA 12 系列具备次版本兼容机制：任何 cu121/cu124/cu126 的 wheel，原则上只要驱动不低于 CUDA 12.0 基线（Linux ≥ 525.60.13，Windows ≥ 528.33）即可运行；例外是硬件代际——RTX 50 系（Blackwell）必须使用 cu128 及以上构建（PyTorch 2.7+），对应驱动 ≥ 570.26。只有当你需要从源码编译扩展（如 flash-attn）时，才需要安装与 PyTorch 构建版本一致的 CUDA Toolkit（含 nvcc）。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>PyTorch 版本</th><th>官方 CUDA 构建</th><th>驱动要求</th><th>本书使用建议</th></tr></thead>
+        <tbody>
+          <tr><td>2.4 / 2.5</td><td>cu118、cu121、cu124</td><td>≥ 525.60.13（Linux）</td><td>老卡（图灵/安培）兼容性好</td></tr>
+          <tr><td>2.6</td><td>cu118、cu124、cu126</td><td>≥ 525.60.13；建议 550+（cu126）</td><td>本章示例锁定 2.6.0 + cu124，2025 年上游生态的"最大公约数"</td></tr>
+          <tr><td>2.7 及以上</td><td>cu126、cu128</td><td>cu128 需 ≥ 570.26</td><td>RTX 50 系（Blackwell）用户唯一选择；老卡可继续用 12.4/12.6 构建</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 2-3：常用 CUDA/PyTorch 兼容矩阵（写作时点整理）。版本迭代很快，安装前请以 pytorch.org 官方选择器与 NVIDIA 驱动页为准；pip 安装不装 CUDA Toolkit，只看驱动。</span>
+    </div>
+
+    <p>安装命令如下。第 1 步配置国内 PyPI 镜像加速所有依赖；第 2 步从 PyTorch 官方源安装带 CUDA 运行时的 wheel（官方源在国内直连可能较慢，可改用上海交大等 PyTorch wheel 镜像）；第 3 步设置 Hugging Face 国内镜像，模型与数据集下载提速的关键；第 4 步安装训练栈。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">install.sh（bash）</span>
+      <pre class="code"><code class="language-bash"># ① 全局使用国内 PyPI 镜像（也可用清华 TUNA：https://pypi.tuna.tsinghua.edu.cn/simple）
+pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+
+# ② 安装带 CUDA 运行时的 PyTorch（wheel 自带 runtime，无需另装 CUDA Toolkit）
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+# ③ Hugging Face 国内镜像：下载模型/数据集前设置环境变量（建议写进 ~/.bashrc）
+export HF_ENDPOINT=https://hf-mirror.com
+
+# ④ 训练栈（走第 ① 步配置的国内镜像；版本组合见 6.2 节 requirements.txt）
+pip install transformers==4.51.3 datasets==3.5.0 accelerate==1.6.0 trl==0.17.0 peft==0.15.2</code></pre>
+    </div>
+
+    <p>两个补充。其一，<b>驱动安装</b>是整条链路中唯一无法用 pip 解决的部分：Linux 服务器建议安装生产分支驱动（如 550 系），Ubuntu 用户可直接安装系统仓库中的对应版本，装完 <code>nvidia-smi</code> 能正常出表即视为就绪；云实例一般已预装，选镜像时确认驱动版本即可。其二，如果不想自己拼环境，NVIDIA NGC 的 PyTorch 容器与 PyTorch 官方 Docker 镜像是两个"开箱即用"的选项——前者针对专业卡做过内核级调优，后者版本跟进快，第 6 节的 Dockerfile 即基于后者构建。</p>
+
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：在系统 Python 里"哪坏修哪"</div>
+      <p>直接往系统环境塞一堆包，冲突后反复卸载重装，是环境问题变成"玄学"的根源。正确做法是下一节的环境隔离：每个项目一个独立环境，版本锁定，坏了就删掉重建——重建成本只有 5 分钟。另外，Windows 用户建议使用 WSL2（Ubuntu 子系统）作为训练环境：绝大多数训练框架对 Linux 的支持与文档远好于原生 Windows，驱动装在 Windows 侧即可被 WSL2 透明使用。</p>
+    </div>
+
+    <p><em>小结：pip 装的 PyTorch 自带 CUDA 运行时，只看驱动版本；RTX 50 系必须 cu128；一切训练依赖都应装在隔离环境里。</em></p>
+
+    <h2>3. 核心工具栈全景</h2>
+    <p>后训练的工具生态可以用五层架构描述：最上层是<b>方法与算法层</b>（SFT、DPO、PPO、GRPO、RLVR 等本书第 3–6 部分的内容）；其下是<b>训练与对齐框架层</b>，把算法实现为可配置的训练器；再下是<b>分布式与效率层</b>，解决"放不下、跑不快"；然后是<b>推理与 rollout 层</b>，负责高速生成（评测与 RL 采样都依赖它）；底层是<b>硬件与运行时层</b>。理解分层的好处是：出问题时能快速定位到层，换工具时知道替换的是哪一层。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="后训练工具栈五层架构">
+        <rect x="12" y="24" width="112" height="60" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="68" y="60" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e293b">方法与算法层</text>
+        <rect x="136" y="24" width="570" height="60" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <rect x="150" y="41" width="70" height="26" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="185" y="59" text-anchor="middle" font-size="14" fill="#1e293b">SFT</text>
+        <rect x="230" y="41" width="110" height="26" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="285" y="59" text-anchor="middle" font-size="14" fill="#1e293b">DPO / PPO</text>
+        <rect x="350" y="41" width="80" height="26" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="390" y="59" text-anchor="middle" font-size="14" fill="#1e293b">GRPO</text>
+        <rect x="440" y="41" width="80" height="26" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="480" y="59" text-anchor="middle" font-size="14" fill="#1e293b">RLVR</text>
+        <rect x="530" y="41" width="70" height="26" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="565" y="59" text-anchor="middle" font-size="14" fill="#1e293b">蒸馏</text>
+        <rect x="12" y="96" width="112" height="60" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="68" y="132" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e293b">训练对齐框架</text>
+        <rect x="136" y="96" width="570" height="60" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <rect x="150" y="113" width="120" height="26" rx="6" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="210" y="131" text-anchor="middle" font-size="14" fill="#1e293b">transformers</text>
+        <rect x="280" y="113" width="60" height="26" rx="6" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="310" y="131" text-anchor="middle" font-size="14" fill="#1e293b">TRL</text>
+        <rect x="350" y="113" width="130" height="26" rx="6" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="415" y="131" text-anchor="middle" font-size="14" fill="#1e293b">LLaMA-Factory</text>
+        <rect x="490" y="113" width="90" height="26" rx="6" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="535" y="131" text-anchor="middle" font-size="14" fill="#1e293b">Axolotl</text>
+        <rect x="590" y="113" width="70" height="26" rx="6" fill="#ffffff" stroke="#10b981" stroke-width="1.5"/>
+        <text x="625" y="131" text-anchor="middle" font-size="14" fill="#1e293b">PEFT</text>
+        <rect x="12" y="168" width="112" height="60" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="68" y="204" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e293b">分布式与效率</text>
+        <rect x="136" y="168" width="570" height="60" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <rect x="150" y="185" width="100" height="26" rx="6" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="200" y="203" text-anchor="middle" font-size="14" fill="#1e293b">DeepSpeed</text>
+        <rect x="260" y="185" width="70" height="26" rx="6" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="295" y="203" text-anchor="middle" font-size="14" fill="#1e293b">FSDP</text>
+        <rect x="340" y="185" width="120" height="26" rx="6" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="400" y="203" text-anchor="middle" font-size="14" fill="#1e293b">Megatron-LM</text>
+        <rect x="470" y="185" width="130" height="26" rx="6" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="535" y="203" text-anchor="middle" font-size="14" fill="#1e293b">FlashAttention</text>
+        <rect x="610" y="185" width="90" height="26" rx="6" fill="#ffffff" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="655" y="203" text-anchor="middle" font-size="14" fill="#1e293b">unsloth</text>
+        <rect x="12" y="240" width="112" height="60" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="68" y="276" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e293b">推理与 Rollout</text>
+        <rect x="136" y="240" width="570" height="60" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.5"/>
+        <rect x="150" y="257" width="80" height="26" rx="6" fill="#ffffff" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="190" y="275" text-anchor="middle" font-size="14" fill="#1e293b">vLLM</text>
+        <rect x="240" y="257" width="90" height="26" rx="6" fill="#ffffff" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="285" y="275" text-anchor="middle" font-size="14" fill="#1e293b">SGLang</text>
+        <rect x="340" y="257" width="90" height="26" rx="6" fill="#ffffff" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="385" y="275" text-anchor="middle" font-size="14" fill="#1e293b">Ollama</text>
+        <rect x="440" y="257" width="150" height="26" rx="6" fill="#ffffff" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="515" y="275" text-anchor="middle" font-size="14" fill="#1e293b">lm-eval-harness</text>
+        <rect x="12" y="312" width="112" height="60" rx="10" fill="#fef2f7" stroke="#ef4444" stroke-width="2"/>
+        <text x="68" y="348" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e293b">硬件与运行时</text>
+        <rect x="136" y="312" width="570" height="60" rx="10" fill="#fef2f7" stroke="#ef4444" stroke-width="1.5"/>
+        <rect x="148" y="329" width="110" height="26" rx="6" fill="#ffffff" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="203" y="347" text-anchor="middle" font-size="14" fill="#1e293b">NVIDIA 驱动</text>
+        <rect x="266" y="329" width="120" height="26" rx="6" fill="#ffffff" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="326" y="347" text-anchor="middle" font-size="14" fill="#1e293b">CUDA 运行时</text>
+        <rect x="394" y="329" width="70" height="26" rx="6" fill="#ffffff" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="429" y="347" text-anchor="middle" font-size="14" fill="#1e293b">NCCL</text>
+        <rect x="472" y="329" width="90" height="26" rx="6" fill="#ffffff" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="517" y="347" text-anchor="middle" font-size="14" fill="#1e293b">PyTorch</text>
+        <rect x="570" y="329" width="128" height="26" rx="6" fill="#ffffff" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="634" y="347" text-anchor="middle" font-size="14" fill="#1e293b">GPU 显存档位</text>
+      </svg>
+      <figcaption>图 2-1：后训练工具栈五层架构（自绘）。上层调用下层：换方法改最上层，显存不够下沉到分布式层，RL 训练还需把推理引擎层作为 rollout 服务接入（第 45 章）。</figcaption>
+    </figure>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>类别</th><th>工具</th><th>一句话定位</th><th>什么时候选它</th></tr></thead>
+        <tbody>
+          <tr><td>训练框架</td><td>transformers + accelerate</td><td>HF 生态地基：模型库 + 设备/分布式调度</td><td>需要完全控制训练循环、读底层源码时</td></tr>
+          <tr><td>训练框架</td><td>TRL</td><td>HF 官方后训练库：SFT/DPO/GRPO/PPO 训练器开箱即用</td><td>学习阶段与中小规模实验的首选（本章示例用它）</td></tr>
+          <tr><td>训练框架</td><td>LLaMA-Factory</td><td>配置化一站式微调：WebUI、多方法、多模型统一入口</td><td>快速出活、团队统一流程（arXiv:2403.13372）</td></tr>
+          <tr><td>训练框架</td><td>Axolotl</td><td>YAML 驱动的微调配置库，社区配方丰富</td><td>复用社区已验证 recipe</td></tr>
+          <tr><td>PEFT</td><td>peft</td><td>LoRA/QLoRA/DoRA 官方实现</td><td>参数高效微调必装（配合第 14 章）</td></tr>
+          <tr><td>PEFT</td><td>bitsandbytes</td><td>NF4/INT8 量化后端</td><td>QLoRA、显存不够时</td></tr>
+          <tr><td>PEFT</td><td>unsloth</td><td>面向单卡的内核级吞吐优化</td><td>消费级单卡想快 2 倍时</td></tr>
+          <tr><td>分布式</td><td>DeepSpeed</td><td>ZeRO-1/2/3 分片 + CPU/NVMe offload</td><td>显存不够多卡扩容的默认答案（arXiv:1910.02054）</td></tr>
+          <tr><td>分布式</td><td>PyTorch FSDP</td><td>官方全自动参数/梯度/优化器分片</td><td>想留在纯 PyTorch 生态、免装第三方（arXiv:2304.11277）</td></tr>
+          <tr><td>分布式</td><td>Megatron-LM</td><td>张量/流水线/序列并行的专家级实现</td><td>超大规模预训练与继续训练</td></tr>
+          <tr><td>RL 后训练</td><td>OpenRLHF</td><td>基于 Ray + vLLM 的 RLHF/RLVR 框架</td><td>多卡 PPO/GRPO 的成熟选择（arXiv:2405.11143）</td></tr>
+          <tr><td>RL 后训练</td><td>verl（HybridFlow）</td><td>混合编排训练引擎与 rollout 引擎的研究型框架</td><td>R1 级推理 RL 复现的主流框架（arXiv:2409.19256）</td></tr>
+          <tr><td>RL 后训练</td><td>TRL（GRPOTrainer 等）</td><td>单机可跑的 GRPO/DPO/PPO 训练器</td><td>小规模 RL 快速验证与学习</td></tr>
+          <tr><td>推理引擎</td><td>vLLM</td><td>PagedAttention 高吞吐推理服务</td><td>评测批量生成、RL rollout 引擎（arXiv:2309.06180）</td></tr>
+          <tr><td>推理引擎</td><td>SGLang</td><td>RadixAttention 前缀缓存 + 结构化生成</td><td>多轮对话、工具调用类 rollout（arXiv:2312.07104）</td></tr>
+          <tr><td>数据工具</td><td>Argilla</td><td>人工标注与偏好数据收集平台</td><td>搭建自有标注流程（第 09 章）</td></tr>
+          <tr><td>数据工具</td><td>distilabel</td><td>用 LLM 流水线批量合成与标注数据</td><td>合成数据与 RLAIF（第 11 章）</td></tr>
+          <tr><td>评测</td><td>lm-eval-harness</td><td>数十种学术基准的统一评测入口</td><td>标准基准评测（arXiv:2405.14782）</td></tr>
+          <tr><td>评测</td><td>LightEval / OpenCompass</td><td>HF / 上海 AI Lab 的多基准评测套件</td><td>批量并行评测与中文基准</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 2-4：核心工具栈分类表。完整清单与版本信息见第 61 章（开源项目与工具大全）；本书主线示例统一使用 transformers + TRL，便于逐行理解原理。</span>
+    </div>
+
+    <p><b>选型判断</b>可以压缩成三句话。学习阶段选 TRL：代码贴近论文、社区文档完善，且每个 Trainer 都能追溯到对应章节的公式。快速交付选 LLaMA-Factory 或 Axolotl：YAML 配置好就能跑，牺牲一点灵活性换工程效率。研究级 RL 选 verl 或 OpenRLHF：它们把训练引擎（FSDP/Megatron）与推理引擎（vLLM）的混合编排工程化，这是单用 TRL 处理不了的多卡推理 RL 场景（第 45 章详细展开 rollout 基础设施）。三者不冲突——很多团队用 LLaMA-Factory 做 SFT、verl 做强化、lm-eval-harness 做评测，同一套环境里共存即可。</p>
+    <p><em>小结：工具栈是五层架构，选型按"学习用 TRL、交付用配置化框架、研究级 RL 用 verl/OpenRLHF"三分，且各层可以混搭。</em></p>
+
+    <h2>4. 环境管理最佳实践：隔离与版本锁定</h2>
+    <p>环境管理的两条铁律：<b>隔离</b>（每个项目一个独立环境，绝不污染 base）与<b>锁定</b>（环境跑通立即固化版本清单，与代码一起提交）。后训练栈的依赖树又深又动态——transformers、trl、peft、vllm 各自都有快速的版本迭代，某些接口甚至每隔几个版本就改名（如 TRL 0.20 把 <code>max_seq_length</code> 改名为 <code>max_length</code>）——不锁版本意味着你的实验在半年后无法复现，也意味着别人无法帮你 debug。conda 与 venv/uv 都能满足要求：conda 在需要安装非 Python 依赖（如 ffmpeg、特定 CUDA 工具链）时更省心，uv 以极快的解析速度和更严格的锁文件（uv.lock）正在成为新项目的流行选择；本书统一用 Miniconda 演示，读者迁移到 uv 没有任何障碍。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">env_setup.sh（bash）</span>
+      <pre class="code"><code class="language-bash"># ① 建议用 Miniconda/Miniforge 管理多套互不污染的环境
+conda create -n posttrain python=3.11 -y
+conda activate posttrain
+
+# ② 训练栈一律装进独立环境，绝不污染 base
+pip install -r requirements.txt
+
+# ③ 复现锁定：环境跑通后立即固化，与代码一起提交到仓库
+pip freeze &gt; requirements.lock
+conda env export &gt; environment.yml
+
+# ④ 新机器一键还原（先装好驱动，再执行）
+conda env create -f environment.yml &amp;&amp; conda activate posttrain</code></pre>
+    </div>
+
+    <div class="code-wrap">
+      <span class="code-label">requirements.txt</span>
+      <pre class="code"><code class="language-text"># requirements.txt —— 2025 年中实测互通的组合（示例锁定，全书冒烟与项目以此为准）
+# 原则：一次锁一组互相验证过的版本；升级任何一个包前，先在分支上跑通冒烟测试
+torch==2.6.0
+transformers==4.51.3
+datasets==3.5.0
+accelerate==1.6.0
+trl==0.17.0
+peft==0.15.2
+bitsandbytes==0.45.5
+deepspeed==0.16.7
+flash-attn==2.7.4.post1
+vllm==0.8.5.post1</code></pre>
+    </div>
+
+    <p>三点解释。其一，这份组合围绕 <b>torch 2.6.0 + cu124</b> 构建，vllm 0.8.5 与之匹配（vLLM 对 torch 版本极其敏感，混装是常见翻车点）；flash-attn 提供 wheel 安装，避免本地编译对 nvcc 的依赖。其二，<code>pip freeze</code> 的输出包含所有间接依赖，比手写 requirements.txt 更"硬"，两者建议都入库：手写文件表达意图（直接依赖），lock 文件表达事实（完整解析结果）。其三，Jupyter 用户注意：内核必须指向 posttrain 环境的 Python（<code>python -m ipykernel install --user --name posttrain</code>），否则笔记本会静默使用错误环境——这是"我明明装了为什么 import 不到"的头号原因。</p>
+
+    <p>几个值得养成的日常习惯：动手前用 <code>conda env list</code> 确认当前环境；用 <code>pip list --outdated</code> 周期性审视依赖，但升级永远在独立分支上先跑通冒烟测试再合入；把模型缓存指到大容量数据盘（如 <code>export HF_HOME=/data/hf_cache</code>），避免缓存悄悄写满系统盘——这两类"磁盘意外"在 0.5B 小模型阶段无害，到 32B 模型阶段就意味着数小时的重新下载。</p>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：把"环境健康检查"写进仓库</div>
+      <p>在仓库放一个 10 行的 check_env.py（打印 torch/CUDA/各包版本与 GPU 名称），README 要求"任何 issue 必须附上它的输出"。这一个习惯能过滤掉 80% 的环境类求助，也是团队协作的好传统。</p>
+    </div>
+
+    <p><em>小结：隔离与锁定是可复现性的地基——每个项目一套环境，跑通即 freeze，升级先过冒烟测试。</em></p>
+
+    <h2>5. 10 分钟冒烟测试：第一个 SFT</h2>
+    <p>现在把整条链路走通。冒烟测试的目标不是训练效果，而是<b>验证"环境 → 数据 → 训练 → 保存 → 推理"五个环节全部健康</b>——任何一个环节出错，都应该在本阶段暴露，而不是等到你用 70B 模型训练三天后才发现。选型刻意取最小：Qwen2.5-0.5B-Instruct（0.5B 参数，下载约 1 GB，任何 8 GB 以上显存的卡可跑）加 2000 条多轮对话样本，1 个 epoch 大约需要几分钟。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 180" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="冒烟测试五步流程">
+        <defs>
+          <marker id="sf-b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker>
+        </defs>
+        <text x="360" y="36" text-anchor="middle" font-size="14" fill="#1e293b">目标：10 分钟内验证闭环健康，而非训练效果</text>
+        <rect x="10" y="66" width="116" height="68" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="68" y="94" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">① 环境自检</text>
+        <text x="68" y="118" text-anchor="middle" font-size="14" fill="#1e293b">GPU 可见？</text>
+        <rect x="158" y="66" width="116" height="68" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="216" y="94" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">② 取模型数据</text>
+        <text x="216" y="118" text-anchor="middle" font-size="14" fill="#1e293b">约 1 GB 下载</text>
+        <rect x="306" y="66" width="116" height="68" rx="12" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="364" y="94" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">③ 启动 SFT</text>
+        <text x="364" y="118" text-anchor="middle" font-size="14" fill="#1e293b">2000 条样本</text>
+        <rect x="454" y="66" width="116" height="68" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="512" y="94" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">④ 保存模型</text>
+        <text x="512" y="118" text-anchor="middle" font-size="14" fill="#1e293b">smoke_sft_out</text>
+        <rect x="602" y="66" width="116" height="68" rx="12" fill="#fef2f7" stroke="#ef4444" stroke-width="2"/>
+        <text x="660" y="94" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e293b">⑤ 对话验证</text>
+        <text x="660" y="118" text-anchor="middle" font-size="14" fill="#1e293b">回答是否正常</text>
+        <path d="M128 100 L154 100" stroke="#2563eb" stroke-width="2" marker-end="url(#sf-b)"/>
+        <path d="M276 100 L302 100" stroke="#2563eb" stroke-width="2" marker-end="url(#sf-b)"/>
+        <path d="M424 100 L450 100" stroke="#2563eb" stroke-width="2" marker-end="url(#sf-b)"/>
+        <path d="M572 100 L598 100" stroke="#2563eb" stroke-width="2" marker-end="url(#sf-b)"/>
+      </svg>
+      <figcaption>图 2-2：冒烟测试五步流程（自绘）。每一步都有明确的通过标准：GPU 可见、模型数据下载成功、loss 下降、权重落盘、生成正常。</figcaption>
+    </figure>
+
+    <div class="code-wrap">
+      <span class="code-label">smoke_sft.py</span>
+      <pre class="code"><code class="language-python"># smoke_sft.py —— 10 分钟冒烟测试：单卡跑通第一个 SFT
+# 依赖：requirements.txt（torch 2.6.0 + transformers 4.51.3 + trl 0.17.0 ...）
+# 硬件：任何 8 GB 以上显存的 NVIDIA 卡；运行前先设置 HF_ENDPOINT（见第 2 节安装命令）
+import torch
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
+
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"   # 0.5B，含现成对话模板
+
+def main():
+    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,   # 消费级卡建议 bf16（40 系后硬件原生支持）
+        device_map="auto",
+    )
+
+    # trl-lib/Capybara：多轮对话数据集（messages 字段），取前 2000 条做冒烟
+    ds = load_dataset("trl-lib/Capybara", split="train[:2000]")
+
+    cfg = SFTConfig(
+        output_dir="smoke_sft_out",
+        num_train_epochs=1,           # 冒烟只为跑通，不求效果
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,  # 等效 batch = 16
+        learning_rate=2e-5,           # SFT 全量微调的常见量级
+        logging_steps=10,
+        bf16=True,
+        report_to="none",             # 不接 wandb/tensorboard
+        seed=42,
+        # 序列截断：TRL 0.20+ 参数名为 max_length=1024；0.17 版本为 max_seq_length
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=cfg,
+        train_dataset=ds,             # 含 messages 列时，TRL 自动套用模型对话模板
+        processing_class=tok,         # 旧版 TRL 此参数名为 tokenizer
+    )
+    trainer.train()
+    trainer.save_model("smoke_sft_out/final")
+    print("冒烟测试通过：loss 应从约 2.x 降到 1.x。")
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+
+    <p>运行 <code>python smoke_sft.py</code>，健康的表现是：日志每 10 步打印一次 <code>loss</code>，数值从 2.0~2.5 附近逐步下降到 1.5 上下（数据集不同会有浮动，关键是单调下降趋势）；训练结束后 <code>smoke_sft_out/final</code> 目录里有完整的模型与分词器文件。第一次运行最常见的三种失败都值得预演：<code>Connection error</code> 或下载卡住——Hugging Face 直连问题，回到第 2 节设置 <code>HF_ENDPOINT</code> 后重跑；<code>CUDA out of memory</code>——按第 7 节的顺序减 batch、加梯度累积；数据或模板相关报错——先确认数据集含 <code>messages</code> 字段、tokenizer 带聊天模板。至于日志怎么读，冒烟场景下只需关注三件事：loss 是否开始下降、是否出现 NaN、显存峰值离上限还有多少余量；loss 曲线的深入解读（欠拟合、过拟合、灾难性遗忘的信号）在第 16 章展开。最后一步验证：用训练目录加载模型，确认生成管道端到端可用。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">verify_chat.py</span>
+      <pre class="code"><code class="language-python"># verify_chat.py —— 训练后验证：同一对话模板下的端到端生成
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("smoke_sft_out/final")
+model = AutoModelForCausalLM.from_pretrained("smoke_sft_out/final", device_map="auto")
+
+msgs = [{"role": "user", "content": "用一句话解释什么是过拟合。"}]
+text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+ids = tok(text, return_tensors="pt").to(model.device)
+out = model.generate(**ids, max_new_tokens=64, do_sample=False)
+print(tok.decode(out[0][ids.input_ids.shape[1]:], skip_special_tokens=True))
+# 通过标准：输出是通顺的中文回答即可。
+# 注意：冒烟测试的 2000 条数据不会让模型"变聪明"，它只证明训练与推理链路是健康的。</code></pre></code></pre>
+    </div>
+
+    <div class="callout note">
+      <div class="callout-title">📘 关于冒烟测试的三点说明</div>
+      <p>其一，首次运行会下载约 1 GB 模型与几十 MB 数据，国内读者务必先设置 <code>HF_ENDPOINT=https://hf-mirror.com</code>，或改用 ModelScope 下载 Qwen 模型。其二，TRL 对话数据的约定是数据集含 <code>messages</code> 列（role/content 结构），SFTTrainer 会自动套用 tokenizer 内置的聊天模板——模板机制本身的细节是 <a href="15-chat-templates.html">第 15 章</a>的主题。其三，如果你的卡只有 8 GB 显存且 OOM，把 batch size 降到 1、加 <code>gradient_accumulation_steps=16</code>，0.5B 模型在任何卡上都能跑动。</p>
+    </div>
+
+    <p><em>小结：冒烟测试的意义在于把"环境是否健康"变成 10 分钟内的确定答案——闭环通了，后面所有章节的实验才有了可信的出发点。</em></p>
+
+    <h2>6. Docker 与云 GPU：没有本地卡怎么办</h2>
+    <p>没有合适的本地显卡不是问题，租用云端 GPU 已是常态，Docker 则是让"我这里是好的"到"云上也是好的"的关键。Docker 镜像把 CUDA 运行时、PyTorch 与全部依赖固化成一个不可变的单元，配合 NVIDIA Container Toolkit（宿主机只需装驱动，<code>--gpus all</code> 即可把 GPU 透传给容器），能彻底消灭"云上环境与本地不一致"这类问题。下面是一个最小可用的训练镜像。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">Dockerfile.posttrain</span>
+      <pre class="code"><code class="language-dockerfile"># Dockerfile.posttrain —— 可复现的隔离环境（基镜像自带 CUDA 运行时）
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+# 国内构建加速：先换 pip 源，再装依赖（层缓存友好：依赖层独立于代码层）
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
+    &amp;&amp; pip install --no-cache-dir \
+       transformers==4.51.3 trl==0.17.0 peft==0.15.2 \
+       datasets==3.5.0 accelerate==1.6.0
+
+WORKDIR /workspace
+COPY smoke_sft.py verify_chat.py ./
+ENV HF_ENDPOINT=https://hf-mirror.com TOKENIZERS_PARALLELISM=false
+
+CMD ["bash"]</code></pre>
+    </div>
+
+    <div class="code-wrap">
+      <span class="code-label">docker_run.sh（bash）</span>
+      <pre class="code"><code class="language-bash">docker build -f Dockerfile.posttrain -t posttrain:0.1 .
+
+# --gpus all：透传全部 GPU；--shm-size：共享内存调大，多卡 DataLoader/NCCL 必需
+# -v：把宿主机缓存目录挂进容器，避免每次容器重建都重新下载模型
+docker run --gpus all --rm -it --shm-size=64g \
+  -v /data/hf_cache:/root/.cache/huggingface \
+  posttrain:0.1 bash</code></pre>
+    </div>
+
+    <p>镜像选型有两派。<b>极简派</b>从 <code>pytorch/pytorch</code> 官方镜像出发自行安装依赖（如上），体积可控、版本自由，适合个人与本书的实验；<b>全家桶派</b>直接使用 NVIDIA NGC 的 PyTorch 容器或各训练框架发布的官方镜像，内置调优好的 CUDA/cuDNN/NCCL 组合，适合专业卡与生产环境。无论哪一派，都建议把模型缓存（<code>/root/.cache/huggingface</code>）与数据目录挂载为宿主机卷：容器可以随时销毁，数据与缓存必须留下来——这也是云环境与本地环境在工程习惯上的最大差异。</p>
+
+    <p>云 GPU 平台的选择主要看三件事：价格、镜像生态与数据安全。下表给出类型化对比（价格为写作时点的量级参考，波动较大，以各官网实时报价为准）。共同注意事项：按量计费的实例<b>释放即数据消失</b>——把数据集与 checkpoint 定期同步回对象存储（OSS/S3）或本地；AutoDL 这类平台提供按 GB 计费的持久网盘，长项目建议启用。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>平台类型</th><th>代表</th><th>价格量级（以官网实时价为准）</th><th>优点</th><th>注意点</th><th>适合</th></tr></thead>
+        <tbody>
+          <tr><td>国内按量租用</td><td>AutoDL 等</td><td>4090 约 ¥1.5–2.5/时；A100-80G 约 ¥6–12/时</td><td>中文界面、社区镜像丰富、按量计费、持久网盘</td><td>数据在第三方机器上；高峰期可能排队</td><td>国内个人、学生、本书全部实验</td></tr>
+          <tr><td>海外社区云</td><td>RunPod、Vast.ai</td><td>4090 约 $0.3–0.7/时；A100-80G 约 $1.2–2/时</td><td>机型多、价格低、支持 Docker 原生</td><td>网络与合规、机器质量参差</td><td>预算敏感、有海外支付渠道</td></tr>
+          <tr><td>大厂公有云</td><td>阿里云 / AWS / GCP 等</td><td>A100 约 $2–5/时（按机型）</td><td>稳定、合规、企业支持、可开票</td><td>贵；GPU 配额常需申请</td><td>公司生产与长周期训练</td></tr>
+          <tr><td>预留/竞价</td><td>云厂商竞价实例、包月</td><td>比按量低约 30–60%</td><td>数周级训练显著省钱</td><td>竞价实例可能被回收，需断点续训</td><td>时间灵活的长任务</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 2-5：云 GPU 获取途径类型对比。本书第 54 章（实战总览与算力方案）会按五个实战项目给出具体的租用配置与预算估算。</span>
+    </div>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：云上环境的安全纪律</div>
+      <p>第一，绝不把 Hugging Face token、API key、SSH 私钥写进 Dockerfile 或 <code>ENV</code> 指令——镜像层是永久记录，用运行时挂载或密钥管理服务注入。第二，公开分享镜像前用 <code>docker history</code> 检查各层是否夹带敏感文件。第三，云实例上的数据默认随实例释放而消失，也默认不受你公司安全策略保护：商业数据上云前确认合规边界。</p>
+    </div>
+
+    <p><em>小结：Docker 解决环境一致性，云 GPU 解决算力可得性；按量租用足够支撑本书全部实验，纪律只有一条——数据和密钥的管理权永远留在自己手里。</em></p>
+
+    <h2>7. OOM 与驱动问题：快速排查清单</h2>
+    <p>环境问题的表现千变万化，但 90% 落在三类：显卡不可见、显存不够（OOM）、多卡通信卡死。遇到问题按下面的顺序执行，大多数能在几分钟内定位。</p>
+    <ol>
+      <li><b>显卡与驱动可见性</b>：<code>nvidia-smi</code> 无输出说明驱动层就没通（新装机先装驱动；WSL2 用户确认 Windows 侧已装驱动）；右上角的 "CUDA Version" 是该驱动<b>支持的上限</b>，不是已安装的版本。</li>
+      <li><b>PyTorch 侧自检</b>：确认 <code>torch.cuda.is_available()</code> 为 True、<code>torch.version.cuda</code> 与驱动匹配；若报 <code>no kernel image</code>，说明 wheel 的 CUDA 构建不含你的显卡架构（典型：RTX 50 系用了 cu124 wheel），换 cu128。</li>
+      <li><b>显存占用排查</b>：<code>nvidia-smi --query-compute-apps=pid,used_memory --format=csv</code> 查看是谁占着显存——云机上残留的僵尸进程（Jupyter 内核、上一个未退出的训练）是头号惯犯。</li>
+      <li><b>OOM 处置顺序</b>：减 batch size 并加梯度累积 → 开启 <code>gradient_checkpointing</code> → 缩短 max_length → 换 LoRA/QLoRA → ZeRO-3 / CPU offload（第 43 章）。按此顺序逐级升级，不要一上来就上分布式。</li>
+      <li><b>多卡通信卡死</b>：优先检查共享内存（容器内 <code>--shm-size=64g</code>）；设 <code>NCCL_DEBUG=INFO</code> 看卡在哪一步；PCIe 多卡机器可试 <code>export NCCL_P2P_DISABLE=1</code> 排除 P2P 问题。</li>
+      <li><b>硬件级故障</b>：<code>sudo dmesg -T | grep -i -E "xid|nvrm"</code> 查看 Xid 错误码（如 Xid 79 常提示显存故障）——云机上遇到应立即换实例而不是反复重试。</li>
+      <li><b>loss 异常</b>：NaN 通常是学习率过大或 fp16 数值溢出——降到 2e-5 以下、统一用 bf16；loss 纹丝不动则先查学习率是否真的生效、数据是否为空。</li>
+    </ol>
+
+    <div class="code-wrap">
+      <span class="code-label">diagnose.sh（bash）</span>
+      <pre class="code"><code class="language-bash"># ① 显卡与驱动是否可见？（右上角 CUDA Version 是驱动支持的上限，不是已装版本）
+nvidia-smi
+
+# ② PyTorch 侧自检：版本 / 编译的 CUDA / 可用性 / 设备名，应与 ① 相互印证
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+# ③ 显存被谁占了？（僵尸进程是云机 OOM 的头号原因）
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+
+# ④ 硬件级错误扫描（Xid 错误码提示显存/驱动层故障）
+sudo dmesg -T | grep -i -E "xid|nvrm" | tail -n 20
+
+# ⑤ 多卡通信自检：NCCL 卡死时打开调试日志定位卡点
+NCCL_DEBUG=INFO torchrun --nproc_per_node=2 smoke_sft.py</code></pre>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>报错 / 现象</th><th>最可能原因</th><th>快速处置</th></tr></thead>
+        <tbody>
+          <tr><td>CUDA out of memory</td><td>batch/序列过长；优化器状态未分片；显存被残留进程占用</td><td>清进程；减 batch + 梯度累积；gradient_checkpointing；LoRA/QLoRA；ZeRO-3（第 43 章）</td></tr>
+          <tr><td>CUDA driver version is insufficient</td><td>驱动低于 wheel 所需版本</td><td>升级驱动，或改装更低 CUDA 构建的 wheel（如 cu118）</td></tr>
+          <tr><td>no kernel image is available for execution</td><td>wheel 架构不含本卡（RTX 50 系用了 cu124）</td><td>换 PyTorch 2.7+ 的 cu128 构建</td></tr>
+          <tr><td>多卡训练 hang 住无报错</td><td>共享内存不足；NCCL 通信超时</td><td>--shm-size=64g；NCCL_DEBUG=INFO；PCIe 机试 NCCL_P2P_DISABLE=1</td></tr>
+          <tr><td>loss = NaN</td><td>学习率过大；fp16 溢出；数据含异常 token</td><td>降学习率；改用 bf16；检查数据 tokenizer 后的异常长词元</td></tr>
+          <tr><td>flash-attn 安装失败</td><td>本地编译时 nvcc 与 torch 的 CUDA 版本不一致</td><td>用官方预编译 wheel，或直接用 NGC/pytorch 官方 Docker 镜像</td></tr>
+          <tr><td>import 很慢或装了找不到</td><td>Jupyter 内核指向了错误环境</td><td>python -m ipykernel install --user --name posttrain 后重启内核</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 2-6：高频报错速查表。训练中断后的系统性调试方法（含断点续训与坏数据定位）见 <a href="46-debugging-cookbook.html">第 46 章</a>调试急救手册。</span>
+    </div>
+
+    <p>最后是一条预防性心法：<b>把环境当成代码来维护</b>。每个新项目从上一份 requirements.txt 复制起点，并记录每次改动理由；任何"顺手升级"一个包之前，先在干净环境跑一遍冒烟测试；遇到查不到资料的诡异问题，先在全新环境用最小复现脚本验证——九成的"灵异问题"会在干净环境里消失，剩下的一成才值得去相关项目的 issue 区提问。这套方法在第 46 章（训练调试急救手册）会扩展为完整的调试体系。</p>
+
+    <p><em>小结：排查的纪律是"分层定位、由外向内"——驱动层、运行时层、显存层、通信层、数值层逐级收窄，绝大多数问题在 10 分钟内有答案。</em></p>
+
+    <blockquote>环境问题从来不是"低级问题"——它吞掉的时间通常超过第一个模型训练本身，值得用工程纪律而非耐心去对付。</blockquote>
+
+    <h2>8. 本章小结</h2>
+    <ul>
+      <li>硬件选型的三要素：显存决定能不能跑（全量微调约 16 字节/参数，7B 即约 112 GB）、算力决定多快、互联决定多卡扩展效率。</li>
+      <li>LoRA/QLoRA 是消费级显卡的入场券：QLoRA 已实现在单张 48 GB 卡上微调 65B 模型（arXiv:2305.14314）；RL 后训练显存需求显著高于 SFT，需为参考模型与采样引擎留余量。</li>
+      <li>pip 安装的 PyTorch 自带 CUDA 运行时，只看驱动版本（CUDA 12 系基线 Linux ≥ 525.60.13）；RTX 50 系必须 cu128 构建；只有源码编译扩展才需要 CUDA Toolkit。</li>
+      <li>工具栈五层架构：方法算法层、训练框架层（TRL/LLaMA-Factory）、分布式层（DeepSpeed/FSDP）、推理 rollout 层（vLLM/SGLang）、硬件运行时层；选型口诀"学习用 TRL、交付用配置化框架、研究级 RL 用 verl/OpenRLHF"。</li>
+      <li>环境管理两条铁律：每项目独立环境 + 跑通即锁定版本；requirements.txt 表达意图、pip freeze 表达事实，双双入库。</li>
+      <li>冒烟测试（Qwen2.5-0.5B + TRL SFTTrainer + 2000 条样本）验证"环境→数据→训练→保存→推理"闭环，是后续所有实验的地基；云上训练遵守数据持久化与密钥安全两条纪律。</li>
+      <li>排查口诀：由外向内分层定位——驱动可见性、运行时匹配、显存占用、通信、数值稳定性。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：为什么通过 pip 安装的 PyTorch 通常不需要单独安装 CUDA Toolkit？什么情况下才需要？</summary>
+      <p>因为官方 PyPI wheel 把完整 CUDA 运行时库打包在轮子里，运行期只依赖 NVIDIA 驱动（CUDA 12 系列靠次版本兼容机制，驱动达到 12.0 基线即可）。需要单独安装 CUDA Toolkit（含 nvcc 编译器）的情况只有一类：从源码编译 CUDA 扩展（如自行编译 flash-attn），此时 toolkit 版本必须与 PyTorch wheel 的 CUDA 构建一致；用预编译 wheel 或官方 Docker 镜像即可绕开。</p></details>
+      <details><summary>问题 2：7B 模型分别用全量 SFT（AdamW 混合精度）、LoRA、QLoRA 微调，显存的大头各是什么？</summary>
+      <p>全量 SFT 的大头是优化器相关状态：按每参数约 16 字节计（bf16 权重 2 + bf16 梯度 2 + fp32 主权重 4 + 一阶/二阶动量各 4），7B 即约 112 GB，再加激活值，需 2×A100-80G 起步。LoRA 冻结原权重，大头变成 bf16 基座（约 14 GB）加很小的适配器与优化器状态，24 GB 单卡可跑。QLoRA 把基座量化为 NF4（约 3.5 GB），大头缩到量化权重加少量适配器开销，16 GB 级单卡即可，QLoRA 论文因此能在单张 48 GB 卡上微调 65B 模型。</p></details>
+      <details><summary>问题 3：冒烟测试为什么选 0.5B 模型、2000 条样本、只跑 1 个 epoch？它验证什么、不验证什么？</summary>
+      <p>目标是把"环境—数据—训练—保存—推理"闭环的验证时间压到 10 分钟以内：小模型把失败归因聚焦到环境与流程（依赖冲突、模板错位、数据格式），而非超参与规模。它验证的是链路健康——CUDA 可用、数据管道正确、模板套用正常、优化在推进、权重能落盘、生成端到端可用；它不验证训练效果（2000 条样本不会带来能力提升），因此 loss 下降趋势正常即通过，不应期待模型"变聪明"。</p></details>
+      <details><summary>问题 4：云上租 GPU 训练，最重要的两条安全纪律是什么？分别对应什么操作？</summary>
+      <p>第一条是数据持久化：按量实例释放即数据消失，必须把数据集与 checkpoint 定期同步回对象存储或本地网盘，长任务还需支持断点续训（竞价实例可能被回收）。第二条是密钥安全：绝不把 token、API key 写进 Dockerfile 或 ENV——镜像层是永久记录，应通过运行时挂载或密钥服务注入，公开镜像前用 docker history 检查各层。此外商业数据上云前要确认合规边界。</p></details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Zheng+, 2024]</span> Zheng, Y. et al. "LLaMA-Factory: Unified Efficient Fine-Tuning for 100+ Language Models." 2024. <span class="rid"><a href="https://arxiv.org/abs/2403.13372" target="_blank">arXiv:2403.13372</a></span></li>
+      <li><span class="rid">[Hu+, 2024]</span> Hu, J. et al. "OpenRLHF: An Easy-to-use, Scalable and High-performance RLHF Framework." 2024. <span class="rid"><a href="https://arxiv.org/abs/2405.11143" target="_blank">arXiv:2405.11143</a></span></li>
+      <li><span class="rid">[Sheng+, 2024]</span> Sheng, G. et al. "HybridFlow: A Flexible and Efficient RLHF Framework." <i>EuroSys</i>, 2025. <span class="rid"><a href="https://arxiv.org/abs/2409.19256" target="_blank">arXiv:2409.19256</a></span>（verl）</li>
+      <li><span class="rid">[Kwon+, 2023]</span> Kwon, W. et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." <i>SOSP</i>, 2023. <span class="rid"><a href="https://arxiv.org/abs/2309.06180" target="_blank">arXiv:2309.06180</a></span>（vLLM）</li>
+      <li><span class="rid">[Zheng+, 2023]</span> Zheng, L. et al. "Efficiently Programming Large Language Models using SGLang." 2023. <span class="rid"><a href="https://arxiv.org/abs/2312.07104" target="_blank">arXiv:2312.07104</a></span></li>
+      <li><span class="rid">[Rajbhandari+, 2020]</span> Rajbhandari, S. et al. "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models." <i>SC</i>, 2020. <span class="rid"><a href="https://arxiv.org/abs/1910.02054" target="_blank">arXiv:1910.02054</a></span>（DeepSpeed）</li>
+      <li><span class="rid">[Zhao+, 2023]</span> Zhao, Y. et al. "PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel." <i>VLDB</i>, 2023. <span class="rid"><a href="https://arxiv.org/abs/2304.11277" target="_blank">arXiv:2304.11277</a></span></li>
+      <li><span class="rid">[Hu+, 2021]</span> Hu, E. et al. "LoRA: Low-Rank Adaptation of Large Language Models." <i>ICLR</i>, 2022. <span class="rid"><a href="https://arxiv.org/abs/2106.09685" target="_blank">arXiv:2106.09685</a></span></li>
+      <li><span class="rid">[Dettmers+, 2023]</span> Dettmers, T. et al. "QLoRA: Efficient Finetuning of Quantized LLMs." <i>NeurIPS</i>, 2023. <span class="rid"><a href="https://arxiv.org/abs/2305.14314" target="_blank">arXiv:2305.14314</a></span></li>
+      <li><span class="rid">[Dao+, 2023]</span> Dao, T. et al. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." 2023. <span class="rid"><a href="https://arxiv.org/abs/2307.08691" target="_blank">arXiv:2307.08691</a></span></li>
+      <li><span class="rid">[Gao+, 2024]</span> Gao, L. et al. "Lessons from the Trenches on Reproducible Evaluation of Language Models." 2024. <span class="rid"><a href="https://arxiv.org/abs/2405.14782" target="_blank">arXiv:2405.14782</a></span>（lm-eval-harness）</li>
+      <li><span class="rid">[Qwen-Team, 2024]</span> Qwen Team. "Qwen2.5 Technical Report." 2024. <span class="rid"><a href="https://arxiv.org/abs/2412.15115" target="_blank">arXiv:2412.15115</a></span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

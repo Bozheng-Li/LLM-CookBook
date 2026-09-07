@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 41 章 · 评测陷阱与数据污染 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 7 部分 · 评测</div>
+      <h1>第 41 章 · 评测陷阱与数据污染</h1>
+      <p class="chapter-lead">“当一项指标变成目标时，它就不再是一项好指标”——古德哈特定律在大模型后训练时代展现得淋漓尽致。当基准测试的分数成为衡量算法工程师绩效与技术公信力的硬通货时，数据泄漏、刷分作弊与基准过拟合便如影随形。本章深入解剖基准测试评测中的虚假繁荣，系统梳理数据污染的三大物理形态，剖析基于 n-gram 重叠度与模型困惑度异常分布的科学检测算法，探讨动态对抗式评测的未来演进，并提供工业级污染泄漏排查工具代码。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★☆☆ ｜ 先修：第 10 章、第 37 章、第 38 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 古德哈特定律与大模型“刷分”的系统性困境</h2>
+    <p>在经济学与系统控制理论中，英国经济学家查尔斯·古德哈特提出了著名的<span class="term">古德哈特定律（Goodhart's Law）</span>：“当一项度量指标变成管理或优化的目标时，它就彻底丧失了作为有效度量指标的价值。”</p>
+    <p>在大模型后训练研发中，这一定律正在引发一场深重的“公信力危机”。为了在公开排行榜（如 Hugging Face Open LLM Leaderboard、MMLU、GSM8K、HumanEval）上摘得桂冠，算法团队面临着巨大的功利诱惑：</p>
+    <ul>
+      <li><strong>测试集直接混入微调集</strong>：有意或无意地将 HumanEval 的题目与标准答案重构成对话格式喂入 SFT 训练集；</li>
+      <li><strong>奖励模型对测试集的过度拟合（Reward Hacking）</strong>：在强化学习（RLHF / PPO / GRPO）对齐阶段，奖励模型高度拟合了特定测试集出题人的语言偏好与结构风格，使生成模型在测试集上准确率暴涨，但在稍加改动的现实任务中发生断崖式对齐坍塌；</li>
+      <li><strong>基准过拟合（Benchmark Overfitting）</strong>：针对 GSM8K 8-shot 的固定提示词格式、固定选项顺序进行超参数与前缀激进调优，模型实际上只是在“背诵”解题模板，而非获得了通用的逻辑推断能力。</li>
+    </ul>
+
+    <p>这种“离线高分、线上低能”的脱节现象，直接削弱了后训练工程的可信度。评测陷阱不仅仅是学术诚信问题，更是严重的工程隐患——如果在训练数据准备与筛选阶段未能彻底排查评测集污染，算法人员将基于虚假指标做出完全错误的架构与超参决策，导致数百万算力投资彻底沉没。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="测试集泄漏与污染检测过滤流水线图">
+        <defs>
+          <marker id="arr-blue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="arr-red" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#ef4444"/>
+          </marker>
+          <marker id="arr-green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+        </defs>
+
+        <!-- 左侧输入源 -->
+        <rect x="20" y="35" width="160" height="90" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="100" y="70" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a">待清洗训练语料</text>
+        <text x="100" y="95" text-anchor="middle" font-size="12" fill="#3b82f6">(预训练 / SFT / DPO 数据)</text>
+
+        <rect x="20" y="155" width="160" height="90" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="100" y="190" text-anchor="middle" font-size="14" font-weight="bold" fill="#92400e">核心基准评测库</text>
+        <text x="100" y="215" text-anchor="middle" font-size="12" fill="#b45309">(MMLU, GSM8K, MATH...)</text>
+
+        <!-- 汇总至中间流水线 -->
+        <path d="M185 80 L 235 110" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-blue)"/>
+        <path d="M185 200 L 235 170" stroke="#f59e0b" stroke-width="2" marker-end="url(#arr-blue)"/>
+
+        <!-- 中间检测中枢 -->
+        <rect x="240" y="30" width="240" height="220" rx="10" fill="#f8fafc" stroke="#64748b" stroke-width="2"/>
+        <text x="360" y="60" text-anchor="middle" font-size="16" font-weight="bold" fill="#1e293b">多模态污染审计流水线</text>
+
+        <rect x="260" y="80" width="200" height="40" rx="6" fill="#eff6ff" stroke="#2563eb"/>
+        <text x="360" y="105" text-anchor="middle" font-size="12" fill="#1e40af">1. 8-gram MinHash 倒排索引扫描</text>
+
+        <rect x="260" y="130" width="200" height="40" rx="6" fill="#f5f3ff" stroke="#8b5cf6"/>
+        <text x="360" y="155" text-anchor="middle" font-size="12" fill="#5b21b6">2. 语义嵌入向量相似度筛查</text>
+
+        <rect x="260" y="180" width="200" height="40" rx="6" fill="#fef2f2" stroke="#ef4444"/>
+        <text x="360" y="205" text-anchor="middle" font-size="12" fill="#991b1b">3. 困惑度 (PPL) 奇异点检测</text>
+
+        <!-- 右侧分支 -->
+        <path d="M485 105 L 535 75" stroke="#ef4444" stroke-width="2" marker-end="url(#arr-red)"/>
+        <path d="M485 175 L 535 205" stroke="#10b981" stroke-width="2" marker-end="url(#arr-green)"/>
+
+        <rect x="540" y="45" width="160" height="65" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="2"/>
+        <text x="620" y="73" text-anchor="middle" font-size="13" font-weight="bold" fill="#991b1b">高污染命中语料</text>
+        <text x="620" y="93" text-anchor="middle" font-size="12" fill="#dc2626">直接剔除 / 隔离归档</text>
+
+        <rect x="540" y="170" width="160" height="65" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="620" y="198" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">洁净合规训练集</text>
+        <text x="620" y="218" text-anchor="middle" font-size="12" fill="#059669">安全流入后训练流水线</text>
+      </svg>
+      <figcaption>图 41-1：大模型后训练语料去污染审计与过滤流水线架构图</figcaption>
+    </figure>
+
+    <h2>2. 数据污染的三大物理形态</h2>
+    <p>数据污染（Data Contamination）是指用于评测下游能力的基准测试样本，在评测之前已全部或部分暴露在模型的训练数据集之中。根据泄漏的严重程度与特征表象，工业界将数据污染归纳为三大物理形态：</p>
+
+    <h3>2.1 输入输出完全泄漏（Input-Output Exact Leakage）</h3>
+    <p>这是最致命、最直白的污染形态。评测集中的题干 Prompt 与真实标准答案（Target Label / Ground Truth）被完整、原封不动地包含在预训练网页抓取语料或微调语料中。例如 GitHub 上公开发布的 HumanEval 题目与断言被爬虫完整捕获，并在无严格去重的情况下作为代码预训练数据灌入模型。模型在推理阶段本质上是在<strong>“精确背诵历史记忆”</strong>，评测通过率完全失去参考价值。</p>
+
+    <h3>2.2 输入泄露（Input-Only Contamination）</h3>
+    <p>评测集的问题输入（Prompt / Question）出现在训练数据中，但并未附带其对应的标准答案。例如网络论坛上对某道 AIME 数学难题的热烈讨论，仅贴出了题干而未给出证明。虽然这看似无害，但实证研究表明，输入泄漏会导致模型极度熟悉该问题的特定词汇组合与注意力模式，模型内部对题干的先验表征已被过度激活，相比未见过的等价问题，其生成正确解的概率出现非正常的统计学显著提升。</p>
+
+    <h3>2.3 合成变体与语义等价污染（Paraphrased & Synthetic Contamination）</h3>
+    <p>在大规模利用前沿模型（如 GPT-4）进行指令合成（Self-Instruct / Evol-Instruct）的后训练数据构建过程中，开发者如果将基准测试样本作为种子提示词（Seeds）进行泛化扩写，就会生成大量在语义上与测试集完全同构、仅替换了人名、数字或句式结构的变体数据。此类污染极难通过简单的字符串精确匹配排查，但在模型特征空间中已实质性破除了盲测的独立性假设。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>污染形态</th>
+            <th>泄漏机制</th>
+            <th>排查技术难度</th>
+            <th>对评测真实性的扭曲破坏</th>
+            <th>典型发生场景</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>输入输出完全泄漏</strong></td>
+            <td>题干与答案一字不差被纳入语料</td>
+            <td>低（精确 n-gram / 哈希匹配即可检出）</td>
+            <td>毁灭性：模型完全退化为硬编码记忆背诵</td>
+            <td>网络爬虫抓取了测试集 GitHub 仓库或题解博客</td>
+          </tr>
+          <tr>
+            <td><strong>输入泄漏</strong></td>
+            <td>仅包含题干描述，无标准答案</td>
+            <td>中（需要长 n-gram 覆盖度判定）</td>
+            <td>显著虚高：大幅降低理解题意的心智成本</td>
+            <td>知乎、Reddit、StackOverflow 上的提问讨论帖</td>
+          </tr>
+          <tr>
+            <td><strong>合成改写与语义同构</strong></td>
+            <td>换词、同义改写、更改数值或代码变量名</td>
+            <td>高（需要语义嵌入相似度或软编辑距离）</td>
+            <td>中~高：削弱真实逻辑泛化评估，形成虚假迁移</td>
+            <td>利用测试集作为 Seed 进行 Evol-Instruct 合成扩增</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 41-1：大模型数据污染三大物理形态特性与排查难度对比</span>
+    </div>
+
+    <h2>3. 数据污染的科学检测算法</h2>
+    <p>为了科学量化和定位训练语料库中潜藏的数据污染，学术界与工业界探索出两大经典检测范式：<strong>基于字符级 N-gram 重叠度分析</strong>与<strong>基于模型内部输出困惑度（Perplexity）的奇异点分析</strong>。</p>
+
+    <h3>3.1 N-gram 重叠度与 MinHash 倒排索引过滤</h3>
+    <p>OpenAI 在 GPT-3 与 GPT-4 报告中广泛采用基于 <strong>8-gram 或 13-gram</strong> 重叠率的去污染协议。其核心数学定义如下：</p>
+    <p>对于评测样本 \( T \)（由 Token 序列或单词序列组成）与训练文档 \( D \)，若存在一个长度为 \( N \) 的连续子序列 \( g \) 同时满足：</p>
+    \[ g \in \text{n-grams}(T) \quad \text{且} \quad g \in \text{n-grams}(D) \]
+    <p>则称样本 \( T \) 与文档 \( D \) 存在局部污染命中。在工程实践中，通常计算评测样本中被训练集覆盖的 n-gram 占该样本总 n-gram 的比例（Coverage Ratio）：</p>
+    \[ \mathrm{OverlapRatio}(T, D) = \frac{|\text{n-grams}(T) \cap \text{n-grams}(D)|}{|\text{n-grams}(T)|} \]
+    <p>当 \( \mathrm{OverlapRatio} \) 超过预设阈值（如 0.7）且满足连续字符匹配长度超过特定上限（如 100 字符）时，即判定该样本被污染。面对数 TB 的海量训练集，直接循环比对是不可行的，必须利用 <strong>MinHash 与 LSH（Locality Sensitive Hashing）</strong> 建立倒排索引以实现工业级并发筛查。</p>
+
+    <h3>3.2 基于困惑度（PPL）与对数似然奇异分布检测</h3>
+    <p>对于闭源模型或未开放训练集的第三方模型，外部评测人员无法直接访问其训练数据。此时，可通过分析模型在测试集样本上的<strong>条件困惑度（Perplexity, PPL）分布</strong>来间接反推是否存在背题行为。</p>
+    <p>根据语言模型生成机理，对于未见过的自然分布文本，模型的对数似然通常服从均值与方差相对稳定的高斯分布；而如果模型在训练中强制反向传播背诵过特定文本，其在这些特定 Token 上的负对数似然（Negative Log-Likelihood）会发生断崖式下跌，困惑度呈现出极其罕见的<strong>负向极端奇异点（Outlier）</strong>：</p>
+    \[ \mathrm{PPL}(X) = \exp\left( -\frac{1}{N}\sum_{t=1}^N \log P_\theta(x_t \mid x_{<t}) \right) \]
+    <p>如果在特定基准测试集上，模型的平均 PPL 异常偏离其在相同领域通用平行语料上的基线 PPL（例如下降超过 3 个标准差），或者模型在极短 Prompt 引导下能够一字不差地“吐出”原题后半段及标点符号，即可从统计学上判定存在严重的训练集记忆泄露。</p>
+
+    <h2>4. 动态评测基准：破解静态过拟合的未来方向</h2>
+    <p>“只要测试集是静态公开的，它被污染和攻破只是时间问题。”为了彻底粉碎数据污染的死结，评测界正在全面转向<strong>动态对抗式与私有隔离式评测基准</strong>。</p>
+
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：静态评测 vs 动态评测</div>
+      <p><strong>1. 静态基准（Static Benchmarks）</strong>：数据集一次性公开发布在 GitHub 或 Hugging Face（如 MMLU）。优点是门槛低、可复现性强；缺点是极易被爬虫吞噬，且随时间推移迅速出现饱和失效。</p>
+      <p><strong>2. 动态基准（Dynamic Benchmarks）</strong>：测试集题目持续演进、定期更新甚至随时间动态生成（如 LiveCodeBench、Codeforces 实时比赛题目、每日新闻常识）。模型研发团队完全无法提前获取评测题目，从而实现了不可作弊的真实盲测。</p>
+    </div>
+
+    <p>当前最具代表性的动态评测体系包括：</p>
+    <ul>
+      <li><strong>时间切片基准（Temporal Cut-off Benchmarks）</strong>：仅评测模型发布时间截点（Knowledge Cutoff）之后发生的国际事件、新出台法律或新发表的科学论文（如 FreshQA）。任何在模型权重训练完毕后发生的知识，模型绝不可能通过“记忆”获得，完全依赖长上下文检索与即时推理。</li>
+      <li><strong>LiveCodeBench</strong>：持续从 LeetCode、AtCoder、Codeforces 等编程竞赛平台实时抓取比赛新题。由于比赛题目在发布日前完全保密，模型必须凭借真实的算法合成能力现场攻坚。</li>
+      <li><strong>程序化程序合成评测（Procedural Benchmark Generation）</strong>：利用参数化元模板（Meta-templates）与图论约束求解器在测试时动态生成数学题目。每次评测时，题目的数值、实体背景、拓扑结构完全随机生成，但保持逻辑深度与解法路径不变。这使任何试图通过死记硬背刷分的策略彻底失效。</li>
+    </ul>
+
+    <h2>5. 8-gram 数据污染检测与去重过滤实战工具实现</h2>
+    <p>为了让算法工程师在后训练启动前能够自动化清洗语料库，本节给出完整的 Python 工业级污染检测实现，涵盖 8-gram 集合提取、倒排索引构建、Jaccard 覆盖度计算与多进程去污染过滤。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">ngram_contamination_detector.py</span>
+      <pre class="code"><code class="language-python">import re
+from typing import List, Set, Dict, Tuple, Any
+
+class NGramContaminationDetector:
+    """基于 N-gram 倒排索引的高性能数据污染检测器"""
+
+    def __init__(self, n: int = 8, min_overlap_ratio: float = 0.5):
+        self.n = n
+        self.min_overlap_ratio = min_overlap_ratio
+        # 评测集索引: ngram -> 评测集样本ID集合
+        self.eval_index: Dict[str, Set[int]] = {}
+        self.eval_samples: Dict[int, Dict[str, Any]] = {}
+
+    def _tokenize(self, text: str) -> List[str]:
+        """简易归一化分词器：小写化并提取字母数字词元"""
+        text = text.lower()
+        # 移除非字母数字字符，仅保留空格用于词切分
+        tokens = re.findall(r"\b\w+\b", text)
+        return tokens
+
+    def _extract_ngrams(self, tokens: List[str]) -> Set[str]:
+        """提取连续 N 个 Token 的滑动窗口集合"""
+        if len(tokens) < self.n:
+            # 若文本过短，退化为全句作为一个特征
+            return {" ".join(tokens)} if tokens else set()
+        ngrams = set()
+        for i in range(len(tokens) - self.n + 1):
+            ngram = " ".join(tokens[i : i + self.n])
+            ngrams.add(ngram)
+        return ngrams
+
+    def register_eval_dataset(self, dataset: List[Dict[str, Any]]):
+        """将评测集注册并构建 N-gram 倒排索引"""
+        for sample_id, item in enumerate(dataset):
+            content = item.get("prompt", "") + " " + item.get("target", "")
+            tokens = self._tokenize(content)
+            ngrams = self._extract_ngrams(tokens)
+            
+            self.eval_samples[sample_id] = {
+                "id": sample_id,
+                "content": content,
+                "total_ngrams": len(ngrams)
+            }
+            for ng in ngrams:
+                if ng not in self.eval_index:
+                    self.eval_index[ng] = set()
+                self.eval_index[ng].add(sample_id)
+                
+        print(f"[Info] 注册完成：共索引 {len(self.eval_samples)} 个评测样本，构建了 {len(self.eval_index)} 个独立 {self.n}-grams")
+
+    def inspect_training_document(self, doc_id: str, doc_text: str) -> Tuple[bool, List[Dict[str, Any]]]:
+        """
+        审计单条训练语料是否与已知评测集存在严重的 N-gram 污染
+        返回: (是否判定为污染, 命中的评测题目详情列表)
+        """
+        tokens = self._tokenize(doc_text)
+        doc_ngrams = self._extract_ngrams(tokens)
+        
+        # 统计每个评测样本命中的 ngram 计数
+        hit_counts: Dict[int, int] = {}
+        for ng in doc_ngrams:
+            if ng in self.eval_index:
+                for sid in self.eval_index[ng]:
+                    hit_counts[sid] = hit_counts.get(sid, 0) + 1
+
+        leakage_reports = []
+        is_contaminated = False
+
+        for sid, hits in hit_counts.items():
+            eval_info = self.eval_samples[sid]
+            total = eval_info["total_ngrams"]
+            overlap_ratio = hits / max(total, 1)
+
+            if overlap_ratio >= self.min_overlap_ratio:
+                is_contaminated = True
+                leakage_reports.append({
+                    "eval_sample_id": sid,
+                    "hit_ngrams": hits,
+                    "total_eval_ngrams": total,
+                    "overlap_ratio": round(overlap_ratio, 4)
+                })
+
+        return is_contaminated, leakage_reports
+
+# ================= 单元测试与检测演示 =================
+if __name__ == "__main__":
+    detector = NGramContaminationDetector(n=8, min_overlap_ratio=0.6)
+
+    # 1. 模拟注册评测基准样本 (如 GSM8K 的一道题)
+    eval_benchmark = [
+        {
+            "prompt": "Janet’s ducks lay 16 eggs per day. She eats three for breakfast and bakes muffins with four.",
+            "target": "She sells the remaining eggs at the farmers market for $2 each. Janet makes $18."
+        },
+        {
+            "prompt": "What is the capital of France and what is the official currency?",
+            "target": "Paris is the capital of France and the official currency is the Euro."
+        }
+    ]
+    detector.register_eval_dataset(eval_benchmark)
+
+    # 2. 测试样本 A: 高度污染的训练样本（几乎全盘复述）
+    tainted_train_doc = (
+        "Here is a common math problem: Janet’s ducks lay 16 eggs per day. "
+        "She eats three for breakfast and bakes muffins with four. "
+        "She sells the remaining eggs at the farmers market for $2 each. Janet makes $18."
+    )
+
+    # 3. 测试样本 B: 正常的无关语料
+    clean_train_doc = (
+        "In modern poultry farming, ducks and chickens are fed balanced diets to ensure consistent egg production."
+    )
+
+    contaminated_a, report_a = detector.inspect_training_document("train_doc_001", tainted_train_doc)
+    print(f"\n样本 A 污染判定: {contaminated_a}")
+    print(f"命中泄漏报告: {report_a}")
+
+    contaminated_b, report_b = detector.inspect_training_document("train_doc_002", clean_train_doc)
+    print(f"\n样本 B 污染判定: {contaminated_b}")
+    print(f"命中泄漏报告: {report_b}")
+</code></pre>
+    </div>
+
+    <h3>5.2 困惑度异常奇异值离群点检测实现</h3>
+    <p>对于外部黑盒模型或评估生成过程中的 PPL 异变，以下脚本演示了利用滑动 Z-score（Z-Score Outlier Detection）自动标记疑似过拟合样本的检测算法。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">ppl_outlier_detector.py</span>
+      <pre class="code"><code class="language-python">import math
+import numpy as np
+from typing import List, Dict
+
+def detect_ppl_anomalies(eval_records: List[Dict[str, Any]], z_thresh: float = -2.5) -> List[Dict[str, Any]]:
+    """
+    通过对数困惑度(Log-PPL)的 Z-Score 识别异常偏低（极可能被死记硬背）的样本
+    eval_records: [{"sample_id": int, "text": str, "ppl": float}, ...]
+    """
+    if not eval_records:
+        return []
+
+    # 取对数困惑度以满足正态分布假设
+    log_ppls = [math.log(max(r["ppl"], 1e-6)) for r in eval_records]
+    mean_val = float(np.mean(log_ppls))
+    std_val = float(np.std(log_ppls))
+
+    if std_val < 1e-6:
+        return []
+
+    flagged_samples = []
+    for r, log_ppl in zip(eval_records, log_ppls):
+        # 计算标准 Z 分数: (x - mu) / sigma
+        z_score = (log_ppl - mean_val) / std_val
+        
+        # 若 Z-score 极度偏负，表明模型对该样本的困惑度异常低下，处于过度背诵区
+        if z_score < z_thresh:
+            flagged_samples.append({
+                "sample_id": r["sample_id"],
+                "ppl": round(r["ppl"], 2),
+                "z_score": round(z_score, 2),
+                "suspect_reason": "Log-PPL 异常极度偏低，疑似训练集过拟合记忆泄漏"
+            })
+
+    return flagged_samples
+
+if __name__ == "__main__":
+    # 模拟某模型在 10 道测试题上的 PPL 表现，其中第 3 题 PPL 只有 1.05（几乎一字不差）
+    mock_evals = [
+        {"sample_id": 1, "ppl": 8.4},
+        {"sample_id": 2, "ppl": 9.1},
+        {"sample_id": 3, "ppl": 1.05},  # 异常过拟合点
+        {"sample_id": 4, "ppl": 7.8},
+        {"sample_id": 5, "ppl": 8.9},
+        {"sample_id": 6, "ppl": 10.2},
+        {"sample_id": 7, "ppl": 8.1},
+    ]
+
+    outliers = detect_ppl_anomalies(mock_evals, z_thresh=-2.0)
+    print("检出的疑似污染样本：", outliers)
+</code></pre>
+    </div>
+
+    <h3>5.3 工业级批量数据去污染流水线集成</h3>
+    <p>为了在海量语料流水线中直接清洗数据，下面的代码展示了如何将检测模块集成进批量清洗流水线中，并生成审计日志。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">decontamination_pipeline.py</span>
+      <pre class="code"><code class="language-python">import json
+from typing import List, Dict
+
+def sanitize_corpus(raw_corpus: List[Dict[str, str]], detector: Any, output_clean_path: str, log_path: str):
+    """批量清洗训练集并持久化审计日志"""
+    clean_records = []
+    audit_logs = []
+
+    for item in raw_corpus:
+        doc_id = item.get("id", "unknown")
+        text = item.get("text", "")
+        
+        is_contaminated, details = detector.inspect_training_document(doc_id, text)
+        if is_contaminated:
+            audit_logs.append({
+                "doc_id": doc_id,
+                "reason": "High N-Gram Contamination",
+                "details": details
+            })
+        else:
+            clean_records.append(item)
+
+    print(f"[Sanitize] 原始语料: {len(raw_corpus)} 篇 | 检出并拦截污染: {len(audit_logs)} 篇 | 合规保留: {len(clean_records)} 篇")
+    
+    # 模拟写入文件
+    # with open(output_clean_path, 'w', encoding='utf-8') as f:
+    #     json.dump(clean_records, f, ensure_ascii=False)
+    # with open(log_path, 'w', encoding='utf-8') as f:
+    #     json.dump(audit_logs, f, indent=2, ensure_ascii=False)
+
+if __name__ == "__main__":
+    det = NGramContaminationDetector(n=8, min_overlap_ratio=0.5)
+    det.register_eval_dataset([{"prompt": "Calculate the square root of 144", "target": "12"}])
+    
+    dummy_corpus = [
+        {"id": "doc_01", "text": "A standard math exercise: Calculate the square root of 144 which is 12."},
+        {"id": "doc_02", "text": "Linear algebra is essential for deep learning engineers."}
+    ]
+    sanitize_corpus(dummy_corpus, det, "clean.json", "audit.json")
+</code></pre>
+    </div>
+
+    <h2>6. 评测治理的最佳实践法则</h2>
+    <p>为了彻底杜绝数据污染对后训练团队造成的误导，企业与实验室应建立严格的工程防火墙制度：</p>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：数据工程与评测体系的物理隔离</div>
+      <p><strong>1. 数据管道单向物理隔离（One-Way Air Gap）</strong>：评测团队与数据生产团队设立权限隔离。评测集的题库与私有测试用例仅保留在独立的专属审计服务器上，数据标注与爬虫工程人员无权直接拉取评测集明文。所有训练数据集在合并进主分支前，必须通过由评测团队维护的自动化去污染 CI/CD 流水线断言。</p>
+      <p><strong>2. 设立私有 Hold-out 测试集</strong>：严禁 100% 依赖公开开源的 Benchmark。每个核心业务线必须人工精挑细选 500~1000 道高度私有化、永不开源上云的专有业务题集，定期用其抽检模型真实能力。</p>
+    </div>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：防范“合成数据反刍”污染</div>
+      <p>在利用大模型生成海量问答对扩充训练集时，由于教师模型（如 GPT-4）本身可能在预训练中背诵了海量学术基准，其生成的合成语料极易在无意识中“反刍（Regurgitation）”出变相的测试题目。因此，对所有外部合成数据必须同样执行严密的 8-gram 过滤与去重校验，切不可盲目信任合成数据的“纯净性”。</p>
+    </div>
+
+    <h3>6.1 评测泄漏分级响应机制与工程应急预案</h3>
+    <p>一旦在模型研发的最后交付阶段或上线前夕检测出核心测试集存在污染泄漏，团队绝不可采取掩耳盗铃的态度。工业界标准治理协议应按泄漏等级启动梯度化应急预案：</p>
+    <ul>
+      <li><strong>P0 级完全泄漏（输入输出均泄漏且污染率 > 5%）</strong>：立即废弃当前受影响的评测指标，严禁将该跑分写入模型技术报告；启动紧急数据清洗作业，从 SFT 与预训练语料库中彻底剔除涉事数据切片并重新计算数据哈希；在公开报告中主动进行负向披露（Negative Disclosure）。</li>
+      <li><strong>P1 级输入局部泄漏（仅题干部分泄露或改写同构）</strong>：利用未泄露的私有 Hold-out 验证集与动态基准（如 LiveCodeBench）进行二次交叉盲测，评估泄漏对下游真实泛化能力产生的实际增益偏差。</li>
+      <li><strong>P2 级微量偶发重叠（单题重叠 n-gram 但逻辑无关）</strong>：更新 MinHash 白名单规则，保留样本并记录异常审计流水。</li>
+    </ul>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>泄漏评级</th>
+            <th>判定标准与触发条件</th>
+            <th>影响范围与危害度</th>
+            <th>处置响应时间与决策动作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>P0 级（毁灭性）</strong></td>
+            <td>测试集 Q&A 完整出现在微调/强化集，重叠率 > 5%</td>
+            <td>基准完全作废，模型面临学术与商业信誉清零</td>
+            <td>2 小时内阻断发版，物理隔离并回滚涉事训练分支</td>
+          </tr>
+          <tr>
+            <td><strong>P1 级（严重偏差）</strong></td>
+            <td>题干输入暴露或合成改写相似度 > 0.85</td>
+            <td>导致离线评估产生 5%~15% 的虚假能力溢出</td>
+            <td>12 小时内切换至私有 Hold-out 测试集重测并重新校准</td>
+          </tr>
+          <tr>
+            <td><strong>P2 级（轻微疑似）</strong></td>
+            <td>通用短语局部命中，逻辑主干未泄漏</td>
+            <td>指标浮动 < 1%，统计噪音范围内</td>
+            <td>常规迭代周期内优化 MinHash 停用词词表并归档</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 41-2：数据污染事件分级响应处置与审计响应矩阵</span>
+    </div>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="数据污染应急响应与修复流转图">
+        <defs>
+          <marker id="arr-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+        </defs>
+
+        <rect x="20" y="40" width="130" height="120" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="2"/>
+        <text x="85" y="75" text-anchor="middle" font-size="14" font-weight="bold" fill="#991b1b">污染报警触发</text>
+        <text x="85" y="105" text-anchor="middle" font-size="12" fill="#dc2626">CI/CD 断言拦截</text>
+        <text x="85" y="130" text-anchor="middle" font-size="11" fill="#7f1d1d">8-gram / PPL 异常</text>
+
+        <path d="M155 100 L 205 100" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-arrow)"/>
+
+        <rect x="210" y="40" width="150" height="120" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="285" y="75" text-anchor="middle" font-size="14" font-weight="bold" fill="#92400e">根因定级溯源</text>
+        <text x="285" y="105" text-anchor="middle" font-size="12" fill="#b45309">排查爬虫日志</text>
+        <text x="285" y="130" text-anchor="middle" font-size="11" fill="#78350f">与合成种子集</text>
+
+        <path d="M365 100 L 415 100" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-arrow)"/>
+
+        <rect x="420" y="40" width="140" height="120" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="490" y="75" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a">语料物理清洗</text>
+        <text x="490" y="105" text-anchor="middle" font-size="12" fill="#2563eb">剔除污染分块</text>
+        <text x="490" y="130" text-anchor="middle" font-size="11" fill="#1e40af">重新生成哈希签名</text>
+
+        <path d="M565 100 L 615 100" stroke="#2563eb" stroke-width="2" marker-end="url(#arr-arrow)"/>
+
+        <rect x="620" y="40" width="85" height="120" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="662" y="75" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">动态盲测</text>
+        <text x="662" y="105" text-anchor="middle" font-size="12" fill="#047857">二次验证</text>
+        <text x="662" y="130" text-anchor="middle" font-size="11" fill="#065f46">发版放行</text>
+      </svg>
+      <figcaption>图 41-2：数据污染告警分级响应与语料回滚修复闭环流转图</figcaption>
+    </figure>
+
+    <h2>7. 本章小结</h2>
+    <ul>
+      <li><strong>古德哈特定律的警钟</strong>：把有限的评测指标当作唯一的训练优化目标，必然导致奖励黑客攻击、测试集泄漏与过度拟合，使模型丧失真实的通用泛化价值。</li>
+      <li><strong>污染形态的多样性</strong>：数据污染不仅包括完全匹配的输入输出泄露，还涵盖隐蔽的输入题干暴露与基于种子题目的改写合成同构。多模态、跨粒度的审计是必由之路。</li>
+      <li><strong>技术检测与动态基准结合</strong>：利用基于 MinHash 倒排索引的 N-gram 重叠度分析与困惑度（PPL）离群点检测，能够有效构筑数据清洗防线；而积极布局时间切片基准与实时代码比赛（如 LiveCodeBench），是摆脱静态跑分困境的终极未来。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：为什么仅泄露评测集的题干输入（Input-Only Contamination），而没有泄露标准答案，依然会导致模型的评测成绩失真？</summary>
+        <p>因为大模型是基于自回归注意力机制的系统。当模型在预训练或微调中反复见过该题干的词汇搭配与句式结构时，其底层表征对该题目的<strong>概念激活与理解门槛被大幅人为削平</strong>。模型无需再分配注意力去解构长难句语义，能够直接将算力集中在生成预测上，导致在特定题型上的表现虚高，破坏了评估模型面对“全新陌生任务时抽象理解能力”的真实初衷。</p>
+      </details>
+      <details>
+        <summary>问题 2：在基于 N-gram 检测数据污染时，为什么工业界普遍选择 8-gram 或 13-gram，而不是选择 2-gram 或 50-gram？</summary>
+        <p>这是一个典型的<strong>精确率与召回率（Precision vs Recall）权衡</strong>。若选择过短的 N-gram（如 2-gram 或 3-gram），通用语言中的高频常用短语（如 "in order to", "as shown in the"）会导致海量误报（False Positive），根本无法筛选出真正的题目泄漏；若选择过长的 N-gram（如 50-gram），只要题干中微调了几个介词或人名，重叠子串就会被彻底打断，导致严重漏报（False Negative）。8 到 13 个连续 Token 在信息论上具有极高的唯一性，能够精准捕捉非平凡的语义重叠。</p>
+      </details>
+      <details>
+        <summary>问题 3：什么是动态基准（Dynamic Benchmark）？它如何从机制设计上根治数据污染与刷分作弊？</summary>
+        <p>动态基准是指<strong>测试样本随着时间推移实时更新、或在测试时按程序化规则动态合成的评测机制</strong>（如 LiveCodeBench 每日抓取最新比赛编程题，或 FreshQA 实时测试最新新闻事件）。由于评测题目在模型训练与权重冻结时尚未在现实世界中产生，模型研发团队在物理上完全无法将测试集提前混入训练数据中，从而在根本机制上杜绝了数据污染，迫使模型只能依靠真正的底层逻辑推断与泛化能力应对挑战。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Brown+, 2020]</span> Brown, T. et al. "Language Models are Few-Shot Learners." <i>NeurIPS</i>, 2020. <span class="rid">arXiv:2005.14165</span> (GPT-3 数据去污染协议)</li>
+      <li><span class="rid">[Achiam+, 2023]</span> Achiam, J. et al. "GPT-4 Technical Report." <i>arXiv preprint</i>, 2023. <span class="rid">arXiv:2303.08774</span></li>
+      <li><span class="rid">[Jain+, 2024]</span> Jain, N. et al. "LiveCodeBench: Holistic and Contamination-Free Evaluation of Large Language Models for Code." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2403.07974</span></li>
+      <li><span class="rid">[Yang+, 2023]</span> Yang, S. et al. "Rethinking Benchmark and Contamination for Computing in Large Language Models." <i>arXiv preprint</i>, 2023. <span class="rid">arXiv:2311.09783</span></li>
+      <li><span class="rid">[Golchin & Surdeanu, 2023]</span> Golchin, S., Surdeanu, M. "Time Travel in LLMs: Tracing Data Contamination in Large Language Models." <i>ICLR</i>, 2024. <span class="rid">arXiv:2308.08493</span></li>
+      <li><span class="rid">[Deng+, 2023]</span> Deng, C. et al. "Investigating Data Contamination in Modern Benchmarks for Large Language Models." <i>arXiv preprint</i>, 2023. <span class="rid">arXiv:2311.09783</span></li>
+      <li><span class="rid">[Srivastava+, 2022]</span> Srivastava, A. et al. "Beyond the Imitation Game: Quantifying and extrapolating the capabilities of language models." <i>Transactions on Machine Learning Research</i>, 2023. <span class="rid">arXiv:2206.04615</span> (BIG-bench)</li>
+      <li><span class="rid">[Vu+, 2023]</span> Vu, T. et al. "FreshQA: Towards Evaluating Dynamic World Knowledge in Large Language Models." <i>arXiv preprint</i>, 2023. <span class="rid">arXiv:2310.03214</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

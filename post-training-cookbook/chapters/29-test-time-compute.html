@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 29 章 · 测试时计算扩展 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 5 部分 · 推理增强后训练</div>
+      <h1>第 29 章 · 测试时计算扩展</h1>
+      <p class="chapter-lead">自 Kaplan 与 Chinchilla 确立以预训练参数量和语料规模为核心的缩放定律以来，大模型领域长久信奉“参数即正义”。然而，以 OpenAI o1 与 DeepSeek-R1 为代表的前沿推理模型，揭示了人工智能的第二条扩展曲线——测试时计算扩展（Test-time Compute Scaling, Inference Scaling Laws）。Rich Sutton 提出的“苦涩的教训”（The Bitter Lesson）在推理阶段再次得到了戏剧性验证：通用搜索与算力消耗远胜于脆弱的人工启发式规则。本章系统解构测试时计算的数学定义，深入剖析生成长度展开与并行/序贯搜索两大扩展维度，对比分析多数投票（Majority Voting）、验证器引导搜索（Verifier-guided Search）的收益边界，并呈现工业级自适应推理算力路由分配系统的架构与工程实现。</p>
+      <div class="chapter-meta">⏱ 预计学习 110 分钟 ｜ 难度 ★★★★★ ｜ 先修：第 4 章、第 26 章、第 28 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 测试时计算扩展的理论根基与缩放定律</h2>
+    <p>在传统的深度学习与大语言模型研究中，模型的性能增益几乎完全被绑定在两个维度上：<strong>模型参数量（Parameters, \( N \)）</strong> 与 <strong>预训练词元数（Dataset Tokens, \( D \)）</strong>。这一理论框架由 Kaplan 等人（2020）与 Chinchilla（Hoffmann et al., 2022）奠定，主导了随后数年的前沿大模型竞赛。然而，这种预训练阶段的扩展遭遇了严峻的物理与现实边界：全球高质量人类文本语料面临耗尽危机、前沿集群电力与互联瓶颈不断加剧，以及万亿参数模型的边际性能递减。</p>
+
+    <h3>1.1 “苦涩的教训”在推理时代的重现</h3>
+    <p>计算大师 Richard Sutton 在其经典短文 <i>The Bitter Lesson</i> 中曾深刻指出：<strong>“70年来人工智能研究最大的教训是：利用大规模计算的通用方法（如搜索和学习）最终大获全胜，而试图依靠人类先验知识将领域启发式规则硬编码进系统的努力最终都被彻底击溃。”</strong></p>
+    <p>AlphaGo 的胜利正是这一定律的早期具现——它并未硬编码人类围棋定式，而是依托深度强化学习与蒙特卡洛树搜索（MCTS）进行海量试错。在自然语言处理领域，过去几年的后训练往往倾向于通过精巧的 Prompt 模板、人类专家撰写的规范示例去“教”模型如何作答；而测试时计算扩展（Test-time Compute Scaling）的兴起，标志着 Sutton 的苦涩教训全面蔓延至大模型的推理阶段：<strong>与其在训练时竭力将人类所有思考方式固化为静态参数，不如在测试推理时赋予模型充沛的浮点运算能力（FLOPS），让它通过动态搜索、试错与自我反思来自主发现解空间。</strong></p>
+
+    <h3>1.2 训练算力 vs 推理算力的 Pareto 最优前沿</h3>
+    <p>Snell 等人（2024）在 <i>Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters</i> 中进行了严格的量化建模。研究表明：对于给定的总计算预算（Compute Budget），一味增加预训练规模往往并非最优解。在很多具有确定性客观判据的任务上，将较小的模型在推理测试时增加 10 倍至 100 倍的计算算力，其最终准确率能够轻松跨越参数量大一个数量级但采用贪心解码的大模型。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="训练算力 vs 推理算力的帕累托最优等高线">
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+        </defs>
+
+        <!-- Coordinate Axes -->
+        <path d="M60 240 L 680 240" stroke="#1e293b" stroke-width="2" marker-end="url(#arrow)"/>
+        <path d="M60 240 L 60 20" stroke="#1e293b" stroke-width="2" marker-end="url(#arrow)"/>
+
+        <text x="670" y="260" text-anchor="middle" font-size="12" fill="#1e293b">测试时推理算力（Test-time Compute, Tokens / Samples）</text>
+        <text x="30" y="30" text-anchor="middle" font-size="12" fill="#1e293b" transform="rotate(-90 30 30)">模型参数规模与训练算力（Train Compute）</text>
+
+        <!-- Pareto Frontier Curves -->
+        <!-- Iso-Performance Curve 1 (Easy Task, Acc = 85%) -->
+        <path d="M 80 80 Q 140 180 350 200" fill="none" stroke="#10b981" stroke-width="3"/>
+        <text x="360" y="195" font-size="11" font-weight="bold" fill="#065f46">中等难度基准（MATH 85% 等性能前沿）</text>
+
+        <!-- Iso-Performance Curve 2 (Hard Task, AIME = 60%) -->
+        <path d="M 120 40 Q 220 140 580 160" fill="none" stroke="#2563eb" stroke-width="3"/>
+        <text x="590" y="155" font-size="11" font-weight="bold" fill="#1e3a8a">高难度奥赛（AIME 60% 等性能前沿）</text>
+
+        <!-- Points Comparison -->
+        <!-- Point A: Giant Model, Greedy -->
+        <circle cx="130" cy="50" r="6" fill="#ef4444"/>
+        <text x="145" y="45" font-size="11" font-weight="bold" fill="#991b1b">方案 A: 70B 模型 + 贪心解码 (Pass@1)</text>
+
+        <!-- Point B: Small Model, Heavy Search -->
+        <circle cx="560" cy="165" r="6" fill="#8b5cf6"/>
+        <text x="460" y="195" font-size="11" font-weight="bold" fill="#5b21b6">方案 B: 7B 模型 + PRM 树搜索 / Best-of-64</text>
+
+        <!-- Trade-off arrow -->
+        <path d="M 140 60 L 540 160" stroke="#f59e0b" stroke-width="2" stroke-dasharray="4,4"/>
+        <text x="340" y="105" text-anchor="middle" font-size="11" fill="#b45309">算力向测试时转移：更低部署成本达成同等准确率</text>
+      </svg>
+      <figcaption>图 29-1：训练算力与测试时推理算力的 Pareto 最优前沿演化图（等性能权衡曲线）</figcaption>
+    </figure>
+
+    <figure class="figure">
+      <img src="../assets/figs/scaling-laws.png" alt="Kaplan 缩放定律示意">
+      <figcaption>图 29-2：经典预训练缩放定律曲线（来源：Kaplan et al., 2020, arXiv:2001.08361）</figcaption>
+    </figure>
+
+    <h2>2. 测试时计算扩展的两大核心维度</h2>
+    <p>在大语言模型测试推理时，分配更多计算资源（FLOPS）主要存在两种互补的技术途径：<strong>维度一：自回归生成长度扩展（Sequential CoT Expansion）</strong>；<strong>维度二：搜索与并发采样扩展（Parallel / Sequential Search）</strong>。二者在算力消耗模式、吞吐延迟特征及适用场景上呈现显著差异。</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>维度</th>
+            <th>机制本质</th>
+            <th>算力消耗特征</th>
+            <th>首字延迟与吞吐</th>
+            <th>典型算法与代表模型</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>生成长度扩展（内生深思）</strong></td>
+            <td>单条推理轨迹内部的自反思、试错、步骤展开与交叉验证</td>
+            <td>序列长度从 500 Token 膨胀至 8K ~ 32K+，KV 缓存显存线性上升</td>
+            <td>首字延迟不变，但生成结束延迟极高（数十秒），难以完全并行化</td>
+            <td>OpenAI o1, DeepSeek-R1 (内生 <code>&lt;think&gt;</code> 展开)</td>
+          </tr>
+          <tr>
+            <td><strong>搜索采样扩展（外部搜索）</strong></td>
+            <td>在解空间树上进行横向多路采样与候选重排（Best-of-N, MCTS）</td>
+            <td>并发度极高，单请求派生出 N 个并发前向解码分支</td>
+            <td>利用 GPU 并行硬件吞吐极高，但显存并发带宽压力剧增</td>
+            <td>Self-Consistency 多数投票、PRM 引导树搜索、AlphaCode</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 29-1：测试时计算扩展两大维度核心机制与工程特质对比</span>
+    </div>
+
+    <h3>2.1 维度一：自回归生成长度扩展（内生长思维链）</h3>
+    <p>在自回归机制中，每个新增的 Token 都代表着模型进行了一次前向计算。在未施加长思维链强化训练前，模型被强迫在固定步数内给出结论，这相当于要求神经网络在固定的计算深度（Depth = 层数）内完成任意高复杂度的状态转移。而通过生成更长的 Token 序列，模型实质上将原本单次前向的“单步近似”转化为了一个具有显式外部记忆（Scratchpad Memory）的循环计算系统（Recurrent System）。</p>
+    <p>长思维链中涌现出的“自我修正”（Self-Correction）并非简单的人工 Prompt 机械重复，而是当模型在当前上下文感知到推导矛盾时，通过自注意力矩阵（Self-Attention）回看历史 Token，在隐空间内重新调整后续词元的输出概率。研究表明，随着强化学习训练的深入，模型生成的思考链长度与解题正确率呈现近乎对数线性的正相关关系。</p>
+    <p>深思展开的本质在于<strong>将计算时间转化为逻辑深度</strong>。在国际象棋或围棋对弈中，人类棋手在落子前会预先推演未来数步的盘面演化，这一心理构想在神经网络中正是通过 Token 的自回归产出实现的。当模型自主输出类似“Wait, let me double check the boundary condition”时，自注意力层得以将注意焦点从局部的数值推导重新拉回题干的约束条件，从而极大地降低了单遍贪心解码下的不可逆幻觉概率。</p>
+
+    <h3>2.2 维度二：搜索与采样扩展（多数投票与树搜索）</h3>
+    <p>搜索扩展则是在外部空间对解法多样性（Solution Diversity）的全面挖掘。其最朴素也是最稳健的形式是 Wang 等人（2022）提出的<span class="term">自一致性采样（Self-Consistency / Majority Voting）</span>。设针对问题 \( x \) 独立采样 \( N \) 条解答 \( y_1, y_2, \dots, y_N \)，从每条解答中提取结构化最终答案 \( a_i = \mathrm{Extract}(y_i) \)。多数投票系统选择出现频次最高的模态值（Mode）：</p>
+
+    \[ a^* = \arg\max_{a \in \mathcal{A}} \sum_{i=1}^N \mathbb{I}(a_i = a) \]
+
+    <p>自一致性的数学本质是利用大数定律压制自回归生成的随机扰动与局部逻辑噪声。当生成模型在解题空间中的正确率 \( p > 0.5 \) 时，随着采样数 \( N \to \infty \)，多数投票的胜率理论上趋近于 1。然而，当面对超高难度的极值问题时（模型单次正确率 \( p < 0.2 \)），纯多数投票的边际效用迅速枯竭，甚至会出现“错误答案由于思维定式而形成虚假共识”的集群失效（Groupthink Failure）。此时，必须引入外置验证器（Verifier）或过程奖励模型进行加权引导。</p>
+    <p>此外，并行采样与顺序树搜索在解空间覆盖上呈现出鲜明的互补性：并行采样能够快速跨越不同的局部极小值谷底（探索全局不同题解思路），而树搜索与束搜索则长于在已探明的可行解分支上进行局部深度挖掘与严密求精。将这两种搜索范式进行多层级混合，是现代超大规模推理系统的基石构架。</p>
+
+    <h2>3. 验证器引导搜索（Verifier-guided Search）的 Scaling 曲线</h2>
+    <p>当利用外置判别器（ORM 或 PRM）对生成的 \( N \) 个候选解答进行排序时，我们获得了经典的 <span class="term">Best-of-N 验证器搜索</span>。形式上，模型输出最优解：</p>
+
+    \[ y^* = \arg\max_{y \in \{y_1, \dots, y_N\}} R_{\mathrm{Verifier}}(x, y) \]
+
+    <p>验证器引导搜索的性能提升并非无限制的线性增长，其随测试时算力（采样数 \( N \)）的扩展曲线遵循典型的对数凹函数特征，并最终不可避免地撞上两堵高墙：<strong>验证器假阳性天花板（False Positive Saturation）</strong> 与 <strong>分布外过拟合（Out-of-Distribution Overfitting）</strong>。</p>
+
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 为什么 Best-of-N 会随着 N 的增大出现性能倒退？</div>
+      <p>设验证器具有一个极小的假阳性错误率 \( \epsilon > 0 \)（即对于逻辑荒谬的错误答案，有 \( \epsilon \) 的概率给出接近满分的异常高分）。当采样候选集较小（如 \( N = 4 \)）时，候选集中碰巧出现假阳性欺诈解答的概率为 \( 1 - (1-\epsilon)^4 \approx 4\epsilon \)，系统大概率由优质正解主导。然而，当算力狂飙至 \( N = 1024 \) 时，集合中至少包含一个假阳性作弊解答的概率激增至 \( 1 - (1-\epsilon)^{1024} \to 100\% \)。验证器将以压倒性的置信度选出这个荒谬但评分畸高的假阳性样本，导致最终准确率呈现断崖式下跌。这就是著名的<strong>测试时奖励作弊饱和现象</strong>。</p>
+    </div>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>测试时采样规模 \( N \)</th>
+            <th>MATH Pass@1 理论上限</th>
+            <th>多数投票（Self-Consistency）</th>
+            <th>PRM 加权多数投票</th>
+            <th>朴素 Best-of-N（ORM 打分）</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>N = 1（贪心解码）</strong></td>
+            <td>54.2%</td>
+            <td>54.2%</td>
+            <td>54.2%</td>
+            <td>54.2%</td>
+          </tr>
+          <tr>
+            <td><strong>N = 8</strong></td>
+            <td>68.5%</td>
+            <td>61.4%</td>
+            <td>65.8%</td>
+            <td>64.1%</td>
+          </tr>
+          <tr>
+            <td><strong>N = 32</strong></td>
+            <td>79.1%</td>
+            <td>67.2%</td>
+            <td>74.6%</td>
+            <td>71.0%</td>
+          </tr>
+          <tr>
+            <td><strong>N = 128</strong></td>
+            <td>86.4%</td>
+            <td>71.8%</td>
+            <td>81.2%</td>
+            <td>73.5%（趋于平缓）</td>
+          </tr>
+          <tr>
+            <td><strong>N = 512</strong></td>
+            <td>91.0%</td>
+            <td>74.5%</td>
+            <td>85.0%</td>
+            <td>70.2%（假阳性恶化倒退）</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 29-2：不同测试时扩展策略随采样预算 \( N \) 增加的实测性能演化趋势对照</span>
+    </div>
+
+    <h2>4. 投票聚合算法进阶：从硬投票到加权边际概率优化</h2>
+    <p>在简单的多数投票中，每条轨迹被赋予完全平等的权重 \( w_i = 1 \)。然而，在实际生成中，每条轨迹的困惑度（Perplexity）、Token 级序列概率乘积以及验证器置信度差异极大。高阶测试时计算系统采用基于概率校准的加权聚合算法。</p>
+    <p>假设模型生成轨迹 \( y_i = (t_1, t_2, \dots, t_L) \)，其自回归序列平均对数似然为：</p>
+    \[ \ell(y_i) = \frac{1}{L} \sum_{j=1}^L \log \pi_\theta(t_j \mid x, t_{<j}) \]
+    <p>结合外置验证器打分 \( R(x, y_i) \)，第 \( i \) 条轨迹的自适应投票权重可构建为软归一化系数：</p>
+    \[ w_i = \exp\left( \frac{\ell(y_i)}{\tau_{\mathrm{gen}}} \right) \cdot \left[ R(x, y_i) \right]^{\gamma} \]
+    <p>其中 \( \tau_{\mathrm{gen}} \) 控制生成概率的平滑度，\( \gamma \) 控制验证器奖励的置信放大倍率。通过这种方式，既能压制低概率乱码输出，又能充分借助验证器的鉴别力。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">weighted_consensus_voting.py</span>
+      <pre class="code"><code class="language-python">import math
+from typing import List, Dict, Any, Tuple
+from collections import defaultdict
+
+class WeightedConsensusEngine:
+    """基于序列概率校准与验证器置信度的加权共识投票引擎"""
+    def __init__(self, temp_gen: float = 1.0, gamma_verifier: float = 2.0):
+        self.temp_gen = temp_gen
+        self.gamma = gamma_verifier
+
+    def compute_trajectory_weight(self, avg_logprob: float, verifier_score: float) -> float:
+        """
+        根据生成器置信度与验证器打分综合计算单条解答的权重
+        """
+        # 防止数值下溢
+        p_gen = math.exp(avg_logprob / self.temp_gen)
+        # 验证器得分进行幂次锐化
+        p_ver = math.pow(max(0.0001, verifier_score), self.gamma)
+        return p_gen * p_ver
+
+    def aggregate_votes(self, traces: List[Dict[str, Any]]) -> Tuple[str, float, Dict[str, float]]:
+        """
+        聚合全部候选解答，输出得票最高的答案、置信共识率及所有答案的分布
+        """
+        score_by_answer = defaultdict(float)
+        total_weight = 0.0
+
+        for trace in traces:
+            ans = trace["extracted_answer"]
+            avg_logp = trace.get("avg_logprob", -0.5)
+            v_score = trace.get("verifier_score", 0.5)
+            
+            w = self.compute_trajectory_weight(avg_logp, v_score)
+            score_by_answer[ans] += w
+            total_weight += w
+
+        if total_weight == 0:
+            return traces[0]["extracted_answer"], 0.0, {}
+
+        # 归一化为共识概率分布
+        dist = {k: v / total_weight for k, v in score_by_answer.items()}
+        sorted_answers = sorted(dist.items(), key=lambda x: x[1], reverse=True)
+        best_answer, highest_confidence = sorted_answers[0]
+
+        return best_answer, highest_confidence, dist</code></pre>
+    </div>
+
+    <h2>5. 计算预算自适应分配：难易度感知路由架构</h2>
+    <p>在真实的工业云服务（如在线 API 服务）中，无差别地为每一个用户请求分配极端奢侈的测试时算力（例如每个问题都生成 64 条长思维链或运行深层 MCTS）在经济成本上是不可承受的。对于形如 <code>"2 + 3 等于几？"</code> 的简单算术题，单次贪心解码（耗费 20 Token）的准确率已达到 100%；只有当面对国际奥林匹克竞赛压轴题或复杂长文档代码重构时，消耗数万 Token 的搜索算力才具备正向的商业回报比。</p>
+
+    <p>因此，现代前沿推理系统必须构建一套<span class="term">自适应推理算力路由分配系统（Adaptive Compute Allocation System）</span>。该系统基于难易度先验估计、早停判据与动态置信度监控，实现毫秒级自适应预算分流。路由系统的决策拓扑遵循三大黄金法则：</p>
+    <ul>
+      <li><strong>分级预算阶梯（Tiered Budget Ladders）</strong>：根据输入 Token 序列特征与领域分类器，预先将请求划分为极简、进阶与专家三级梯队，设置差异化的初始候选数 \( N \) 与温度 \( T \)。</li>
+      <li><strong>序贯鞅检验早停（Sequential Martingale Early Stopping）</strong>：在多路采样流式返回过程中，实时维护当前最高频答案的置信区间。一旦胜出者的得票优势在统计学意义上达到不可逆转的阈值（例如前 5 个输出中已有 4 个一致），立即向推断引擎下发取消信号（Cancellation Signal），截断剩余分支计算。</li>
+      <li><strong>跨模型降级回退（Fallback & Escalation）</strong>：初始阶段由参数小、吞吐高的轻量模型（如 7B）快速尝试短 CoT 解答；若轻量模型给出的置信度低下或无法通过轻量验证，再动态将上下文升级转派给前沿大模型（如 70B 或 MoE）启动深层 MCTS 搜索。</li>
+    </ul>
+
+    <div class="code-wrap">
+      <span class="code-label">adaptive_compute_router.py</span>
+      <pre class="code"><code class="language-python">import math
+import time
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from collections import Counter
+
+@dataclass
+class ComputeBudget:
+    max_samples: int
+    temperature: float
+    max_tokens_per_sample: int
+    use_prm_verification: bool
+
+class AdaptiveComputeRouter:
+    """生产级难易度感知与自适应推理算力分配引擎"""
+    def __init__(self, high_threshold: float = 0.85, low_threshold: float = 0.50):
+        self.high_threshold = high_threshold
+        self.low_threshold = low_threshold
+
+    def estimate_problem_difficulty(self, prompt: str) -> str:
+        """
+        基于轻量级分类器或启发式特征评估输入问题的预估难度
+        实际生产中可使用紧凑型 BERT 分类器或轻量 Prompt 判定
+        """
+        prompt_len = len(prompt)
+        math_symbols = sum(prompt.count(sym) for sym in ["\\sum", "\\int", "\\frac", "\\sqrt", "\\matrix"])
+        
+        if math_symbols &gt;= 3 or prompt_len &gt; 500:
+            return "hard"
+        elif math_symbols &gt;= 1 or prompt_len &gt; 150:
+            return "medium"
+        else:
+            return "easy"
+
+    def allocate_initial_budget(self, difficulty: str) -> ComputeBudget:
+        """根据难度梯级分配初始计算算力包"""
+        if difficulty == "easy":
+            # 极简模式：单次解码，禁止 PRM 额外开销
+            return ComputeBudget(max_samples=1, temperature=0.0, max_tokens_per_sample=512, use_prm_verification=False)
+        elif difficulty == "medium":
+            # 适度模式：小规模并发，开启自一致性多数投票
+            return ComputeBudget(max_samples=5, temperature=0.7, max_tokens_per_sample=2048, use_prm_verification=False)
+        else:
+            # 深度推理模式：大规模并发与深层 PRM 验证
+            return ComputeBudget(max_samples=16, temperature=0.85, max_tokens_per_sample=8192, use_prm_verification=True)
+
+    def check_early_stopping(self, collected_answers: List[str], current_sample_count: int, total_budget: int) -> Tuple[bool, Optional[str]]:
+        """
+        动态序贯置信度检验：若候选答案已呈现压倒性共识，立即提前截断退出
+        节省后续尚未展开的并发 GPU 推理开销
+        """
+        if not collected_answers:
+            return False, None
+
+        counter = Counter(collected_answers)
+        most_common_ans, count = counter.most_common(1)[0]
+        consensus_ratio = count / current_sample_count
+
+        # 当已采样的样本数达到一定基数且共识率极高时，触发早停
+        if current_sample_count &gt;= 3 and consensus_ratio &gt;= self.high_threshold:
+            return True, most_common_ans
+
+        # 当预算耗尽时，必须截断
+        if current_sample_count &gt;= total_budget:
+            return True, most_common_ans
+
+        return False, None
+
+    def execute_adaptive_inference(self, prompt: str, mock_generator_fn, mock_verifier_fn) -> Dict[str, Any]:
+        """调度自适应扩展推断流水线"""
+        start_time = time.time()
+        difficulty = self.estimate_problem_difficulty(prompt)
+        budget = self.allocate_initial_budget(difficulty)
+
+        collected_answers = []
+        collected_traces = []
+        stopped_early = False
+        final_answer = None
+
+        # 序贯批次执行探索，便于尽早截断
+        batch_size = 2 if budget.max_samples &gt; 1 else 1
+        num_batches = math.ceil(budget.max_samples / batch_size)
+
+        for b_idx in range(num_batches):
+            current_batch_samples = min(batch_size, budget.max_samples - len(collected_answers))
+            
+            # 批量并发生成
+            new_traces = mock_generator_fn(
+                prompt=prompt, 
+                n=current_batch_samples, 
+                temp=budget.temperature, 
+                max_tokens=budget.max_tokens_per_sample
+            )
+            
+            for trace in new_traces:
+                ans = trace["extracted_answer"]
+                collected_answers.append(ans)
+                collected_traces.append(trace)
+
+            # 动态检查早停
+            should_stop, best_ans = self.check_early_stopping(
+                collected_answers, len(collected_answers), budget.max_samples
+            )
+            if should_stop:
+                stopped_early = True
+                final_answer = best_ans
+                break
+
+        # 若开启了验证器且存在多个候选分歧，执行 PRM 重排
+        if budget.use_prm_verification and len(set(collected_answers)) &gt; 1:
+            scored_traces = mock_verifier_fn(prompt, collected_traces)
+            scored_traces.sort(key=lambda x: x["prm_score"], reverse=True)
+            final_answer = scored_traces[0]["extracted_answer"]
+
+        latency = time.time() - start_time
+        return {
+            "prompt": prompt,
+            "difficulty": difficulty,
+            "final_answer": final_answer,
+            "samples_consumed": len(collected_answers),
+            "allocated_budget": budget.max_samples,
+            "stopped_early": stopped_early,
+            "latency_seconds": round(latency, 4)
+        }</code></pre>
+    </div>
+
+    <h2>6. 测试时推理的系统工程：显存复用与吞吐瓶颈突破</h2>
+    <p>将测试时计算扩展到大规模并发或长推理展开，系统面临的直接瓶颈并非单纯的算力（TFLOPS），而是显存容量（VRAM Footprint）与内存带宽（Memory Bandwidth）。</p>
+
+    <h3>6.1 Radix Attention（前缀树缓存共享）</h3>
+    <p>当一个 Prompt 派生出 32 个采样分支时，朴素实现会导致系统在显存中复制 32 份完全一致的 Prompt KV Cache。在长 Prompt（如 4000 Token）场景下，这种冗余复制会瞬间耗尽几十 GB 显存。工业级推理系统（如 SGLang、vLLM）采用 Radix Tree 结构，将公共的前缀 Token 统一挂载在树根节点，所有子分支只读共享该节点的物理内存页（Page Blocks）。只有当分支产生差异化的新 Token 时，才为新叶子节点动态分配内存。这种机制使得高并发测试时搜索的显存利用率提升了 3 至 8 倍。</p>
+
+    <h3>6.2 连续批处理与长短混合调度（In-flight Batching）</h3>
+    <p>自回归长思考链的另一个系统级挑战是计算密度的极度不均匀。在并发采样中，不同的推导轨迹在不同的时刻结束（遇到 <code>&lt;/think&gt;</code> 或完成解题）。传统静态批处理会导致整个 Batch 的完成时间被最慢的那条长尾轨迹卡住。引入 In-flight Batching 可以在每次自回归迭代步（Iteration Step）中，动态将已完成的序列从调度队列移出，并即时注入新的并发解码任务，确保 GPU 计算核心始终保持 100% 满负荷运转。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">radix_prefix_cache_mock.py</span>
+      <pre class="code"><code class="language-python">from typing import Dict, List, Optional
+
+class RadixTreeNode:
+    """Radix 树节点：表示一段共享的 Token 序列及其对应的 KV Cache 块指针"""
+    def __init__(self, token_ids: List[int], parent: Optional['RadixTreeNode'] = None):
+        self.token_ids = token_ids
+        self.parent = parent
+        self.children: Dict[int, 'RadixTreeNode'] = {}
+        self.ref_count = 1  # 引用计数
+        self.kv_block_id = id(self)  # 模拟物理显存块指针
+
+class RadixCacheManager:
+    """前缀共享缓存管理器，用于在并发搜索中消除冗余 Prefill 显存与计算"""
+    def __init__(self):
+        self.root = RadixTreeNode(token_ids=[])
+
+    def insert_or_match_prefix(self, token_ids: List[int]) -> Tuple[int, RadixTreeNode]:
+        """
+        匹配最长已缓存前缀，返回（复用的 token 数，当前挂载节点）
+        避免在并发 Best-of-N 中对相同的题干 Prompt 进行重复 Prefill
+        """
+        curr = self.root
+        matched_tokens = 0
+        
+        idx = 0
+        while idx &lt; len(token_ids):
+            first_tok = token_ids[idx]
+            if first_tok in curr.children:
+                child = curr.children[first_tok]
+                # 检查子节点序列匹配度
+                c_len = len(child.token_ids)
+                if token_ids[idx:idx+c_len] == child.token_ids:
+                    matched_tokens += c_len
+                    idx += c_len
+                    curr = child
+                    curr.ref_count += 1
+                else:
+                    break
+            else:
+                # 插入新的分支叶子节点
+                new_node = RadixTreeNode(token_ids=token_ids[idx:], parent=curr)
+                curr.children[first_tok] = new_node
+                matched_tokens += len(token_ids[idx:])
+                curr = new_node
+                break
+                
+        return matched_tokens, curr</code></pre>
+    </div>
+
+    <h2>7. 常见陷阱与调试排查手册</h2>
+    <p>在构建测试时计算系统时，研究者与工程师常陷入以下误区：</p>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 误区一：盲目调高采样温度（Temperature）获取多样性</div>
+      <p><strong>现象</strong>：为了在 Best-of-N 中获取更多解题思路，将温度调高至 1.2 甚至 1.5。结果发现采样结果中充斥着语法破碎与数学乱码，多数投票共识率极度发散，最终准确率反而暴跌。<br>
+      <strong>正解</strong>：对于严谨推理任务，采样温度应严格控制在 0.6 ~ 0.9 之间。多样性应当来自于模型对不同推导路径的自然探索，而非纯粹高熵随机性带来的退化噪声。</p>
+    </div>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 误区二：忽视答案抽取器（Answer Extractor）的脆弱性</div>
+      <p><strong>现象</strong>：在自一致性投票中，由于正则表达式无法兼容千奇百怪的排版（例如 <code>\boxed{42}</code>、<code>最终答案是：42</code>、<code>x = 42</code>），导致本应属于同一共识组的正确答案被切分为多个不同的散列键，最终投票被错误答案偷跑。<br>
+      <strong>正解</strong>：必须建立标准化的符号代数规范化解析器（如 SymPy AST 解析），在投票前将所有提取结果归一化为标准形式。</p>
+    </div>
+
+    <h2>8. 本章小结</h2>
+    <ul>
+      <li>测试时计算扩展（Test-time Compute Scaling）打破了仅依靠模型参数量扩展的单一范式，成为现代大模型智力突破的第二条生命线。</li>
+      <li>扩展的两大支柱包括内生长思维链自反思展开（长度扩展）与解空间并行/序贯采样搜索（宽度与树扩展）。</li>
+      <li>验证器引导搜索（Best-of-N / PRM）存在假阳性饱和天花板，盲目增大采样池可能导致作弊解答逆向淘汰正解。</li>
+      <li>通过构建难易度感知路由与加权序贯早停系统，能够在控制推理延时与经济成本的前提下，逼近 Pareto 理论最优前沿。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：什么是“苦涩的教训”（The Bitter Lesson）？为什么说测试时计算扩展是对这一教训的最新印证？</summary>
+        <p><strong>答案</strong>：“苦涩的教训”由计算大师 Richard Sutton 提出，核心论断是：AI 历史上所有试图依靠人类先验规则、手工构造的特定领域启发式特征来提升系统能力的努力，最终都会被能够利用海量算力的通用学习与搜索算法所彻底碾压。测试时计算扩展再次印证了这一规律：与其依靠精细的人工提示词工程去限制和规范模型的简短输出，不如直接给模型提供充足的推理测试时算力（FLOPS），允许其自主生成长思维链、展开树搜索并进行假设检验，以纯计算和探索机制暴力破解复杂逻辑空间。</p>
+      </details>
+      <details>
+        <summary>问题 2：为什么在超大规模采样（如 \( N=2048 \)）时，纯粹依靠 ORM 验证器的 Best-of-N 往往会出现准确率不仅不再提升、反而严重倒退的现象？</summary>
+        <p><strong>答案</strong>：因为现实中的奖励模型（ORM）并非绝对完美的真理判卷机，存在微小的假阳性错误率（False Positive Rate, \( \epsilon \)）。在小采样规模下，采到这种碰巧蒙对或利用规则漏洞欺骗打分器的“作弊解答”概率较低；但当采样池扩展到数千个时，包含假阳性作弊解答的概率无限趋近于 100%。这些逻辑混乱但被验证器错误赋予顶格分数的样本会彻底挤占真正的正确推导，最终导致系统选出错误答案，发生性能崩塌。</p>
+      </details>
+      <details>
+        <summary>问题 3：在工业级推理引擎中，当同一个 Prompt 派生出 64 条并发采样分支时，Radix Attention（基数树缓存）是如何防止显存溢出的？</summary>
+        <p><strong>答案</strong>：如果不做优化，64 个采样任务将各自为 Prompt 独立计算并保存一份完全相同的 KV 缓存，占用 64 倍的显存空间。Radix Attention 在显存层构建树状基数索引结构，64 个并发工作线程只引用同一份物理存在的 Prompt KV Cache 内存页（只读共享）。只有当各个线程自回归生成出彼此不同的分支 Token 时，系统才通过 Copy-on-Write 机制为差异化 Token 分配独立页块，从而大幅削减了显存足迹并消除了重复的前向 Prefill 开销。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Snell et al., 2024]</span> Snell, C. et al. "Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2408.03314</span></li>
+      <li><span class="rid">[Kaplan et al., 2020]</span> Kaplan, J. et al. "Scaling Laws for Neural Language Models." <i>arXiv preprint</i>, 2020. <span class="rid">arXiv:2001.08361</span></li>
+      <li><span class="rid">[Hoffmann et al., 2022]</span> Hoffmann, J. et al. "Training Compute-Optimal Large Language Models." <i>NeurIPS</i>, 2022. <span class="rid">arXiv:2203.15556</span></li>
+      <li><span class="rid">[Wang et al., 2022]</span> Wang, X. et al. "Self-Consistency Improves Chain of Thought Reasoning in Language Models." <i>ICLR</i>, 2023. <span class="rid">arXiv:2203.11171</span></li>
+      <li><span class="rid">[Sutton, 2019]</span> Sutton, R. "The Bitter Lesson." <i>Incomplete Ideas blog</i>, 2019.</li>
+      <li><span class="rid">[DeepSeek-AI, 2025]</span> DeepSeek-AI. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." <i>arXiv preprint</i>, 2025. <span class="rid">arXiv:2501.12948</span></li>
+      <li><span class="rid">[Brown et al., 2024]</span> Brown, B. et al. "Large Language Monkeys: Scaling Inference Compute with Repeated Sampling." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2407.21787</span></li>
+      <li><span class="rid">[Zheng et al., 2023]</span> Zheng, L. et al. "SGLang: Efficient Execution of Structured Language Model Programs." <i>arXiv preprint</i>, 2023. <span class="rid">arXiv:2312.07104</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

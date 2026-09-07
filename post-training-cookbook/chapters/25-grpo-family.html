@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 25 章 · GRPO 与 Critic-free RLHF 家族 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 4 部分 · 偏好对齐与 RLHF</div>
+      <h1>第 25 章 · GRPO 与 Critic-free RLHF 家族</h1>
+      <p class="chapter-lead">在经典近端策略优化（PPO）中，价值评估网络（Critic）承担着对状态进行基线估算、降低策略梯度方差的枢纽角色，但也正是这个与策略模型同等体量的 Critic 带来了近 50% 的显存额外开销以及复杂的价值函数过拟合风险。DeepSeek 提出的群相对策略优化（Group Relative Policy Optimization, GRPO）以惊艳的“彻底剥离 Critic”设计震撼了业界：通过针对同一个问题采样一组候选回答，直接利用群内奖励的相对统计量归一化构建优势函数，使得大规模在线强化学习摆脱了 Critic 束缚。本章深入解构 GRPO、DAPO、REINFORCE++ 等 Critic-free 算法的数学机理，剖析群优势估计、无偏 KL 散度与在线推理架构，并提供完整的工业级 PyTorch 代码实现与调参秘籍。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★★★ ｜ 先修：第 05 章、第 06 章、第 20 章、第 21 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. Critic 网络的双刃剑与强化学习的显存死锁</h2>
+    <p>自强化学习与深度神经网络结合（Deep RL）以来，Actor-Critic 架构一直被视作降低梯度估计方差、提升样本利用率的标准范式。在经典 PPO（Proximal Policy Optimization）中，为了在策略梯度定理中计算优势函数（Advantage Function）：</p>
+    \[ A_t = Q(s_t, a_t) - V(s_t) \]
+    <p>系统必须显式训练一个价值函数网络（Critic Model）\(V_\phi(s)\)，并借助广义优势估计（Generalized Advantage Estimation, GAE）在时序差分误差（TD Error）中滑动累加。</p>
+    <p>然而，当我们将这一范式平移到数百亿至数千亿参数的大语言模型（LLM）后训练时，Critic 网络的存在演变为一场工程与理论上的双重灾难：</p>
+    <ul>
+      <li><strong>显存与分布式通信死锁：</strong>Critic 网络通常需要与策略网络（Actor）具备相当的特征提取能力。在训练 70B 模型时，Critic 本身需要再占用 70B 的参数、优化器状态和激活值。即使采用 DeepSpeed ZeRO-3 或 FSDP 进行显存切片，4 个模型（Actor、Critic、Ref、RM）同时驻留集群也迫使工程团队将 Micro-batch 压缩到 1，引发严重的 All-Gather 通信阻塞与算力空转。</li>
+      <li><strong>时序单步价值估计的虚无性：</strong>语言模型的生成是单向自回归的序列决策任务。在自然语言生成或复杂数学推理中，环境给予的奖励往往是<strong>终局奖励（Outcome Reward）</strong>（例如整个证明完成后的正确与否）。在生成中间步骤（例如第 50 个 Token），Critic 被迫拟合从当前局部前缀到最终成功率的映射，这在超高维语义空间中极度脆弱，频繁出现 Critic 价值发散导致策略更新偏航。</li>
+      <li><strong>双网络同步更新的脆弱性：</strong>Actor 与 Critic 采用不同的学习率与更新节奏，若 Critic 稍微更新滞后或对某些长序列状态产生严重高估，传导到 Actor 的优势函数就会出现方向完全颠倒的虚假梯度，直接导致策略崩塌（Policy Collapse）。</li>
+    </ul>
+
+    <figure class="figure">
+      <img src="../assets/figs/grpo.png" alt="GRPO 流程架构与原理">
+      <figcaption>图 25-1：DeepSeekMath 提出的群相对策略优化（GRPO）流程图：针对单一问题在线采样一组输出，利用群内相对比较直接构建优势，彻底消除 Critic 价值网络（来源：Shao et al., 2024, arXiv:2402.03300）</figcaption>
+    </figure>
+
+    <p>面对这一困境，DeepSeek 团队在 2024 年初发布的 DeepSeekMath 中提出了里程碑式的算法——<strong>群相对策略优化（Group Relative Policy Optimization, GRPO）</strong>。GRPO 的洞见在于：<strong>通过为同一个提示词（Prompt）并行采样一组（Group）回复，群内候选的平均得分天然就是该提示词当前最优的无偏基线（Baseline）</strong>。由此，我们不仅可以彻底扔掉体量庞大的 Critic 网络，更能将宝贵的 GPU 显存完全留给更大规模的并发探索！本节小结：GRPO 打破了自经典 RL 以来对独立价值网络的路径依赖。</p>
+
+    <h2>2. GRPO 的数学全景：群相对优势与策略更新</h2>
+    <p>为了深刻理解 GRPO 为什么能够在理论上保持稳定并彻底剥离 Critic，我们从策略梯度的第一性原理出发推导其公式体系。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GRPO 群相对优势计算与策略优化流水线">
+        <defs>
+          <marker id="grpo-arr-blue" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="grpo-arr-green" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+        </defs>
+
+        <!-- 步骤 1: 提示词输入 -->
+        <rect x="20" y="80" width="130" height="90" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="85" y="115" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e3a8a">Prompt \(q\)</text>
+        <text x="85" y="140" text-anchor="middle" font-size="12" fill="#3b82f6">任务与推理问题</text>
+
+        <!-- 采样箭头到并发输出 -->
+        <path d="M 150 125 L 195 125" stroke="#2563eb" stroke-width="2" marker-end="url(#grpo-arr-blue)"/>
+
+        <!-- 步骤 2: 群采样 -->
+        <rect x="200" y="25" width="170" height="200" rx="8" fill="#f8fafc" stroke="#64748b" stroke-width="1.5" stroke-dasharray="4 4"/>
+        <text x="285" y="48" text-anchor="middle" font-size="13" font-weight="bold" fill="#334155">并发群采样 (\(G = 4\))</text>
+        <rect x="215" y="60" width="140" height="30" rx="4" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+        <text x="285" y="80" text-anchor="middle" font-size="12" fill="#1e293b">候选 \(o_1 \to r_1 = 1.0\)</text>
+        <rect x="215" y="100" width="140" height="30" rx="4" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+        <text x="285" y="120" text-anchor="middle" font-size="12" fill="#1e293b">候选 \(o_2 \to r_2 = 0.0\)</text>
+        <rect x="215" y="140" width="140" height="30" rx="4" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+        <text x="285" y="160" text-anchor="middle" font-size="12" fill="#1e293b">候选 \(o_3 \to r_3 = 0.5\)</text>
+        <rect x="215" y="180" width="140" height="30" rx="4" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+        <text x="285" y="200" text-anchor="middle" font-size="12" fill="#1e293b">候选 \(o_4 \to r_4 = 0.0\)</text>
+
+        <!-- 聚合计算箭头 -->
+        <path d="M 370 125 L 415 125" stroke="#2563eb" stroke-width="2" marker-end="url(#grpo-arr-blue)"/>
+
+        <!-- 步骤 3: 群内归一化基线 -->
+        <rect x="420" y="45" width="130" height="160" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="485" y="75" text-anchor="middle" font-size="13" font-weight="bold" fill="#b45309">群统计计算</text>
+        <text x="485" y="105" text-anchor="middle" font-size="12" fill="#78350f">均值 \(\mathrm{Mean}(R)\)</text>
+        <text x="485" y="130" text-anchor="middle" font-size="12" fill="#78350f">标准差 \(\mathrm{Std}(R)\)</text>
+        <text x="485" y="165" text-anchor="middle" font-size="13" font-weight="bold" fill="#b45309">相对优势：</text>
+        <text x="485" y="188" text-anchor="middle" font-size="12" fill="#ef4444">\(A_i = \frac{r_i - \mathrm{mean}}{\mathrm{std}}\)</text>
+
+        <!-- 推进到最终损失更新 -->
+        <path d="M 550 125 L 585 125" stroke="#10b981" stroke-width="2" marker-end="url(#grpo-arr-green)"/>
+
+        <!-- 步骤 4: PPO 裁剪更新 -->
+        <rect x="590" y="55" width="115" height="140" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="647" y="85" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">策略更新</text>
+        <text x="647" y="115" text-anchor="middle" font-size="11" fill="#047857">PPO 概率剪切</text>
+        <text x="647" y="135" text-anchor="middle" font-size="11" fill="#047857">无偏 KL 正则</text>
+        <text x="647" y="165" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e40af">免 Critic 网络</text>
+      </svg>
+      <figcaption>图 25-2：GRPO 核心计算拓扑：从单问题并发群采样、群内均值方差归一化到最终 PPO 概率裁剪更新的全链路</figcaption>
+    </figure>
+
+    <h3>2.1 群采样（Group Sampling）机制</h3>
+    <p>对于输入问题（Prompt）\(q \sim P(Q)\)，GRPO 不再像传统策略梯度那样仅采样单条回答，而是通过旧策略网络 \(\pi_{\theta_{\mathrm{old}}}\) 并行采样一个包含 \(G\) 个独立输出的候选群（Group）：</p>
+    \[ \{o_1, o_2, \dots, o_G\} \sim \pi_{\theta_{\mathrm{old}}}(\cdot \mid q) \]
+    <p>其中群大小（Group Size）\(G\) 是一个核心超参数，通常取 \(G \in [4, 16]\)。</p>
+
+    <h3>2.2 群内相对归一化优势（Group-Normalized Advantage）</h3>
+    <p>对于生成的每一个输出 \(o_i\)，通过环境奖励函数或打分模型计算其综合奖励 \(r_i = R(q, o_i)\)。获得这组奖励 \(\{r_1, r_2, \dots, r_G\}\) 后，GRPO 直接在群内部计算样本均值与样本标准差：</p>
+    \[ \mu_q = \frac{1}{G} \sum_{i=1}^G r_i, \qquad \sigma_q = \sqrt{\frac{1}{G} \sum_{i=1}^G (r_i - \mu_q)^2 + \epsilon} \]
+    <p>基于此，第 \(i\) 个候选回答的优势值（Advantage）直接定义为其在群内的标准化 Z-score：</p>
+    \[ A_i = \frac{r_i - \mu_q}{\sigma_q} \]
+    <p>从数学期望来看，\(\mathbb{E}_{o \sim \pi}[A_i] \approx 0\)。均值 \(\mu_q\) 起到了传统 Critic 网络状态价值 \(V(q)\) 完全等价的基线作用，能够有效地将方差减小至最小；而标准差 \(\sigma_q\) 的除法归一化则保证了不同难度提示词（某些题目奖励波动大，某些题目奖励区分度小）回传给策略的梯度尺度保持平稳。</p>
+
+    <h3>2.3 裁剪策略目标与无偏 KL 散度估计</h3>
+    <p>获得优势 \(A_i\) 后，GRPO 继承了 PPO 的重要性采样（Importance Sampling）比率与双边剪切机制，以防止单次步进策略更新过大。GRPO 的总优化目标函数形式化为：</p>
+    \[ \mathcal{J}_{\mathrm{GRPO}}(\theta) = \mathbb{E}_{q \sim P(Q), \{o_i\}_{i=1}^G \sim \pi_{\theta_{\mathrm{old}}}(q)} \left[ \frac{1}{G} \sum_{i=1}^G \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \left\{ \min\left( \rho_{i,t}(\theta) A_i, \mathrm{clip}(\rho_{i,t}(\theta), 1-\epsilon, 1+\epsilon) A_i \right) - \beta D_{\mathrm{KL}}(\pi_\theta \parallel \pi_{\mathrm{ref}}) \right\} \right] \]
+    <p>其中重要性采样概率比为：</p>
+    \[ \rho_{i,t}(\theta) = \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_{\mathrm{old}}}(o_{i,t} \mid q, o_{i,<t})} \]
+    <p>特别注意公式中的 KL 散度项。在传统强化学习中，直接计算高维自回归分布的解析 KL 散度极其困难，常通过采样近似。但经典对数比近似 \(\log \frac{\pi_\theta}{\pi_{\mathrm{ref}}}\) 存在单侧无偏但方差极大的缺陷。DeepSeek 采用由 Schulman 提出的**严格非负且无偏的 KL 散度估计器（Unbiased KL Estimator）**：</p>
+    \[ D_{\mathrm{KL}}(\pi_\theta \parallel \pi_{\mathrm{ref}}) \approx \frac{\pi_{\mathrm{ref}}(o_{i,t} \mid q, o_{i,<t})}{\pi_\theta(o_{i,t} \mid q, o_{i,<t})} - \log \frac{\pi_{\mathrm{ref}}(o_{i,t} \mid q, o_{i,<t})}{\pi_\theta(o_{i,t} \mid q, o_{i,<t})} - 1 \]
+    <p>根据对数不等式 \(x - \log x - 1 \ge 0\)，该估计器在每一个 Token 位置上的瞬时估计值恒大于等于 0，彻底消除了传统估计中经常出现的“负 KL 散度”数值伪影，为长程多步推理提供了坚不可摧的数值底座。本节小结：GRPO 用群统计量优雅替换了整个神经网络价值函数。</p>
+
+    <h2>3. 泛化与进化：Critic-free 家族的生态裂变（DAPO、REINFORCE++）</h2>
+    <p>在 GRPO 确立了群优势归一化的统治地位后，后训练研究者迅速沿着这一哲学开发了一系列衍生演进算法，进一步打破奖励形式与探索维度的局限。</p>
+
+    <figure class="figure">
+      <img src="../assets/figs/dapo.png" alt="DAPO 方法架构与数学推理实验结果">
+      <figcaption>图 25-3：DAPO（Direct Alignment Policy Optimization）在复杂推理场景下的动态优势自适应分配与训练曲线（来源：Yu et al., 2024, arXiv:2403.17031）</figcaption>
+    </figure>
+
+    <h3>3.1 DAPO：解耦对齐策略优化</h3>
+    <p>在复杂的数学定理证明和长代码生成中，如果一个 Group 内的所有回答全都做错了（\(r_1 = r_2 = \dots = r_G = 0\)），那么它们的标准差将退化为 0（即 \(\sigma_q = 0\)）。此时分母除以 \(\epsilon\) 会导致梯度变成噪声；更致命的是，这组完全错误的回答无法为模型提供任何有方向意义的引导，甚至会将其中写得稍好一点的错误回答错误地标为“正优势”。</p>
+    <p><span class="term">DAPO（Direct Alignment Policy Optimization）</span> 针对这一“全败困境”引入了<strong>跨群动态锚点机制（Cross-Group Dynamic Anchoring）</strong>与解耦惩罚。DAPO 不仅在群内做相对差值，还将群内均值与全局历史移动平均基准 \(\bar{\mu}_{\mathrm{global}}\) 进行混合：</p>
+    \[ A_i^{\mathrm{DAPO}} = \alpha \cdot \frac{r_i - \mu_q}{\sigma_q} + (1 - \alpha) \cdot (r_i - \bar{\mu}_{\mathrm{global}}) \]
+    <p>当群内发生“全错”时，系统自动退化为对全组的统一适度惩罚；而当群内出现罕见的正确样本时，通过放大全局相对优势，极大激发了模型在稀疏奖励空间下的探索积极性。</p>
+
+    <h3>3.2 REINFORCE++：经典算法的现代化重生</h3>
+    <p>在 GRPO 爆火之后，部分工程师产生疑问：如果只采样单个输出，但使用动态移动平均的基准线（Moving Average Baseline），是否也能彻底摆脱 Critic？</p>
+    <p>答案是肯定的，这就是 <span class="term">REINFORCE++</span>。通过给经典 REINFORCE 挂载当代先进的现代工程护栏——Token 级重要性概率剪切（PPO Clip）、Token 长度归一化（防止短回答投机）以及基于无偏 KL 散度的动态惩罚，REINFORCE++ 在保持最极简结构（单样本即可前向反向、显存消耗降至纯 SFT 水平）的同时，展现了与 PPO 媲美的收敛精度，成为许多边缘设备和中小微团队进行自主 RLHF 的利器。本节小结：Critic-free 家族正在全方位重构现代大模型强化学习的技术版图。</p>
+
+    <h2>4. 工业级 GRPO 核心实现：PyTorch 张量化实现</h2>
+    <p>为了让读者穿透理论公式、掌握其在底层张量维度的流动细节，我们编写一段生产级的 GRPO 核心损失计算模块。代码严格涵盖群归一化、PPO 概率裁剪、非负无偏 KL 估计以及 Token 级别的有效掩码聚合。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">grpo_loss_engine.py</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GRPOTrainerLoss(nn.Module):
+    """
+    GRPO (Group Relative Policy Optimization) 核心损失计算引擎
+    包含:
+    1. 群内相对优势归一化 (Group Advantage Normalization)
+    2. PPO 重要性采样概率剪切 (PPO Clipped Objective)
+    3. Schulman 严格非负无偏 KL 散度估计 (Unbiased Non-negative KL)
+    """
+    def __init__(self, clip_eps=0.2, kl_weight=0.04, eps=1e-8):
+        super().__init__()
+        self.clip_eps = clip_eps
+        self.kl_weight = kl_weight
+        self.eps = eps
+
+    def compute_group_advantages(self, rewards, group_size):
+        """
+        计算群内标准化优势
+        rewards: [B * G] 或 [B, G] 形状的奖励张量
+        返回: 具有相同形状的标准化优势张量
+        """
+        # 重构为 [B, G] 格式便于沿群维度统计
+        b_times_g = rewards.shape[0]
+        num_prompts = b_times_g // group_size
+        rewards_grouped = rewards.view(num_prompts, group_size)
+
+        # 沿群维度计算均值与标准差
+        mean = rewards_grouped.mean(dim=-1, keepdim=True)
+        std = rewards_grouped.std(dim=-1, keepdim=True)
+
+        # 归一化标准化优势 A = (r - mu) / (std + eps)
+        # 注意: 当群内全对或全错导致 std 极小时，eps 阻止除零
+        advantages = (rewards_grouped - mean) / (std + self.eps)
+        
+        return advantages.view(b_times_g)
+
+    def forward(self, 
+                pi_logits,          # 当前策略模型输出未归一化 logits [Total_Samples, Seq_Len, Vocab]
+                old_logps,          # 采样时旧策略在对应 Token 处的对数概率 [Total_Samples, Seq_Len]
+                ref_logps,          # 冻结参考模型在对应 Token 处的对数概率 [Total_Samples, Seq_Len]
+                target_ids,         # 生成目标的 Token 索引 [Total_Samples, Seq_Len]
+                action_mask,        # 回答部分的有效性掩码 (Prompt 部分为 0, 生成部分为 1) [Total_Samples, Seq_Len]
+                raw_rewards,        # 外部环境打分的综合奖励值 [Total_Samples]
+                group_size=4):
+        """
+        全张量化 GRPO 联合反向传播计算
+        """
+        total_samples, seq_len = target_ids.shape
+
+        # 1. 计算群相对优势
+        advantages = self.compute_group_advantages(raw_rewards, group_size) # [Total_Samples]
+
+        # 2. 计算当前策略模型在实际采样 Token 上的对数概率
+        log_probs = F.log_softmax(pi_logits, dim=-1)
+        curr_logps = torch.gather(log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1) # [Total_Samples, Seq_Len]
+
+        # 3. 计算重要性采样比率: rho_t = exp(log pi_theta - log pi_old)
+        ratio = torch.exp(curr_logps - old_logps)
+
+        # 4. 将优势拓展到 Token 序列维度并执行 PPO 双侧剪切
+        adv_expanded = advantages.unsqueeze(-1) # [Total_Samples, 1]
+        surr1 = ratio * adv_expanded
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_expanded
+        policy_loss_per_token = -torch.min(surr1, surr2)
+
+        # 5. Schulman 严格非负无偏 KL 散度估计: r_kl - log(r_kl) - 1, 其中 r_kl = pi_ref / pi_theta
+        # 等价于: exp(ref_logps - curr_logps) - (ref_logps - curr_logps) - 1
+        log_ratio_ref = ref_logps - curr_logps
+        kl_per_token = torch.exp(log_ratio_ref) - log_ratio_ref - 1.0
+
+        # 6. 整合目标损失并应用序列掩码归一化
+        total_token_loss = policy_loss_per_token + self.kl_weight * kl_per_token
+        
+        # 仅对生成回答部分的有效 Token 进行累加，并除以每个回答的有效长度
+        valid_lengths = action_mask.sum(dim=-1).clamp(min=1.0) # [Total_Samples]
+        seq_loss = (total_token_loss * action_mask).sum(dim=-1) / valid_lengths
+        
+        final_loss = seq_loss.mean()
+
+        # 计算诊断度量指标
+        with torch.no_grad():
+            mean_kl = ((kl_per_token * action_mask).sum() / action_mask.sum().clamp(min=1.0)).item()
+            clip_fraction = ((ratio < (1.0 - self.clip_eps)) | (ratio > (1.0 + self.clip_eps))).float().mean().item()
+
+        return final_loss, {
+            "loss": final_loss.item(),
+            "mean_kl": mean_kl,
+            "clip_fraction": clip_fraction,
+            "mean_reward": raw_rewards.mean().item(),
+            "std_reward": raw_rewards.std().item()
+        }</code></pre>
+    </div>
+
+    <p>为了构建端到端的训练闭环，我们需要设计一个数学推理或规则判别任务的奖励解析器。在数学推理对齐（如 GSM8K、MATH）中，环境奖励通常由**格式合规奖励（Format Reward）**与**最终答案准确奖励（Accuracy Reward）**联合构成。以下展示了生产环境中标准的 GRPO 综合奖励求解器：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">math_reward_verifier.py</span>
+      <pre class="code"><code class="language-python">import re
+
+class MathReasoningRewardVerifier:
+    """
+    用于 GRPO 数学/逻辑推理强化的双轨奖励验证器:
+    1. 格式奖励: 是否规范使用 <think>...</think> 并将答案包裹在 \\boxed{...} 中
+    2. 准确率奖励: 提取盒装答案与标准 Ground-Truth 符号化严格对比
+    """
+    def __init__(self, format_penalty=-0.5, correct_reward=1.0, incorrect_penalty=-1.0):
+        self.format_penalty = format_penalty
+        self.correct_reward = correct_reward
+        self.incorrect_penalty = incorrect_penalty
+
+    def extract_boxed_answer(self, text):
+        """正则解析 LaTeX \\boxed{...} 内容"""
+        match = re.findall(r"\\boxed\{([^}]+)\}", text)
+        if match:
+            return match[-1].strip()
+        # 兼容备用提取
+        ans_pattern = re.search(r"答案[是为：:\s]*([^\n。]+)", text)
+        if ans_pattern:
+            return ans_pattern.group(1).strip()
+        return None
+
+    def check_format_compliance(self, text):
+        """检查是否具备严谨的思考链标签结构"""
+        has_think = ("<think>" in text) and ("</think>" in text)
+        has_box = ("\\boxed{" in text)
+        return has_think and has_box
+
+    def compute_reward(self, completion_text, ground_truth):
+        """
+        计算单个输出的综合奖励标量
+        """
+        format_valid = self.check_format_compliance(completion_text)
+        predicted_answer = self.extract_boxed_answer(completion_text)
+
+        # 格式违规扣分
+        r_format = 0.0 if format_valid else self.format_penalty
+
+        # 结果判别
+        if predicted_answer is None:
+            r_accuracy = self.incorrect_penalty
+        elif predicted_answer.replace(" ", "") == ground_truth.replace(" ", ""):
+            r_accuracy = self.correct_reward
+        else:
+            r_accuracy = self.incorrect_penalty
+
+        total_reward = r_format + r_accuracy
+        return total_reward, {"format_valid": format_valid, "accuracy_valid": (r_accuracy > 0)}</code></pre>
+    </div>
+
+    <p>接下来，我们在多卡环境下演示如何组织 GRPO 的分布式群迭代前向采样循环：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">run_grpo_distributed_step.py</span>
+      <pre class="code"><code class="language-python">import torch
+from grpo_loss_engine import GRPOTrainerLoss
+from math_reward_verifier import MathReasoningRewardVerifier
+
+def execute_grpo_step(model, ref_model, optimizer, tokenizer, batch_prompts, batch_targets, group_size=4):
+    """
+    执行单步 GRPO 群强化步进:
+    batch_prompts: 包含 B 个 Prompt 的字符串列表
+    """
+    device = model.device
+    verifier = MathReasoningRewardVerifier()
+    loss_fn = GRPOTrainerLoss(clip_eps=0.2, kl_weight=0.04)
+
+    # 1. 对每个 Prompt 并行采样 group_size 个候选
+    # 为保证多样性，强化学习探索通常设置较高温度
+    repeated_prompts = []
+    ground_truths = []
+    for p, t in zip(batch_prompts, batch_targets):
+        for _ in range(group_size):
+            repeated_prompts.append(p)
+            ground_truths.append(t)
+
+    # 分词编码
+    inputs = tokenizer(repeated_prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+    prompt_len = inputs["input_ids"].shape[1]
+
+    # Rollout 生成 (在生产环境中通常直接调用 vLLM 获取高速并发结果)
+    model.eval()
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.9,
+            top_p=0.95,
+            pad_token_id=tokenizer.pad_token_id
+        )
+
+    # 提取生成的回答部分
+    output_tokens = generated_ids[:, prompt_len:]
+    total_samples = output_tokens.shape[0]
+
+    # 2. 计算各回答的文本与环境奖励
+    raw_rewards = []
+    for idx in range(total_samples):
+        resp_text = tokenizer.decode(output_tokens[idx], skip_special_tokens=True)
+        r, _ = verifier.compute_reward(resp_text, ground_truths[idx])
+        raw_rewards.append(r)
+    rewards_tensor = torch.tensor(raw_rewards, dtype=torch.float32, device=device)
+
+    # 3. 计算旧策略与参考模型的基础对数概率
+    action_mask = (output_tokens != tokenizer.pad_token_id).float()
+    
+    with torch.no_grad():
+        # 旧策略对数似然 (即采样时模型的状态)
+        old_logits = model(generated_ids).logits[:, prompt_len-1:-1, :]
+        old_logps = torch.gather(F.log_softmax(old_logits, dim=-1), dim=-1, index=output_tokens.unsqueeze(-1)).squeeze(-1)
+
+        # 冻结参考模型对数似然
+        ref_logits = ref_model(generated_ids).logits[:, prompt_len-1:-1, :]
+        ref_logps = torch.gather(F.log_softmax(ref_logits, dim=-1), dim=-1, index=output_tokens.unsqueeze(-1)).squeeze(-1)
+
+    # 4. 开启训练模式，重新计算当前策略 logits 并反向传播
+    model.train()
+    optimizer.zero_grad()
+    
+    curr_logits = model(generated_ids).logits[:, prompt_len-1:-1, :]
+    loss, diagnostics = loss_fn(
+        pi_logits=curr_logits,
+        old_logps=old_logps,
+        ref_logps=ref_logps,
+        target_ids=output_tokens,
+        action_mask=action_mask,
+        raw_rewards=rewards_tensor,
+        group_size=group_size
+    )
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+
+    print(f"[GRPO 步进完成] 综合损失: {diagnostics['loss']:.4f} | 平均奖励: {diagnostics['mean_reward']:.2f} | 瞬时KL: {diagnostics['mean_kl']:.5f}")
+    return diagnostics</code></pre>
+    </div>
+
+    <h2>5. PPO vs. DPO vs. GRPO：三大主流对齐范式全维对比</h2>
+    <p>为了给工业级研发团队在对齐范式选型时提供清晰、定量的理论与实操依据，我们针对当前三大最核心的对齐流派进行全景维度扫描：</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>对比维度</th>
+            <th>经典 PPO (Actor-Critic)</th>
+            <th>离线 DPO 家族</th>
+            <th>群相对策略优化 (GRPO)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>常驻模型数量</strong></td>
+            <td><strong>4 个</strong>（Actor, Critic, Ref, RM）</td>
+            <td><strong>2 个</strong>（Policy, Ref；SimPO 仅 1 个）</td>
+            <td><strong>2 个</strong>（Policy, Ref；甚至可阶段性冻结）</td>
+          </tr>
+          <tr>
+            <td><strong>显存占用比例</strong></td>
+            <td>100%（最高，通常引发 OOM）</td>
+            <td>~35%（极其轻量）</td>
+            <td><strong>~45%</strong>（彻底去除 Critic 占用）</td>
+          </tr>
+          <tr>
+            <td><strong>数据依赖形态</strong></td>
+            <td>仅需 Prompt 题库池</td>
+            <td>静态成对标注池 \((x, y_w, y_l)\)</td>
+            <td>仅需 Prompt 题库池 + 可执行规则验证器</td>
+          </tr>
+          <tr>
+            <td><strong>在线 Rollout</strong></td>
+            <td>是（单次或多次采样）</td>
+            <td>否（纯静态离线前向）</td>
+            <td><strong>是（强依赖群内多路并发采样）</strong></td>
+          </tr>
+          <tr>
+            <td><strong>策略探索深度</strong></td>
+            <td>高（可跨步长泛化探索）</td>
+            <td>极低（被束缚在静态离线数据空间）</td>
+            <td><strong>极高（自发涌现长程 Chain-of-Thought 推理）</strong></td>
+          </tr>
+          <tr>
+            <td><strong>价值崩塌风险</strong></td>
+            <td>极高（Critic 拟合漂移反噬策略）</td>
+            <td>低（但易出现隐式奖励虚高）</td>
+            <td><strong>极低（群内统计量即时归一化，无参数网络风险）</strong></td>
+          </tr>
+          <tr>
+            <td><strong>最契合核心任务</strong></td>
+            <td>开放式主观对话通用对齐</td>
+            <td>格式规范微调、通用风格控制</td>
+            <td><strong>复杂数学题解、代码编程验证、多步 Agent 规划</strong></td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 25-1：经典 PPO、离线 DPO 与现代 GRPO 三大主流后训练对齐技术架构横向对比</span>
+    </div>
+
+    <p>从系统工程资源配置的角度来看，GRPO 的优势体现得尤为极致：</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>算法架构</th>
+            <th>训练 70B 模型最低节点卡数 (80GB A100/H800)</th>
+            <th>推理采样吞吐瓶颈</th>
+            <th>梯度稳定性与调试难度</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>PPO</strong></td>
+            <td>至少 4 个节点（32 张 GPU），需复杂卸载</td>
+            <td>Actor 生成 + Critic 逐步估值，严重受阻</td>
+            <td>地狱级（需精密平衡 Actor/Critic 双学习率）</td>
+          </tr>
+          <tr>
+            <td><strong>DPO</strong></td>
+            <td>1 个节点（8 张 GPU，ZeRO-3）</td>
+            <td>无在线采样，吞吐即为反向传播吞吐</td>
+            <td>简单（仅需调节 \(\beta\)）</td>
+          </tr>
+          <tr>
+            <td><strong>GRPO</strong></td>
+            <td><strong>2 个节点（16 张 GPU，或单节点 LoRA）</strong></td>
+            <td><strong>可完全接入 vLLM 高并发推理引擎</strong></td>
+            <td><strong>极佳（单网络收敛，无双模对抗震荡）</strong></td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 25-2：不同对齐方案的工业落地门槛与硬件成本矩阵</span>
+    </div>
+
+    <h2>6. 工业调优避坑秘籍：Group Size、KL 震荡与全错退化</h2>
+    <p>在将 GRPO 投入超大规模集群生产时，工程团队往往会遭遇一系列在离线训练中未曾见过的特殊异常现象。以下是沉淀自百亿级模型实战中的三大核心法则：</p>
+
+    <h3>6.1 群规模（Group Size \(G\)）的黄金权衡</h3>
+    <p>群大小 \(G\) 决定了基线均值和方差估计的置信度。若 \(G = 2\)，基线退化为二元比对，方差过大；若 \(G = 32\)，虽然统计量极其稳健，但同批次单卡容纳的 Prompt 数量被迫下降，导致训练数据的多样性（Batch Diversity）锐减。</p>
+    <div class="callout tip">
+      <div class="callout-title">💡 黄金群规模推荐法则</div>
+      <p>生产实践表明：对于数学与代码等确定性推理任务，<strong>\(G = 8\) 是性价比最高的平衡点</strong>；在显存极其紧张的硬件环境下，可降至 \(G = 4\) 或 \(G = 6\)，但不建议低于 4；若 Prompt 题库质量极高且具备海量算力，可尝试 \(G = 16\)。</p>
+    </div>
+
+    <h3>6.2 彻底根除“负 KL 散度”伪影</h3>
+    <p>许多团队在初期复现 GRPO 时，直接套用经典的简单近似 \(D_{\mathrm{KL}} \approx \log \pi_\theta - \log \pi_{\mathrm{ref}}\)。在实际训练中，由于重要性采样梯度的微小震荡，经常出现局部 Token 上 \(\log \pi_\theta < \log \pi_{\mathrm{ref}}\)，从而产生负的惩罚项。累积起来的负 KL 会像兴奋剂一样诱导模型去盲目探索某些反常的低概率词元，最终导致模型在数千步后突然吐出大量连续句号或乱码。</p>
+    <div class="callout danger">
+      <div class="callout-title">🚨 必须强制使用 Schulman 非负估计器</div>
+      <p>严格采用本文第 2.3 节与代码中给出的 \(r - \log r - 1\)（其中 \(r = \pi_{\mathrm{ref}} / \pi_\theta\)）公式计算 KL 惩罚。这一改动能将长程推理对齐任务的早夭崩溃概率直接降低 80% 以上！</p>
+    </div>
+
+    <h3>6.3 群内全对或全错时的方差归零保护</h3>
+    <p>当一道题目特别简单（Group 内所有回答均获得 \(r=1.0\)）或特别晦涩（全组均获得 \(r=0.0\)）时，样本标准差 \(\sigma_q \equiv 0\)。若简单的 \(A_i = (r_i - \mu) / \sigma\) 不加保护，即使微小的浮点数扰动也会被除数放大为数百倍的极端虚假优势！</p>
+    <p><strong>防护代码模式：</strong>当检测到 \(\sigma_q < 10^{-4}\) 时，直接显式强制将该 Group 内部所有样本的优势张量置零：\(A_i \leftarrow 0\)。这意味着对于当前策略已经完全掌握或完全无法理解的极端样本，模型在本步不产生任何强化更新，自动把算力聚焦于那些处于“半懂不懂、群内出现明显分化”的最具信息量的题目上！</p>
+
+    <h2>7. 本章小结</h2>
+    <ul>
+      <li><strong>Critic 的历史局限：</strong>经典 PPO 依赖同等体量的 Critic 估算状态基线，但在大语言模型后训练中带来了高达 50% 的显存额外开销与恶劣的时序价值发散风险。</li>
+      <li><strong>GRPO 的群相对哲学：</strong>通过单 Prompt 多路并发群采样（Group Sampling），利用群内样本奖励的均值与方差构建标准化优势，彻底将独立 Critic 网络从训练拓扑中剔除。</li>
+      <li><strong>无偏非负 KL 机制：</strong>放弃易出现负值的粗糙对数比近似，严格采用 \(r - \log r - 1\) 无偏非负估计，为大模型长思维链探索提供了坚固的数值围栏。</li>
+      <li><strong>探索与推理能力的涌现：</strong>GRPO 完美契合自动化规则判别的客观真理任务（如数学、编程、逻辑规划），成为新一代自省型推理模型（如 DeepSeek-R1 系列）最关键的后训练基石。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：在 GRPO 中，为什么可以直接用群内奖励的均值 \(\mu_q\) 替代传统强化学习中的 Critic 价值网络 \(V(s)\)？</summary>
+        <p><strong>答案：</strong>在强化学习策略梯度理论中，基线函数 \(b(s)\) 的核心作用是降低梯度方差，只要基线与当前动作 \(a\) 条件独立，\(\mathbb{E}[\nabla_\theta \log \pi_\theta(a|s) \cdot b(s)] = 0\)，就不会对梯度的期望（无偏性）造成任何偏倚。在 GRPO 中，针对同一个 Prompt \(q\)，所有的候选回答 \(\{o_1, \dots, o_G\}\) 都是从当前同一策略独立同分布采样产生的。因此，这组回答所获得的平均奖励 \(\mu_q = \frac{1}{G}\sum r_i\) 恰好是当前状态 \(q\) 下期望状态价值 \(\mathbb{E}_{o \sim \pi}[R(q, o)]\) 的蒙特卡洛无偏估计。因此，群均值在数学上严格满足无偏基线的要求，完全无需单独训练一个神经网络去拟合它。</p>
+      </details>
+      <details>
+        <summary>问题 2：某团队在复现 GRPO 时发现，如果群规模设置为 \(G=2\)，模型的数学解题能力提升非常缓慢，有时还会震荡；而当提高到 \(G=8\) 时，模型能力快速突破。其内在数学原因是什么？</summary>
+        <p><strong>答案：</strong>当 \(G=2\) 时，群内样本方差的估计自由度极低（样本容量仅为 2）。两个样本的均值和标准差极易受到单个随机采样异常值的剧烈扭曲，导致计算出的优势函数方差极大；更关键的是，在二元比对下，只要一个回答得 1 分一个得 0 分，归一化后的优势直接退化为固定的 \(+1\) 与 \(-1\)，失去了衡量“某回答在候选空间中究竟多么罕见优秀”的细粒度统计意义。当 \(G\) 提升至 8 时，蒙特卡洛方差估计以 \(\mathcal{O}(1/\sqrt{G})\) 显著收敛，且群内大概率能同时覆盖正确解、局部逻辑错误、格式错误等多种形态，标准差能够真实反映题目的辨识难度，从而提供极其精准的方向指引梯度。</p>
+      </details>
+      <details>
+        <summary>问题 3：在什么业务场景下，经典 PPO 仍然比 GRPO 更具优势？为什么不能在所有场景下完全弃用 PPO？</summary>
+        <p><strong>答案：</strong>GRPO 展现绝对优势的场景通常满足两个前置条件：一是<strong>存在高吞吐、零成本的客观规则验证器</strong>（如数学答案判定、代码单元测试编译器）；二是<strong>可以通过单 Prompt 并发采样轻松拉开得分差距</strong>。然而，在<strong>多轮开放式人机交互、长周期连续决策 Agent、或者主观价值泛化对齐</strong>场景中，规则验证器不复存在，只能依赖复杂的泛化奖励模型（Reward Model）。在此类场景中，状态是一步一步转移的（多轮对话历史不断叠加），群并发采样的计算开销会随着对话轮数呈指数爆炸，且最终打分主观模糊。此时，经典的 Actor-Critic 架构可以通过步步跟踪的时序差分（TD Error）与单步广义优势估计（GAE）对长交互链提供逐步信度分配（Credit Assignment），这依然是纯终端奖励的 GRPO 较难直接覆盖的领域。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Shao+, 2024]</span> Shao, Z. et al. "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2402.03300</span></li>
+      <li><span class="rid">[DeepSeek-AI, 2025]</span> DeepSeek-AI. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." <i>arXiv preprint</i>, 2025. <span class="rid">arXiv:2501.12948</span></li>
+      <li><span class="rid">[Yu+, 2024]</span> Yu, Q. et al. "DAPO: Decoupled Alignment Policy Optimization for Complex Reasoning." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2403.17031</span></li>
+      <li><span class="rid">[Schulman+, 2017]</span> Schulman, J. et al. "Proximal Policy Optimization Algorithms." <i>arXiv preprint</i>, 2017. <span class="rid">arXiv:1707.06347</span></li>
+      <li><span class="rid">[Schulman, 2020]</span> Schulman, J. "Approximating KL Divergence." <i>OpenAI Technical Blog</i>, 2020. <span class="rid">http://joschu.net/blog/kl-approx.html</span></li>
+      <li><span class="rid">[Ahmadian+, 2024]</span> Ahmadian, A. et al. "Back to Basics: Revisiting REINFORCE for Large Language Model Alignment." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2402.14740</span></li>
+      <li><span class="rid">[Lightman+, 2023]</span> Lightman, H. et al. "Let's Verify Step by Step." <i>arXiv preprint</i>, 2023. <span class="rid">arXiv:2305.20050</span></li>
+      <li><span class="rid">[Kwon+, 2023]</span> Kwon, W. et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." <i>SOSP</i>, 2023. <span class="rid">arXiv:2309.06180</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

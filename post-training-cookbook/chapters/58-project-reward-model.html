@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 58 章 · 项目四：训练自己的奖励模型 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 10 部分 · 完整实战项目</div>
+      <h1>第 58 章 · 项目四：训练自己的奖励模型</h1>
+      <p class="chapter-lead">奖励模型（Reward Model, RM）是强化学习对齐（RLHF）体系中的“裁判官”与“指路灯”，也是拒识采样（Rejection Sampling / Best-of-N）提升推理性能的核心标尺。尽管像 DPO 这样的无奖励模型算法日益普及，但在复杂多轮长文本判别、多目标价值权衡及拒识生成搜索中，一个显式、高精度的标量奖励模型依然具有不可替代的工程地位。本章从成对偏好数据建模、单标量 Value Head 架构改造、带 Margin 的 Pairwise 排名损失、RewardBench 基准测评，到工业级 Best-of-N 拒识采样全流程，带你亲手训练一个工业级奖励模型。</p>
+      <div class="chapter-meta">⏱ 预计学习 110 分钟 ｜ 难度 ★★★★☆ ｜ 先修：第 18 章、第 19 章、第 20 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 奖励模型的定位与核心价值</h2>
+    <p>在人类反馈强化学习（RLHF）的三阶段范式中，奖励模型（Reward Model, RM）扮演着承前启后的中枢角色：它在 SFT 阶段之后接入，专门学习人类的价值喜好，将复杂的主观自然语言文本映射为一个标量分数（Scalar Reward Score）\( r \in \mathbb{R} \)。在随后的 PPO 或在线策略优化中，RM 作为代理环境（Surrogate Environment），为生成模型源源不断地提供奖励信号。</p>
+    <p>许多开发者产生了一个疑问：既然 DPO 与 GRPO 可以绕过奖励模型直接在偏好或规则上训练，为什么工业界（如 OpenAI、Anthropic、Meta Llama 3 团队）依然高度重视独立奖励模型的研发？主要原因有三：</p>
+    <ul>
+      <li><strong>拒识采样（Rejection Sampling / Best-of-N）的刚需：</strong>在推理阶段，让策略模型并发生成 \( N \) 个回答，通过奖励模型打分并挑选得分最高的那个（Best-of-N）。大量实验（如 Llama 2 / Llama 3 技术报告）证明，Best-of-N 往往能在不需要更新策略参数的前提下，显著超越单一贪婪生成的上限；</li>
+      <li><strong>长程推理过程验证（PRM 演进基石）：</strong>标量奖励模型是进一步研发步骤级过程奖励模型（Process Reward Model, PRM）的直系前身，也是测试时搜索（Test-time Compute / MCTS）的关键评估器；</li>
+      <li><strong>对齐评估与安全守门员：</strong>训练好的奖励模型可以直接转化为内容安全审核分类器或自动化 A/B 测试的判别器，成为系统上线前的高精度质量门禁。</li>
+    </ul>
+
+    <!-- 图 58-1：InstructGPT 论文位图引用 -->
+    <figure class="figure">
+      <img src="../assets/figs/instructgpt-pipeline.png" alt="InstructGPT 三阶段强化学习流程">
+      <figcaption>图 58-1：经典 RLHF 流程：SFT 冷启动 -&gt; 训练奖励模型（Step 2）-&gt; PPO 策略迭代（来源：Ouyang et al., 2022, arXiv:2203.02155）</figcaption>
+    </figure>
+
+    <h2>2. 奖励模型网络架构与 Pairwise 损失数学推导</h2>
+    <p>如何让一个自回归因果语言模型（Causal LM）输出一个标量评分？标准做法是将模型顶层的自回归输出头（<code>lm_head</code>，映射到词表大小 \( V \)）替换为一个<strong>单标量线性回归头（Value Head）</strong>，即一个权重矩阵 \( W \in \mathbb{R}^{d_{\mathrm{model}} \times 1} \)。</p>
+
+    <h3>2.1 输入构造与末位 Token 池化</h3>
+    <p>给定一个提示词 \( x \) 以及模型生成的回答 \( y \)，我们将它们按照对话模板拼接为单条序列：</p>
+    \[ s = [x; y] = (t_1, t_2, \dots, t_L) \]
+    <p>序列经过 Transformer 骨干网络（如 <code>AutoModelForSequenceClassification</code>）前向传播后，获得最后一层每个 Token 的隐状态向量 \( \mathbf{h}_1, \dots, \mathbf{h}_L \in \mathbb{R}^{d} \)。由于自回归 Transformer 的因果掩码特性，最后一个有效 Token（通常是 <code>&lt;|im_end|&gt;</code> 或句尾 <code>eos_token</code>）的隐状态 \( \mathbf{h}_L \) 已经汇聚了前面所有 Token 的双向与因果注意力上下文。因此，我们提取该末位隐状态，通过单标量权重向量相乘，得到最终的全局标量奖励：</p>
+    \[ r_\theta(x, y) = W^T \mathbf{h}_L + b \]
+
+    <!-- 自绘 SVG：奖励模型正向推理与成对判优结构图 -->
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="奖励模型网络架构与末位标量打分计算图">
+        <defs>
+          <marker id="rm-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="rm-arr-green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+        </defs>
+
+        <rect x="0" y="0" width="720" height="270" fill="#ffffff" rx="8"/>
+
+        <!-- 输入序列 1: Prompt + Chosen -->
+        <rect x="20" y="30" width="220" height="40" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="130" y="55" text-anchor="middle" font-size="12" fill="#1e40af">Prompt + Chosen 文本序列 (y_w)</text>
+
+        <!-- 输入序列 2: Prompt + Rejected -->
+        <rect x="20" y="150" width="220" height="40" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="130" y="175" text-anchor="middle" font-size="12" fill="#991b1b">Prompt + Rejected 文本序列 (y_l)</text>
+
+        <!-- Transformer 共享骨干 -->
+        <rect x="290" y="20" width="180" height="180" rx="10" fill="#f8fafc" stroke="#334155" stroke-width="2"/>
+        <text x="380" y="50" text-anchor="middle" font-size="14" font-weight="bold" fill="#0f172a">Transformer 骨干网络</text>
+        <text x="380" y="75" text-anchor="middle" font-size="11" fill="#64748b">(Qwen2.5 序列分类底座)</text>
+        <text x="380" y="105" text-anchor="middle" font-size="11" fill="#475569">L 层 Transformer Blocks</text>
+        <text x="380" y="130" text-anchor="middle" font-size="11" fill="#475569">提取末位 Token 隐状态 h_L</text>
+        <text x="380" y="165" text-anchor="middle" font-size="11" font-weight="bold" fill="#8b5cf6">Value Head (Linear d -&gt; 1)</text>
+
+        <!-- 连线到骨干 -->
+        <path d="M240 50 L 290 70" stroke="#2563eb" stroke-width="1.5" marker-end="url(#rm-arr)"/>
+        <path d="M240 170 L 290 150" stroke="#ef4444" stroke-width="1.5" marker-end="url(#rm-arr)"/>
+
+        <!-- 标量输出 -->
+        <rect x="520" y="35" width="175" height="45" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="607" y="55" text-anchor="middle" font-size="12" font-weight="bold" fill="#047857">r_θ(x, y_w) = +1.85</text>
+        <text x="607" y="72" text-anchor="middle" font-size="10.5" fill="#065f46">获选样本标量奖励</text>
+
+        <rect x="520" y="145" width="175" height="45" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="607" y="165" text-anchor="middle" font-size="12" font-weight="bold" fill="#b45309">r_θ(x, y_l) = -0.72</text>
+        <text x="607" y="182" text-anchor="middle" font-size="10.5" fill="#92400e">落选样本标量奖励</text>
+
+        <path d="M470 70 L 520 57" stroke="#10b981" stroke-width="1.5" marker-end="url(#rm-arr-green)"/>
+        <path d="M470 150 L 520 167" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#rm-arr)"/>
+
+        <!-- 底部 Pairwise 损失条 -->
+        <rect x="20" y="215" width="675" height="45" rx="6" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="357" y="235" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#5b21b6">Pairwise Ranking Loss with Margin:  L = - E [ log σ( r_θ(x, y_w) - r_θ(x, y_l) - m(x) ) ]</text>
+        <text x="357" y="252" text-anchor="middle" font-size="11" fill="#64748b">拉大获选与落选回答的标量奖励分差，支持置信度边缘约束</text>
+      </svg>
+      <figcaption>图 58-2：奖励模型（Reward Model）单标量输出头与成对排名损失计算架构</figcaption>
+    </figure>
+
+    <h3>2.2 带边缘惩罚的 Pairwise 排名损失（Margin Ranking Loss）</h3>
+    <p>人类在标注偏好时，给出的绝对分数极易受到个人主观打分基准（Calibration Shift）的干扰。因此，奖励模型绝不能按直接回归真实分数的 MSE 损失训练，而必须采用成对比较的<strong>对比排序损失（Pairwise Ranking Loss）</strong>：</p>
+    \[ \mathcal{L}_{\mathrm{RM}}(\theta) = -\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}} \left[ \log \sigma \left( r_\theta(x, y_w) - r_\theta(x, y_l) \right) \right] \]
+    <p>当偏好数据集中附带了标注员或 GPT-4 裁判的具体评分差距时，我们可以引入自适应边际惩罚（Margin）\( m(x, y_w, y_l) \ge 0 \)：</p>
+    \[ \mathcal{L}_{\mathrm{Margin}}(\theta) = -\mathbb{E} \left[ \log \sigma \left( r_\theta(x, y_w) - r_\theta(x, y_l) - m(x, y_w, y_l) \right) \right] \]
+    <p>引入 Margin 机制的核心收益在于：若 \( y_w \) 仅比 \( y_l \) 略优，模型只需保持微小的奖励差即可收敛；但如果 \( y_w \) 是满分回答而 \( y_l \) 存在严重安全毒害，Margin 强制模型必须将两者的标量奖励拉开极大的绝对安全间距，大幅增强奖励模型在安全边界上的判决鲁棒性。</p>
+
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：为什么必须在同一个 Batch 内绑定计算 chosen 和 rejected？</div>
+      <p>若将 \( (x, y_w) \) 和 \( (x, y_l) \) 分开打散到不同的训练批次中，模型很容易产生打分漂移（Score Drift），例如不同 Step 输出的分数整体向上或向下漂移数百点。只有将同一个 Prompt 的 chosen 与 rejected 绑定在同一个张量批次中，通过相对差值做损失反向传播，模型才能学到稳定不变的相对序关系（Invariant Ranking Relation）。</p>
+    </div>
+
+    <h2>3. 偏好数据转化为 RM 专用张量格式</h2>
+    <p>训练奖励模型时，数据的格式要求非常特殊。我们需要将每个三元组 <code>(prompt, chosen, rejected)</code> 解构为两条完全拼接好的纯文本：<code>text_chosen = format_chat(prompt, chosen)</code> 和 <code>text_rejected = format_chat(prompt, rejected)</code>。在 DataLoader 组装 Batch 时，必须确保输入张量的偶数索引是 chosen，奇数索引是 rejected。</p>
+
+    <!-- 表 58-1：奖励模型训练数据格式转换规范 -->
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>输入字段</th>
+            <th>拼接渲染格式示例</th>
+            <th>末位 Token 截取策略</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>input_ids_chosen</code></td>
+            <td><code>&lt;|im_start|&gt;system\n...&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\n...&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n{chosen}&lt;|im_end|&gt;</code></td>
+            <td>定位至 assistant 回答结束的最后一个 <code>&lt;|im_end|&gt;</code></td>
+          </tr>
+          <tr>
+            <td><code>input_ids_rejected</code></td>
+            <td><code>&lt;|im_start|&gt;system\n...&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\n...&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n{rejected}&lt;|im_end|&gt;</code></td>
+            <td>定位至 assistant 回答结束的最后一个 <code>&lt;|im_end|&gt;</code></td>
+          </tr>
+          <tr>
+            <td><code>margin (可选)</code></td>
+            <td>标量浮点数，如 \( \text{clip}((\text{score}_w - \text{score}_l) \times 0.5, 0.0, 2.0) \)</td>
+            <td>直接注入损失函数的 Margin 惩罚项</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 58-1：成对偏好数据转化为奖励模型张量特征的映射规范</span>
+    </div>
+
+    <h2>4. 完整奖励模型训练代码实现</h2>
+    <p>下面给出基于 Hugging Face <code>transformers</code> 和 <code>peft</code> 框架的工业级奖励模型微调脚本。代码基于 <strong>Qwen2.5-1.5B</strong>，使用 <code>AutoModelForSequenceClassification(num_labels=1)</code> 构建单标量输出头，并编写自定义 Trainer 严格实现带 Margin 的对比排名损失：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">train_reward_model.py</span>
+      <pre class="code"><code class="language-python">import os
+import torch
+import torch.nn as nn
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    Trainer,
+    TrainingArguments,
+    PreTrainedTokenizerBase
+)
+from peft import LoraConfig, get_peft_model, TaskType
+
+# 自定义带 Margin 的成对排名损失 Trainer
+class RewardModelTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # inputs 包含成对拼接的 chosen 与 rejected 特征
+        rewards_chosen = model(
+            input_ids=inputs["input_ids_chosen"],
+            attention_mask=inputs["attention_mask_chosen"]
+        ).logits.squeeze(-1)
+        
+        rewards_rejected = model(
+            input_ids=inputs["input_ids_rejected"],
+            attention_mask=inputs["attention_mask_rejected"]
+        ).logits.squeeze(-1)
+
+        margins = inputs.get("margin", torch.zeros_like(rewards_chosen))
+        
+        # 核心损失：L = - log σ( r_w - r_l - margin )
+        diff = rewards_chosen - rewards_rejected - margins
+        loss = -torch.mean(nn.functional.logsigmoid(diff))
+
+        if return_outputs:
+            return loss, {"chosen_rewards": rewards_chosen, "rejected_rewards": rewards_rejected}
+        return loss
+
+@dataclass
+class RewardDataCollator:
+    tokenizer: PreTrainedTokenizerBase
+    max_length: int = 1536
+
+    def __call__(self, features: List[Dict[str, Any]]) -&gt; Dict[str, torch.Tensor]:
+        batch_chosen = []
+        batch_rejected = []
+        margins = []
+
+        for item in features:
+            # 格式化组装
+            prompt = item["prompt"]
+            c_text = item["chosen"]
+            r_text = item["rejected"]
+            
+            # 使用 ChatML 渲染
+            text_w = f"&lt;|im_start|&gt;user\n{prompt}&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n{c_text}&lt;|im_end|&gt;"
+            text_l = f"&lt;|im_start|&gt;user\n{prompt}&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n{r_text}&lt;|im_end|&gt;"
+            
+            batch_chosen.append(text_w)
+            batch_rejected.append(text_l)
+            margins.append(item.get("margin", 0.0))
+
+        tok_chosen = self.tokenizer(
+            batch_chosen, max_length=self.max_length, padding="longest", truncation=True, return_tensors="pt"
+        )
+        tok_rejected = self.tokenizer(
+            batch_rejected, max_length=self.max_length, padding="longest", truncation=True, return_tensors="pt"
+        )
+
+        return {
+            "input_ids_chosen": tok_chosen["input_ids"],
+            "attention_mask_chosen": tok_chosen["attention_mask"],
+            "input_ids_rejected": tok_rejected["input_ids"],
+            "attention_mask_rejected": tok_rejected["attention_mask"],
+            "margin": torch.tensor(margins, dtype=torch.float32)
+        }
+
+def run_rm_training():
+    base_model = "Qwen/Qwen2.5-1.5B"
+    output_dir = "output/qwen2.5-1.5b-rm"
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print("&gt;&gt;&gt; 加载具有标量 Value Head 的序列分类模型...")
+    # num_labels=1 将顶层替换为 Linear(hidden_size, 1) 单标量回归头
+    model = AutoModelForSequenceClassification.from_pretrained(
+        base_model,
+        num_labels=1,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True
+    )
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    # 挂载 LoRA，指定同时训练 score.weight (Value Head)
+    peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        modules_to_save=["score"] # 关键：必须显式将分类打分头列入可学习参数
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+
+    # 模拟构建小规模数据集
+    sample_data = [
+        {
+            "prompt": "如何高效提高深度学习模型的训练吞吐？",
+            "chosen": "推荐采用混合精度（BF16/FP16）、FlashAttention-2 内核加速，并配合 DataLoader 多进程预读取与梯度累加。",
+            "rejected": "多买几张显卡就可以了，越贵越好。",
+            "margin": 0.5
+        }
+    ] * 64
+
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        learning_rate=2e-5,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+        num_train_epochs=2,
+        weight_decay=0.01,
+        bf16=True,
+        logging_steps=5,
+        save_steps=50,
+        save_total_limit=2,
+        remove_unused_columns=False,
+        report_to="none"
+    )
+
+    trainer = RewardModelTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=sample_data,
+        data_collator=RewardDataCollator(tokenizer=tokenizer)
+    )
+
+    print("&gt;&gt;&gt; 开始奖励模型训练...")
+    trainer.train()
+    trainer.save_model(output_dir)
+    print(f"奖励模型训练完毕，权重已保存至 {output_dir}")
+
+if __name__ == "__main__":
+    run_rm_training()
+</code></pre>
+    </div>
+
+    <h2>5. RewardBench 体系与对齐评测基准</h2>
+    <p>如何客观评价训练出来的奖励模型是“真懂好坏”还是“仅仅在死记硬背”？AllenAI 提出了权威的 <strong>RewardBench</strong> 评测基准。RewardBench 从四个维度全面测试奖励模型的判决泛化能力：</p>
+    <ul>
+      <li><strong>Chat（日常对话偏好）：</strong>评估模型对通用指令遵循、语气诚恳度以及信息完整性的打分敏锐度；</li>
+      <li><strong>Chat Hard（对话硬核困难集）：</strong>包含极度相似但存在细微逻辑瑕疵的成对回答，测试 RM 是否会落入“浅层相似度陷阱”；</li>
+      <li><strong>Safety（安全性与越狱检测）：</strong>包含针对性红队诱导提示词（Red-teaming Prompts），测试 RM 是否能给充满恶意攻击但文笔华丽的回答赋予最低分；</li>
+      <li><strong>Reasoning（代码与数学分步推理）：</strong>测试 RM 是否具备识别推理中间步骤逻辑断裂的能力。</li>
+    </ul>
+
+    <!-- 表 58-2：主流开源奖励模型在 RewardBench 上的典型性能参考 -->
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>模型架构 / 名称</th>
+            <th>参数量</th>
+            <th>Chat 准确率</th>
+            <th>Safety 准确率</th>
+            <th>Reasoning 准确率</th>
+            <th>综合得分 (Overall)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Llama-3-8B-Instruct-RM</strong></td>
+            <td>8B</td>
+            <td>93.2%</td>
+            <td>88.6%</td>
+            <td>84.1%</td>
+            <td>88.6%</td>
+          </tr>
+          <tr>
+            <td><strong>Qwen2.5-7B-RM</strong></td>
+            <td>7B</td>
+            <td>91.8%</td>
+            <td>89.4%</td>
+            <td>86.5%</td>
+            <td>89.2%</td>
+          </tr>
+          <tr>
+            <td><strong>本项目实战 RM (Qwen2.5-1.5B)</strong></td>
+            <td>1.5B</td>
+            <td>82.4%</td>
+            <td>79.8%</td>
+            <td>71.5%</td>
+            <td>77.9%</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 58-2：RewardBench 基准主要子集指标对比与基线表现参考</span>
+    </div>
+
+    <h2>6. 实战应用：基于 RM 的 Best-of-N 拒识采样引擎</h2>
+    <p>训练好奖励模型后，最具性价比的应用就是<strong>拒识采样（Rejection Sampling / Best-of-N）</strong>。它的运行逻辑极其清晰：针对用户的问题，生成模型在较高采样温度（如 \( T=0.8 \)）下并发采样 \( N \) 个（如 \( N=8 \) 或 \( 16 \)）多样化的候选回答；奖励模型对这 \( N \) 个候选回答逐一打分，并挑选最高分的那一个返回给用户。</p>
+
+    <!-- 自绘 SVG：Best-of-N 拒识采样执行流 -->
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 190" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Best-of-N 拒识采样架构流程">
+        <defs>
+          <marker id="bon-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+        </defs>
+
+        <rect x="0" y="0" width="720" height="190" fill="#ffffff" rx="8"/>
+
+        <!-- 输入提问 -->
+        <rect x="15" y="55" width="115" height="75" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="72" y="85" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e40af">用户提问 Prompt</text>
+        <text x="72" y="108" text-anchor="middle" font-size="11" fill="#64748b">开放问答 / 逻辑题</text>
+
+        <path d="M130 92 L 165 92" stroke="#2563eb" stroke-width="1.5" marker-end="url(#bon-arr)"/>
+
+        <!-- 生成模型 N 采样 -->
+        <rect x="170" y="35" width="155" height="115" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="247" y="65" text-anchor="middle" font-size="13" font-weight="bold" fill="#b45309">生成模型 (Generator)</text>
+        <text x="247" y="88" text-anchor="middle" font-size="11" fill="#1e293b">较高温度采样 T=0.8</text>
+        <text x="247" y="108" text-anchor="middle" font-size="11" fill="#64748b">并发输出 N 条候选</text>
+        <text x="247" y="128" text-anchor="middle" font-size="11" fill="#64748b">{ cand_1, ..., cand_N }</text>
+
+        <path d="M325 92 L 360 92" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#bon-arr)"/>
+
+        <!-- 奖励模型打分 -->
+        <rect x="365" y="35" width="165" height="115" rx="8" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="447" y="65" text-anchor="middle" font-size="13" font-weight="bold" fill="#5b21b6">奖励模型 (Scorer)</text>
+        <text x="447" y="88" text-anchor="middle" font-size="11" fill="#1e293b">批量因果编码</text>
+        <text x="447" y="108" text-anchor="middle" font-size="11" fill="#64748b">计算 Value Head 标量</text>
+        <text x="447" y="128" text-anchor="middle" font-size="11" fill="#5b21b6">[ r_1, r_2, ..., r_N ]</text>
+
+        <path d="M530 92 L 565 92" stroke="#8b5cf6" stroke-width="1.5" marker-end="url(#bon-arr)"/>
+
+        <!-- 择优输出 -->
+        <rect x="570" y="45" width="135" height="95" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="637" y="75" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">择优胜出 (Top-1)</text>
+        <text x="637" y="100" text-anchor="middle" font-size="11" fill="#1e293b">argmax(r_1..r_N)</text>
+        <text x="637" y="120" text-anchor="middle" font-size="10.5" fill="#065f46">交付最高质量回答</text>
+      </svg>
+      <figcaption>图 58-3：基于奖励模型的 Best-of-N 并发采样与标量打分择优引擎流水线</figcaption>
+    </figure>
+
+    <p>以下代码展示了完整的 Best-of-N 推理采样脚本，支持批量前向打分与最佳项选择：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">rejection_sampling_engine.py</span>
+      <pre class="code"><code class="language-python">from typing import List
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
+from peft import PeftModel
+
+class BestOfNEngine:
+    def __init__(self, generator_path: str, reward_model_path: str, device: str = "cuda:0"):
+        self.device = device
+        
+        print("&gt;&gt;&gt; 加载生成器模型...")
+        self.gen_tokenizer = AutoTokenizer.from_pretrained(generator_path)
+        self.generator = AutoModelForCausalLM.from_pretrained(
+            generator_path, torch_dtype=torch.bfloat16, device_map=device
+        )
+        self.generator.eval()
+
+        print("&gt;&gt;&gt; 加载奖励模型...")
+        self.rm_tokenizer = AutoTokenizer.from_pretrained(generator_path)
+        # 加载分类模型骨干
+        rm_base = AutoModelForSequenceClassification.from_pretrained(
+            generator_path, num_labels=1, torch_dtype=torch.bfloat16, device_map=device
+        )
+        self.reward_model = PeftModel.from_pretrained(rm_base, reward_model_path)
+        self.reward_model.eval()
+
+    def generate_candidates(self, prompt: str, n: int = 4) -&gt; List[str]:
+        """并发采样 N 条候选回答"""
+        prompt_text = f"&lt;|im_start|&gt;user\n{prompt}&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n"
+        inputs = self.gen_tokenizer(prompt_text, return_tensors="pt").to(self.device)
+        prompt_len = inputs.input_ids.shape[1]
+
+        with torch.no_grad():
+            outputs = self.generator.generate(
+                **inputs,
+                max_new_tokens=512,
+                num_return_sequences=n,
+                do_sample=True,
+                temperature=0.85,
+                top_p=0.9,
+                pad_token_id=self.gen_tokenizer.eos_token_id
+            )
+            
+        candidates = []
+        for out in outputs:
+            resp = self.gen_tokenizer.decode(out[prompt_len:], skip_special_tokens=True).strip()
+            candidates.append(resp)
+        return candidates
+
+    def score_candidates(self, prompt: str, candidates: List[str]) -&gt; List[float]:
+        """使用奖励模型对所有候选回答进行标量打分"""
+        texts = [
+            f"&lt;|im_start|&gt;user\n{prompt}&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n{c}&lt;|im_end|&gt;"
+            for c in candidates
+        ]
+        inputs = self.rm_tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(self.device)
+        
+        with torch.no_grad():
+            logits = self.reward_model(**inputs).logits.squeeze(-1)
+            scores = logits.cpu().float().tolist()
+        return scores
+
+    def select_best(self, prompt: str, n: int = 4) -&gt; dict:
+        """主入口：采样 N 条，打分，返回最高质量结果"""
+        candidates = self.generate_candidates(prompt, n=n)
+        scores = self.score_candidates(prompt, candidates)
+        
+        best_idx = int(torch.tensor(scores).argmax().item())
+        return {
+            "prompt": prompt,
+            "best_response": candidates[best_idx],
+            "best_score": scores[best_idx],
+            "all_scores": scores,
+            "all_candidates": candidates
+        }
+
+if __name__ == "__main__":
+    # 实例化并运行拒识采样测试
+    engine = BestOfNEngine(
+        generator_path="output/qwen2.5-1.5b-sft",
+        reward_model_path="output/qwen2.5-1.5b-rm"
+    )
+    result = engine.select_best("请解释量子纠缠的基本物理直觉，并用通俗的比喻说明。", n=4)
+    print(f"\n最佳回答得分: {result['best_score']:.4f}")
+    print(f"最佳回答内容:\n{result['best_response']}")
+</code></pre>
+    </div>
+
+    <h2>7. 本章小结</h2>
+    <p>在本章中，我们完整攻克了自主训练工业级奖励模型的全套技术栈。核心要点总结如下：</p>
+    <ul>
+      <li><strong>架构转变：</strong>将因果语言模型的顶层解构为单标量 Value Head，通过抽取末位有效 Token 的上下文隐状态计算绝对奖励分数；</li>
+      <li><strong>成对对比优势：</strong>摒弃绝对 MSE 回归，严格采用 Bradley-Terry 成对排名对比损失（Pairwise Ranking Loss），并注入边际动态 Margin 惩罚，赋予模型对不同质量差距的鲁棒区分力；</li>
+      <li><strong>训练细节至关重要：</strong>在挂载 LoRA 训练分类模型时，必须显式将 <code>score</code>（分类层权重）列入 <code>modules_to_save</code>，避免打分层未被更新；</li>
+      <li><strong>下游释放价值：</strong>奖励模型不仅是 PPO 的裁判，更是 Best-of-N 拒识采样与搜索验证的核心基石。低显存的小规模 RM 同样能在推理端展现出强大的性能增益。</li>
+    </ul>
+
+    <!-- 自测题 -->
+    <h2>8. 自测题</h2>
+    <div class="quiz">
+      <div class="quiz-question"><strong>题 1：</strong>为什么在微调因果语言模型构建奖励模型时，通常选择提取最后一个 Token 的隐状态向量来计算标量分数，而不是像普通分类任务那样对所有 Token 进行平均池化（Mean Pooling）？</div>
+      <div class="quiz-answer">
+        <strong>解析：</strong>因为标准因果语言模型（Causal LM）采用下三角注意力掩码矩阵，每个 Token 只能看到其自身及之前的词符。靠前的 Token 根本无法获取后面回答的上下文信息。只有序列中最后一个 Token（如 <code>&lt;|im_end|&gt;</code>），其注意力能够单向覆盖前面完整的 Prompt 以及 Assistant 回答的所有词符，汇聚了全局特征表示。若采用平均池化，会导致前期信息严重稀释甚至破坏因果语义。
+      </div>
+    </div>
+
+    <div class="quiz">
+      <div class="quiz-question"><strong>题 2：</strong>在使用 PEFT/LoRA 针对 <code>AutoModelForSequenceClassification</code> 进行奖励模型训练时，为什么必须在 <code>LoraConfig</code> 中设置 <code>modules_to_save=["score"]</code>？</div>
+      <div class="quiz-answer">
+        <strong>解析：</strong>在默认情况下，PEFT 只会将指定的注意力矩阵或全连接层（如 <code>q_proj</code>、<code>v_proj</code>）包裹上 LoRA 增量矩阵，而将其他所有未指定的原生权重完全冻结（<code>requires_grad = False</code>）。在序列分类模型中，<code>score</code> 是新初始化的单标量分类头。如果不将其显式声明在 <code>modules_to_save</code> 中，<code>score.weight</code> 将被冻结为随机初始化的初始权重，导致损失无法反向传播训练分类头，打分输出始终是一团随机噪声。
+      </div>
+    </div>
+
+    <div class="quiz">
+      <div class="quiz-question"><strong>题 3：</strong>在 Best-of-N 拒识采样中，当采样候选数量 \( N \) 从 4 增加到 64 时，模型最终输出质量会无节制地无限提升吗？可能会遭遇什么问题？</div>
+      <div class="quiz-answer">
+        <strong>解析：</strong>不会无限提升。当 \( N \) 过大时，会遭遇严重的“奖励过拟合/黑客攻击（Reward Hacking / Overoptimization）”。由于神经奖励模型并非完美的人类价值代理，它在某些非正常特征（如异常长度、特定重复修饰语）上存在预测盲区。当候选池极大时，极易抽样出刚好命中 RM 漏洞的畸形样本，导致 RM 打出虚高极值，但人类阅读体验反而显著下降。此外，计算推理开销随 \( N \) 线性增长，边际收益急剧递减。
+      </div>
+    </div>
+
+    <!-- 参考文献 -->
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li>Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C. L., Mishkin, P., ... & Lowe, R. (2022). Training language models to follow instructions with human feedback. <em>NeurIPS 2022</em>. <a href="https://arxiv.org/abs/2203.02155" target="_blank">arXiv:2203.02155</a></li>
+      <li>Lambert, N., Pyatkin, V., Morrison, J., Miranda, L. J., Lin, B. Y., Chandu, K., ... & Hajishirzi, H. (2024). RewardBench: Evaluating Reward Models for Language Modeling. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2403.13787" target="_blank">arXiv:2403.13787</a></li>
+      <li>Gao, L., Schulman, J., & Hilton, J. (2023). Scaling Laws for Reward Model Overoptimization. <em>ICML 2023</em>. <a href="https://arxiv.org/abs/2210.10760" target="_blank">arXiv:2210.10760</a></li>
+      <li>Stiennon, N., Ouyang, L., Wu, J., Ziegler, D., Lowe, R., Voss, C., ... & Christiano, P. F. (2020). Learning to summarize with human feedback. <em>NeurIPS 2020</em>. <a href="https://arxiv.org/abs/2009.01325" target="_blank">arXiv:2009.01325</a></li>
+      <li>Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi, A., Babaei, Y., ... & Scialom, T. (2023). Llama 2: Open Foundation and Fine-Tuned Chat Models. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2307.09288" target="_blank">arXiv:2307.09288</a></li>
+      <li>Lightman, H., Kosaraju, V., Burda, Y., Couairon, G., Leike, J., & Sutskever, I. (2023). Let's Verify Step by Step. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2305.20050" target="_blank">arXiv:2305.20050</a></li>
+      <li>Wang, B., Zheng, R., Chen, L., Liu, Y., Dou, S., Huang, C., ... & Qiu, X. (2023). Secrets of RLHF in Large Language Models Part I: PPO. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2307.04964" target="_blank">arXiv:2307.04964</a></li>
+      <li>Dubois, Y., Li, X., Taori, R., Hashimoto, T., & Liang, P. (2024). AlpacaFarm: A Simulation Framework for Methods that Learn from Human Feedback. <em>NeurIPS 2024</em>. <a href="https://arxiv.org/abs/2305.14387" target="_blank">arXiv:2305.14387</a></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

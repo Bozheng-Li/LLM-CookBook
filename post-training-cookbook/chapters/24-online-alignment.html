@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 24 章 · 在线迭代对齐与免奖励模型方法 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 4 部分 · 偏好对齐与 RLHF</div>
+      <h1>第 24 章 · 在线迭代对齐与免奖励模型方法</h1>
+      <p class="chapter-lead">离线对齐方法（如经典 DPO、SimPO）在训练时完全依赖固定的静态偏好池，极易陷入严重的分布外（Out-of-Distribution, OOD）退化与策略漂移：随着模型权重的更新，模型实际生成的回复分布与离线数据集中的输赢样本分布渐行渐远，导致隐式奖励预测失真。在线迭代对齐（Iterative / Online Alignment）通过“边生成、边评估、边对齐”的动态闭环，让模型持续在自身最新策略边界上展开自博弈或在线评判。本章全面揭示以 SPIN 为代表的自博弈免奖励模型对齐机制、迭代 DPO（Iterative DPO）、在线直接偏好优化（Online DPO）以及在线直接奖励对齐（Direct Alignment from Online AI Feedback, OAIF），打通动态自回归采样与流式偏好更新的高性能工程管线。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★★☆ ｜ 先修：第 18 章、第 22 章、第 23 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 静态离线对齐的致命软肋：分布漂移与虚假偏好</h2>
+    <p>自 DPO 问世以来，后训练工业界在享受其免去 PPO 繁复超参调整的同时，也逐步遭遇了其根本性的理论瓶颈。这一瓶颈根源于<strong>离线偏好学习的静态分布假设（Static Off-policy Assumption）</strong>。在经典的离线直接偏好优化中，偏好对 \((x, y_w, y_l) \sim \mathcal{D}_{\mathrm{offline}}\) 是由历史上的参考模型 \(\pi_{\mathrm{ref}}\) 或其它开源大模型生成的。在训练开始的最初几百个步长内，待优化的策略网络 \(\pi_\theta\) 与 \(\mathcal{D}_{\mathrm{offline}}\) 的分布高度契合，优化器能够快速拉大对数似然差值。</p>
+    <p>然而，强化学习控制理论与统计学习理论明确指出：<strong>策略优化本质上是一个动态的协变量偏移（Covariate Shift）过程</strong>。随着梯度步进的累积，当前策略 \(\pi_\theta\) 能够生成的回复分布 \(p_{\pi_\theta}(y \mid x)\) 会显著偏离初始分布 \(\mathcal{D}_{\mathrm{offline}}\)。这导致了两大灾难性的现象：</p>
+    <ul>
+      <li><strong>分布外（OOD）隐式奖励虚高：</strong>DPO 损失将隐式奖励定义为 \(r_\theta(x, y) = \beta \log \frac{\pi_\theta(y \mid x)}{\pi_{\mathrm{ref}}(y \mid x)}\)。在 \(\mathcal{D}_{\mathrm{offline}}\) 覆盖之外的高维 Token 空间中，可能存在某些特殊的生成模式，其在参考模型下似然极低但在策略模型下被微小扰动放大，导致隐式奖励飙升。这类似于强化学习中的“盲目乐观”，导致模型在实际推理时生成胡言乱语却自我感觉极佳。</li>
+      <li><strong>对自身新产生的错误缺乏防御免疫：</strong>在静态离线数据中，落败样本 \(y_l\) 往往是旧模型产生的低级错误。当模型进阶变强后，它所面临的新挑战不再是这些低级语法或格式错误，而是诸如复杂的逻辑漏洞、隐蔽的推理偷换概念等高级缺陷。静态离线数据集无法提供模型当前策略下最新缺陷的“靶子”，优化因此迅速陷入瓶颈。</li>
+    </ul>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="离线对齐分布漂移与在线迭代闭环对比图">
+        <defs>
+          <marker id="arrow-blue2" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="arrow-green2" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L8,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+        </defs>
+
+        <!-- 左侧: 离线静态对齐困境 -->
+        <rect x="20" y="20" width="320" height="200" rx="10" fill="#f8fafc" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="180" y="45" text-anchor="middle" font-size="14" font-weight="bold" fill="#991b1b">离线静态对齐（Off-policy DPO）</text>
+        <rect x="40" y="65" width="280" height="40" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1"/>
+        <text x="180" y="90" text-anchor="middle" font-size="13" fill="#b91c1c">固定静态偏好池 \(\mathcal{D}_{\mathrm{static}}(y_w, y_l)\)</text>
+        <path d="M 180 105 L 180 125" stroke="#ef4444" stroke-width="2" marker-end="url(#arrow-blue2)"/>
+        <rect x="40" y="125" width="280" height="40" rx="6" fill="#ffffff" stroke="#64748b" stroke-width="1"/>
+        <text x="180" y="150" text-anchor="middle" font-size="13" fill="#334155">持续更新模型 \(\pi_{\theta_t} \to \pi_{\theta_{t+1}}\)</text>
+        <text x="180" y="195" text-anchor="middle" font-size="12" fill="#ef4444">⚠️ 分布漂移加剧 / 无法应对自身新型缺陷</text>
+
+        <!-- 右侧: 在线迭代对齐闭环 -->
+        <rect x="380" y="20" width="320" height="200" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="540" y="45" text-anchor="middle" font-size="14" font-weight="bold" fill="#065f46">在线迭代对齐（On-policy Iterative）</text>
+        <rect x="400" y="65" width="280" height="35" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1"/>
+        <text x="540" y="88" text-anchor="middle" font-size="13" fill="#1e40af">1. 当前策略在线 Rollout: \(y \sim \pi_{\theta_t}(x)\)</text>
+        <path d="M 540 100 L 540 115" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green2)"/>
+        <rect x="400" y="115" width="280" height="35" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="1"/>
+        <text x="540" y="138" text-anchor="middle" font-size="13" fill="#92400e">2. 实时评判或自博弈比对（在线打分/排序）</text>
+        <path d="M 540 150 L 540 165" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green2)"/>
+        <rect x="400" y="165" width="280" height="35" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="1"/>
+        <text x="540" y="188" text-anchor="middle" font-size="13" fill="#047857">3. 在线优化更新 \(\pi_{\theta_{t+1}}\) 并滚入下轮</text>
+      </svg>
+      <figcaption>图 24-1：离线静态对齐的开环退化与在线迭代对齐的自适应闭环机制对比</figcaption>
+    </figure>
+
+    <p>为了解决上述痛点，后训练技术由静态拟合演进为<strong>在线迭代对齐（Online / Iterative Alignment）</strong>。其核心哲学是：<strong>永远用当前模型最新生成的劣质输者作为靶子，或者利用模型自身充当判别器展开对抗博弈，从而使策略在动态更新中始终保持探索与校准的张力</strong>。本节小结：闭环是在线算法克服分布偏移的根本出路。</p>
+
+    <h2>2. 自博弈弱监督对齐范式：SPIN（Self-Play Fine-Tuning）</h2>
+    <p>在所有免奖励模型且追求在线自博弈的算法中，加利福尼亚大学洛杉矶分校（UCLA）Chen 等人提出的 <span class="term">SPIN（Self-Play Fine-Tuning）</span> 是最具革命性的一步。SPIN 的核心立意是：<strong>不需要人类偏好数据，不需要外部奖励模型，仅凭高质量 SFT 数据集，让模型自身与先前的自己展开博弈，能否自发实现能力的持续飞跃？</strong></p>
+
+    <figure class="figure">
+      <img src="../assets/figs/spin.png" alt="SPIN 自博弈架构与博弈循环">
+      <figcaption>图 24-2：SPIN（Self-Play Fine-Tuning）双人两常和博弈循环机制：主玩家（主模型）最大化区分真实 SFT 数据与对手（上一轮模型）生成数据的胜率（来源：Chen et al., 2024, arXiv:2401.01335）</figcaption>
+    </figure>
+
+    <h3>2.1 两常和不完全信息博弈的数学形式化</h3>
+    <p>SPIN 将大语言模型的后训练重新定义为主玩家（Main Player，当前策略 \(\pi_\theta\)）与对手玩家（Opponent Player，上一轮迭代冻结的策略 \(\pi_t\)）之间的两常和博弈。设目标真实数据分布为 \(p_{\mathrm{data}}(y \mid x)\)（由人工精标 SFT 数据集给出）。主玩家的目标是寻找一个策略 \(\pi_\theta\)，使得判别器无法区分其生成的回答与真实人工数据；而对手玩家则试图以历史策略生成伪造样本。</p>
+    <p>在每一轮迭代 \(t = 0, 1, 2, \dots\) 中：</p>
+    <ol>
+      <li><strong>对手玩家 Rollout：</strong>固定上一轮策略 \(\pi_t\)，输入提示词 \(x \sim \mathcal{D}\)，生成伪造回答 \(y' \sim \pi_t(\cdot \mid x)\)。</li>
+      <li><strong>配对构成：</strong>将人工真实回复 \(y \sim p_{\mathrm{data}}(\cdot \mid x)\) 视作胜者（Chosen），将本模型上一轮生成的回复 \(y'\) 视作输者（Rejected），构造动态偏好对 \((x, y, y')\)。</li>
+      <li><strong>主玩家策略更新：</strong>主玩家 \(\pi_{\theta}\) 通过优化下述极小化极大（Minimax）目标完成步进：</li>
+    </ol>
+    \[ \mathcal{L}_{\mathrm{SPIN}}(\theta) = \mathbb{E}_{(x, y) \sim \mathcal{D}, y' \sim \pi_t(\cdot \mid x)} \left[ \ell\left( \lambda \log \frac{\pi_\theta(y \mid x)}{\pi_t(y \mid x)} - \lambda \log \frac{\pi_\theta(y' \mid x)}{\pi_t(y' \mid x)} \right) \right] \]
+    <p>其中损失函数通常选用二元逻辑斯蒂回归函数 \(\ell(z) = \log(1 + \exp(-z))\)。注意这里的参照物直接换成了上一轮迭代的策略 \(\pi_t\)。</p>
+
+    <h3>2.2 理论收敛性证明与纳什均衡</h3>
+    <p>Chen 等人在论文中从理论上给出了严格的收敛性保证：当博弈达到纳什均衡（Nash Equilibrium）时，必有：</p>
+    \[ \pi^* = p_{\mathrm{data}} \]
+    <p>这意味着，模型在不断打败“过去的自己”的过程中，其概率质量分布在全空间无偏地向真实高质量数据流形靠拢。相较于单遍 SFT 训练（极易对特定表述过拟合），SPIN 每一轮都在寻找当前模型生成分布与真实分布重叠薄弱的边界区域，动态压制模型自发产生的错漏模式。实测表明，在 GSM8K、MATH 及各类自然语言问答基准上，仅使用原始 SFT 数据集，经过 3 轮 SPIN 迭代，模型胜率与推理准确度获得了显著的自发性增长。本节小结：SPIN 将对抗判别转化为自演化对齐动力学。</p>
+
+    <h2>3. 工业级多轮迭代 DPO（Iterative DPO / Online DPO）</h2>
+    <p>虽然 SPIN 依赖真实 SFT 数据作为天然胜者，但在开放式对话、代码生成、创意写作以及价值观安全对齐等更为广阔的场景中，我们往往拥有更具辨识力的即时反馈机制（例如专用的过程奖励模型 PRM、集成判别器，或是多评测器投票系统）。将 DPO 推向在线化的主流工业路径是<strong>迭代 DPO（Iterative DPO）</strong>与<strong>在线 DPO（Online DPO）</strong>。</p>
+
+    <h3>3.1 Iterative DPO：批式动态外循环</h3>
+    <p>在 Iterative DPO 范式中，训练过程被切分为离散的 \(K\) 个宏观轮次（Epoch / Cycle）。在每个宏观轮次 \(k\) 中：</p>
+    <ul>
+      <li><strong>阶段 A（动态数据合成）：</strong>从提示词池 \(\mathcal{X}\) 中采样，使用当前的检查点 \(\pi_{\theta_k}\) 对每个提示词独立采样 \(M\) 个候选输出（例如通过 Nucleus Sampling，\(M = 4 \sim 8\)）：
+      \[ \{y^{(1)}, y^{(2)}, \dots, y^{(M)}\} \sim \pi_{\theta_k}(\cdot \mid x) \]</li>
+      <li><strong>阶段 B（在线评估与偏好成对化）：</strong>利用高精度奖励模型 \(R_\phi\) 或在线仲裁器对这 \(M\) 个候选打分，挑选出得分最高者为 \(y_w\)，得分最低者为 \(y_l\)。若两者分差小于阈值 \(\delta\)，则抛弃该样本以防噪声污染。由此构成当前轮次专属的数据集 \(\mathcal{D}_k\)。</li>
+      <li><strong>阶段 C（策略微调与参考模型轮转）：</strong>将参考模型更新为 \(\pi_{\mathrm{ref}} \leftarrow \pi_{\theta_k}\)，并以 \(\mathcal{D}_k\) 为输入执行标准 DPO 训练，获得下一轮检查点 \(\pi_{\theta_{k+1}}\)。</li>
+    </ul>
+
+    <h3>3.2 Fully Online DPO：单步流式流水线</h3>
+    <p>Iterative DPO 的批式切分在大规模集群调度上容易造成 GPU 利用率波峰波谷（生成阶段访存受限，训练阶段计算密集）。近年来，诸如 HuggingFace TRL 与 DeepSeek 团队采用的是更先进的 <strong>Fully Online DPO（流式在线对齐）</strong>：每个 Micro-batch 内部，训练引擎直接调用绑定的推理引擎（如 vLLM 或 TensorRT-LLM）对当前 Prompt 实时生成两个采样，经由紧凑型轻量奖励模型即时打分判定胜负，随即直接构造 DPO 梯度进行反向传播！</p>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 为什么 Online DPO 能在 AlpacaEval 上击败离线 DPO 10 个百分点以上？</div>
+      <p>核心原因在于负样本的新鲜度（Freshness）。在离线 DPO 中，负样本是过时模型产生的；而在 Online DPO 中，负样本是当前这一秒模型犯下的“最高概率错误”。优化器对这种在线错误的回击，能够直接削平当前策略在生成几何面上的尖锐虚假奇点，避免了优化方向在错误空间打空拳。</p>
+    </div>
+
+    <h2>4. 免显式奖励模型的 AI 自主对齐（RLAIF 与 OAIF）</h2>
+    <p>在追求极致自驱动后训练的路径上，不仅可以免去人工标注，甚至可以免去单独训练的数值型奖励模型（Scalar RM）。数值型 RM 存在一个众所周知的痼疾：<strong>标量打分难以解释且极易被长度、特殊标点或阿谀奉承（Sycophancy）攻破</strong>。</p>
+    <p>DeepMind 与 Google 研究团队提出了 <span class="term">OAIF（Online AI Feedback）</span> 与直接指令遵从对齐。OAIF 采用一个更强或同等能力但搭载严密指令的语言模型直接作为“自然语言仲裁器”。对于策略模型在线生成的两份候选 \(y_1, y_2 \sim \pi_\theta(x)\)，直接构造如下元提示词送入判别器：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">oaif_prompt_template.txt</span>
+      <pre class="code"><code class="language-text">你是一位极其严谨的大语言模型回答仲裁专家。请评判针对以下提示词的两个候选回答，哪一个在准确性、无幻觉、格式严谨性上表现更优。
+【提示词】：{prompt}
+【候选 1】：{y1}
+【候选 2】：{y2}
+
+请根据第一性原理进行逻辑分析，并最终在最后一行输出明确的结论：
+若候选 1 优于候选 2，输出 [[A]]；
+若候选 2 优于候选 1，输出 [[B]]。</code></pre>
+    </div>
+
+    <p>通过解析输出的 Token 概率分布：</p>
+    \[ P(y_1 \succ y_2 \mid x) = \frac{\exp(\mathrm{logit}_{[[A]]})}{\exp(\mathrm{logit}_{[[A]]}) + \exp(\mathrm{logit}_{[[B]]})} \]
+    <p>不仅完全免去了单独维护复杂价值网络的显存负担，而且可以利用推理模型强大的上下文理解与 Chain-of-Thought（思维链）判别能力，为策略模型提供极其敏锐的高信噪比偏好反馈。本节小结：大模型自身的语义判别能力已成为替代标量奖励模型的最强武器。</p>
+
+    <h2>5. 在线迭代对齐工程实战：基于 vLLM + PyTorch 的完整在线 DPO 流水线</h2>
+    <p>构建在线对齐系统的难点从来不在损失函数本身，而在于<strong>推理生成子进程（Generation Actor）与训练反传引擎（Training Engine）的高吞吐协同</strong>。如果在训练卡上直接使用 HuggingFace 默认的 <code>model.generate()</code>，由于缺乏 PagedAttention 与连续批处理（Continuous Batching），GPU 算力利用率通常低于 15%。</p>
+    <p>在下面的生产级实战中，我们演示如何利用 <strong>vLLM 推理引擎</strong> 作为高性能并发 Rollout 发生器，结合轻量打分规则与 DPO 反向传播，构建一个自包含、模块化的在线迭代对齐流水线。</p>
+
+    <div class="code-wrap">
+      <span class="code-label">online_dpo_pipeline.py</span>
+      <pre class="code"><code class="language-python">import os
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm import LLM, SamplingParams
+
+class OnlineDPOOrchestrator:
+    """
+    在线迭代 DPO 协调调度器:
+    1. 使用 vLLM 高性能引擎进行在线并发采样本 (Rollout)
+    2. 基于规则/打分器确定即时胜负
+    3. 同步回传给 PyTorch 策略模型完成梯度步进
+    """
+    def __init__(self, model_id, beta=0.1, lr=5e-7):
+        self.model_id = model_id
+        self.beta = beta
+        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+        print(f">>> 正在初始化策略与参考模型: {model_id}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # 训练策略模型
+        self.policy_model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16
+        ).to(self.device)
+        self.policy_model.train()
+
+        # 冻结的参考模型
+        self.ref_model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.bfloat16
+        ).to(self.device)
+        self.ref_model.eval()
+        for p in self.ref_model.parameters():
+            p.requires_grad = False
+
+        self.optimizer = torch.optim.AdamW(self.policy_model.parameters(), lr=lr)
+
+        # 初始化 vLLM 推理引擎用于高速 Rollout (指定显存利用率)
+        print(">>> 正在启动 vLLM 异步采样后端...")
+        self.llm_generator = LLM(
+            model=model_id,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.35, # 预留显存给策略模型训练
+            trust_remote_code=True
+        )
+        self.sampling_params = SamplingParams(
+            n=2,                        # 对每个 Prompt 在线生成 2 个候选回复
+            temperature=0.8,
+            top_p=0.95,
+            max_tokens=256
+        )
+
+    def generate_online_pairs(self, prompts):
+        """利用 vLLM 并发采样候选对"""
+        outputs = self.llm_generator.generate(prompts, self.sampling_params)
+        online_data = []
+        for out in outputs:
+            prompt_text = out.prompt
+            resp_a = out.outputs[0].text
+            resp_b = out.outputs[1].text
+            online_data.append((prompt_text, resp_a, resp_b))
+        return online_data
+
+    @staticmethod
+    def mock_online_evaluator(prompt, resp_a, resp_b):
+        """
+        模拟在线判别器（生产环境中可替换为过程奖励模型 PRM、外部 LLM Judge 或语法解析器）
+        此处使用简单启发式：优先选择不含代码块错误、字数适中且结构清晰的回答
+        """
+        score_a = len(resp_a) - (500 if "错误" in resp_a or len(resp_a) > 800 else 0)
+        score_b = len(resp_b) - (500 if "错误" in resp_b or len(resp_b) > 800 else 0)
+        
+        if score_a >= score_b:
+            return resp_a, resp_b # winner, loser
+        else:
+            return resp_b, resp_a
+
+    def compute_logps_for_sequence(self, model, input_ids, attention_mask, labels):
+        """计算序列自回归对数似然和"""
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits[:, :-1, :] # [B, T-1, V]
+        shift_labels = labels[:, 1:]        # [B, T-1]
+
+        # 仅对回答部分的 Token 计算对数概率
+        loss_mask = (shift_labels != -100)
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # gather 目标 label 的对数似然
+        per_token_logps = torch.gather(
+            log_probs, dim=2, index=shift_labels.unsqueeze(2).clamp(min=0)
+        ).squeeze(2)
+        
+        seq_logps = (per_token_logps * loss_mask).sum(dim=-1)
+        return seq_logps
+
+    def train_step(self, prompt, chosen_text, rejected_text):
+        """在线 DPO 单步反向传播"""
+        # 构建分词张量
+        p_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        c_ids = self.tokenizer.encode(chosen_text, add_special_tokens=False) + [self.tokenizer.eos_token_id]
+        r_ids = self.tokenizer.encode(rejected_text, add_special_tokens=False) + [self.tokenizer.eos_token_id]
+
+        # 胜者输入与掩码
+        input_w = torch.tensor([p_ids + c_ids], device=self.device)
+        labels_w = torch.tensor([[-100] * len(p_ids) + c_ids], device=self.device)
+        mask_w = torch.ones_like(input_w)
+
+        # 输者输入与掩码
+        input_l = torch.tensor([p_ids + r_ids], device=self.device)
+        labels_l = torch.tensor([[-100] * len(p_ids) + r_ids], device=self.device)
+        mask_l = torch.ones_like(input_l)
+
+        # 1. 策略模型前向 (需梯度)
+        pi_w_logps = self.compute_logps_for_sequence(self.policy_model, input_w, mask_w, labels_w)
+        pi_l_logps = self.compute_logps_for_sequence(self.policy_model, input_l, mask_l, labels_l)
+
+        # 2. 参考模型前向 (无梯度)
+        with torch.no_grad():
+            ref_w_logps = self.compute_logps_for_sequence(self.ref_model, input_w, mask_w, labels_w)
+            ref_l_logps = self.compute_logps_for_sequence(self.ref_model, input_l, mask_l, labels_l)
+
+        # 3. 计算在线 DPO 损失
+        pi_ratio = pi_w_logps - pi_l_logps
+        ref_ratio = ref_w_logps - ref_l_logps
+        loss = -F.logsigmoid(self.beta * (pi_ratio - ref_ratio)).mean()
+
+        # 4. 反向传播与梯度裁剪
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        return loss.item()
+
+    def run_online_cycle(self, prompt_batch):
+        print(f"\n>>> 正在为 {len(prompt_batch)} 条 Prompt 在线生成候选并构建偏好...")
+        rollouts = self.generate_online_pairs(prompt_batch)
+        
+        total_loss = 0.0
+        for prompt, resp_a, resp_b in rollouts:
+            winner, loser = self.mock_online_evaluator(prompt, resp_a, resp_b)
+            step_loss = self.train_step(prompt, winner, loser)
+            total_loss += step_loss
+
+        avg_loss = total_loss / len(rollouts)
+        print(f">>> 在线 DPO 迭代轮完成, 当前批平均损失: {avg_loss:.4f}")
+        return avg_loss</code></pre>
+    </div>
+
+    <p>在 SPIN 自博弈方案中，每一轮迭代需要将当前策略模型的输出存盘，作为下一轮博弈的输者参考池。以下展示了 SPIN 的数据生成与轮转迭代管理模块：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">spin_iteration_runner.py</span>
+      <pre class="code"><code class="language-python">import json
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def generate_spin_synthetic_negatives(model_path, sft_dataset_path, output_jsonl_path, batch_size=4):
+    """
+    SPIN 数据生成阶段:
+    读取人工真实 SFT 数据集 (含 prompt 和真实人工回答 chosen_response),
+    调用上一轮策略模型生成伪造样本作为 negative_response (输者).
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16, device_map="auto"
+    )
+    model.eval()
+
+    with open(sft_dataset_path, "r", encoding="utf-8") as f:
+        sft_data = [json.loads(line) for line in f]
+
+    print(f">>> 正在加载 {len(sft_data)} 条 SFT 数据生成 SPIN 对手负样本...")
+    spin_dataset = []
+
+    for i in range(0, len(sft_data), batch_size):
+        batch = sft_data[i : i + batch_size]
+        prompts = [item["prompt"] for item in batch]
+        
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(model.device)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=256,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id
+            )
+        
+        for idx, item in enumerate(batch):
+            gen_tokens = outputs[idx][inputs["input_ids"][idx].shape[0]:]
+            neg_reply = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            spin_dataset.append({
+                "prompt": item["prompt"],
+                "chosen": item["response"],        # 人工真实回复作为胜者
+                "rejected": neg_reply               # 对手策略生成的样本作为输者
+            })
+
+    with open(output_jsonl_path, "w", encoding="utf-8") as f:
+        for entry in spin_dataset:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(f">>> SPIN 对手样本集已成功输出至: {output_jsonl_path}")</code></pre>
+    </div>
+
+    <h2>6. 在线对齐的稳定性陷阱与工程防护机制</h2>
+    <p>将偏好对齐从静态推向在线虽然大幅提高了能力上限，但同时也成倍放大了系统的不稳定性。如果缺乏严格的工程护栏，在线系统可能在几轮迭代内迅速崩溃。以下是工业落地中最常见的四大故障模式及其解决方案：</p>
+
+    <h3>6.1 策略自增强崩塌（Self-Reinforcing Delusion）</h3>
+    <p>在自博弈或使用内部模型作为在线判别器时，如果当前模型产生了一种错误的思维模式（例如某种冗长且看似高深的伪学术废话），并且判别器（或启发式规则）误将其判定为优秀回答，这种错误就会在下一轮迭代中被强化。随着轮次累积，模型将彻底蜕变为“废话生成器”。</p>
+    <div class="callout danger">
+      <div class="callout-title">🚨 防御措施：锚定真实基准分布</div>
+      <p>绝不要进行纯粹无锚定的封闭自博弈！在每一轮在线生成与 DPO 训练中，必须混入至少 <strong>20%~30% 的高保真静态人工精标 SFT 数据</strong>，并在损失中施加标准因果语言模型交叉熵正则项（Cross-Entropy Regularization），强制拉拽模型词元先验不偏离自然语言流形。</p>
+    </div>
+
+    <h3>6.2 在线采样的高熵爆炸与拒绝阈值</h3>
+    <p>在动态生成时，若温度超参 \(T\) 设置过高，模型在线生成的负样本可能充斥着无逻辑乱码或截断文本。这种极其低级的负样本无法提供任何有价值的区分梯度，导致训练步虚耗。</p>
+    <p><strong>工程法则：引入奖励裕度截断（Margin Filtering）。</strong>在在线打分阶段，设定胜负分差门限 \(\delta\)：只有当 \(|R(y_1) - R(y_2)| \ge \delta_{\min}\) 且两者皆不含乱码与重复死循环时，才允许入队反向传播，过滤掉 40% 以上的无效噪声。</p>
+
+    <h2>7. 在线迭代与离线方法的多维特性对比</h2>
+    <p>为了帮助读者建立系统化的架构认知，我们将离线 DPO、SPIN 自博弈、Iterative DPO 以及在线 OAIF 的技术维度进行横向归纳：</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>对齐范式</th>
+            <th>偏好信号来源</th>
+            <th>在线 Rollout 依赖</th>
+            <th>是否需独立奖励模型</th>
+            <th>显存与硬件门槛</th>
+            <th>克服分布漂移能力</th>
+            <th>工业应用成熟度</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>离线 DPO</strong></td>
+            <td>静态离线标注池</td>
+            <td>否（纯静态 Forward）</td>
+            <td>否</td>
+            <td>低（双模型）</td>
+            <td>差（易产生 OOD 幻觉）</td>
+            <td>极高（开箱即用）</td>
+          </tr>
+          <tr>
+            <td><strong>SPIN 自博弈</strong></td>
+            <td>人工真实 SFT 数据 vs 历史模型</td>
+            <td>是（批式离线轮转）</td>
+            <td><strong>否（完全自博弈）</strong></td>
+            <td>中等</td>
+            <td>中等（依赖真实数据分布）</td>
+            <td>中等（适合持续微调）</td>
+          </tr>
+          <tr>
+            <td><strong>Iterative DPO</strong></td>
+            <td>在线生成 + 独立打分模型</td>
+            <td>是（宏观周期生成）</td>
+            <td>是（或 LLM-Judge）</td>
+            <td>高（需训练与推理双集群）</td>
+            <td><strong>强（自适应动态修正）</strong></td>
+            <td><strong>极高（顶级实验室标配）</strong></td>
+          </tr>
+          <tr>
+            <td><strong>Online OAIF</strong></td>
+            <td>大语言模型在线自然语言仲裁</td>
+            <td>是（即时高并发采样）</td>
+            <td><strong>否（Prompt 指令替代 RM）</strong></td>
+            <td>极高（极高吞吐推理）</td>
+            <td><strong>极强（细粒度语义纠偏）</strong></td>
+            <td>快速崛起（前沿探索）</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 24-1：主流在线迭代对齐范式与离线基准全维对比表</span>
+    </div>
+
+    <p>为了在工程规划中合理分配算力，下表给出了各方案在 8 卡 H800/A800（80GB）集群上处理 7B/8B 模型时的吞吐量与时间开销基准：</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>方案类型</th>
+            <th>并发采样引擎</th>
+            <th>单轮有效样本数</th>
+            <th>单轮生成耗时</th>
+            <th>单轮训练耗时</th>
+            <th>端到端完成周期（3轮）</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>离线 DPO</strong></td>
+            <td>无（预先生成完毕）</td>
+            <td>50k 对</td>
+            <td>0 小时</td>
+            <td>1.2 小时</td>
+            <td><strong>1.2 小时</strong></td>
+          </tr>
+          <tr>
+            <td><strong>SPIN (3 轮)</strong></td>
+            <td>原生 PyTorch Generate</td>
+            <td>50k 提示词</td>
+            <td>4.5 小时</td>
+            <td>1.5 小时</td>
+            <td><strong>18.0 小时</strong></td>
+          </tr>
+          <tr>
+            <td><strong>SPIN + vLLM 加速</strong></td>
+            <td>vLLM 异步推理引擎</td>
+            <td>50k 提示词</td>
+            <td>0.6 小时</td>
+            <td>1.5 小时</td>
+            <td><strong>6.3 小时</strong></td>
+          </tr>
+          <tr>
+            <td><strong>Iterative DPO</strong></td>
+            <td>vLLM + TensorRT-RM</td>
+            <td>30k 提示词 (N=4)</td>
+            <td>1.1 小时</td>
+            <td>1.0 小时</td>
+            <td><strong>6.5 小时</strong></td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 24-2：典型集群环境下各对齐方案的算力开销与吞吐基准（基于 8B 规模模型实测预估）</span>
+    </div>
+
+    <h2>8. 本章小结</h2>
+    <ul>
+      <li><strong>离线对齐的死穴：</strong>静态偏好学习必然导致模型生成分布与固定数据集渐行渐远，诱发严重的分布外（OOD）隐式奖励虚高，且无法有效消解当前策略新暴露的缺陷。</li>
+      <li><strong>SPIN 自博弈的力量：</strong>通过将当前模型与历史模型对立，以真实 SFT 数据为靶心展开博弈，SPIN 在完全不依赖外部奖励模型的前提下实现了能力的自举与泛化提升。</li>
+      <li><strong>Iterative/Online DPO 的工业支配地位：</strong>通过“实时采样当前策略输出 \(\to\) 动态打分筛选 \(\to\) 偏好步进”的紧密闭环，最新模型错误得以即刻被惩罚，大幅提升了在基准竞技场中的泛化胜率。</li>
+      <li><strong>基础设施的进化要求：</strong>在线对齐的性能天花板不再取决于反向传播算力，而取决于推理引擎（如 vLLM）的 Rollout 并发吞吐与 GPU 显存的精细切分管理。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：在 SPIN 自博弈算法中，为什么可以将人工真实 SFT 数据直接作为永恒的胜者（Chosen），而不会导致模型对 SFT 数据过拟合？</summary>
+        <p><strong>答案：</strong>在传统 SFT 中，模型只是单纯地以最大似然为目标最小化交叉熵，极易在有限的语料库上对句式、停用词等非本质统计特征过拟合。而在 SPIN 的博弈架构中，主模型不仅要提高真实 SFT 样本的似然，更关键的是要将其与<strong>当前对手策略实时生成的伪造样本</strong>进行对数概率做差比较（\(\log \pi_\theta(y) - \log \pi_\theta(y')\)）。这意味着损失函数并非单向逼近数据分布，而是在动态调整真实流形与模型错误生成流形之间的相对决策边界。由于对手生成的伪造样本在每一轮迭代中都在动态变化，模型被迫持续探索更鲁棒的语义辨别维度，从而自然获得了正则化效果，克服了单向 SFT 的过拟合。</p>
+      </details>
+      <details>
+        <summary>问题 2：某团队在搭建 Online DPO 系统时，发现 GPU 显存频繁溢出（OOM），且训练吞吐极低，排查发现他们是在同一个训练脚本中交替调用 HuggingFace 的 <code>generate()</code> 和 <code>backward()</code>。应如何从系统架构层面进行重构？</summary>
+        <p><strong>答案：</strong>交替在单张训练卡上运行原生 <code>generate()</code> 会导致严重的显存碎片化，且 HuggingFace 原生生成缺乏针对 KV Cache 的显存分页优化（PagedAttention），吞吐极低。工程重构方案通常有两种：<br>1. <strong>分离集群架构（推荐）：</strong>将系统解耦为推理集群（专用节点运行 vLLM / TensorRT-LLM，通过共享存储或高速 RPC 接收 Prompt 并高吞吐返回采样结果）与训练集群（专用节点挂载 DeepSpeed ZeRO-3 / FSDP 专心执行反向传播）；<br>2. <strong>同节点双卡显存切分：</strong>若物理卡数有限，可通过 <code>gpu_memory_utilization</code> 严格划分显存界限，例如给 vLLM 实例分配 35% 显存作为独立常驻进程，训练框架占用剩余 60% 显存并开启梯度检查点（Gradient Checkpointing），通过跨进程队列传递在线生成的张量。</p>
+      </details>
+      <details>
+        <summary>问题 3：在迭代 DPO（Iterative DPO）中，每一轮训练结束后，是否应该将参考模型 \(\pi_{\mathrm{ref}}\) 更新为上一轮新训练出的模型权重？为什么？</summary>
+        <p><strong>答案：</strong>应该更新（即执行 \(\pi_{\mathrm{ref}} \leftarrow \pi_{\theta_k}\)）。因为在迭代训练中，如果参考模型始终固定为最初的冷启动 SFT 模型，随着训练轮次 \(k\) 的增加，当前策略 \(\pi_{\theta_k}\) 与最初参考模型之间的 KL 散度会无限制拉大，导致 DPO 损失公式中的对数似然比项出现数值发散或梯度饱和；更重要的是，更新参考模型相当于将当前的生成基准锚定在最新达到的认知水平上，从而使 DPO 能够聚焦于微调当前轮次生成分布的边缘细微偏好，这与近端策略优化（PPO）中定期更新旧策略（Old Policy）以维持信任域约束（Trust Region）的理论逻辑完全一致。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Chen+, 2024]</span> Chen, Z. et al. "Self-Play Fine-Tuning Converts Weak Language Models to Strong Language Models (SPIN)." <i>ICML</i>, 2024. <span class="rid">arXiv:2401.01335</span></li>
+      <li><span class="rid">[Guo+, 2024]</span> Guo, S. et al. "Direct Language Model Alignment from Online AI Feedback (OAIF)." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2402.04792</span></li>
+      <li><span class="rid">[Xu+, 2023]</span> Xu, W. et al. "Some things are more equal than others: Preference Optimization with Iterative DPO." <i>arXiv preprint</i>, 2023. <span class="rid">arXiv:2312.10586</span></li>
+      <li><span class="rid">[Xiong+, 2023]</span> Xiong, W. et al. "Iterative Preference Learning from Human Feedback: Bridging Theory and Practice." <i>arXiv preprint</i>, 2023. <span class="rid">arXiv:2312.11456</span></li>
+      <li><span class="rid">[Calandriello+, 2024]</span> Calandriello, D. et al. "Human Alignment of Large Language Models through Online Preference Optimization." <i>ICLR</i>, 2024. <span class="rid">arXiv:2403.08635</span></li>
+      <li><span class="rid">[Rosset+, 2024]</span> Rosset, C. et al. "Direct Nash Exploration: Breaking the Exploration Bottleneck in Reinforcement Learning from Human Feedback." <i>arXiv preprint</i>, 2024. <span class="rid">arXiv:2404.03773</span></li>
+      <li><span class="rid">[Pang+, 2024]</span> Pang, R. Y. et al. "Iterative Reasoning Preference Optimization." <i>NeurIPS</i>, 2024. <span class="rid">arXiv:2404.19733</span></li>
+      <li><span class="rid">[Swamy+, 2024]</span> Swamy, G. et al. "A Minimaximalist Approach to Reinforcement Learning from Human Feedback." <i>ICML</i>, 2024. <span class="rid">arXiv:2401.04056</span></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

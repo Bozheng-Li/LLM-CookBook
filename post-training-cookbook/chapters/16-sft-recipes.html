@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 16 章 · SFT 实践法则与灾难性遗忘 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 3 部分 · 监督微调 SFT</div>
+      <h1>第 16 章 · SFT 实践法则与灾难性遗忘</h1>
+      <p class="chapter-lead">监督微调不仅是换上指令数据跑几个 epoch，而是一门关于学习率退火、数据缩放、过拟合控制与通用能力保留的精细工程科学。本章系统梳理主流开源大模型在 SFT 阶段的工业界超参配方，深入剖析灾难性遗忘的本质机理与缓解防线，拆解常见训练失败模式，并确立 SFT 转向偏好对齐的工程决策准则。</p>
+      <div class="chapter-meta">⏱ 预计学习 100 分钟 ｜ 难度 ★★★☆☆ ｜ 先修：第 12、13、14、15 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. SFT 超参数工程法则：工业界基线与选型经验</h2>
+    <p>在大模型工程实践中，<span class="term">监督微调（Supervised Fine-Tuning, SFT）</span>的超参数设置往往决定了模型的最终上限与稳定性。许多团队在尝试微调 LLaMA、Qwen 或 Mistral 底座时，常因套用全量预训练的超参数或传统 NLP 时代的微调经验，导致模型出现损失发散、能力塌缩或输出退化。与从零预训练（Pre-training）相比，SFT 的核心特征是<strong>预训练权重已处于损失函数的极优吸引盆（Attraction Basin）附近</strong>，微调的本质是在不破坏底层语言与世界知识表征的前提下，对输出空间进行指令对齐与任务格式调制。</p>
+
+    <p>不同参数规模（7B、13B、70B）以及不同的微调范式（全参数微调 vs. 参数高效微调 LoRA/QLoRA）对超参数的敏感区间有着严格的分野。下表综合了业界顶级开源对齐项目（包括 Stanford Alpaca、Zephyr-7B、Tulu-1/2/3 系列、OpenOrca 以及 LLaMA-Factory 生产实战）所验证的黄金基线数值：</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>微调范式</th>
+            <th>模型规模</th>
+            <th>有效批大小 (Tokens / Global BS)</th>
+            <th>峰值学习率 (Peak LR)</th>
+            <th>调度器与 Warmup</th>
+            <th>Epoch 范围</th>
+            <th>Weight Decay</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>全参数微调 (Full FT)</td>
+            <td>7B ~ 8B</td>
+            <td>128 ~ 256 seqs (512K tokens)</td>
+            <td>\(1.0 \times 10^{-5} \sim 2.0 \times 10^{-5}\)</td>
+            <td>Cosine (Warmup 3%~5%)</td>
+            <td>1 ~ 3</td>
+            <td>0.0 ~ 0.05</td>
+          </tr>
+          <tr>
+            <td>全参数微调 (Full FT)</td>
+            <td>13B ~ 14B</td>
+            <td>256 ~ 512 seqs (1M tokens)</td>
+            <td>\(8.0 \times 10^{-6} \sim 1.5 \times 10^{-5}\)</td>
+            <td>Cosine (Warmup 3%~5%)</td>
+            <td>1 ~ 2</td>
+            <td>0.0 ~ 0.05</td>
+          </tr>
+          <tr>
+            <td>全参数微调 (Full FT)</td>
+            <td>70B ~ 72B</td>
+            <td>512 ~ 1024 seqs (2M tokens)</td>
+            <td>\(3.0 \times 10^{-6} \sim 8.0 \times 10^{-6}\)</td>
+            <td>Cosine (Warmup 3%~5%)</td>
+            <td>1 ~ 2</td>
+            <td>0.05 ~ 0.1</td>
+          </tr>
+          <tr>
+            <td>LoRA (r=16~64, α=2r)</td>
+            <td>7B ~ 8B</td>
+            <td>64 ~ 128 seqs (256K tokens)</td>
+            <td>\(1.0 \times 10^{-4} \sim 3.0 \times 10^{-4}\)</td>
+            <td>Cosine (Warmup 3%~5%)</td>
+            <td>2 ~ 3</td>
+            <td>0.0</td>
+          </tr>
+          <tr>
+            <td>LoRA (r=32~128, α=2r)</td>
+            <td>13B / 70B</td>
+            <td>128 ~ 256 seqs (512K tokens)</td>
+            <td>\(5.0 \times 10^{-5} \sim 2.0 \times 10^{-4}\)</td>
+            <td>Cosine (Warmup 3%~5%)</td>
+            <td>2 ~ 3</td>
+            <td>0.0</td>
+          </tr>
+          <tr>
+            <td>QLoRA (NF4 4-bit)</td>
+            <td>任意规模</td>
+            <td>64 ~ 128 seqs</td>
+            <td>\(1.0 \times 10^{-4} \sim 2.0 \times 10^{-4}\)</td>
+            <td>Cosine (Warmup 5%)</td>
+            <td>2 ~ 3</td>
+            <td>0.0</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 16-1：SFT 工业界典型超参数推荐表（基于 4096 序列长度，Packed 样本训练）</span>
+    </div>
+
+    <p>在理解上述超参数时，有几个决定成败的物理事实：</p>
+    <ul>
+      <li><strong>全参微调对学习率具有"悬崖效应"：</strong>预训练阶段 7B 模型的学习率通常在 \(3.0 \times 10^{-4}\)，但 SFT 全参微调一旦超过 \(3.0 \times 10^{-5}\)，模型的预训练知识熵便会骤升，在 GSM8K 与 MMLU 上出现不可逆的性能雪崩。这是因为主干网络权重一旦剧烈位移，跨注意力层的特征对齐被强行拉扯。</li>
+      <li><strong>LoRA 学习率高一个数量级是数学必然：</strong>在第 14 章中推导过，LoRA 旁路矩阵初始化为零与高斯分布，其权重更新范数局限在低秩瓶颈内，且主干网络不承担梯度。为了让轻量旁路 \(\Delta W = \frac{\alpha}{r}BA\) 产生足够的激活调制，必须使用 \(10^{-4}\) 量级的学习率。</li>
+      <li><strong>Effective Batch Size 必须足够大：</strong>LLM 指令微调不能采用小批量（如 Batch Size = 4 或 8）。SFT 样本形式各异（长问答、数学推理、提取摘要、多轮对话），单样本梯度的方差极大。批大小过小会导致优化方向在不同任务流形间高频震荡。生产经验中，全局有效 Batch 大小（\(\text{micro\_batch} \times \text{gradient\_accumulation\_steps} \times \text{world\_size}\)）建议至少维持在 128 条序列以上（约 50 万至 100 万 tokens）。</li>
+    </ul>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：Min-LR 的设置玄机</div>
+      <p>在配置 Cosine 学习率退火时，切忌将 <code>min_lr</code> 设为 0。将最小学习率设为峰值学习率的 5%~10%（例如 Peak LR 为 \(1.0 \times 10^{-5}\)，Min-LR 设为 \(1.0 \times 10^{-6}\)）。如果在训练末期让学习率完全跌零，最后 10% 步数的样本将几乎无法对权重产生实质性梯度更新，破坏长尾知识的学习平衡。</p>
+    </div>
+
+    <p><strong>本节小结：</strong>全参 SFT 是低学习率、大 Batch、小 Epoch 的敏感微调，而 LoRA 容忍更高学习率；超参配置的第一准则是保护预训练底座已有的几何结构。</p>
+
+    <h2>2. Epoch 数与过拟合诊断：从训练 Loss 到泛化鸿沟</h2>
+    <p>在传统机器学习任务中，模型往往需要训练几十乃至数百个 epoch 直至收敛。但在 LLM SFT 阶段，<strong>1 到 3 个 Epoch 是绝对的主流区间，超过 3 个 Epoch 几乎必然导致过拟合与能力退化</strong>。这一现象与大模型参数量远超微调样本量的非对称结构直接相关。</p>
+
+    <p>微调时的交叉熵损失函数为：</p>
+    \[ \mathcal{L}_{\mathrm{SFT}}(\theta) = -\frac{1}{\sum_{i=1}^{N} |y^{(i)}|} \sum_{i=1}^{N} \sum_{t=1}^{|y^{(i)}|} \log P_\theta(y_t^{(i)} \mid x^{(i)}, y_{<t}^{(i)}) \]
+    <p>当模型反复遍历相同的指令-回复对时，模型首先学会的是宏观语法与意图响应格式；随着轮次继续推进，极高参数容量的 Transformer 开始机械记忆具体 token 的共现顺序，而非抽象推理逻辑。此时会出现典型的"表面损失降低、实测能力崩塌"。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SFT 训练健康 Loss 曲线 vs 过拟合曲线对比">
+        <defs>
+          <marker id="arrow16" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#64748b"/></marker>
+        </defs>
+        <rect x="0" y="0" width="720" height="340" fill="#ffffff" rx="8"/>
+        <!-- 坐标轴 -->
+        <line x1="60" y1="280" x2="680" y2="280" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow16)"/>
+        <line x1="60" y1="280" x2="60" y2="30" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow16)"/>
+        <text x="680" y="305" font-size="13" fill="#64748b" text-anchor="end">训练步数 / Epochs (1 ~ 3)</text>
+        <text x="50" y="25" font-size="13" fill="#64748b" text-anchor="start">交叉熵损失 (Cross-Entropy Loss)</text>
+
+        <!-- 网格辅助线 -->
+        <line x1="60" y1="210" x2="670" y2="210" stroke="#f1f5f9" stroke-width="1.5" stroke-dasharray="4"/>
+        <line x1="60" y1="140" x2="670" y2="140" stroke="#f1f5f9" stroke-width="1.5" stroke-dasharray="4"/>
+        <line x1="60" y1="70" x2="670" y2="70" stroke="#f1f5f9" stroke-width="1.5" stroke-dasharray="4"/>
+
+        <!-- 阶段分割虚线 -->
+        <line x1="360" y1="30" x2="360" y2="280" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6"/>
+        <text x="210" y="50" font-size="14" fill="#2563eb" font-weight="bold">阶段 I：意图与格式快速对齐 (Epoch 1)</text>
+        <text x="520" y="50" font-size="14" fill="#ef4444" font-weight="bold">阶段 II：过度拟合与机械记忆 (Epoch 2~3+)</text>
+
+        <!-- 曲线 1: 训练集 Loss (持续下降) -->
+        <path d="M 70 240 Q 150 160 250 130 T 360 105 T 500 85 T 660 65" fill="none" stroke="#2563eb" stroke-width="3"/>
+        <text x="665" y="65" font-size="13" fill="#2563eb" font-weight="bold">Train Loss (持续走低)</text>
+
+        <!-- 曲线 2: 健康的 Validation Loss (轻微放缓但持平) -->
+        <path d="M 70 245 Q 150 170 250 145 T 360 125 T 500 120 T 660 118" fill="none" stroke="#10b981" stroke-width="2.5" stroke-dasharray="5"/>
+        <text x="665" y="122" font-size="13" fill="#10b981" font-weight="bold">理想 Eval Loss (泛化良好)</text>
+
+        <!-- 曲线 3: 过拟合 Validation Loss (后期翘头回升) -->
+        <path d="M 70 245 Q 150 170 250 145 T 360 130 Q 450 140 520 170 T 660 220" fill="none" stroke="#ef4444" stroke-width="3"/>
+        <text x="665" y="225" font-size="13" fill="#ef4444" font-weight="bold">过拟合 Eval Loss (严重翘头)</text>
+
+        <!-- 标注拐点与早停建议 -->
+        <circle cx="360" cy="130" r="5" fill="#f59e0b" stroke="#ffffff" stroke-width="2"/>
+        <rect x="375" y="115" width="130" height="28" rx="4" fill="#fffbeb" stroke="#f59e0b" stroke-width="1"/>
+        <text x="440" y="134" font-size="12" fill="#b45309" text-anchor="middle">最佳 Early Stopping 点</text>
+      </svg>
+      <figcaption>图 16-1：SFT 训练健康 Loss 曲线与过拟合曲线对比（作者自绘）：当验证集 Loss 脱离训练集并开始掉头向上时，即为过拟合临界点</figcaption>
+    </figure>
+
+    <p>过拟合在 LLM 生成评测中表现为一种隐蔽的<strong>表征退化</strong>：</p>
+    <ol>
+      <li><strong>语气模板僵化（Style Overfitting）：</strong>模型无论面对何种开放提问，均以固定的客套话开场（例如"作为一个人工智能助手，我很乐意为您解答……"），丧失了根据场景灵活调整语域的能力。</li>
+      <li><strong>困惑度（Perplexity）与推理能力倒挂：</strong>在验证集上的 PPL 极低，但在 GSM8K、HumanEval 或开放问答中，模型开始复读训练集中的特定短语，甚至出现前言不搭后语的逻辑断层。</li>
+      <li><strong>微观 Eval Loss 分离：</strong>当训练步数越过最佳早停点（Early Stopping Point）后，即使测试集在通用分布上的损失只微升 0.05，下游 Benchmark 的得分可能已经暴跌 10% 以上。</li>
+    </ol>
+
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：只看 Train Loss 决定训练结束</div>
+      <p>在多轮海量数据 SFT 中，很多工程师不切分 Validation 集，仅凭借 Train Loss 从 1.8 降到 0.6 就认定模型收敛完美。实际上，0.6 的 Train Loss 往往意味着模型已经对特定样本的标点符号和冗长排版进行了机械记忆。必须在微调前切分出 1000~2000 条高质量、未参与训练的留出验证集，以步为单位监测 Eval Loss。</p>
+    </div>
+
+    <p><strong>本节小结：</strong>SFT 训练遵循"少即是多"；1 到 2 个 Epoch 足以完成指令遵循与格式注入，过长的轮次是诱发灾难性遗忘与泛化崩塌的催化剂。</p>
+
+    <h2>3. SFT 数据缩放研究：Quality vs Quantity</h2>
+    <p>在大模型发展的早期，社区普遍认为后训练与预训练类似，需要数百万条指令数据才能达到优秀的交互效果。然而，2023 年以来的系统性实证研究彻底颠覆了这一认知，确立了<strong>"质量碾压数量，多样性决定上限"</strong>的现代后训练哲学。</p>
+
+    <div class="paper-ref">
+      <div class="pr-title">LIMA: Less Is More for Alignment</div>
+      <div class="pr-meta">Zhou et al., Meta AI, 2023 · <a href="https://arxiv.org/abs/2305.11206" target="_blank">arXiv:2305.11206</a> · 提出著名的“表面对齐假说”</div>
+    </div>
+
+    <p>LIMA 论文提出了著名的<span class="term">表面对齐假说（Superficial Alignment Hypothesis）</span>：模型的几乎所有世界知识、逻辑推理能力和事实表征都是在无监督预训练阶段获得的；SFT 阶段并没有教会模型"思考"，而仅仅是教会了模型与用户交互的特定"子风格（Sub-style）"与响应格式。LIMA 仅使用 <strong>1,000 条</strong>极其精心编写、排版规范的高质量指令微调 LLaMA-65B，在人类偏好评测中不仅大幅领先 Stanford Alpaca（5.2 万条），甚至与 GPT-4 和 Claude 的胜率打得有来有回。</p>
+
+    <p>随后的多项研究沿着这一脉络展开了深入的缩放曲线（Scaling Curves）探索：</p>
+    <ul>
+      <li><strong>AlpaGasus（Chen et al., 2023，arXiv:2307.08701）：</strong>利用强大 LLM 对 Alpaca 的 5.2 万条数据进行打分，剔除评分低于 4.5 的低质样本，仅保留 9,000 条（过滤掉 82% 数据）。在保留优质子集后微调的模型，在各基准上的得分全面超越原 52k 全量训练模型。证明了<strong>脏数据、模糊指令不仅没有贡献，而且在主动破坏对齐表征</strong>。</li>
+      <li><strong>DEITA（Liu et al., 2023，arXiv:2312.15685）：</strong>提出了一套从复杂度（Complexity）、质量（Quality）和多样性（Diversity）三个维度量化采样的算法。研究发现，从成百上千万合成数据中，仅需系统性筛选出 <strong>6,000 条</strong>具有最大梯度多样性的核心指令样本，就能在 MT-Bench 和 AlpacaEval 上达到甚至超越 10 万级全量数据集的水平。</li>
+      <li><strong>UltraChat / UltraFeedback（Ding et al., 2023，arXiv:2305.14283）：</strong>该项目展示了规模与质量结合的边界。在多轮对话与复杂指令跟踪场景下，20 万条经过严格清洗、涵盖 30 余个主题领域的多轮合成对话（UltraChat）构成了 Zephyr-7B 强悍交互能力的基础。但研究同样指出：当高质量数据量从 20 万增加到 100 万时，边际收益几乎平缓，而计算开销呈线性增加。</li>
+    </ul>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>代表工作</th>
+            <th>数据量级</th>
+            <th>核心数据配方与策略</th>
+            <th>下游核心结论</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Alpaca (2023)</td>
+            <td>52,000 条</td>
+            <td>早期 Self-Instruct 盲目生成，未精细去重与打分</td>
+            <td>确立了指令微调范式，但存在大量复读与幻觉</td>
+          </tr>
+          <tr>
+            <td>LIMA (2023)</td>
+            <td>1,000 条</td>
+            <td>纯人工顶级撰写，极其严格的长度、格式、安全性规范</td>
+            <td>证明千级顶级数据足以激发大底座对齐潜力</td>
+          </tr>
+          <tr>
+            <td>AlpaGasus (2023)</td>
+            <td>9,000 条</td>
+            <td>基于大模型裁判（LLM Judge）过滤低质与无意义样本</td>
+            <td>仅用 18% 数据全面超越 52K 全量基线</td>
+          </tr>
+          <tr>
+            <td>DEITA (2023)</td>
+            <td>6,000 条</td>
+            <td>复杂度打分 + 语义向量聚类最大距离多样性采样</td>
+            <td>在 AlpacaEval 与 MT-Bench 达到开源 SOTA 表现</td>
+          </tr>
+          <tr>
+            <td>Tulu 2 / 3 (2023-2024)</td>
+            <td>300K ~ 500K 条</td>
+            <td>多源混合（开源精选 + 数学推理 + 代码合成 + 角色扮演）</td>
+            <td>工业级全功能模型的黄金容量平衡点</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 16-2：SFT 数据规模与质量演进对比表（arXiv:2305.11206 / 2307.08701 / 2312.15685 / 2311.10702）</span>
+    </div>
+
+    <p><strong>本节小结：</strong>盲目堆砌数百万条低质量网页问答毫无意义；现代 SFT 的精髓在于"万级精选"（10k~100k），在极高的指令复杂性、回复专业度与跨领域多样性之间寻求帕累托最优。</p>
+
+    <h2>4. 灾难性遗忘专题：机理、度量与缓解防线</h2>
+    <p>当大语言模型在特定垂直领域或特定任务（例如撰写金融合规研报、编写特定 DSL 代码）进行高强度 SFT 后，往往会出现一个令人头痛的现象：领域任务表现显著提升，但原有的通用编程（HumanEval）、常识与科学推理（MMLU）、数学计算（GSM8K）甚至基本的跨语言翻译能力出现断崖式下跌。这就是深度学习领域著名的<span class="term">灾难性遗忘（Catastrophic Forgetting）</span>。</p>
+
+    <p>在权重几何视角下，底座模型参数 \(\theta_{\mathrm{base}}\) 处在一个具有宽阔平坦底部的全局最优低维流形上。当微调损失函数针对新领域数据 \(D_{\mathrm{domain}}\) 反向传播时，强烈的任务偏置梯度 \(\nabla_\theta \mathcal{L}_{\mathrm{domain}}\) 会强行将参数拽向新任务的局部极值点。若没有约束机制，参数在原始通用任务参数空间上的投影位移就会彻底破坏原有的激活正交性。</p>
+
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="灾难性遗忘机理与回放缓解机制">
+        <defs>
+          <marker id="arrow16b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/></marker>
+          <marker id="arrow16r" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#ef4444"/></marker>
+          <marker id="arrow16g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#10b981"/></marker>
+        </defs>
+        <rect x="0" y="0" width="720" height="360" fill="#ffffff" rx="8"/>
+
+        <!-- 左侧：参数空间漂移示意 -->
+        <rect x="30" y="30" width="310" height="300" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+        <text x="185" y="60" font-size="15" fill="#1e293b" font-weight="bold" text-anchor="middle">参数空间与流形偏离</text>
+
+        <!-- 通用能力等高线 -->
+        <ellipse cx="140" cy="180" rx="90" ry="70" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4"/>
+        <ellipse cx="140" cy="180" rx="55" ry="40" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+        <text x="140" y="185" font-size="12" fill="#1e3a8a" text-anchor="middle">通用能力最优区</text>
+
+        <!-- 领域微调目标 -->
+        <ellipse cx="260" cy="240" rx="45" ry="35" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="260" y="245" font-size="12" fill="#991b1b" text-anchor="middle">领域极值区</text>
+
+        <!-- 纯领域微调漂移向量 (红) -->
+        <line x1="140" y1="180" x2="245" y2="235" stroke="#ef4444" stroke-width="3" marker-end="url(#arrow16r)"/>
+        <text x="180" y="235" font-size="12" fill="#ef4444" font-weight="bold">严重漂移 (遗忘)</text>
+
+        <!-- 混合回放约束向量 (绿) -->
+        <line x1="140" y1="180" x2="200" y2="205" stroke="#10b981" stroke-width="3" marker-end="url(#arrow16g)"/>
+        <text x="160" y="150" font-size="12" fill="#10b981" font-weight="bold">重放平衡路径</text>
+
+        <!-- 右侧：四道防遗忘工程防线 -->
+        <rect x="370" y="30" width="320" height="300" rx="8" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+        <text x="530" y="60" font-size="15" fill="#1e293b" font-weight="bold" text-anchor="middle">工业界防遗忘四重防线</text>
+
+        <!-- 防线 1 -->
+        <rect x="385" y="80" width="290" height="50" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1"/>
+        <text x="395" y="102" font-size="13" fill="#1e40af" font-weight="bold">防线 1：经验重放（Experience Replay）</text>
+        <text x="395" y="120" font-size="12" fill="#475569">在领域语料中强制掺入 10%~20% 通用指令多任务数据</text>
+
+        <!-- 防线 2 -->
+        <rect x="385" y="140" width="290" height="50" rx="6" fill="#ecfdf5" stroke="#10b981" stroke-width="1"/>
+        <text x="395" y="162" font-size="13" fill="#065f46" font-weight="bold">防线 2：参数高效隔离（LoRA 旁路）</text>
+        <text x="395" y="180" font-size="12" fill="#475569">底座 W0 绝对冻结，将知识调制约束在低秩子空间内</text>
+
+        <!-- 防线 3 -->
+        <rect x="385" y="200" width="290" height="50" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="1"/>
+        <text x="395" y="222" font-size="13" fill="#92400e" font-weight="bold">防线 3：退火超参纪律（Conservative LR）</text>
+        <text x="395" y="240" font-size="12" fill="#475569">降低学习率至 1e-5 以下，配合 0.05~0.1 的 Weight Decay</text>
+
+        <!-- 防线 4 -->
+        <rect x="385" y="260" width="290" height="50" rx="6" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1"/>
+        <text x="395" y="282" font-size="13" fill="#5b21b6" font-weight="bold">防线 4：多目标正则化 / 权重融合（Merge）</text>
+        <text x="395" y="300" font-size="12" fill="#475569">微调后使用 SLERP 或 TIES 与原底座模型进行球形线性插值</text>
+      </svg>
+      <figcaption>图 16-2：灾难性遗忘的参数漂移机理与工程缓解四重防线（作者自绘）</figcaption>
+    </figure>
+
+    <p>要建立有效的防遗忘体系，首先需要确立严格的<strong>度量方法</strong>。在微调全过程中，评测脚本不能只测垂直业务指标，而必须设置常态化的"通用哨兵基准（Canary Benchmarks）"：</p>
+    <ul>
+      <li><strong>MMLU（Massive Multitask Language Understanding）：</strong>用于监控模型的全科通识知识库。如果 MMLU 下跌超过 2.5 个百分点，表明主干网络概念表征受损。</li>
+      <li><strong>GSM8K（Grade School Math）：</strong>多步推理能力对参数扰动最为敏感。GSM8K 往往是灾难性遗忘最早爆发的预警指标。</li>
+      <li><strong>KL 散度哨兵：</strong>在训练过程中对通用基准验证集计算当前模型分布与 Base 模型分布的 Kullback-Leibler 散度 \(D_{\mathrm{KL}}(\pi_\theta \parallel \pi_{\mathrm{base}})\)，一旦散度突破阈值，立刻终止或增加重放。</li>
+    </ul>
+
+    <p>在工程实战中，<strong>数据回放（Experience Replay）是成本最低、效果最稳固的解法</strong>。在纯领域数据集中，掺入 10%~20% 的高质量通用指令数据（如 ShareGPT 筛选子集、LIMA、OpenHermes 或通用数学代码指令）。这部分通用数据充当了参数空间的"锚点（Anchors）"，迫使优化器在更新领域权重的过程中，持续维护通用的语义投影。</p>
+
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：LoRA 为什么天生抗遗忘？</div>
+      <p>LoRA 的抗遗忘能力源于其数学架构：预训练底座 \(W_0\) 被完全锁定，所有的增量仅为 \(\Delta W = \frac{\alpha}{r}BA\)。因为 \(r \ll d\)，低秩矩阵的秩空间维数极低，它在数学上根本没有足够的自由度来彻底擦除分布在全秩空间中的多维世界知识。即使 LoRA 发生了过拟合，其对底座表征的干扰上限也是有界的。</p>
+    </div>
+
+    <p><strong>本节小结：</strong>灾难性遗忘是参数空间盲目漂移的必然代价；通过数据回放保底、LoRA 结构隔离与通用哨兵基准实时度量，可以将其牢牢控制在安全阈值内。</p>
+
+    <h2>5. 多任务数据混合与采样策略</h2>
+    <p>在生产级 SFT 中，单一类型的数据集（如纯粹的问答或纯粹的代码）无法培养出成熟的通用交互助手。业界领先的模型（如 LLaMA-3-Instruct、Qwen2.5、Tulu-3）无一例外采用了跨模态、多任务的海量数据混合工程。</p>
+
+    <p>当我们要混合通用对话、数学推导、代码生成、逻辑推理、安全性对齐以及垂直领域业务数据时，如何决定各自的配比？直觉上的"简单按原始样本量拼接（Concatenation）"会导致大样本任务（如数十万条合成网页问答）彻底淹没高价值的小样本任务（如仅 5,000 条的复杂竞赛数学题）。</p>
+
+    <p>主流工业界采用以下三种采样与混合机制：</p>
+
+    <h3>5.1 比例缩减与上限截断（Capped Sampling）</h3>
+    <p>假设各任务数据集的大小为 \(|D_k|\)，若某任务数据量极其庞大，设定单任务的最大样本量上限 \(C_{\max}\)：</p>
+    \[ |D_k'| = \min(|D_k|, C_{\max}) \]
+    <p>例如，即使有 50 万条多轮闲聊，也将其硬性截断采样为 5 万条，防止闲聊风格主导优化器的注意力分布。</p>
+
+    <h3>5.2 温度采样（Temperature-based Sampling）</h3>
+    <p>为了兼顾大数据集的覆盖度与小数据集的特征密度，广泛采用温度系数 \(\tau\) 对任务分布进行平滑重加权。第 \(k\) 个任务的采样概率 \(P(k)\) 定义为：</p>
+    \[ P(k) = \frac{|D_k|^{1/\tau}}{\sum_{j} |D_j|^{1/\tau}} \]
+    <ul>
+      <li>当 \(\tau = 1.0\) 时，完全退化为按原始数据量比例采样；</li>
+      <li>当 \(\tau \to \infty\) 时，所有任务等概率均匀采样；</li>
+      <li>在后训练工程中，通常取 \(\tau \in [2.0, 3.0]\)。这种温和的幂律缩放能够显著提升数学、代码、安全拒绝等小样本文档的被采样频率，同时保持大任务的基本丰富度。</li>
+    </ul>
+
+    <h3>5.3 生产级数据黄金配比经验</h3>
+    <p>对于综合型企业级助手，经过多个前沿团队反复打磨的推荐混合保底比例如下：</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>数据大类</th>
+            <th>典型来源与内容</th>
+            <th>推荐混合比例</th>
+            <th>核心战略作用</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>通用指令与问答</td>
+            <td>LIMA, ShareGPT 精选, UltraChat 优质子集</td>
+            <td>35% ~ 45%</td>
+            <td>提供流畅的交互风格、多轮上下文承接与格式遵循</td>
+          </tr>
+          <tr>
+            <td>代码与程序合成</td>
+            <td>Evol-Code, StarCoder 筛选问答, Python/SQL 解题</td>
+            <td>20% ~ 25%</td>
+            <td>强化精确符号逻辑、形式化推演与结构化思维链</td>
+          </tr>
+          <tr>
+            <td>数学与逻辑推理</td>
+            <td>GSM8K/MATH 衍生 CoT 过程, 逻辑解谜, 符号运算</td>
+            <td>15% ~ 20%</td>
+            <td>激活深度推理（System 2）链路，抑制幻觉</td>
+          </tr>
+          <tr>
+            <td>领域专有数据</td>
+            <td>业务专有知识问答, 内部工具调用 (Tool Call), 私有规章</td>
+            <td>10% ~ 20%</td>
+            <td>注入特定行业壁垒与专有实体认知</td>
+          </tr>
+          <tr>
+            <td>安全与事实校准</td>
+            <td>红队有害拒答, 事实查证, 诚实性校准样本</td>
+            <td>5% ~ 8%</td>
+            <td>兜底安全合规，防止越狱，建立审慎拒答边界</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 16-3：通用生产级 SFT 数据混合参考配比表</span>
+    </div>
+
+    <p><strong>本节小结：</strong>多任务数据切忌直接拼接，必须通过温度平滑或上限截断重权采样；代码与数学数据不仅是专项能力，更是支撑全模型通用逻辑推理的"基石任务"。</p>
+
+    <h2>6. SFT 常见失败模式与排查对照表</h2>
+    <p>SFT 训练往往伴随着各种异常现象。许多刚接触后训练的工程师在遇到生成退化时往往手足无措，盲目重新调参。以下梳理了微调中最经典的四种失败模式及其根因与工程对策：</p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>失败模式</th>
+            <th>具体临床症状</th>
+            <th>根本诱因分析</th>
+            <th>排查与修复方案</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>死循环复读 (Repetition)</strong></td>
+            <td>模型在生成特定短语或标点后陷入无限循环（例如"……等等等等等等"），直到达到 max_tokens 截断。</td>
+            <td>1. 数据集包含低质爬取的重复文字或截断代码；<br>2. 序列填充（Padding）未被正确 Mask（损失计算到了 Pad Token 上）；<br>3. 学习率过高导致自注意力权重范数失真。</td>
+            <td>1. 严格检查 Data Collator，确保 Prompt 和 Pad 的 <code>labels=-100</code>；<br>2. 对训练集运行 N-gram 重复率过滤；<br>3. 推理时临时调高 <code>repetition_penalty=1.1~1.2</code> 辅助验证。</td>
+          </tr>
+          <tr>
+            <td><strong>过度拒答 (Over-Refusal)</strong></td>
+            <td>面对完全良性、中立的日常提问（如"如何切洋葱"、"用 Python 编写端口扫描器测试内网"），模型生硬拒绝回答："对不起，这违反了安全政策。"</td>
+            <td>1. 安全微调数据中负样本（拒答样本）比例过高（超过 15%）；<br>2. 拒绝样本中的触发词过于宽泛，模型学到了关键词与拒答的伪相关；<br>3. 缺乏良性敏感词样本（如医学科普中的毒理学、网络安全防护）。</td>
+            <td>1. 压低安全拒答样本至总量的 5% 以内；<br>2. 引入 XSTest 这类反向对抗评测集，专门针对假敏感词进行校准；<br>3. 拒答模板多元化，避免单一的机械短句。</td>
+          </tr>
+          <tr>
+            <td><strong>格式与标记崩溃 (Special Token Leak)</strong></td>
+            <td>模型在输出正文中间直接打印出 <code>&lt;|im_start|&gt;</code>、<code>&lt;unk&gt;</code>、<code>&lt;/s&gt;</code>，或无法在应结束处吐出 EOS，产生大量乱码尾巴。</td>
+            <td>1. 分词器与 Chat Template 不匹配（第 15 章）；<br>2. 训练时特殊 Token 被当成普通文本切分为了多个 subwords；<br>3. EOS Token 的 label 未参与损失计算或被错误置为了 -100。</td>
+            <td>1. 检查 <code>tokenizer.all_special_tokens</code> 与添加方式；<br>2. 确保在 Prompt 拼接中显式包含正确的终止符；<br>3. 验证 <code>labels</code> 中 EOS 对应位置必须计算损失。</td>
+          </tr>
+          <tr>
+            <td><strong>幻觉与虚假自信加剧 (Hallucination)</strong></td>
+            <td>模型对于生僻实体、错误事实坚定不移地胡编乱造，甚至编造出具有极高欺骗性的学术论文引用或法律条款。</td>
+            <td>1. SFT 试图向模型强行注入预训练阶段完全未见过的长尾专有事实；<br>2. 训练集回复中包含大量无事实支撑的肯定陈述，缺乏"不确定性"表达。</td>
+            <td>1. 牢记"SFT 调风格，预训练/检索拓知识"；专有事实走 RAG 或继续预训练（第 17 章）；<br>2. 加入包含"我目前无法确认该信息"、"根据已知事实"等表达的自知样本。</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 16-4：SFT 四大典型失败模式排查对照表</span>
+    </div>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：不要试图用 SFT 强行灌输海量全新知识</div>
+      <p>如果在 SFT 阶段强迫一个 7B 模型背诵某公司数万条内部 API 定义或数千页全新医学教材，由于样本交叉熵的强制约束，模型会被迫以最高置信度过度拟合极少量的 token 组合。其直接后果就是模型在遇到未知问题时丧失校准能力（Calibration），产生严重的虚假自信与严重幻觉。这是领域后训练最常见的技术路线错误。</p>
+    </div>
+
+    <p><strong>本节小结：</strong>失败模式往往根植于数据管线的细节遗漏（如 Pad 未 Mask、特殊标记泄漏、知识边界越界）；善用排查对照表可避免盲目试错。</p>
+
+    <h2>7. SFT 何时该结束转向偏好对齐？</h2>
+    <p>在完整的大模型后训练生命周期中，SFT 只是通向可用助手的关键中转站，后续紧接着就是偏好对齐（RLHF/DPO/GRPO，第 18~25 章）。然而许多项目在实践中往往陷入"SFT 无限微调"的泥潭，不断扩充 SFT 数据试图解决所有对话质量问题。</p>
+
+    <p><strong>SFT 什么时候应该鸣金收兵？</strong>工程决策可以通过以下三个量化准则与边际效应来裁决：</p>
+
+    <h3>7.1 边际收益衰减（Marginal Return Saturation）</h3>
+    <p>在指令微调的初期（例如从 0 扩展到 1 万条高质量样本），模型的胜率与指令遵循率（IFEval、MT-Bench）通常呈现出陡峭的对数增长。但当样本量继续翻倍至 5 万、10 万甚至 20 万时，核心基准得分的增长幅度通常会跌入 1% 以内的平原区。此时，继续清洗和标注 SFT 数据的单位边际 ROI 极低，模型迫切需要不同形式的监督信号（偏好排序对）来打破瓶颈。</p>
+
+    <h3>7.2 监督泛化边界（Teacher-Forced Discrepancy）</h3>
+    <p>SFT 本质上是<strong>强行教师引导（Teacher Forcing）</strong>下的单步极大似然优化。模型从未在训练过程中直面自己推理错误的生成状态，也无法学习在不同合理表达间做出"更偏好哪个"的相对权衡。当模型已经能够百分之百遵循复杂格式（如 Markdown 表格、JSON 格式输出、代码块规范），但输出内容的深层逻辑深度和价值安全性停滞不前时，说明 SFT 的格式调制使命已经完成。</p>
+
+    <h3>7.3 对齐税（Alignment Tax）承受极限</h3>
+    <p>随着 SFT 的不断深入，通用推理能力（如 GSM8K、MMLU）不可避免地承受微小的对齐税损耗。当监控体系发现当前 SFT 版本的领域得分已达标，但核心基准能力已接近预警红线时，必须立刻终止 SFT。后续的对齐阶段（特别是带有 KL 惩罚的 PPO 或 DPO）可以通过设置对齐约束，在不进一步破坏基础能力的前提下重塑价值边界。</p>
+
+    <blockquote>“SFT 解决的是‘模型懂不懂怎么答’（格式、角色、意图）；而偏好对齐解决的是‘模型怎样答得更让人满意’（深度、偏好、诚实）。一旦格式稳定、意图清晰，就该毫不犹豫进入对齐阶段。”</blockquote>
+
+    <p><strong>本节小结：</strong>SFT 不是终点；当格式遵循完备、边际收益趋平、通用能力接近容忍底线时，正是转向偏好对齐的最佳窗口。</p>
+
+    <h2>8. 生产级实战：LLaMA-Factory 与 TRL SFTTrainer 落地</h2>
+    <p>为了将上述实践法则转化为工程生产力，本节提供两个业界最为广泛采用的落地代码方案：一是基于成熟框架 <strong>LLaMA-Factory</strong> 的生产级声明式 YAML 配置；二是基于 Hugging Face <strong>TRL（Transformer Reinforcement Learning）</strong>的底层编程式微调脚本，全面集成序列拼箱（Sample Packing）、学习率退火与防遗忘验证监控。</p>
+
+    <h3>8.1 LLaMA-Factory 生产级多任务训练 YAML 配置</h3>
+    <p>LLaMA-Factory 是目前中文与开源社区集成度最高的微调系统之一。以下配置展示了如何在 8 卡 A100/H800 环境下进行一个标准的 8B 模型 SFT，严格遵守前述超参数法则：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">sft_qwen2_8b_full.yaml</span>
+      <pre class="code"><code class="language-yaml">### 模型与基础参数
+model_name_or_path: /data/models/Qwen2.5-7B
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: /data/configs/ds_z3_config.json
+
+### 数据混合配方 (对应第 5 节黄金比例)
+dataset: lima_zh,ultrachat_curated,evol_code_python,gsm8k_cot,safety_refusal
+dataset_dir: /data/datasets
+template: qwen
+cutoff_len: 4096
+max_samples: 100000
+overwrite_cache: true
+preprocessing_num_workers: 16
+packing: true  # 启用样本拼箱，大幅提升短序列吞吐量并消除 Padding 浪费
+
+### 训练超参数 (遵循表 16-1 推荐)
+output_dir: /data/checkpoints/qwen2.5-7b-sft-v1
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8  # 8 卡并行: 2 * 8 * 8 = 128 Global BS
+learning_rate: 1.5e-5           # 全参微调 7B 稳妥峰值学习率
+num_train_epochs: 2.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.04
+weight_decay: 0.05
+bf16: true
+ddp_timeout: 180000000
+
+### 验证与防遗忘监控
+val_size: 0.02
+per_device_eval_batch_size: 2
+eval_strategy: steps
+eval_steps: 250</code></pre>
+    </div>
+
+    <h3>8.2 TRL SFTTrainer 生产级 Python 训练脚本</h3>
+    <p>对于需要更深定制的场景，使用 TRL 库直接编写脚本是工业界算法团队的标配。以下脚本实现了一个生产级训练入口，包含样本合并打包、分词模板自动适配、EOS 标记保护与损失回传：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">train_sft_production.py</span>
+      <pre class="code"><code class="language-python">import os
+import torch
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    set_seed,
+)
+from trl import SFTTrainer, SFTConfig
+
+def main():
+    set_seed(42)
+    model_id = "meta-llama/Llama-3.1-8B"
+
+    # 1. 加载分词器与设置特殊标记
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"  # SFT 训练建议右侧补齐或使用 packing
+
+    # 2. 生产级 SFTConfig 参数构建
+    training_args = SFTConfig(
+        output_dir="./output/llama3-sft-production",
+        num_train_epochs=2,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=8,
+        learning_rate=1.5e-5,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+        weight_decay=0.05,
+        logging_steps=10,
+        eval_strategy="steps",
+        eval_steps=200,
+        save_strategy="steps",
+        save_steps=400,
+        save_total_limit=3,
+        bf16=True,
+        max_seq_length=4096,
+        packing=True,  # 序列打包：将多个短对话拼接为 4096 长度，避免 padding 浪费
+        dataset_text_field=None,  # 显式使用 formatting_func
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        report_to="tensorboard",
+    )
+
+    # 3. 加载模型（生产环境下通常配合 FSDP 或 DeepSpeed ZeRO）
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        use_cache=False,  # 训练时必须关闭 KV 缓存以节省显存
+    )
+
+    # 4. 加载并切分混合数据集（包含 5% 留出验证集）
+    raw_dataset = load_dataset("json", data_files={"train": "./data/sft_mixed_data.jsonl"})
+    split_dataset = raw_dataset["train"].train_test_split(test_size=0.03, seed=42)
+
+    # 5. 格式化函数：利用 tokenizer 的 chat_template 生成标准化序列
+    def format_chat(batch):
+        formatted_prompts = []
+        for conversation in batch["messages"]:
+            text = tokenizer.apply_chat_template(
+                conversation,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            formatted_prompts.append(text)
+        return formatted_prompts
+
+    # 6. 初始化并执行 SFTTrainer
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=split_dataset["train"],
+        eval_dataset=split_dataset["test"],
+        formatting_func=format_chat,
+    )
+
+    print("开始生产级 SFT 训练流程...")
+    trainer.train()
+
+    # 7. 最终权重与分词器持久化
+    trainer.save_model("./output/llama3-sft-production/final_model")
+    tokenizer.save_pretrained("./output/llama3-sft-production/final_model")
+    print("模型已成功保存至 ./output/llama3-sft-production/final_model")
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+
+    <h3>8.3 防遗忘多基准动态评估挂载脚本</h3>
+    <p>为了在训练中实施动态监控，可在训练过程中插入轻量评测钩子（Callback），持续监测 MMLU 通用哨兵集的困惑度漂移：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">eval_canary_callback.py</span>
+      <pre class="code"><code class="language-python">import math
+import torch
+from transformers import TrainerCallback
+
+class ForgettingMonitorCallback(TrainerCallback):
+    """
+    监控通用任务困惑度漂移的轻量回调函数。
+    当通用数据集上的 Loss 恶化超过容忍阈值时输出告警。
+    """
+    def __init__(self, canary_dataset, tokenizer, max_allowed_loss_increase=0.15):
+        self.canary_dataset = canary_dataset
+        self.tokenizer = tokenizer
+        self.baseline_loss = None
+        self.max_allowed_loss_increase = max_allowed_loss_increase
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        model = kwargs.get("model")
+        model.eval()
+        total_loss = 0.0
+        total_batches = 0
+
+        with torch.no_grad():
+            for batch in self.canary_dataset:
+                inputs = {k: v.to(model.device) for k, v in batch.items()}
+                outputs = model(**inputs)
+                total_loss += outputs.loss.item()
+                total_batches += 1
+                if total_batches >= 50:  # 仅做 50 个 batch 的快速采样以减少耗时
+                    break
+
+        avg_loss = total_loss / max(total_batches, 1)
+        ppl = math.exp(min(avg_loss, 100))
+
+        if self.baseline_loss is None:
+            self.baseline_loss = avg_loss
+            print(f"\n[哨兵基准初始化] 初始基准 Loss: {avg_loss:.4f} | PPL: {ppl:.2f}")
+        else:
+            diff = avg_loss - self.baseline_loss
+            print(f"\n[哨兵基准监测] Step: {state.global_step} | 当前 Loss: {avg_loss:.4f} | 漂移量: {diff:+.4f}")
+            if diff > self.max_allowed_loss_increase:
+                print(f"🚨 [警告] 通用基准已出现严重遗忘迹象！漂移量 {diff:.4f} 超过阈值 {self.max_allowed_loss_increase}")</code></pre>
+    </div>
+
+    <p><strong>本节小结：</strong>现代 SFT 工程依靠声明式配置（LLaMA-Factory）与底层灵活 API（TRL）的协同；将序列打包、余弦退火与哨兵回调贯穿于训练全流程，是保障工业级产出稳定性的基石。</p>
+
+    <h2>9. 本章小结</h2>
+    <ul>
+      <li><strong>超参纪律第一：</strong>全参 SFT 是在预训练极优盆地边缘的平滑对齐，峰值学习率严格限制在 \(1.0 \times 10^{-5} \sim 2.0 \times 10^{-5}\)（7B）与 \(3.0 \times 10^{-6} \sim 8.0 \times 10^{-6}\)（70B）；LoRA 因低秩空间隔离，可采用 \(1.0 \times 10^{-4}\) 量级。</li>
+      <li><strong>Epoch 决不盲目堆砌：</strong>1 到 2 个 Epoch 即可完成格式与意图注入；超过 3 个 Epoch 会引发样式过拟合、自注意力范数崩坏以及机械复读。</li>
+      <li><strong>质量碾压数量：</strong>表面对齐假说（LIMA）与 DEITA 的实验表明，1 万条高复杂度、高多样性的精选数据胜过 50 万条盲目爬取的网页低质对话。</li>
+      <li><strong>防御灾难性遗忘：</strong>在领域微调中强制掺入 10%~20% 的通用指令数据（经验回放），并配置 MMLU/GSM8K 哨兵验证集实时监控泛化边界。</li>
+      <li><strong>SFT 的交棒时机：</strong>当格式遵循完备、边际收益递减且对齐税接近红线时，应果断结束 SFT，将更深层次的价值取向与复杂推理提升交由偏好对齐（RLHF/DPO/GRPO）完成。</li>
+    </ul>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details>
+        <summary>问题 1：为什么全参微调 7B 模型时学习率设为 \(2.0 \times 10^{-4}\) 会导致严重的灾难性遗忘，而 LoRA 微调使用该学习率却表现优异？</summary>
+        <p><strong>答案：</strong>因为全参微调时，模型的全部权重均会接收梯度并更新。预训练模型已经处于语言与世界知识表征的低损失极优盆地，过高的学习率（如 \(2.0 \times 10^{-4}\)）会产生剧烈的参数位移，直接破坏深层自注意力和前馈网络的正交特征空间，导致预训练知识熵增与灾难性遗忘。而 LoRA 冻结了底座模型的主干权重 \(W_0\)，梯度仅作用在极小维度的低秩旁路矩阵 \(A\) 与 \(B\) 上；为了驱动这个零初始化的紧凑子空间产生足够强度的激活调制，必须使用大一个数量级的学习率。且由于低秩矩阵自由度受限，它从数学机制上无法彻底覆盖主干网络的全局知识。</p>
+      </details>
+      <details>
+        <summary>问题 2：在 SFT 训练过程中，为什么必须严格监控 Validation Loss，且为什么训练集 Loss 降到 0.6 以下往往不是好事？</summary>
+        <p><strong>答案：</strong>大语言模型的参数容量极大（数十亿至数百亿），而 SFT 数据集通常仅有数万条。过低的训练集 Loss（如 0.6 以下）通常意味着模型已经脱离了宏观语用对齐，进入了对训练集具体 token、标点和冗长句式结构的机械记忆阶段（过拟合）。此时验证集上的 Eval Loss 会出现翘头回升（泛化误差扩大），且在开放评测中会出现语气僵化、特定句式复读以及虚假自信幻觉加剧等严重表征退化。因此必须通过留出验证集进行早停控制。</p>
+      </details>
+      <details>
+        <summary>问题 3：在垂直领域（如医疗或法律）SFT 时，为什么不能仅使用 100% 垂直领域数据进行微调？业界最标准的数据配方是什么？</summary>
+        <p><strong>答案：</strong>如果进行 100% 垂直领域微调，优化器的单一梯度流向会将参数强行拉向该领域特有的语义子空间，导致通用常识、数学推理与通用指令遵循能力发生严重的灾难性遗忘。业界的标准解法是采用经验重放（Experience Replay）机制：在数据集中保持 70%~80% 领域核心数据的同时，强制混入 20%~30% 的通用高质量多任务数据（包括代码、数学推导与日常问答）。通用数据充当参数空间中的几何锚点，约束模型在吸收专业领域表征的同时维持原有的泛化结构。</p>
+      </details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Zhou+, 2023]</span> Zhou, C. et al. "LIMA: Less Is More for Alignment." <i>NeurIPS</i>, 2023. <a href="https://arxiv.org/abs/2305.11206" target="_blank">arXiv:2305.11206</a></li>
+      <li><span class="rid">[Chen+, 2023]</span> Chen, L. et al. "AlpaGasus: Training A Better Alpaca with Fewer Data." <i>arXiv preprint</i>, 2023. <a href="https://arxiv.org/abs/2307.08701" target="_blank">arXiv:2307.08701</a></li>
+      <li><span class="rid">[Liu+, 2023]</span> Liu, W. et al. "What Makes Good Data for Alignment? A Comprehensive Study of Automatic Data Selection." <i>ICLR</i>, 2024. <a href="https://arxiv.org/abs/2312.15685" target="_blank">arXiv:2312.15685</a></li>
+      <li><span class="rid">[Tunstall+, 2023]</span> Tunstall, L. et al. "Zephyr: Direct Distillation of LM Alignment." <i>arXiv preprint</i>, 2023. <a href="https://arxiv.org/abs/2310.16944" target="_blank">arXiv:2310.16944</a></li>
+      <li><span class="rid">[Ivison+, 2023]</span> Ivison, H. et al. "Camels in a Changing Climate: Enhancing LM Adaptation with Tulu 2." <i>arXiv preprint</i>, 2023. <a href="https://arxiv.org/abs/2311.10702" target="_blank">arXiv:2311.10702</a></li>
+      <li><span class="rid">[Lambert+, 2024]</span> Lambert, N. et al. "Tulu 3: Pushing Frontiers in Open Language Model Post-Training." <i>arXiv preprint</i>, 2024. <a href="https://arxiv.org/abs/2411.15124" target="_blank">arXiv:2411.15124</a></li>
+      <li><span class="rid">[Ding+, 2023]</span> Ding, N. et al. "Enhancing Chat Language Models by Scaling High-quality Instructional Conversations." <i>EMNLP</i>, 2023. <a href="https://arxiv.org/abs/2305.14283" target="_blank">arXiv:2305.14283</a></li>
+      <li><span class="rid">[Taori+, 2023]</span> Taori, R. et al. "Stanford Alpaca: An Instruction-following LLaMA model." <i>GitHub Repository</i>, 2023. <a href="https://github.com/tatsu-lab/stanford_alpaca" target="_blank">https://github.com/tatsu-lab/stanford_alpaca</a></li>
+      <li><span class="rid">[Zheng+, 2024]</span> Zheng, Y. et al. "LlamaFactory: Unified Efficient Fine-Tuning of 100+ Language Models." <i>ACL System Demonstrations</i>, 2024. <a href="https://arxiv.org/abs/2403.13372" target="_blank">arXiv:2403.13372</a></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

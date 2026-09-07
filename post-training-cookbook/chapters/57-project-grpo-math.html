@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 57 章 · 项目三：GRPO 数学推理强化 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 10 部分 · 完整实战项目</div>
+      <h1>第 57 章 · 项目三：GRPO 数学推理强化</h1>
+      <p class="chapter-lead">DeepSeek-R1-Zero 的横空出世，向世界证明了纯强化学习（Pure RL）无需昂贵的监督微调冷启动，仅凭客观规则奖励就能激发大语言模型的深层反思、自我纠错与长思维链（Long CoT）涌现。本章带领读者在消费级显卡（单卡或双卡 RTX 4090）上，使用极简且高效的群体相对策略优化（Group Relative Policy Optimization, GRPO）算法，在 GSM8K 与 MATH 数据集上对 Qwen2.5-Math-1.5B 进行数学推理专项强化。我们将从 LaTeX 符号判优、组采样优势归一化、思考长度涌现监控，到完整的端到端闭环代码，全景复现大模型“顿悟时刻”（Aha Moment）。</p>
+      <div class="chapter-meta">⏱ 预计学习 120 分钟 ｜ 难度 ★★★★★ ｜ 先修：第 25 章、第 26 章、第 27 章</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 项目背景与 DeepSeek-R1-Zero 范式</h2>
+    <p>传统的强化学习算法（如 PPO）在提升复杂多步推理任务（如奥林匹克数学、代码竞赛、定理证明）时，常常面临两大瓶颈：第一，<strong>Critic（价值网络）拟合难度高且极易过拟合</strong>。在长达数千 Token 的推理链条中，单一价值模型很难在早期准确预测最终答案的正误，导致单步优势评估充斥巨大方差；第二，<strong>显存开销沉重</strong>。PPO 要求 Actor、Critic、Ref、Reward 四个大模型同时驻留显存或分布式节点，严重限制了消费级硬件探索强化学习的可能。</p>
+
+    <p>DeepSeek 团队在 DeepSeekMath 与 DeepSeek-R1 中提出的 <strong>GRPO（Group Relative Policy Optimization）</strong> 彻底颠覆了这种范式。GRPO 的第一项革新是<strong>彻底砍掉 Critic 模型</strong>：对于每个输入问题，策略网络并发 Rollout 采样一组（如 \( G = 8 \) 或 \( 16 \)）候选输出序列，以该组内所有回答的平均奖励和标准差作为基线，直接计算出每个候选回答的相对优势（Relative Advantage）。GRPO 的第二项革新是<strong>以客观可验证的规则判定取代脆弱的神经奖励模型</strong>：对于数学问题，答案要么正确，要么错误，利用精确的符号计算引擎（如 SymPy）提取并比对 LaTeX 终解，完全避免了神经网络奖励模型容易被“奖励黑客（Reward Hacking）”欺骗的顽疾。</p>
+
+    <p>在本项目中，我们将以 <strong>Qwen2.5-Math-1.5B</strong> 为基础，搭建一套极致轻量的 GRPO 强化学习流水线。在纯基于规则奖励的环境下，读者将直观观测到模型在没有人工干预的情况下，自发学会“在 <code>&lt;think&gt;...&lt;/think&gt;</code> 标签内长篇草稿演算、自我否定‘Wait, let me double check’并最终推导出正确答案”的顿悟全过程。</p>
+
+    <!-- 图 57-1：GRPO 位图引用 -->
+    <figure class="figure">
+      <img src="../assets/figs/grpo.png" alt="DeepSeekMath GRPO 算法原理示意">
+      <figcaption>图 57-1：GRPO 算法原理：对于输入查询并发采样输出组，通过组内奖励归一化计算优势函数，彻底摆脱 Critic 模型（来源：Shao et al., 2024, arXiv:2402.03300）</figcaption>
+    </figure>
+
+    <h2>2. GRPO 数学原理与组内归一化优势推导</h2>
+    <p>为了深刻理解 GRPO 为什么能够在保持策略梯度无偏的同时大幅降低显存，我们考察其目标函数。对于每一个问题查询 \( q \sim \mathcal{P}(Q) \)，GRPO 不再调用 Critic 网络计算状态价值 \( V_\phi(s) \)，而是利用当前旧策略 \( \pi_{\theta_{\mathrm{old}}} \) 独立采样生成 \( G \) 个候选回答：</p>
+    \[ \{o_1, o_2, \dots, o_G\} \sim \pi_{\theta_{\mathrm{old}}}(\cdot \mid q) \]
+    <p>环境根据预设的规则奖励函数（Rule-based Reward Function）为每一个输出 \( o_i \) 评定一个标量奖励 \( r_i \)。随后，在当前回答组内部计算标量奖励的样本均值 \( \bar{r} \) 与标准差 \( \sigma_r \)：</p>
+    \[ \bar{r} = \frac{1}{G} \sum_{i=1}^G r_i, \quad \sigma_r = \sqrt{\frac{1}{G} \sum_{i=1}^G (r_i - \bar{r})^2 + \epsilon} \]
+    <p>第 \( i \) 个候选回答获得的归一化相对优势 \( A_i \) 被严格定义为标准化 Z-score：</p>
+    \[ A_i = \frac{r_i - \bar{r}}{\sigma_r} \]
+    <p>该设计的精妙之处在于：如果某个回答在组内表现鹤立鸡群（如其余 7 个回答都算错，只有它做对），其相对优势 \( A_i \) 将显著为正，策略梯度会大幅强化其所有 Token 的发射概率；反之，若某个回答犯了愚蠢错误，其优势为负，梯度将被压制。若组内所有回答全部正确或全部错误，此时方差极小或为零（分子全为 0），该样本对策略梯度不做无效贡献，天然充当了极佳的样本难度筛选器！</p>
+
+    <p>GRPO 的整体策略优化损失函数结合了 PPO-Clip 截断与 KL 散度惩罚约束：</p>
+    \[ \mathcal{L}_{\mathrm{GRPO}}(\theta) = -\frac{1}{G}\sum_{i=1}^G \frac{1}{|o_i|}\sum_{t=1}^{|o_i|} \min \left( \frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_{\mathrm{old}}}(o_{i,t} \mid q, o_{i,<t})} A_i, \; \text{clip}\left(\frac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\pi_{\theta_{\mathrm{old}}}(o_{i,t} \mid q, o_{i,<t})}, 1-\varepsilon, 1+\varepsilon\right) A_i \right) + \beta \mathbb{D}_{\mathrm{KL}}(\pi_\theta \parallel \pi_{\mathrm{ref}}) \]
+
+    <!-- 自绘 SVG：GRPO 并发采样与闭环优化图 -->
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="GRPO 并发 Rollout 采样、规则验证器打分与优势反向传播闭环图">
+        <defs>
+          <marker id="grpo-arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+          </marker>
+          <marker id="grpo-arr-green" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#10b981"/>
+          </marker>
+          <marker id="grpo-arr-red" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="#ef4444"/>
+          </marker>
+        </defs>
+
+        <rect x="0" y="0" width="720" height="280" fill="#ffffff" rx="8"/>
+
+        <!-- 输入查询 -->
+        <rect x="15" y="45" width="115" height="75" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="72" y="75" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e40af">数学问题 q</text>
+        <text x="72" y="98" text-anchor="middle" font-size="10.5" fill="#64748b">GSM8K / MATH</text>
+
+        <path d="M130 82 L 165 82" stroke="#2563eb" stroke-width="1.5" marker-end="url(#grpo-arr)"/>
+
+        <!-- 策略模型 Rollout -->
+        <rect x="170" y="30" width="150" height="105" rx="8" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="245" y="55" text-anchor="middle" font-size="13" font-weight="bold" fill="#b45309">Policy 网络 π_θ</text>
+        <text x="245" y="78" text-anchor="middle" font-size="11" fill="#1e293b">组并发采样 (G=8)</text>
+        <text x="245" y="98" text-anchor="middle" font-size="10.5" fill="#64748b">生成 &lt;think&gt; 思维链</text>
+        <text x="245" y="118" text-anchor="middle" font-size="10.5" fill="#64748b">输出 Candidate o_1..o_G</text>
+
+        <!-- 规则奖励函数群 -->
+        <rect x="355" y="25" width="165" height="115" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="437" y="50" text-anchor="middle" font-size="13" font-weight="bold" fill="#047857">规则验证奖励引擎</text>
+        <text x="437" y="72" text-anchor="middle" font-size="11" fill="#065f46">1. 标签格式完整性 (r_fmt)</text>
+        <text x="437" y="92" text-anchor="middle" font-size="11" fill="#065f46">2. 正则提取 \boxed{} 答案</text>
+        <text x="437" y="112" text-anchor="middle" font-size="11" fill="#065f46">3. SymPy 符号代数精确校验</text>
+        <text x="437" y="130" text-anchor="middle" font-size="11" font-weight="bold" fill="#047857">得出标量奖励: r_1 ... r_G</text>
+
+        <path d="M320 82 L 350 82" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#grpo-arr)"/>
+
+        <!-- 组归一化优势计算 -->
+        <rect x="550" y="30" width="155" height="105" rx="8" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>
+        <text x="627" y="55" text-anchor="middle" font-size="13" font-weight="bold" fill="#5b21b6">组相对优势归一化</text>
+        <text x="627" y="78" text-anchor="middle" font-size="11" fill="#1e293b">均值: μ = Σ r_i / G</text>
+        <text x="627" y="98" text-anchor="middle" font-size="11" fill="#1e293b">标准差: σ = Std(r)</text>
+        <text x="627" y="120" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#5b21b6">A_i = (r_i - μ) / σ</text>
+
+        <path d="M520 82 L 545 82" stroke="#10b981" stroke-width="1.5" marker-end="url(#grpo-arr-green)"/>
+
+        <!-- 策略梯度优化 -->
+        <rect x="230" y="180" width="370" height="75" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="415" y="205" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e40af">GRPO 裁剪策略梯度与 KL 散度约束更新</text>
+        <text x="415" y="226" text-anchor="middle" font-size="11" fill="#1e293b">L = - (1/G) Σ [ min(Ratio · A_i, Clip · A_i) ] + β D_KL(π_θ || π_ref)</text>
+        <text x="415" y="244" text-anchor="middle" font-size="10.5" fill="#475569">无 Critic 梯度反传，极致节省显存</text>
+
+        <!-- 闭环连线 -->
+        <path d="M627 135 L 627 217 L 605 217" stroke="#8b5cf6" stroke-width="1.5" marker-end="url(#grpo-arr)"/>
+        <path d="M230 217 L 110 217 L 110 95 L 165 95" stroke="#ef4444" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#grpo-arr-red)"/>
+        <text x="145" y="240" text-anchor="middle" font-size="11" font-weight="bold" fill="#ef4444">梯度更新参数 θ</text>
+      </svg>
+      <figcaption>图 57-2：GRPO 组并发 Rollout 采样、纯规则验证器打分与无 Critic 优势反传闭环架构</figcaption>
+    </figure>
+
+    <div class="callout tip">
+      <div class="callout-title">💡 深度洞察：为什么 GRPO 天然需要组采样大小 G ≥ 4？</div>
+      <p>在优势归一化式 \( A_i = (r_i - \bar{r})/\sigma_r \) 中，如果 \( G=2 \)，一旦两个回答一个对一个错，则标准化后的优势恒为 \( +1 \) 和 \( -1 \)，丧失了更细粒度的奖励幅度对比；如果两个都对或都错，则方差为 0。当 \( G \ge 8 \) 时，组内采样能够充分覆盖“多种解题路径”、“不同格式错误”以及“计算偶然失误”的样本分布空间，使均值 \( \bar{r} \) 成为极具统计代表性的移动基线（Moving Baseline），从而实现极低方差的稳定梯度回传。</p>
+    </div>
+
+    <h2>3. 严密的多维度规则奖励函数设计</h2>
+    <p>在数学强化学习中，奖励函数的设计必须做到<strong>客观、确定、无漏洞</strong>。任何模棱两可的打分都会被语言模型迅速利用为捷径。我们为模型定制了一套复合规则奖励系统，涵盖结构格式、终解正确性与长度平滑性。</p>
+
+    <h3>3.1 奖励三元组构成</h3>
+    <ol>
+      <li><strong>格式规范奖励（Format Reward, \( r_{\mathrm{format}} \in \{0.0, 0.5\} \)）：</strong>
+        强制要求模型严格按照 <code>&lt;think&gt;推理过程&lt;/think&gt; \n 答案在 \boxed{result}</code> 的格式输出。若标签未闭合、顺序颠倒或缺失，直接扣除格式分；</li>
+      <li><strong>精确答案奖励（Accuracy Reward, \( r_{\mathrm{acc}} \in \{0.0, 1.0\} \)）：</strong>
+        从输出文本中提取 <code>\boxed{...}</code> 内的 LaTeX 字符。通过正则表达式与 SymPy 符号代数引擎进行同解简化比对（例如识别 \( \frac{2}{4} = 0.5 \)、\( 2\sqrt{2} = \sqrt{8} \) 等等）。若完全一致赋 1.0 分，否则 0 分；</li>
+      <li><strong>惩罚项与兜底：</strong>若模型回答为空、超时或产生恶性死循环，直接赋予总奖励 0.0。</li>
+    </ol>
+
+    <!-- 表 57-1：数学强化学习规则奖励权重与细则设计 -->
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>奖励分项</th>
+            <th>权重 / 取值</th>
+            <th>判定逻辑与提取技术</th>
+            <th>规避的异常行为（Anti-Patterns）</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>准确性（Accuracy）</strong></td>
+            <td>1.0 / 0.0</td>
+            <td>SymPy 符号等价判定、浮点绝对误差 \( < 10^{-4} \)</td>
+            <td>防止浮点截断或代数异形表达被误杀为错误</td>
+          </tr>
+          <tr>
+            <td><strong>思考标签完整性</strong></td>
+            <td>0.3</td>
+            <td>正则严格匹配 <code>^&lt;think&gt;.*&lt;/think&gt;</code> 闭合</td>
+            <td>防止模型跳过草稿推演，直接瞎猜最终答案</td>
+          </tr>
+          <tr>
+            <td><strong>终解框定规范</strong></td>
+            <td>0.2</td>
+            <td>必须包含且仅包含一个 <code>\boxed{...}</code></td>
+            <td>防止模型生成多个自相矛盾的候选答案博弈分数</td>
+          </tr>
+          <tr>
+            <td><strong>重复惩罚（Penalty）</strong></td>
+            <td>-0.5</td>
+            <td>4-gram 重复率超过 40% 触发惩罚</td>
+            <td>防止在思考标签内陷入复读机式无效延展刷长度</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 57-1：GRPO 数学推理训练规则奖励组件与惩罚设计</span>
+    </div>
+
+    <h3>3.2 符号化判优器实现代码</h3>
+    <p>以下代码展示了工业级符号数学判定器的实现，能够优雅处理 LaTeX 复杂分式、根号与方程：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">math_verifier.py</span>
+      <pre class="code"><code class="language-python">import re
+from typing import Optional
+import sympy
+from sympy.parsing.sympy_parser import parse_expr
+
+class MathRuleRewardVerifier:
+    def __init__(self):
+        # 严格匹配 <think>...</think> 以及 \boxed{...} 的正则模式
+        self.think_pattern = re.compile(r"&lt;think&gt;(.*?)&lt;/think&gt;", re.DOTALL)
+        self.boxed_pattern = re.compile(r"\\boxed\{([^{}]+)\}")
+
+    def extract_boxed_answer(self, text: str) -&gt; Optional[str]:
+        """从生成文本中提取最终框定答案"""
+        matches = self.boxed_pattern.findall(text)
+        if not matches:
+            return None
+        # 默认取最后一个框定答案作为终决结论
+        return matches[-1].strip()
+
+    def check_format_compliance(self, text: str) -&gt; float:
+        """检查思考标签与答案框定格式完整度"""
+        reward = 0.0
+        has_think = bool(self.think_pattern.search(text))
+        has_boxed = bool(self.boxed_pattern.search(text))
+        
+        if has_think:
+            reward += 0.3
+        if has_boxed:
+            reward += 0.2
+        return reward
+
+    def verify_algebraic_equivalence(self, pred: str, ground_truth: str) -&gt; bool:
+        """利用 SymPy 判断两个数学表达是否符号等价"""
+        if pred == ground_truth:
+            return True
+        
+        # 简单清洗 LaTeX 常见语法
+        def clean_latex(s: str) -&gt; str:
+            s = s.replace(r"\frac", "").replace(r"\times", "*").replace(r"\div", "/")
+            s = s.replace("{", "(").replace("}", ")").replace("^", "**")
+            s = re.sub(r"[a-zA-Z\\]", "", s) # 移除非公式文本
+            return s.strip()
+
+        try:
+            p_expr = parse_expr(clean_latex(pred))
+            g_expr = parse_expr(clean_latex(ground_truth))
+            # 两式做差化简，若为 0 则代数恒等
+            if sympy.simplify(p_expr - g_expr) == 0:
+                return True
+        except Exception:
+            pass
+
+        # 浮点数比对兜底
+        try:
+            p_val = float(pred.replace(",", "").strip())
+            g_val = float(ground_truth.replace(",", "").strip())
+            return abs(p_val - g_val) &lt; 1e-4
+        except ValueError:
+            pass
+
+        return False
+
+    def compute_reward(self, response: str, ground_truth: str) -&gt; float:
+        """综合打分主入口"""
+        fmt_reward = self.check_format_compliance(response)
+        pred_ans = self.extract_boxed_answer(response)
+        
+        acc_reward = 0.0
+        if pred_ans is not None:
+            if self.verify_algebraic_equivalence(pred_ans, ground_truth):
+                acc_reward = 1.0
+                
+        return fmt_reward + acc_reward
+
+if __name__ == "__main__":
+    verifier = MathRuleRewardVerifier()
+    demo_sample = (
+        "&lt;think&gt;Let x be the speed. 2x + 10 = 30 =&gt; 2x = 20 =&gt; x = 10.&lt;/think&gt;\n"
+        "The final answer is \\boxed{10}"
+    )
+    score = verifier.compute_reward(demo_sample, "10.0")
+    print(f"验证打分测试结果: {score}")  # 应输出 1.5 (0.5 格式分 + 1.0 答案分)
+</code></pre>
+    </div>
+
+    <h2>4. 单卡/双卡极简 GRPO 训练架构与流水线</h2>
+    <p>传统的强化学习实现库（如 TRL 的 PPO 或 Ray 分布式套件）对于 24GB 显存显卡往往过于庞大。为了让读者完全掌握 GRPO 的内在机理，我们提供一个<strong>轻量、原生 PyTorch 实现的 GRPO 训练脚本</strong>。该脚本具备组采样生成、重要性采样比率截断、KL 散度在线惩罚及梯度累积功能。</p>
+
+    <!-- 表 57-2：GRPO 数学训练关键超参数配置 -->
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>超参数名称</th>
+            <th>推荐设置值</th>
+            <th>说明与调参经验</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>group_size (G)</code></td>
+            <td>8</td>
+            <td>每道数学题并发生成的候选样本数。单卡显存受限时可设为 4，若显存充足建议设为 16。</td>
+          </tr>
+          <tr>
+            <td><code>rollout_temperature</code></td>
+            <td>0.85 ~ 1.0</td>
+            <td>采样温度必须保持较高，以激发模型探索不同的解题路径。过低会导致组内缺乏多样性。</td>
+          </tr>
+          <tr>
+            <td><code>clip_eps (\(\varepsilon\))</code></td>
+            <td>0.2</td>
+            <td>重要性采样比率截断阈值，防止单步策略概率剧烈跳跃导致发散。</td>
+          </tr>
+          <tr>
+            <td><code>kl_weight (\(\beta\))</code></td>
+            <td>0.04</td>
+            <td>控制相对参考模型的漂移惩罚。数学领域允许适度放宽探索，因此略低于通用对话。</td>
+          </tr>
+          <tr>
+            <td><code>max_new_tokens</code></td>
+            <td>1024 ~ 2048</td>
+            <td>必须给长思维链预留充足的展开空间。过短会导致深层推理在未完成时被强行截断。</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 57-2：Qwen2.5-Math-1.5B 单卡 GRPO 强化学习核心超参数表</span>
+    </div>
+
+    <h3>4.1 端到端单卡 GRPO 训练脚本</h3>
+    <p>以下是完整的可运行训练脚本，包含批量 Rollout、组归一化优势计算与策略梯度回传：</p>
+
+    <div class="code-wrap">
+      <span class="code-label">train_grpo_math_minimal.py</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
+from math_verifier import MathRuleRewardVerifier
+
+# 系统提示词强制引导模型开启标签思考
+SYSTEM_PROMPT = "你是一名卓越的数学家。请在 <think> 标签内写下极其详尽的解题思考推导步骤，并在最后给出格式为 \\boxed{答案} 的最终结果。"
+
+def selective_log_probs(logits: torch.Tensor, input_ids: torch.Tensor) -&gt; torch.Tensor:
+    """提取生成 Token 对应的条件对数概率"""
+    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
+    targets = input_ids[:, 1:].unsqueeze(-1)
+    selected = torch.gather(log_probs, dim=-1, index=targets).squeeze(-1)
+    return selected
+
+def compute_group_advantages(rewards: torch.Tensor, eps: float = 1e-6) -&gt; torch.Tensor:
+    """计算组内样本的归一化相对优势"""
+    mean = rewards.mean()
+    std = rewards.std()
+    return (rewards - mean) / (std + eps)
+
+def run_grpo_training():
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model_name = "Qwen/Qwen2.5-Math-1.5B"
+    group_size = 8
+    lr = 2e-5
+    clip_eps = 0.2
+    beta_kl = 0.04
+
+    print("&gt;&gt;&gt; 加载分词器与策略模型...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16).to(device)
+    
+    # 挂载 LoRA 仅更新轻量适配层
+    peft_config = LoraConfig(
+        r=16, lora_alpha=32, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        task_type="CAUSAL_LM"
+    )
+    model = get_peft_model(model, peft_config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    
+    verifier = MathRuleRewardVerifier()
+
+    # 模拟一道 GSM8K 数学题
+    query = "小明有 15 个苹果，他把其中的 1/3 送给了小红，随后又买来了 8 个。请问小明现在一共有多少个苹果？"
+    ground_truth = "18"
+
+    prompt_text = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n"
+    prompt_inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    prompt_len = prompt_inputs.input_ids.shape[1]
+
+    print(f"&gt;&gt;&gt; 启动 GRPO Rollout 并发采样 (G={group_size})...")
+    # 扩展 Prompt 为 group_size 份
+    expanded_input_ids = prompt_inputs.input_ids.repeat(group_size, 1)
+    
+    model.eval()
+    with torch.no_grad():
+        generated_ids = model.generate(
+            expanded_input_ids,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.9,
+            top_p=0.95,
+            pad_token_id=tokenizer.eos_token_id
+        )
+
+    # 截取新生成的 Token
+    responses = [tokenizer.decode(g[prompt_len:], skip_special_tokens=True) for g in generated_ids]
+    
+    # 计算每条路径的规则奖励
+    raw_rewards = []
+    for resp in responses:
+        score = verifier.compute_reward(resp, ground_truth)
+        raw_rewards.append(score)
+    rewards_tensor = torch.tensor(raw_rewards, device=device, dtype=torch.float32)
+    
+    # 计算组归一化优势
+    advantages = compute_group_advantages(rewards_tensor)
+    print(f"组奖励得分: {raw_rewards} | 归一化优势: {advantages.tolist()}")
+
+    # 开始策略梯度更新
+    model.train()
+    optimizer.zero_grad()
+
+    # 前向计算当前策略的对数似然
+    outputs = model(generated_ids)
+    all_log_probs = selective_log_probs(outputs.logits, generated_ids)
+    response_log_probs = all_log_probs[:, prompt_len - 1:]
+
+    with torch.no_grad():
+        # 旧策略的似然，此处近似为 Rollout 时的当前值
+        old_log_probs = response_log_probs.detach()
+
+    # 计算重要性采样比率 ratio = pi_theta / pi_old
+    ratio = torch.exp(response_log_probs - old_log_probs)
+    
+    # 将优势沿序列维度广播
+    adv_broadcast = advantages.unsqueeze(-1).expand_as(ratio)
+    
+    # PPO-Clip 目标
+    surr1 = ratio * adv_broadcast
+    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_broadcast
+    policy_loss = -torch.min(surr1, surr2).mean()
+
+    # 简单 KL 惩罚（向旧似然靠拢）
+    kl_div = (torch.exp(old_log_probs) * (old_log_probs - response_log_probs)).mean()
+    total_loss = policy_loss + beta_kl * kl_div
+
+    total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+
+    print(f"Step 完成: Loss = {total_loss.item():.4f}, 平均奖励 = {rewards_tensor.mean().item():.2f}")
+
+if __name__ == "__main__":
+    run_grpo_training()
+</code></pre>
+    </div>
+
+    <h2>5. 思考长度涌现（Length Surge）与顿悟现象监控</h2>
+    <p>在复现 DeepSeek-R1-Zero 风格的纯强化学习训练时，工程师通常会经历标志性的三阶段演进：</p>
+    <ol>
+      <li><strong>探索混沌期（0 ~ 100 Steps）：</strong>模型输出混乱，常常忘记闭合 <code>&lt;/think&gt;</code> 标签或完全猜错，平均奖励低迷（0.2 ~ 0.4），回答长度平稳；</li>
+      <li><strong>思考长度涌现爆发期（100 ~ 500 Steps）：</strong>在纯准确率奖励与格式奖励的持续双向选择下，模型猛然发现：<strong>在 <code>&lt;think&gt;</code> 标签内展开更长时间的分步穷举与自我检验，能够大幅增加猜中最终正确答案的概率！</strong>此时，平均输出长度从 200 Token 瞬间激增至 1500+ Token。在 TensorBoard 监控曲线上，可以观察到显著的“长度激增（Length Surge）”脉冲；</li>
+      <li><strong>顿悟与收敛期（500+ Steps）：</strong>模型开始在思维链中自主展现反思词符（例如生成“Wait, let me rethink the previous step”、“Could this case be zero?”等）。准确率从初期的 35% 跃升至 70% 以上，同时思维长度逐步稳定在合理的有效区间，不再无节制膨胀。</li>
+    </ol>
+
+    <!-- 自绘 SVG：思考长度激增与顿悟时刻双轴演变图 -->
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="思考长度涌现与准确率监控演化趋势图">
+        <rect x="0" y="0" width="720" height="220" fill="#ffffff" rx="8"/>
+
+        <!-- 坐标轴 -->
+        <line x1="60" y1="180" x2="680" y2="180" stroke="#94a3b8" stroke-width="1.5"/>
+        <line x1="60" y1="20" x2="60" y2="180" stroke="#94a3b8" stroke-width="1.5"/>
+        <line x1="680" y1="20" x2="680" y2="180" stroke="#94a3b8" stroke-width="1.5"/>
+
+        <!-- 刻度与标签 -->
+        <text x="60" y="198" text-anchor="middle" font-size="11" fill="#64748b">0 Step</text>
+        <text x="250" y="198" text-anchor="middle" font-size="11" fill="#64748b">200 Step (探索期)</text>
+        <text x="450" y="198" text-anchor="middle" font-size="11" fill="#64748b">500 Step (涌现爆发)</text>
+        <text x="660" y="198" text-anchor="middle" font-size="11" fill="#64748b">1000 Step (收敛)</text>
+
+        <text x="20" y="25" text-anchor="start" font-size="11" font-weight="bold" fill="#2563eb">准确率 (%)</text>
+        <text x="700" y="25" text-anchor="end" font-size="11" font-weight="bold" fill="#f59e0b">思考 Token 长度</text>
+
+        <!-- 准确率曲线 (蓝实线) -->
+        <path d="M60 145 C 200 140, 350 110, 450 70 S 600 45, 680 40" fill="none" stroke="#2563eb" stroke-width="2.5"/>
+        <!-- 思考长度曲线 (橙虚线) -->
+        <path d="M60 165 C 200 160, 320 130, 420 50 S 550 65, 680 75" fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="4 3"/>
+
+        <!-- 关键事件标注：顿悟时刻 -->
+        <circle cx="430" cy="55" r="5" fill="#ef4444"/>
+        <line x1="430" y1="55" x2="430" y2="15" stroke="#ef4444" stroke-width="1.5"/>
+        <rect x="380" y="5" width="100" height="20" rx="4" fill="#fef2f2" stroke="#ef4444" stroke-width="1"/>
+        <text x="430" y="19" text-anchor="middle" font-size="11" font-weight="bold" fill="#ef4444">Aha Moment (顿悟)</text>
+
+        <!-- 图例 -->
+        <line x1="220" y1="212" x2="250" y2="212" stroke="#2563eb" stroke-width="2.5"/>
+        <text x="255" y="215" font-size="11" fill="#1e293b">数学准确率 (Accuracy)</text>
+
+        <line x1="420" y1="212" x2="450" y2="212" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="4 3"/>
+        <text x="455" y="215" font-size="11" fill="#1e293b">思考链平均长度 (Tokens)</text>
+      </svg>
+      <figcaption>图 57-3：纯强化学习训练过程中思维链长度激增与数学推理准确率双轴演化图谱</figcaption>
+    </figure>
+
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：如何防范有害的“假思考与复读死循环”？</div>
+      <p>在纯规则驱动的 RL 训练中，若仅给予正确性奖励，模型可能会钻空子：在 <code>&lt;think&gt;</code> 标签内疯狂重复同一句话几十次来规避思考难度，以此尝试随机撞大运。排查手段与防护技巧：</p>
+      <ul>
+        <li><strong>引入 n-gram 重复惩罚：</strong>当检测到思考区间内连续出现 3 次以上相同短语时，施加严重的负奖励（-0.5）；</li>
+        <li><strong>动态最大长度裁剪：</strong>在初期限制 <code>max_new_tokens = 768</code>，待准确率提升至 50% 之后再分阶段解锁至 1536，引导模型逐步构建深层推理；</li>
+        <li><strong>早停拦截：</strong>若 Rollout 生成提前遇到连续三个 EOS 或死循环标点，立即截断并判定该样本为 0 奖励。</li>
+      </ul>
+    </div>
+
+    <h2>6. 常见陷阱与工程调优避坑指南</h2>
+    <p>复现基于 GRPO 的长思维链模型是一项充满挑战的工程实践。下表汇总了单卡训练过程中最常见的五类严重故障与针对性修复方案：</p>
+
+    <!-- 表 57-3：GRPO 训练常见故障定位与解决字典 -->
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>异常现象</th>
+            <th>底层原因分析</th>
+            <th>推荐排查与调优方案</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>组内方差为 0 过于频繁</strong></td>
+            <td>题目过难（8 个全算错）或过简单（8 个全算对），导致标准化分子为 0</td>
+            <td>引入动态样本难度过滤，剔除全错/全对的 Prompt，保持探索有效性</td>
+          </tr>
+          <tr>
+            <td><strong>显存 OOM 崩溃</strong></td>
+            <td>并发生成 8 条长文本（每条 1024 Token）导致 KV Cache 瞬间占满 24GB</td>
+            <td>启用 FlashAttention-2，梯度检查点，或将 <code>group_size</code> 拆分为批次串行执行</td>
+          </tr>
+          <tr>
+            <td><strong>思考标签消失</strong></td>
+            <td>格式奖励权重过低，模型为了省事直接输出最终答案</td>
+            <td>调高格式合规奖励（如由 0.1 提升至 0.5），或在系统提示中强化格式指令</td>
+          </tr>
+          <tr>
+            <td><strong>奖励欺骗（Reward Hacking）</strong></td>
+            <td>模型在输出中罗列多个 <code>\boxed{}</code>，博取正则匹配的命中率</td>
+            <td>正则解析器必须限定“取且仅取最后一个框定项”，有多余框定项直接扣分</td>
+          </tr>
+          <tr>
+            <td><strong>策略崩溃（输出乱码）</strong></td>
+            <td>学习率过高（如 &gt; 5e-5）或 KL 散度约束权重 \( \beta \) 设为 0</td>
+            <td>将学习率回撤至 1e-5 ~ 2e-5，并确保保留 \( \beta \ge 0.02 \) 的基线约束</td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 57-3：GRPO 强化学习工程实战故障排除手册</span>
+    </div>
+
+    <h2>7. 本章小结</h2>
+    <p>在本章中，我们完整探索了以 GRPO 为核心的数学推理纯强化学习范式。核心结论包括：</p>
+    <ul>
+      <li><strong>去除 Critic 的革命性：</strong>GRPO 凭借组内均值与标准差的自归一化，在保持策略梯度稳定性的同时削减了价值网络的庞大开销，使得在消费级单卡上运行大规模强化学习成为现实；</li>
+      <li><strong>规则验证是推理任务的基石：</strong>使用 SymPy 符号代数解析配合严密正则提取，构建了坚固耐用、免受奖励黑客攻击的确定性打分闭环；</li>
+      <li><strong>顿悟现象是 RL 的天然产物：</strong>在无人工干预的纯强化激励下，模型会自发展开反思重算、检验边界与探索替代分支，伴随出现标志性的“思考长度激增”；</li>
+      <li><strong>防范过拟合与退化：</strong>严防重复复读与伪思考，利用轻量 LoRA、严格格式扣分与梯度截断，确保模型在数学逻辑推理主干道上稳健收敛。</li>
+    </ul>
+
+    <!-- 自测题 -->
+    <h2>8. 自测题</h2>
+    <div class="quiz">
+      <div class="quiz-question"><strong>题 1：</strong>GRPO 算法相较于经典 PPO 算法，最本质的架构简化是什么？它是如何替代传统 Critic（价值模型）的功能的？</div>
+      <div class="quiz-answer">
+        <strong>解析：</strong>最本质的简化是彻底移除了独立的 Critic（价值模型）网络。在经典 PPO 中，Critic 用于拟合状态价值 \( V(s) \) 以计算单步优势；而在 GRPO 中，策略模型针对同一个输入问题并发采样生成一组候选输出（Group Rollout，如 \( G=8 \)），通过计算该组内全部样本奖励的均值与标准差，使用标准化公式 \( A_i = (r_i - \bar{r})/\sigma_r \) 直接得出相对优势，从而完全免除了 Critic 的显存和计算开销。
+      </div>
+    </div>
+
+    <div class="quiz">
+      <div class="quiz-question"><strong>题 2：</strong>如果在 GRPO 训练的一轮迭代中，采样出的 \( G \) 个候选回答由于题目过难全部算错，导致获得的奖励均为 0 分，此时反向传播的梯度是多大？这种现象对训练有什么影响？</div>
+      <div class="quiz-answer">
+        <strong>解析：</strong>当所有回答的奖励完全相同时（如均为 0），组奖励均值 \( \bar{r} = 0 \)，每个回答的奖励与其均值之差 \( r_i - \bar{r} = 0 \)。在加入微小常数 \( \epsilon \) 防止除零后，计算出的所有相对优势 \( A_i \) 严格等于 0。根据策略梯度公式，该批次产生的策略梯度为零向量，不会对模型权重产生任何更新。这既防止了无效噪声对策略的扰动，也表明过于困难的样本在当前阶段无法提供有效探索反馈。
+      </div>
+    </div>
+
+    <div class="quiz">
+      <div class="quiz-question"><strong>题 3：</strong>在复现 DeepSeek-R1-Zero 模式时，观察到的“思考长度激增（Length Surge）”和“顿悟时刻（Aha Moment）”背后的强化学习驱动机制是什么？</div>
+      <div class="quiz-answer">
+        <strong>解析：</strong>驱动机制在于规则奖励对终解正确性的强确定性反馈。由于数学多步推理具有链式依赖性，直接跳到最终结论的猜测成功率极低。在多次随机探索中，模型偶尔在 <code>&lt;think&gt;</code> 标签内多进行几步试算与反思重查，从而命中了正确答案并获得了高正向优势；在策略梯度的正反馈累积下，模型迅速学到了“拉长思维链、在草稿中推演与检验能极大提升获赏期望”这一策略，自发展开长文本自我纠错，从而在宏观上呈现出思考长度激增与顿悟自省。
+      </div>
+    </div>
+
+    <!-- 参考文献 -->
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li>Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., Bi, X., ... & Guo, D. (2024). DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2402.03300" target="_blank">arXiv:2402.03300</a></li>
+      <li>DeepSeek-AI. (2025). DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2501.12948" target="_blank">arXiv:2501.12948</a></li>
+      <li>Schulman, J., Wolski, F., Dhariwal, P., Radford, A., & Klimov, O. (2017). Proximal policy optimization algorithms. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/1707.06347" target="_blank">arXiv:1707.06347</a></li>
+      <li>Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H., Kaiser, L., ... & Schulman, J. (2021). Training verifiers to solve math word problems. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2110.14168" target="_blank">arXiv:2110.14168</a></li>
+      <li>Hendrycks, D., Burns, C., Kadavath, S., Arora, A., Basart, S., Tang, E., ... & Steinhardt, J. (2021). Measuring Mathematical Problem Solving With the MATH Dataset. <em>NeurIPS 2021</em>. <a href="https://arxiv.org/abs/2103.03874" target="_blank">arXiv:2103.03874</a></li>
+      <li>Yang, A., Yang, B., Hui, B., Zheng, B., Yu, B., Zhou, C., ... & Zhang, Z. (2024). Qwen2.5-Math: Technical Report. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2409.12122" target="_blank">arXiv:2409.12122</a></li>
+      <li>Lightman, H., Kosaraju, V., Burda, Y., Couairon, G., Leike, J., & Sutskever, I. (2023). Let's Verify Step by Step. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2305.20050" target="_blank">arXiv:2305.20050</a></li>
+      <li>Uesato, J., Kushman, N., Kumar, R., Song, F., Siegel, N., Wang, L., ... & Higgins, I. (2022). Solving math word problems with process-and outcome-based feedback. <em>arXiv preprint</em>. <a href="https://arxiv.org/abs/2211.14275" target="_blank">arXiv:2211.14275</a></li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>

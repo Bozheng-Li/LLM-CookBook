@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 6 章 · 语言模型作为序贯决策问题 | 大模型后训练实战 Cookbook</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<script src="../assets/js/manifest.js"></script>
+<script>window.MathJax = { tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] }, options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] } };</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="../assets/js/nav.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content">
+
+    <header class="chapter-header">
+      <div class="chapter-crumb">第 1 部分 · 理论基础</div>
+      <h1>第 6 章 · 语言模型作为序贯决策问题</h1>
+      <p class="chapter-lead">本章是理论部分与算法部分的最后一座桥：把第 5 章的 MDP、策略梯度与 PPO 逐项翻译到语言模型上。你将看到 RLHF 目标函数如何从"最大化奖励 + KL 正则"推导出来、KL 项为什么可以并进奖励、三种 KL 估计器的数值差异，以及 LLM 上做 RL 的三大困难——读完即可无障碍进入第 4、5 部分的算法章节。</p>
+      <div class="chapter-meta">⏱ 预计学习 90 分钟 ｜ 难度 ★★★★☆ ｜ 先修：第 5 章（策略梯度、PPO）、概率论</div>
+    </header>
+
+    <nav class="toc-box" id="auto-toc"></nav>
+
+    <h2>1. 换个视角：生成即决策</h2>
+    <p>SFT 把生成当"模仿"：给定标准答案的每个 token，做加权最大似然。但后训练很快会撞上模仿的天花板：<strong>没人能写出"最优回答"</strong>。人类标注员只能告诉你哪个回答更好；数学题可以验证对错但没有过程模板；智能体任务里环境会返回成功或失败。这些信号的共同形态是：给定模型的<strong>一次完整生成</strong>，返回一个（或几个）标量评价——这正是第 5 章 MDP 的"回合 + 奖励"结构。换视角的实质是：不再问"下一个 token 应该是什么"，而是问"在已生成前缀的每一个决策点上，哪种选择会让最终评价更高"。</p>
+    <p>这个视角迁移不是文字游戏，它带来三个可操作的新能力。<strong>第一，优化目标可以直接写成评价函数</strong>：奖励模型分数、规则验证器、人类偏好，任何可计算的标量都能成为目标，不需要构造 token 级监督。<strong>第二，模型自己的采样成为训练数据</strong>：RL 在模型自己生成的分布上优化（on-policy），天然对齐部署时的分布；而 SFT 固定在人类示范分布上，存在"见过的会、没见过的崩"的暴露偏差（exposure bias）。<strong>第三，探索成为可能</strong>：采样温度让模型尝试多种回答，好的被强化、坏的被打压——这是"超越示范者"的唯一机制，DeepSeek-R1-Zero 展示了它的极限：不靠任何过程示范，纯 RL 把 base 模型的 AIME 2024 pass@1 从 39.7% 推到 71.0%（arXiv:2501.12948）。</p>
+    <p>当然，代价是继承了第 5 章列出的全部 RL 病灶，且被文本的尺度放大。本章的目标就是把翻译工作做彻底：每个 RL 概念对应 LLM 的什么对象（第 2 节），目标函数长什么样、为什么要加 KL（第 3~4 节），信号怎么给（第 5~7 节），怎么估计（第 8 节），坑在哪里（第 9 节），最后落到代码（第 10 节）。</p>
+    <p><strong>本节小结：</strong>生成即决策的视角把"没有标准答案、只有后果评价"的后训练问题接入 RL 框架，换来可优化任意评价函数、on-policy 数据与探索机制三样新能力。</p>
+
+    <h2>2. token-level MDP：一张完整的映射表</h2>
+    <p>把一次自回归生成映射为 MDP 的回合（episode）。设提示词为 \(x\)（含对话模板，见第 15 章），回答为 token 序列 \(y = (y_1, \dots, y_T)\)，以 EOS 结束。表 6-1 给出逐项对应——这张表是理解本书所有 RL 算法章节的"字典"，建议打印出来贴在屏幕旁。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>RL 概念</th><th>LLM 对应物</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>状态 \( s_t \)</td><td>\( s_t = (x, y_{&lt;t}) \)：提示词 + 已生成前缀</td><td>状态空间指数级大（所有可能的文本前缀）</td></tr>
+          <tr><td>动作 \( a_t \)</td><td>\( y_t \in \mathcal{V} \)：词表中的一个 token</td><td>动作空间 3.2 万~25 万维，远超经典 RL</td></tr>
+          <tr><td>转移 \( P(s_{t+1} \mid s_t, a_t) \)</td><td>确定性拼接：把 \( y_t \) 追加到前缀</td><td>无环境随机性——随机性全部来自策略采样</td></tr>
+          <tr><td>策略 \( \pi_\theta(a \mid s) \)</td><td>\( \pi_\theta(y_t \mid x, y_{&lt;t}) \)：softmax 后的词表分布</td><td>与语言模型的下一 token 分布完全相同</td></tr>
+          <tr><td>轨迹 \( \tau \)</td><td>完整回答 \( y = (y_1, \dots, y_T) \)</td><td>回合 = 一次采样生成</td></tr>
+          <tr><td>回合终点</td><td>采样到 EOS 或达到长度上限</td><td>回合长度由策略决定，非固定步数</td></tr>
+          <tr><td>奖励 \( r_t \)</td><td>多数为 0；末位 \( r_T = R(x, y) \)（RM 分数/验证器）+ 每 token 的 KL 惩罚</td><td>序列级稀疏为主，KL 项天然稠密（第 4 节）</td></tr>
+          <tr><td>回报 \( G_t \)</td><td>\( \gamma = 1 \) 时 \( G_t = R(x,y) \)（对一切 \( t \)）</td><td>回合内未来奖励恒定，无需折扣</td></tr>
+          <tr><td>价值 \( V(s_t) \)</td><td>对部分前缀的期望最终奖励（PPO 需 Critic 学习）</td><td>目标噪声大、学习困难（第 7 节）</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 6-1：LLM 生成的 token-level MDP 映射表（全书 RL 算法章节的统一口径）</span>
+    </div>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="token 级决策链与奖励分配">
+        <defs><marker id="arrow6a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#2563eb"/></marker></defs>
+        <defs><marker id="arrow6b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#ef4444"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">一次生成 = 一条决策链：每个 token 是一个决策点</text>
+        <rect x="20" y="44" width="240" height="52" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+        <text x="140" y="66" text-anchor="middle" font-size="14" fill="#1e3a8a">提示词 x（含对话模板）</text>
+        <text x="140" y="86" text-anchor="middle" font-size="13" fill="#475569">初始状态 s_0</text>
+        <rect x="30" y="140" width="92" height="64" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="76" y="164" text-anchor="middle" font-size="14" fill="#065f46">决策 t=1</text>
+        <text x="76" y="186" text-anchor="middle" font-size="12" fill="#475569">y_1 ∈ 词表</text>
+        <rect x="136" y="140" width="92" height="64" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="182" y="164" text-anchor="middle" font-size="14" fill="#065f46">决策 t=2</text>
+        <text x="182" y="186" text-anchor="middle" font-size="12" fill="#475569">s_1=(x,y_1)</text>
+        <rect x="242" y="140" width="92" height="64" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="288" y="164" text-anchor="middle" font-size="14" fill="#065f46">决策 t=3</text>
+        <text x="288" y="186" text-anchor="middle" font-size="12" fill="#475569">s_2=(x,y_1..2)</text>
+        <text x="366" y="176" font-size="16" fill="#475569">…</text>
+        <rect x="396" y="140" width="92" height="64" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="442" y="164" text-anchor="middle" font-size="14" fill="#065f46">决策 t=T</text>
+        <text x="442" y="186" text-anchor="middle" font-size="12" fill="#475569">y_T=EOS</text>
+        <rect x="540" y="140" width="160" height="64" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+        <text x="620" y="164" text-anchor="middle" font-size="14" fill="#92400e">结果奖励 R(x,y)</text>
+        <text x="620" y="186" text-anchor="middle" font-size="12" fill="#92400e">RM 打分 / 规则验证</text>
+        <line x1="140" y1="96" x2="90" y2="140" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow6a)"/>
+        <line x1="122" y1="172" x2="136" y2="172" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow6a)"/>
+        <line x1="228" y1="172" x2="242" y2="172" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow6a)"/>
+        <line x1="334" y1="172" x2="396" y2="172" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow6a)"/>
+        <line x1="488" y1="172" x2="540" y2="172" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow6a)"/>
+        <rect x="30" y="232" width="92" height="40" rx="8" fill="#fef2f7" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="76" y="250" text-anchor="middle" font-size="12" fill="#881337">KL 惩罚 −β·k3</text>
+        <text x="76" y="266" text-anchor="middle" font-size="12" fill="#881337">（逐 token）</text>
+        <rect x="136" y="232" width="92" height="40" rx="8" fill="#fef2f7" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="182" y="250" text-anchor="middle" font-size="12" fill="#881337">KL 惩罚 −β·k3</text>
+        <text x="182" y="266" text-anchor="middle" font-size="12" fill="#881337">（逐 token）</text>
+        <rect x="242" y="232" width="92" height="40" rx="8" fill="#fef2f7" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="288" y="250" text-anchor="middle" font-size="12" fill="#881337">KL 惩罚 −β·k3</text>
+        <text x="288" y="266" text-anchor="middle" font-size="12" fill="#881337">（逐 token）</text>
+        <rect x="396" y="232" width="92" height="40" rx="8" fill="#fef2f7" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="442" y="250" text-anchor="middle" font-size="12" fill="#881337">KL 惩罚 −β·k3</text>
+        <text x="442" y="266" text-anchor="middle" font-size="12" fill="#881337">（逐 token）</text>
+        <line x1="76" y1="232" x2="76" y2="204" stroke="#ef4444" stroke-width="1.5"/>
+        <line x1="182" y1="232" x2="182" y2="204" stroke="#ef4444" stroke-width="1.5"/>
+        <line x1="288" y1="232" x2="288" y2="204" stroke="#ef4444" stroke-width="1.5"/>
+        <line x1="442" y1="232" x2="442" y2="204" stroke="#ef4444" stroke-width="1.5"/>
+        <path d="M560 232 C 450 300, 160 300, 60 208" fill="none" stroke="#ef4444" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow6b)"/>
+        <text x="300" y="306" text-anchor="middle" font-size="13" fill="#881337">credit assignment：末位一个标量 R，如何分配到每个 token 的决策？（优势估计 / 组基线 / 过程奖励）</text>
+      </svg>
+      <figcaption>图 6-1：token 级决策链示意：状态随动作确定性增长，随机性全部来自策略采样；奖励由稠密的逐 token KL 惩罚与稀疏的末位结果奖励组成（作者自绘）</figcaption>
+    </figure>
+    <p>这张映射表里藏着一个常被忽略的幸运事实：<strong>转移是确定性的</strong>。经典 RL 的高方差很大程度来自环境随机性（同样的动作落到不同状态）；文本生成中 \( s_{t+1} = (s_t, a_t) \) 完全确定，随机性只来自策略自己的采样与回合长度的不定。这带来两个简化：其一，"环境模型"就是拼接操作，不需要学世界模型；其二，策略对轨迹分布的控制是全局的——分布偏移的根源纯粹是"策略变了"，这解释了为什么 KL 到参考模型（第 3 节）在 LLM RL 里几乎是唯一需要的"安全带"。</p>
+    <p><strong>本节小结：</strong>状态是前缀、动作是 token、转移是拼接、回合是一次生成；确定性转移让问题比经典 RL 干净，但 15 万维动作空间与数千步回合也带来独特困难。</p>
+
+    <h2>3. KL 正则化的 RLHF 目标函数：推导与闭式最优解</h2>
+    <p>如果只写"最大化奖励"，优化器会给出灾难性的答案：奖励模型是训练在有限偏好数据上的代理，无约束最大化会找到它的盲区——重复讨好性短语、超长输出、格式套利，语言能力本身崩坏（第 9 节展开）。InstructGPT 以来的标准解法是在目标里加一项"别离参考模型太远"的正则：</p>
+    \[ \max_{\theta}\; \mathbb{E}_{x \sim \mathcal{D}}\; \mathbb{E}_{y \sim \pi_\theta(\cdot \mid x)}\left[ r(x, y) \right] - \beta\, \mathbb{D}_{\mathrm{KL}}\!\left( \pi_\theta(\cdot \mid x)\, \|\, \pi_{\mathrm{ref}}(\cdot \mid x) \right) \]
+    <p>其中 \(\pi_{\mathrm{ref}}\) 是冻结的 SFT 模型，\(\beta &gt; 0\) 控制拴绳强度。这个目标有一个精确的闭式解，推导值得完整走一遍（它同时是 DPO 的出发点，第 22 章会复用）。固定 \(x\)，把 \(\pi\) 看作任意分布，用拉格朗日乘子处理归一化约束 \(\sum_y \pi(y) = 1\)：</p>
+    \[ \mathcal{L}(\pi, \lambda) = \sum_y \pi(y)\left[ r(y) - \beta \log \frac{\pi(y)}{\pi_{\mathrm{ref}}(y)} \right] + \lambda \left( \sum_y \pi(y) - 1 \right) \]
+    <p>对 \(\pi(y)\) 求导并置零：\( r(y) - \beta\log\pi(y) + \beta\log\pi_{\mathrm{ref}}(y) - \beta + \lambda = 0 \)，解出：</p>
+    \[ \pi^*(y \mid x) = \frac{1}{Z(x)}\, \pi_{\mathrm{ref}}(y \mid x) \exp\!\left( \frac{r(x, y)}{\beta} \right), \qquad Z(x) = \sum_y \pi_{\mathrm{ref}}(y \mid x) \exp\!\left( \frac{r(x,y)}{\beta} \right) \]
+    <p>读一下这个解的三层含义。<strong>其一，形式是"参考分布 × 奖励指数加权"</strong>：KL 约束下的最优策略不是"奖励最大者"，而是把参考模型的分布按奖励做指数级重加权——奖励每高 \(\beta\)，概率质量多 \(e\) 倍。<strong>其二，\(\beta\) 的极限行为</strong>：\(\beta \to \infty\) 时指数趋平，\(\pi^* \to \pi_{\mathrm{ref}}\)（完全不动）；\(\beta \to 0\) 时退化为 argmax（纯奖励最大化，崩溃）。实战中 \(\beta\) 在 0.02~0.1 之间（第 21 章给调参方法）。<strong>其三，重参数化</strong>：对最优解取对数、移项，奖励可以反过来用策略比表达：</p>
+    \[ r(x, y) = \beta \log \frac{\pi^*(y \mid x)}{\pi_{\mathrm{ref}}(y \mid x)} + \beta \log Z(x) \]
+    <p>这说明"训练后的策略与参考模型的 log 概率比"本身就是奖励的充分统计量——把 \(\pi^*\) 换成可学习的 \(\pi_\theta\)、消掉与 \(y\) 无关的 \(Z(x)\)，就得到 DPO 的损失函数（Rafailov et al., 2023, arXiv:2305.18290）。同一个数学结构，从"RLHF 为什么合理"与"DPO 为什么可行"两个方向被使用，这是理论部分给你的第一份复利。</p>
+    <div class="callout note">
+      <div class="callout-title">📘 概念辨析：为什么 KL 用"反向"方向 \( \mathrm{KL}(\pi_\theta \| \pi_{\mathrm{ref}}) \)</div>
+      <p>KL 不对称。这里约束的是"新策略覆盖不到参考分布"的问题：反向 KL \( \mathrm{KL}(p \| q) = \mathbb{E}_{y \sim p}[\log p - \log q] \) 在 \(p\) 覆盖不到 \(q\) 的高概率区时急剧增大（因为 \(\log p - \log q\) 里 \(\log q\) 很小、\(\log p\) 有概率质量），也就是<strong>模式寻求（mode-seeking）</strong>——它惩罚"放弃参考模型会说的内容"。反之若用 \( \mathrm{KL}(\pi_{\mathrm{ref}} \| \pi_\theta) \)（正向、均值覆盖），参考分布中低概率的长尾会被新策略"顺手覆盖"，语言可以在奖励方向上漂移得更远。工程上反向 KL 还有决定性优势：样本来自 \(\pi_\theta\)（rollout 本来就要做），期望可直接估计（第 8 节）。</p>
+    </div>
+    <p><strong>本节小结：</strong>RLHF 目标 = 奖励期望 − β·KL(θ‖ref)，其闭式解是"参考分布按奖励指数重加权"；\(\beta\) 是拴绳，重参数化该解即得 DPO——这是全书最重要的一个公式。</p>
+
+    <h2>4. reward shaping：把 KL 并进奖励</h2>
+    <p>第 3 节的目标里 KL 是序列级的整项；PPO 的算法结构（第 5 章）却要求<strong>逐 token 的奖励序列</strong>（用于 GAE 与价值回归）。两者能统一起来吗？可以，而且是精确等价，不是近似。关键观察是：序列级 log 概率比按链式法则逐 token 分解：</p>
+    \[ \log \frac{\pi_\theta(y \mid x)}{\pi_{\mathrm{ref}}(y \mid x)} = \sum_{t=1}^{T} \left[ \log \pi_\theta(y_t \mid x, y_{&lt;t}) - \log \pi_{\mathrm{ref}}(y_t \mid x, y_{&lt;t}) \right] \]
+    <p>而 KL 正是 log 比在 \(\pi_\theta\) 分布下的期望，所以</p>
+    \[ \mathbb{D}_{\mathrm{KL}}\!\left( \pi_\theta \| \pi_{\mathrm{ref}} \right) = \mathbb{E}_{y \sim \pi_\theta}\left[ \sum_{t=1}^{T} \log \frac{\pi_\theta(y_t \mid x, y_{&lt;t})}{\pi_{\mathrm{ref}}(y_t \mid x, y_{&lt;t})} \right] \]
+    <p>于是"期望奖励 − \(\beta\)·KL"完全等价于把每 token 的 shaped reward 定义为：</p>
+    \[ \tilde{r}_t = \begin{cases} -\beta\, \log \dfrac{\pi_\theta(y_t \mid x, y_{&lt;t})}{\pi_{\mathrm{ref}}(y_t \mid x, y_{&lt;t})}, &amp; t &lt; T \\[6pt] R(x, y) - \beta\, \log \dfrac{\pi_\theta(y_T \mid x, y_{&lt;T})}{\pi_{\mathrm{ref}}(y_T \mid x, y_{&lt;T})}, &amp; t = T \end{cases} \]
+    <p>即：每个 token 挂一个"离参考模型太远"的负奖励，结果奖励 \(R(x,y)\) 放在末位（InstructGPT 与 Ziegler et al., 2019, arXiv:1909.08593 的原始做法正是如此）。这不只是实现技巧，它改变了学习动力学：KL 惩罚从"回合末的一笔总账"变成<strong>即时反馈</strong>——策略每漂移一个 token 就被轻轻拉一下，credit assignment 问题凭空多了一条稠密通道（对比第 7 节纯稀疏奖励的困境）。这也是 reward shaping 理论（Ng et al., 1999）在 LLM 上的实例：设计良好的逐项 reward 不改变最优策略，只改变到达它的速度与稳定性。</p>
+    <div class="callout tip">
+      <div class="callout-title">💡 实践建议：KL 惩罚放每个 token，结果奖励放末位</div>
+      <p>这是 PPO-for-LLM 的标准姿势，也是第 20 章代码的默认配置。两个细节：其一，KL 惩罚用第 8 节的 k3 估计器（恒非负、数值稳），不要用裸的 log 比（可为负，等效于奖励"向参考模型漂移"，会引入反向的套利空间）；其二，若把结果奖励平摊到每个 token（\(R/|y|\)），会引入"长回答人均摊薄"的长度偏置，不如集中放末位、靠 GAE/优势广播回传。</p>
+    </div>
+    <p><strong>本节小结：</strong>序列级 KL 与逐 token log 比之和精确等价，KL 正则可以无损地改写为每 token 的 shaped reward；"KL 放每个 token、结果奖励放末位"是 RLHF 实现的标准形。</p>
+
+    <h2>5. per-token 与 sequence-level 奖励：为过程奖励埋下伏笔</h2>
+    <p>第 4 节解决了"奖励放在哪些时间步"的机械问题，但"奖励信号本身在哪一层产生"是另一个正交且更重要的设计决策。按产生粒度分三类：<strong>序列级（outcome）</strong>——整条回答一个分数，来自奖励模型（第 19 章）或规则验证器（答案对错、单元测试通过）；<strong>步级/过程（process）</strong>——对推理的每个步骤打分，来自过程奖励模型（PRM）或人工/AI 步骤标注；<strong>逐 token</strong>——目前只有 KL 惩罚天然逐 token，纯粹的 token 级奖励模型尚不成熟。表 6-2 对比三类信号，第 28 章将展开过程奖励的完整方法论。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>信号类型</th><th>典型来源</th><th>密度</th><th>优势</th><th>主要风险</th></tr></thead>
+        <tbody>
+          <tr><td>结果奖励（outcome）</td><td>RM / 数学验证器 / 单元测试</td><td>稀疏（每回合 1 个）</td><td>标注便宜、目标干净、可验证域无假信号</td><td>credit assignment 困难；RM 可被黑客</td></tr>
+          <tr><td>过程奖励（process）</td><td>PRM / 步骤级人工标注 / 蒙特卡洛估计</td><td>稠密（每步 1 个）</td><td>精确定位错误步骤，探索效率高</td><td>标注昂贵；步骤评分可被"合法但无用"的步骤骗分</td></tr>
+          <tr><td>KL 惩罚</td><td>参考模型 log 概率（免标注）</td><td>逐 token</td><td>零成本、恒定可用、防漂移</td><td>只约束不指导：拉回但不告诉方向</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 6-2：三种奖励信号粒度的对比（结果 vs 过程之争详见第 28 章；Uesato et al., 2022, arXiv:2211.14235；Lightman et al., 2023, arXiv:2305.20050）</span>
+    </div>
+    <figure class="figure">
+      <svg class="diagram" viewBox="0 0 720 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="三种奖励信号的时间轴对比">
+        <defs><marker id="arrow6c" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#94a3b8"/></marker></defs>
+        <text x="360" y="24" text-anchor="middle" font-size="16" fill="#1e293b">三种奖励信号的时间轴：一个 8 token 的回答</text>
+        <line x1="150" y1="76" x2="670" y2="76" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow6c)"/>
+        <text x="670" y="94" text-anchor="end" font-size="12" fill="#64748b">token 时间步 t →</text>
+        <circle cx="190" cy="76" r="4" fill="#cbd5e1"/><circle cx="250" cy="76" r="4" fill="#cbd5e1"/>
+        <circle cx="310" cy="76" r="4" fill="#cbd5e1"/><circle cx="370" cy="76" r="4" fill="#cbd5e1"/>
+        <circle cx="430" cy="76" r="4" fill="#cbd5e1"/><circle cx="490" cy="76" r="4" fill="#cbd5e1"/>
+        <circle cx="550" cy="76" r="4" fill="#cbd5e1"/>
+        <rect x="596" y="58" width="52" height="36" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+        <text x="622" y="74" text-anchor="middle" font-size="13" fill="#065f46">R=1</text>
+        <text x="622" y="88" text-anchor="middle" font-size="11" fill="#475569">末位</text>
+        <rect x="14" y="56" width="120" height="40" rx="8" fill="#ecfdf5" stroke="#10b981" stroke-width="1.5"/>
+        <text x="74" y="73" text-anchor="middle" font-size="13" fill="#065f46">结果奖励</text>
+        <text x="74" y="89" text-anchor="middle" font-size="12" fill="#475569">稀疏（1 个）</text>
+        <line x1="150" y1="166" x2="670" y2="166" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow6c)"/>
+        <circle cx="190" cy="166" r="7" fill="#10b981"/><circle cx="250" cy="166" r="6" fill="#10b981"/>
+        <circle cx="310" cy="166" r="8" fill="#10b981"/><circle cx="370" cy="166" r="5" fill="#10b981"/>
+        <circle cx="430" cy="166" r="7" fill="#10b981"/><circle cx="490" cy="166" r="6" fill="#10b981"/>
+        <circle cx="550" cy="166" r="7" fill="#10b981"/><circle cx="610" cy="166" r="6" fill="#10b981"/>
+        <text x="400" y="184" text-anchor="middle" font-size="12" fill="#475569">每步一个过程分数（点越大分越高）</text>
+        <rect x="14" y="146" width="120" height="40" rx="8" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+        <text x="74" y="163" text-anchor="middle" font-size="13" fill="#1e3a8a">过程奖励</text>
+        <text x="74" y="179" text-anchor="middle" font-size="12" fill="#475569">稠密（每步）</text>
+        <line x1="150" y1="256" x2="670" y2="256" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arrow6c)"/>
+        <rect x="184" y="256" width="14" height="18" fill="#fca5a5"/><rect x="244" y="256" width="12" height="18" fill="#fca5a5"/>
+        <rect x="304" y="256" width="16" height="18" fill="#fca5a5"/><rect x="364" y="256" width="10" height="18" fill="#fca5a5"/>
+        <rect x="424" y="256" width="13" height="18" fill="#fca5a5"/><rect x="484" y="256" width="11" height="18" fill="#fca5a5"/>
+        <rect x="544" y="256" width="14" height="18" fill="#fca5a5"/><rect x="604" y="256" width="12" height="18" fill="#fca5a5"/>
+        <text x="400" y="294" text-anchor="middle" font-size="12" fill="#475569">逐 token 的小额负奖励（拉回参考模型，柱越高罚越重）</text>
+        <rect x="14" y="240" width="120" height="40" rx="8" fill="#fef2f7" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="74" y="257" text-anchor="middle" font-size="13" fill="#881337">KL 惩罚</text>
+        <text x="74" y="273" text-anchor="middle" font-size="12" fill="#475569">逐 token、免标注</text>
+        <rect x="14" y="304" width="692" height="24" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="1"/>
+        <text x="360" y="321" text-anchor="middle" font-size="13" fill="#92400e">标准 RLHF 配方 = 稀疏结果奖励（末位） + 逐 token KL 惩罚；过程奖励在可验证任务上按需引入</text>
+      </svg>
+      <figcaption>图 6-2：三种奖励信号在时间轴上的密度对比：结果奖励稀疏、过程奖励每步一个、KL 惩罚逐 token 免标注（作者自绘）</figcaption>
+    </figure>
+    <p>一个务实的中庸方案是把序列级奖励"伪稠密化"：把 \(R(x,y)\) 放在末位后，用第 5 章的 GAE 让 Critic 把它逐 token 传播成优势；或用<strong>组内基线</strong>——同一 prompt 采样 \(k\) 条回答、以组内均值当基线——让每个回答的 token 共享"这组回答好/坏"的信号，这正是 GRPO/RLOO 的思路（第 25 章），它绕开了 Critic，代价是牺牲步级分辨率。什么时候值得升级到真过程奖励？当任务的多步链条长（数学证明、代码多文件修改）、错误步骤需要被单独惩罚而不是"整条连坐"时——可验证奖励 + 过程奖励的混合是第 5 部分反复出现的配方。</p>
+    <p><strong>本节小结：</strong>奖励粒度是正交于放置位置的核心设计：结果奖励便宜但稀疏、过程奖励精准但昂贵、KL 惩罚免费但只约束；组基线与 GAE 是把稀疏信号"传播开"的两大工具。</p>
+
+    <h2>6. 采样温度与探索</h2>
+    <p>经典 RL 用 ε-greedy 或熵正则探索；LLM 的探索机制是<strong>采样温度</strong>。对 logits \(z\)，温度 \(T\) 把 softmax 改写为：</p>
+    \[ p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)} \]
+    <p>\( T \to 0 \) 时分布收缩到 argmax（贪心，无随机性），\( T &gt; 1 \) 时长尾被放大（高熵），\( T \to \infty \) 趋于均匀分布。温度同时控制三件事：生成质量（贪心解码易陷入重复退化，Holtzman et al., 2019, arXiv:1904.09751）、探索广度（rollout 的多样性决定 RL 能发现多少改进方向）、以及与参考模型的 KL 尺度（高温度会系统性抬高逐 token KL 惩罚）。</p>
+    <div class="code-wrap">
+      <span class="code-label">temperature_demo.py</span>
+      <pre class="code"><code class="language-python">import torch
+
+def sample_with_temperature(logits: torch.Tensor, temperature: float = 1.0) -&gt; int:
+    """温度采样：T 越小分布越尖（趋近贪心），T 越大越平（探索越强）"""
+    if temperature &lt;= 0:                          # 贪心解码：无随机性、无探索
+        return int(logits.argmax(dim=-1))
+    probs = torch.softmax(logits / temperature, dim=-1)
+    return int(torch.multinomial(probs, num_samples=1))
+
+z = torch.tensor([4.0, 3.0, 2.0, 1.0])            # 假想的 4 个候选 token 的 logits
+for t in [0.5, 1.0, 2.0]:
+    p = torch.softmax(z / t, dim=-1)
+    entropy = -(p * p.log()).sum().item()
+    print(f"T={t}: 概率 = {[round(x, 3) for x in p.tolist()]}, 熵 = {entropy:.3f}")
+# T=0.5: 概率 ≈ [0.866, 0.117, 0.016, 0.002] —— 头部几乎垄断
+# T=1.0: 概率 ≈ [0.644, 0.237, 0.087, 0.032] —— 标准 softmax
+# T=2.0: 概率 ≈ [0.455, 0.276, 0.167, 0.102] —— 长尾显著放大，熵更高</code></pre>
+    </div>
+    <p>区分两个容易混淆的旋钮：<strong>采样温度</strong>作用于数据生成（决定 rollout 的分布与探索量），<strong>熵正则</strong>（第 5 章）作用于参数化分布本身（防止策略在训练中过早确定化）。实践中温度是主力：RLHF 的 rollout 常用 \( T = 0.7 \sim 1.0 \)；推理强化（RLVR）倾向较高温度以维持推理路径的多样性，DeepSeek-R1-Zero 直接用 \( T = 1.0 \) 采样（arXiv:2501.12948）。调试提示：若训练中发现"每个 prompt 的组内回答几乎相同"，先查温度与 top-p 的设置——组内多样性为 0 的 rollouts 让组基线（GRPO）退化为常数，优势恒为 0，训练静默失效。</p>
+    <p><strong>本节小结：</strong>温度是 LLM 的探索旋钮，同时牵动质量、多样性与 KL 尺度；RL rollout 保持 \( T \approx 0.7 \sim 1.0 \)，并警惕"组内采样同质化"这一静默故障。</p>
+
+    <h2>7. credit assignment：文本生成的特殊困难</h2>
+    <p>第 5 章把 credit assignment 列为 RL 的本质困难之一，在文本生成里它被放大到极限，特殊性有四。<strong>其一，回合极长</strong>：一条回答几百到几千个 token，就是一个几千步的决策序列，而评价只有一个标量——第 5 章的策略梯度公式里，几千个 \(\nabla\log\pi\) 共享同一个 \(G_t\)。<strong>其二，贡献极不均匀</strong>：回答质量常常由少数关键 token 决定（转折处的"但是"、算式里的那个进位、工具调用的参数），大量功能词只是语法填充；均匀广播奖励会把关键信号稀释在噪声里。<strong>其三，价值估计先天贫血</strong>：Critic 要学的 \(V(x, y_{&lt;t})\) 是"这个前缀的期望最终奖励"，而最终奖励因 prompt、因标注者、因验证器而剧烈波动，信号-噪声比极差——这是 PPO 的 Critic 在 LLM 上又贵又难训的结构性原因（第 25 章 GRPO 的动机）。</p>
+    <p><strong>其四，方差随长度二次增长</strong>：不做任何方差治理时，单标量奖励对 \(T\) 个独立决策的梯度估计方差以 \(O(T^2)\) 增长。实战中的四层缓解，按工程成本从低到高：第一层，<strong>基线</strong>——批均值、prompt 级均值或移动平均（第 5 章第 5 节的恒等式保证无偏）；第二层，<strong>组基线</strong>——同一 prompt 采 \(k\) 条互相当基线（GRPO/RLOO），把 prompt 难度从信号中剔除，对奖励尺度跨 prompt 波动的问题尤其有效；第三层，<strong>GAE + Critic</strong>——用学到的 \(V\) 做每步基线与自举，分辨率最高、成本也最高；第四层，<strong>过程奖励</strong>——直接给每步打分，从源头缓解（第 28 章）。这四层不是互斥的：R1 式训练常用"组基线 + 规则验证器"，工业 RLHF 常用"组基线或 Critic + KL shaping"。</p>
+    <div class="callout warn">
+      <div class="callout-title">⚠️ 常见误区：把序列奖励平摊到每个 token 当作 per-token 优势</div>
+      <p>一种偷懒写法是 \( A_t = R(x,y)/|y| \) 直接当每 token 优势。它无偏性尚可，但把"哪个 token 立功"的信息彻底抹平，且长度偏置会诱导模型学出凑长度或凑段落的策略。正确姿势：奖励放末位，用 GAE/组基线求优势后广播；若确需稠密监督，上 PRM 或步级验证器，而不是算术平摊。</p>
+    </div>
+    <p><strong>本节小结：</strong>长回合 + 稀疏单标量 + 贡献不均 + Critic 贫血，构成文本生成 credit assignment 的四重特殊困难；基线 → 组基线 → GAE → 过程奖励，是按成本递增的四层解法。</p>
+
+    <h2>8. KL 散度的三种估计器：k1、k2、k3</h2>
+    <p>训练时你无法精确计算 \(\mathrm{KL}(\pi_\theta \| \pi_{\mathrm{ref}})\)（要对全部 \(10^{15}\) 条可能序列求和），只能用 rollout 样本估计。John Schulman 的博客《Approximating KL Divergence》给出了三个估计器及其性质，这组工具在 KL 惩罚、early-stop 监控、DPO 校准里无处不在。目标量是 \( \mathrm{KL}(p \| q) = \mathbb{E}_{y \sim p}[\log p(y) - \log q(y)] \)，样本来自 \(p\)（即当前策略的 rollout），记逐 token 的 log 比 \( \ell = \log p - \log q \)（\(p = \pi_\theta\)，\(q = \pi_{\mathrm{ref}}\)）：</p>
+    \[ k_1 = \ell, \qquad k_2 = \tfrac{1}{2}\, \ell^2, \qquad k_3 = \frac{q}{p} - \log\frac{q}{p} - 1 \]
+    <p>三者都是对同一个 KL 的估计，性质却差别很大（表 6-3）。<strong>\(k_1\)</strong> 是定义本身，无偏，但逐 token 可为负——把它当惩罚会出现"靠近参考模型反而得正奖励"的套利空间，且方差大。<strong>\(k_2\)</strong> 恒非负、方差小，但有偏：由 \( \mathbb{E}_p[\ell^2] = \mathrm{Var}_p(\ell) + (\mathbb{E}_p[\ell])^2 = \mathrm{Var}_p(\ell) + \mathrm{KL}^2 \) 可得 \( \mathbb{E}[k_2] = \tfrac12 \mathrm{Var}_p(\ell) + \tfrac12 \mathrm{KL}^2 \)——KL 很小时它低估（被方差项主导的符号随机），KL 很大时又高估（平方项爆炸）。<strong>\(k_3\)</strong> 是兼顾者：利用恒等式 \( \mathbb{E}_p[q/p] = \sum_y p(y) \cdot \frac{q(y)}{p(y)} = 1 \)，有 \( \mathbb{E}_p[k_3] = 1 + \mathrm{KL} - 1 = \mathrm{KL} \)，<strong>无偏</strong>；又因 \( x - \log x - 1 \ge 0 \) 对一切 \(x &gt; 0\) 成立，<strong>逐点非负</strong>；在 \(p \approx q\) 附近它关于 \(\ell\) 展开的线性项与 \(k_1\) 相同、方差与 \(k_1\) 同阶但被非负截断压低。这三条性质让 k3 成为 TRL 等主流实现的默认选择。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>估计器</th><th>公式（\(\ell = \log p - \log q\)）</th><th>无偏</th><th>逐点非负</th><th>备注</th></tr></thead>
+        <tbody>
+          <tr><td>k1</td><td>\( \ell \)</td><td>是</td><td>否</td><td>InstructGPT 早期 per-token 惩罚用此形式；可为负、方差大</td></tr>
+          <tr><td>k2</td><td>\( \frac{1}{2}\ell^2 \)</td><td>否</td><td>是</td><td>\( \mathbb{E}[k_2] = \frac12 \mathrm{Var}(\ell) + \frac12 \mathrm{KL}^2 \)：小 KL 低估、大 KL 高估</td></tr>
+          <tr><td>k3</td><td>\( e^{-\ell} - 1 + \ell \)</td><td>是</td><td>是</td><td>TRL/PPO 实现默认；\(x - \log x - 1\) 结构保证非负</td></tr>
+        </tbody>
+      </table>
+      <span class="tbl-caption" style="display:block;font-size:13px;color:#64748b;margin-top:8px;">表 6-3：三种 KL 估计器对比（出自 Schulman, 2020, "Approximating KL Divergence" 博客；注意 k3 中 \(x = q/p = e^{-\ell}\)）</span>
+    </div>
+    <div class="code-wrap">
+      <span class="code-label">kl_estimators.py</span>
+      <pre class="code"><code class="language-python">import torch
+
+def kl_estimators(logp_theta, logp_ref):
+    """三种 KL 估计器（输入为逐 token 的 log 概率，样本来自当前策略 p）"""
+    log_ratio = logp_theta - logp_ref           # ell = log(p/q)
+    k1 = log_ratio                              # 无偏，可为负，方差大
+    k2 = 0.5 * log_ratio.pow(2)                 # 恒非负，但有偏
+    k3 = torch.exp(-log_ratio) - 1 + log_ratio  # q/p - 1 + log(p/q)：无偏且恒非负
+    return k1, k2, k3
+
+# 数值验证：从 p 采样，三个估计器的均值与真实 KL 的关系
+torch.manual_seed(0)
+p = torch.softmax(torch.randn(8), dim=-1)
+q = torch.softmax(torch.randn(8) * 1.3, dim=-1)
+true_kl = (p * (p.log() - q.log())).sum().item()
+samples = torch.multinomial(p, num_samples=200000, replacement=True)
+k1, k2, k3 = kl_estimators(p.log()[samples], q.log()[samples])
+print(f"真实 KL      = {true_kl:.5f}")
+print(f"k1 估计      = {k1.mean():.5f}（无偏，但单样本可负）")
+print(f"k2 估计      = {k2.mean():.5f}（有偏：小 KL 时被压向 0）")
+print(f"k3 估计      = {k3.mean():.5f}（无偏，且逐点非负）")
+print(f"单样本为负比例(k1) = {(k1 &lt; 0).float().mean():.3f}")
+
+# 工程提示：实际代码在 log 空间拿到 logp_theta 与 logp_ref，
+# exp(-log_ratio) 可能在 logp_ref 溢出为 -inf 时爆炸，需 clamp 或跳过极端 token。</code></pre>
+    </div>
+    <div class="callout danger">
+      <div class="callout-title">🚨 重要警告：KL 估计器的方向与数值边界</div>
+      <p>两个高频事故。其一，<strong>方向装反</strong>：估计器假设样本来自 \(p\)、目标是 \(\mathrm{KL}(p\|q)\)。若 rollout 来自当前策略却把 \(p\)、\(q\) 写反，k3 的期望不再等于 KL（恒等式 \(\mathbb{E}_p[q/p]=1\) 不成立），惩罚项系统性失真。其二，<strong>数值边界</strong>：\(q/p = \exp(\log q - \log p)\)，当参考模型对某 token 的概率下溢（log q ≈ −inf）时 k3 爆炸；实现里要 clamp log 比或用 fp32 计算 log 概率。KL 监控曲线突然出现尖刺，先查这两处（第 46 章）。</p>
+    </div>
+    <p><strong>本节小结：</strong>k1 无偏可为负、k2 稳但有偏、k3 无偏且非负——作为惩罚项选 k3，作为监控指标三条一起看；方向（样本来自 p）与 log 空间数值边界是实现层的两大雷区。</p>
+
+    <h2>9. 为什么 LLM + RL 这么难：五大结构性困难</h2>
+    <p>把前几节的结论拼起来，就能系统回答"为什么 RLHF/RLVR 的工程难度远超 SFT"。<strong>其一，奖励稀疏且延迟</strong>：几百上千个决策共享末位一个标量（第 5、7 节），信号-噪声比先天低下；缓解靠 shaping（KL 项）、组基线、GAE 与过程奖励。<strong>其二，序列长、方差大</strong>：策略梯度方差随长度与动作空间（15 万维）放大，必须依赖方差治理全家桶——基线、优势标准化、梯度裁剪、小学习率；任何一层缺失都可能在某个 batch 上引爆。<strong>其三，奖励黑客（reward hacking）</strong>：奖励模型是有限数据的代理，强化会让策略精确地最大化代理而非本意（Goodhart 定律），表现为谄媚、冗长、模板化、格式套利；Gao et al.（2022, arXiv:2210.10760）定量刻画了"代理奖励持续上升、真实奖励先升后降"的过优化曲线，KL 系数、RM 集成与人工抽查是三道闸（第 21 章专题）。<strong>其四，rollout 成本主导</strong>：训练前向是稠密矩阵乘（GPU 友好），生成是访存受限的自回归循环（第 3 章第 9 节），RL 训练的墙钟时间一半以上花在采样；这决定了 rollout 基础设施（vLLM/异步采样，第 45 章）与算法设计的经济约束（GRPO 的组采样正是"一次 rollout 多次复用"的经济学）。<strong>其五，超参敏感且失效静默</strong>：KL 系数过大=训练无效（策略不动）、过小=崩坏；clip 比例、温度、组大小的失效都不抛异常，只表现为曲线平掉或评测悄然回落——这要求把"监控先于训练"当成纪律（第 46 章的急救手册）。</p>
+    <div class="callout note">
+      <div class="callout-title">📘 视角：SFT 与 RL 的适用边界不是"先进/落后"</div>
+      <p>RL 的三项独特价值（优化任意评价信号、on-policy 分布对齐、超越示范者）与五项结构性困难，共同决定了选型逻辑：<strong>有 token 级监督 → SFT；有可验证标量信号且行为可枚举 → RLVR；只有偏好信号 → RM + RLHF 或 DPO 类离线方法；信号昂贵且行为空间小 → 先把 SFT 做满</strong>。Ramamurthy et al.（2022, arXiv:2210.01241）对此有系统讨论。第 4 部分会把这条决策树展开成完整方法谱系。</p>
+    </div>
+    <p><strong>本节小结：</strong>稀疏奖励、长序列方差、奖励黑客、rollout 成本、静默失效——五难决定了 LLM+RL 的工程形态；每个困难都已有标准缓解层，关键是组合与监控。</p>
+
+    <h2>10. 动手：LLM 上的 REINFORCE</h2>
+    <p>把第 5 章的母公式翻译成 LLM 版本，策略梯度有如下的具体形式（组基线版，即 REINFORCEleave-one-out 的核心）：</p>
+    \[ \nabla_\theta J(\theta) = \mathbb{E}_{x \sim \mathcal{D}}\; \mathbb{E}_{y \sim \pi_\theta(\cdot \mid x)}\left[ \sum_{t=1}^{T} \nabla_\theta \log \pi_\theta(y_t \mid x, y_{&lt;t}) \cdot \left( R(x, y) - b(x) - \beta\, \hat{k}_3(t) \right) \right] \]
+    <p>其中 \(b(x)\) 是组均值基线（同一 prompt 的 \(k\) 条回答平均奖励），\(\hat{k}_3(t)\) 是第 8 节的逐 token KL 估计（并入奖励，第 4 节）。对应损失就是"优势加权的负对数似然"：\( \mathcal{L} = -\mathbb{E}\left[ \sum_t A_t \log \pi_\theta(y_t \mid x, y_{&lt;t}) \right] \)。下面的最小实现把整章的零件（采样 → 打分 → k3 KL → 组基线 → 加权似然）串成一条流水线，去掉工程件后只有 60 行，GRPO/PPO 的骨架尽在其中：</p>
+    <div class="code-wrap">
+      <span class="code-label">reinforce_llm_min.py</span>
+      <pre class="code"><code class="language-python">import torch
+import torch.nn.functional as F
+
+def reinforce_llm_step(policy, ref_model, tokenizer, prompts, reward_fn,
+                       group_size=4, beta=0.05, lr=1e-6, temperature=1.0):
+    """最小化 REINFORCE-for-LLM：组基线 + 末位结果奖励 + k3 逐 token KL 惩罚
+    （教学示意：省略 vLLM 加速、长度截断、多 epoch 等工程件）"""
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr)
+    stats = []
+    for x in prompts:
+        enc = tokenizer(x, return_tensors="pt").to(policy.device)
+        prompt_len = enc["input_ids"].shape[1]
+
+        # 1) 组采样：同一 prompt 采 group_size 条回答（探索来自采样温度）
+        rollouts, seq_logps, seq_kl, rewards = [], [], [], []
+        for _ in range(group_size):
+            out = policy.generate(**enc, do_sample=True, temperature=temperature,
+                                  max_new_tokens=256)
+            resp = out[0, prompt_len:]                    # 生成的 token（动作序列）
+            labels = out                                   # 完整序列（含提示词）
+
+            # 2) 重算当前/参考模型对 response 逐 token 的 log 概率
+            logits = policy(labels).logits[:, :-1, :]
+            logp = F.log_softmax(logits, dim=-1)
+            tok_lp = logp.gather(-1, labels[:, 1:].unsqueeze(-1)).squeeze(-1)[0, prompt_len - 1:]
+            with torch.no_grad():
+                rlogits = ref_model(labels).logits[:, :-1, :]
+                rlogp = F.log_softmax(rlogits, dim=-1)
+                ref_lp = rlogp.gather(-1, labels[:, 1:].unsqueeze(-1)).squeeze(-1)[0, prompt_len - 1:]
+
+            # 3) k3 逐 token KL 估计（无偏、非负），并入奖励构成 shaped reward
+            log_ratio = tok_lp - ref_lp
+            k3 = torch.exp(-log_ratio) - 1 + log_ratio
+            r_seq = reward_fn(x, tokenizer.decode(resp, skip_special_tokens=True))
+
+            rollouts.append(resp)
+            seq_logps.append(tok_lp)
+            seq_kl.append(k3)
+            rewards.append(r_seq)
+
+        # 4) 组基线：剔除 prompt 难度，优势 = 回报 - 组均值
+        rewards_t = torch.tensor(rewards, device=policy.device)
+        advantages = (rewards_t - rewards_t.mean()) / (rewards_t.std() + 1e-8)
+
+        # 5) 优势加权的负对数似然（KL 惩罚经 advantage 折算进权重）
+        loss = 0.0
+        for i in range(group_size):
+            A = advantages[i] - beta * seq_kl[i].mean()   # 简化：KL 以均值并入优势
+            loss = loss - A * seq_logps[i].mean()
+        loss = loss / group_size
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+        optimizer.step()
+        stats.append(rewards_t.mean().item())
+        print(f"组奖励均值 = {stats[-1]:.3f} | 奖励方差 = {rewards_t.std().item():.3f}")
+    return policy
+
+# reward_fn 示例（可验证奖励）：数学题只认最终答案
+# def reward_fn(prompt, completion):
+#     gold = extract_answer(prompt)
+#     return 1.0 if extract_answer(completion) == gold else 0.0</code></pre>
+    </div>
+    <p>对照第 5 章的伪代码读这段实现：第 1 步是 rollout（成本大头，生产环境换 vLLM），第 2 步对应 PPO 的 logp_old 与参考模型 logp，第 3 步是第 4 节的 reward shaping，第 4 步是第 7 节的组基线，第 5 步就是"优势加权最大似然"。把组基线换成 GAE+Critic、加权似然换成 clip 损失，就得到 PPO；去掉 KL 项换成组内相对排序，就接近 GRPO 的原始形态（第 25 章）。万变不离其宗：<strong>LLM 强化方法的全部差异，几乎都在"优势从哪来、KL 怎么算"这两件事上</strong>。</p>
+    <p><strong>本节小结：</strong>LLM 版策略梯度 = 优势加权的负对数似然；60 行教学实现已经包含 GRPO/PPO 的全部骨架，方法差异收敛于"优势来源"与"KL 处理"两个自由度。</p>
+
+    <h2>11. 本章小结</h2>
+    <ul>
+      <li><strong>MDP 映射</strong>：状态 = 前缀，动作 = token，转移 = 拼接（确定性），回合 = 一次生成；随机性全部来自策略采样，\(\gamma = 1\)。</li>
+      <li><strong>核心目标</strong>：\( \max_\theta \mathbb{E}[r] - \beta\,\mathrm{KL}(\pi_\theta \| \pi_{\mathrm{ref}}) \)，闭式最优解 \( \pi^* \propto \pi_{\mathrm{ref}} \exp(r/\beta) \)；重参数化它即得 DPO。</li>
+      <li><strong>KL 并入奖励</strong>：序列级 KL 与逐 token log 比之和精确等价；标准姿势是"逐 token KL 惩罚（k3）+ 末位结果奖励"。</li>
+      <li><strong>奖励粒度</strong>：结果（稀疏便宜）、过程（稠密昂贵）、KL（免费但只约束）三种信号各有定位，组基线与 GAE 是稀疏信号的两大传播器。</li>
+      <li><strong>KL 估计器</strong>：k1 无偏可为负、k2 有偏、k3 无偏且逐点非负；惩罚用 k3，方向与 log 空间溢出是实现雷区。</li>
+      <li><strong>五难</strong>：稀疏奖励、长序列方差、奖励黑客、rollout 成本、静默失效——各自的缓解层构成第 4、5 部分算法设计的全景图。</li>
+    </ul>
+    <p>理论部分到此收官。你已经具备进入方法主体的全部地基：架构与 log 概率从哪来（第 3 章）、base 模型能干什么（第 4 章）、策略梯度与 PPO 的数学（第 5 章）、以及它们如何落在语言模型上（本章）。接下来进入第 2 部分——后训练的数据工程，那里决定你手里这把"RL 之剑"挥向什么方向。</p>
+
+    <div class="quiz">
+      <div class="quiz-title">🧠 自测题（点击展开答案）</div>
+      <details><summary>问题 1：LLM 的 MDP 转移是确定性的。这个性质带来哪些简化？它是否意味着 RL 的方差问题在 LLM 上不存在？</summary><p>简化有二：不需要学习或建模环境动力学（"环境"就是字符串拼接），模型和奖励函数是仅有的随机性来源；且回合内未来奖励与当前动作之后的环境随机性无关，回报 \(G_t\) 的条件期望结构更干净。但方差问题依然严重：随机性来自 15 万维动作空间的采样与回合长度不定，单条轨迹的回报方差依旧巨大，策略梯度的方差随序列长度与奖励尺度增长——这正是基线、组基线、GAE、优势标准化在 LLM RL 中不可或缺的原因。确定性转移只是移除了"环境噪声"这一种方差来源。</p></details>
+      <details><summary>问题 2：证明 \( k_3 = q/p - \log(q/p) - 1 \) 在样本来自 \(p\) 时是 KL(\(p\|q\)) 的无偏估计，且逐点非负。</summary><p>无偏性：\( \mathbb{E}_p[q/p] = \sum_y p(y)\, q(y)/p(y) = \sum_y q(y) = 1 \)；\( \mathbb{E}_p[-\log(q/p)] = \mathbb{E}_p[\log(p/q)] = \mathrm{KL}(p\|q) \)；再减常数 1，得 \( \mathbb{E}_p[k_3] = 1 - 1 + \mathrm{KL} = \mathrm{KL} \)。非负性：令 \( x = q/p &gt; 0 \)，由 \( \log x \le x - 1 \)（对数函数的凸性/切线不等式）得 \( x - \log x - 1 \ge 0 \)，等号当且仅当 \(x=1\)（即 \(p=q\)）。两条性质合起来：k3 逐点非负、期望恰为 KL，是三估计器中最适合当惩罚项的。</p></details>
+      <details><summary>问题 3：把 RLHF 目标里的 β 从 0.05 调到 0.5，模型行为会发生什么系统性变化？调到 0.001 呢？</summary><p>\( \beta=0.5 \)：拴绳收紧，最优策略 \( \pi^* \propto \pi_{\mathrm{ref}} e^{r/\beta} \) 中奖励的指数权重被压缩，策略贴近 SFT 参考模型——奖励分数提升有限、回答风格变化小，KL 曲线平直，等于"训练了个寂寞"。\( \beta=0.001 \)：几乎纯奖励最大化，策略迅速漂向奖励模型的盲区——冗长、谄媚、模板化、语言质量退化，评测上代理奖励（RM 分数）持续上升而真实偏好先升后崩（Gao et al. 的过优化曲线）。调参实践：从 0.02~0.1 起步，以"KL 随训练缓慢增长且可控、人工抽查语言质量不退化"为准（第 21 章）。</p></details>
+      <details><summary>问题 4：同一个 prompt 用温度 1.0 采样 8 条回答，奖励全都是 1.0。此时组基线（GRPO 式）的优势是多少？训练会发生什么？请给出至少两个可能的原因与排查动作。</summary><p>优势恒为 0（减去组均值后全为 0），该 prompt 的梯度为 0，训练静默无效。可能原因与排查：其一，任务太简单——模型已能全对，应换更难的 prompt 分桶或提高过滤阈值（RLVR 常按通过率 0.2~0.8 过滤提示词）；其二，探索不足——检查温度/top-p 是否过低、组内回答是否雷同，必要时提高温度或去掉Beam/前缀截断；其三，奖励函数饱和——验证器可能对多种合理输出全给满分，需细化评分。监控指标：组内奖励方差应保持非零，长期为零的 batch 占比是训练健康度的核心仪表（第 46 章）。</p></details>
+    </div>
+
+    <h2>参考文献</h2>
+    <ol class="refs">
+      <li><span class="rid">[Ziegler+, 2019]</span> Ziegler, D. et al. "Fine-Tuning Language Models from Human Preferences." 2019. <span class="rid">arXiv:1909.08593</span></li>
+      <li><span class="rid">[Stiennon+, 2020]</span> Stiennon, N. et al. "Learning to Summarize with Human Feedback." <i>NeurIPS</i>, 2020. <span class="rid">arXiv:2009.01325</span></li>
+      <li><span class="rid">[Ouyang+, 2022]</span> Ouyang, L. et al. "Training language models to follow instructions with human feedback." <i>NeurIPS</i>, 2022. <span class="rid">arXiv:2203.02155</span></li>
+      <li><span class="rid">[Schulman+, 2017]</span> Schulman, J. et al. "Proximal Policy Optimization Algorithms." 2017. <span class="rid">arXiv:1707.06347</span></li>
+      <li><span class="rid">[Schulman, 2020]</span> Schulman, J. "Approximating KL Divergence." Blog post, 2020.（k1/k2/k3 估计器，无 arXiv）</li>
+      <li><span class="rid">[Rafailov+, 2023]</span> Rafailov, R. et al. "Direct Preference Optimization: Your Language Model is Secretly a Reward Model." <i>NeurIPS</i>, 2023. <span class="rid">arXiv:2305.18290</span></li>
+      <li><span class="rid">[Ranzato+, 2016]</span> Ranzato, M. et al. "Sequence Level Training with Recurrent Neural Networks." <i>ICLR</i>, 2016. <span class="rid">arXiv:1511.06732</span></li>
+      <li><span class="rid">[Paulus+, 2018]</span> Paulus, R., Xiong, C., Socher, R. "A Deep Reinforced Model for Abstractive Summarization." <i>ICLR</i>, 2018. <span class="rid">arXiv:1705.04304</span></li>
+      <li><span class="rid">[Uesato+, 2022]</span> Uesato, J. et al. "Solving math word problems with process- and outcome-based feedback." 2022. <span class="rid">arXiv:2211.14235</span></li>
+      <li><span class="rid">[Lightman+, 2023]</span> Lightman, H. et al. "Let's Verify Step by Step." <i>ICLR</i>, 2024. <span class="rid">arXiv:2305.20050</span></li>
+      <li><span class="rid">[Gao+, 2022]</span> Gao, L. et al. "Scaling Laws for Reward Model Overoptimization." <i>ICML</i>, 2023. <span class="rid">arXiv:2210.10760</span></li>
+      <li><span class="rid">[Holtzman+, 2019]</span> Holtzman, A. et al. "The Curious Case of Neural Text Degeneration." <i>ICLR</i>, 2019. <span class="rid">arXiv:1904.09751</span></li>
+      <li><span class="rid">[Ramamurthy+, 2022]</span> Ramamurthy, R. et al. "Is Reinforcement Learning (Not) for Natural Language Processing?: Benchmarks, Baselines, and Building Blocks for Natural Language Policy Optimization." <i>ICLR</i>, 2023. <span class="rid">arXiv:2210.01241</span></li>
+      <li><span class="rid">[Zheng+, 2023]</span> Zheng, R. et al. "Secrets of RLHF in Large Language Models Part I: Reward Model Averaging." 2023. <span class="rid">arXiv:2307.04964</span></li>
+      <li><span class="rid">[DeepSeek-AI, 2025]</span> DeepSeek-AI. "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." 2025. <span class="rid">arXiv:2501.12948</span></li>
+      <li><span class="rid">[Ng+, 1999]</span> Ng, A., Harada, D., Russell, S. "Policy invariance under reward transformations: Theory and application to reward shaping." <i>ICML</i>, 1999.（无 arXiv）</li>
+    </ol>
+
+    <footer class="chapter-footer"></footer>
+  </main>
+</div>
+</body>
+</html>
